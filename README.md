@@ -398,16 +398,6 @@ Early-stage fusion support:
 - Diagnostics tracking fusion attempts and outcomes
 - Currently not integrated into main training loop; reserved for future work
 
-## Documentation
-
-Detailed guides are in `docs/`:
-
-- **[PvZRL_Learning_Guide.md](docs/PvZRL_Learning_Guide.md)**: Conceptual overview of architecture and project goals
-- **[PvZRLBridge.md](docs/PvZRLBridge.md)**: Bridge build, proof-of-control, board readiness, and integration checklist
-- **[PPO_Readiness.md](docs/PPO_Readiness.md)**: Training validation steps and readiness criteria
-- **[ADVENTURE_GENERALIST.md](docs/ADVENTURE_GENERALIST.md)**: 14-slot policy design, curriculum, metadata, and implementation details
-- **[ImplementationProcess.md](docs/ImplementationProcess.md)**: Development history and decision rationale
-- **[AdventureAndFusionRoadmap.md](docs/AdventureAndFusionRoadmap.md)**: Planned work and future directions
 
 ## Known Limitations
 
@@ -428,9 +418,6 @@ This is an active research project. Areas for contribution:
 - **Bridge robustness**: Better error handling and edge case detection in IL2CPP read/write operations
 - **Testing**: Additional integration tests and edge case validation
 
-## License
-
-See LICENSE file (if present) for project licensing details.
 
 ## References
 
