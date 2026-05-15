@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "notes": "Adventure stage router schedule. The early model uses the duplicate 4-slot SunFlower/Peashooter layout; the utility stage expects all four utility seeds unlocked and visible before selection.",
+  "stages": [
+    {
+      "id": "early",
+      "family": "ppo_4slot_sunflower_peashooter",
+      "levels": "1-1..1-3",
+      "model_path": "runs/ppo_4slot_sunflower_peashooter_20260504_104628/checkpoints/ppo_pvz_250000_steps.zip",
+      "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
+      "plant_types": [1, 1, 0, 0],
+      "requires_unlocked": ["SunFlower", "Peashooter"],
+      "requires_available": ["SunFlower", "Peashooter"],
+      "action_space_mode": "fixed"
+    },
+    {
+      "id": "post_unlock_utility",
+      "family": "ppo_4slot_sunflower_peashooter_wallnut_cherrybomb",
+      "levels": "1-4..1-10",
+      "model_path": "runs/ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_104514/checkpoints/ppo_pvz_100000_steps.zip",
+      "seed_list": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
+      "plant_types": [1, 0, 3, 2],
+      "requires_unlocked": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
+      "requires_available": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
+      "action_space_mode": "fixed"
+    }
+  ]
+}

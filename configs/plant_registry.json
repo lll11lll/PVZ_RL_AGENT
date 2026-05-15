@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "notes": "Plant metadata registry for PvZRL. Future plants may be added here, but PPO only uses entries with enabled_for_training=true.",
+  "plants": [
+    {
+      "canonical_name": "SunFlower",
+      "aliases": ["Sunflower", "Sun Flower", "sun", "economy"],
+      "plant_type_id": 1,
+      "cost": 50,
+      "cooldown": 7.5,
+      "role": "economy",
+      "description": "Produces extra sun. Current training uses it as the economy plant.",
+      "source_of_metadata": "registry fallback; runtime cost/cooldown verified through CardUI when available",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "Peashooter",
+      "aliases": ["Pea Shooter", "Pea"],
+      "plant_type_id": 0,
+      "cost": 100,
+      "cooldown": 7.5,
+      "role": "attacker",
+      "description": "Shoots peas in its lane. Current training uses it as the basic attacker.",
+      "source_of_metadata": "registry fallback; runtime cost/cooldown verified through CardUI when available",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "WallNut",
+      "aliases": ["Wall-Nut", "Wallnut", "Nut"],
+      "plant_type_id": 3,
+      "cost": 50,
+      "cooldown": 30.0,
+      "role": "blocker",
+      "description": "Blocks zombies with high health. Metadata only; not enabled for the first PPO scope.",
+      "source_of_metadata": "almanac dump plus registry fallback",
+      "enabled_for_training": false
+    },
+    {
+      "canonical_name": "CherryBomb",
+      "aliases": ["Cherry Bomb", "Cherry"],
+      "plant_type_id": 2,
+      "cost": 150,
+      "cooldown": 50.0,
+      "role": "explosive",
+      "description": "Area burst damage plant. Metadata only; not enabled for the first PPO scope.",
+      "source_of_metadata": "almanac dump plus registry fallback",
+      "enabled_for_training": false
+    }
+  ]
+}

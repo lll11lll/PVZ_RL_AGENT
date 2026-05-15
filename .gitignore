@@ -1,0 +1,81 @@
+# Project-specific directories and files
+runs/
+Game Files/
+cmdOutputs/
+run
+
+# Model checkpoints and artifacts
+model.zip
+final_model.zip
+*.zip
+train.log
+live_status.json
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# C# build outputs
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment files
+.env
+.env.local
+
+# Log files
+*.log
+*.log.*
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.backup
+~*
+
+# IDE-specific
+*.code-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Windows
+*.lnk
+
+# Diagnostic files
+diagnostics/
+*.jsonl
