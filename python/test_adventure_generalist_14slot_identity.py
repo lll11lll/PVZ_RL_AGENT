@@ -127,6 +127,8 @@ def fake_dashboard() -> PvZDashboard:
     dashboard.generalist_tactical_masks_var = Var(True)
     dashboard.generalist_wallnut_mask_var = Var(True)
     dashboard.generalist_cherrybomb_mask_var = Var(True)
+    dashboard.generalist_fusion_action_mask_train_var = Var(True)
+    dashboard.generalist_fusion_action_mask_eval_var = Var(False)
     dashboard.generalist_curriculum_var = Var("conservative")
     dashboard.generalist_randomize_seed_order_var = Var(False)
     dashboard.human_coach_enabled_var = Var(False)
@@ -134,6 +136,8 @@ def fake_dashboard() -> PvZDashboard:
     dashboard.human_coach_bonus_var = Var("")
     dashboard.human_coach_match_bonus_var = Var("")
     dashboard.human_coach_override_penalty_var = Var("")
+    dashboard.human_coach_fusion_reward_var = Var("")
+    dashboard.human_coach_tactical_reward_var = Var("")
     dashboard.human_coach_log_path_var = Var("runs/human_coach.jsonl")
     dashboard.human_coach_command_path_var = Var("runs/coach_commands.jsonl")
     dashboard.human_coach_command_input_var = Var("")
@@ -2405,6 +2409,7 @@ def main() -> int:
     dash_with_coach.stream_coach_log_path_var = Var("runs/stream_coach.jsonl")
     dash_with_coach.coach_allow_fusion_planning_var = Var(True)
     dash_with_coach.fusion_bridge_enabled_var = Var(True)
+    dash_with_coach.human_coach_fusion_reward_var = Var("0.07")
     coach_train_command = dash_with_coach._build_adventure_generalist_command()
     assert_case(
         results,
@@ -2422,6 +2427,20 @@ def main() -> int:
             and "--fusion-bridge-enabled" in coach_train_command
             and "--live-status-path" in coach_train_command
         ),
+        coach_train_command,
+    )
+    assert_case(
+        results,
+        "Coach fusion success reward entry flows the adjusted value into the command",
+        "--coach-fusion-success-reward" in coach_train_command
+        and coach_train_command[coach_train_command.index("--coach-fusion-success-reward") + 1] == "0.07",
+        coach_train_command,
+    )
+    assert_case(
+        results,
+        "Coach reward flags omitted when value is blank",
+        "--coach-fusion-success-reward" not in fake_dashboard()._build_adventure_generalist_command()
+        and "--coach-tactical-usefulness-reward" not in coach_train_command,
         coach_train_command,
     )
     dash_without_coach = fake_dashboard()
@@ -2445,12 +2464,53 @@ def main() -> int:
         coach_eval_command,
     )
 
+    fusion_mask_default = fake_dashboard()
+    default_train_command = fusion_mask_default._build_adventure_generalist_command()
+    default_eval_command = fusion_mask_default._build_adventure_generalist_eval_command()
+    assert_case(
+        results,
+        "Adventure Generalist train defaults fusion action mask ON",
+        "--fusion-action-mask-enabled" in default_train_command,
+        default_train_command,
+    )
+    assert_case(
+        results,
+        "Adventure Generalist eval defaults fusion action mask OFF",
+        "--fusion-action-mask-enabled" not in default_eval_command,
+        default_eval_command,
+    )
+    legacy_train_dash = fake_dashboard()
+    legacy_train_dash.generalist_fusion_action_mask_train_var = Var(False)
+    legacy_train_command = legacy_train_dash._build_adventure_generalist_command()
+    assert_case(
+        results,
+        "Unchecking train fusion mask restores legacy command (flag omitted)",
+        "--fusion-action-mask-enabled" not in legacy_train_command,
+        legacy_train_command,
+    )
+    fusion_eval_dash = fake_dashboard()
+    fusion_eval_dash.generalist_fusion_action_mask_eval_var = Var(True)
+    fusion_eval_command = fusion_eval_dash._build_adventure_generalist_eval_command()
+    assert_case(
+        results,
+        "Enabling eval fusion mask adds the flag to the eval command",
+        "--fusion-action-mask-enabled" in fusion_eval_command,
+        fusion_eval_command,
+    )
+
     train_source = Path("python/train_ppo.py").read_text(encoding="utf-8")
     assert_case(
         results,
         "CLI parser includes adventure frontier mastery streak argument",
         "--adventure-frontier-win-streak-required" in train_source,
         "--adventure-frontier-win-streak-required",
+    )
+    assert_case(
+        results,
+        "CLI parser includes fusion action mask argument and live status surfaces it",
+        "--fusion-action-mask-enabled" in train_source
+        and "\"fusion_action_mask_enabled\"" in train_source,
+        "--fusion-action-mask-enabled",
     )
     assert_case(
         results,

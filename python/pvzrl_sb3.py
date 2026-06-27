@@ -100,6 +100,7 @@ class PvZSB3Config:
     debug_sun: bool = False
     debug_sun_sample_interval: int = 25
     fusion_policy: str = FUSION_POLICY_NONE
+    fusion_action_mask_enabled: bool = False
     run_mode: str = RUN_MODE_FIXED_TRAIN
     target_level: int = 0
     tactical_masks: bool = False
@@ -233,6 +234,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             debug_sun=self.config.debug_sun,
             debug_sun_sample_interval=self.config.debug_sun_sample_interval,
             fusion_policy=self.config.fusion_policy,
+            fusion_action_mask_enabled=self.config.fusion_action_mask_enabled,
             run_mode=self.config.run_mode,
             target_level=self.config.target_level,
             tactical_masks=self.config.tactical_masks,

@@ -218,6 +218,11 @@ class PvZDashboard:
         self.generalist_tactical_masks_var = tk.BooleanVar(value=True)
         self.generalist_wallnut_mask_var = tk.BooleanVar(value=True)
         self.generalist_cherrybomb_mask_var = tk.BooleanVar(value=True)
+        # Model self-fusion action mask: default ON for training so the agent
+        # learns to fuse; optional (default OFF) for eval. Unchecking either
+        # restores legacy behavior (occupied tiles illegal, no model fusion).
+        self.generalist_fusion_action_mask_train_var = tk.BooleanVar(value=True)
+        self.generalist_fusion_action_mask_eval_var = tk.BooleanVar(value=False)
         self.generalist_curriculum_var = tk.StringVar(value="conservative")
         self.generalist_randomize_seed_order_var = tk.BooleanVar(value=False)
         self.level3_mode_var = tk.StringVar(value="train")
@@ -239,6 +244,10 @@ class PvZDashboard:
         self.human_coach_bonus_var = tk.StringVar(value="")
         self.human_coach_match_bonus_var = tk.StringVar(value="")
         self.human_coach_override_penalty_var = tk.StringVar(value="")
+        # Reward sent to the model when a coach command succeeds. Blank = use the
+        # train_ppo defaults (--coach-fusion-success-reward / -tactical-usefulness).
+        self.human_coach_fusion_reward_var = tk.StringVar(value="")
+        self.human_coach_tactical_reward_var = tk.StringVar(value="")
         self.human_coach_log_path_var = tk.StringVar(value=str(DEFAULT_HUMAN_COACH_LOG_PATH))
         self.human_coach_command_path_var = tk.StringVar(value=str(DEFAULT_COACH_COMMAND_QUEUE_PATH))
         self.human_coach_command_input_var = tk.StringVar(value="")
@@ -697,6 +706,7 @@ class PvZDashboard:
             ("Tactical masks", self.generalist_tactical_masks_var),
             ("WallNut mask", self.generalist_wallnut_mask_var),
             ("CherryBomb mask", self.generalist_cherrybomb_mask_var),
+            ("Fusion mask (model self-fuse)", self.generalist_fusion_action_mask_train_var),
         )
         for index, (label, variable) in enumerate(option_specs):
             ttk.Checkbutton(advanced, text=label, variable=variable).grid(
@@ -777,6 +787,9 @@ class PvZDashboard:
         )
         ttk.Checkbutton(settings, text="Tactical masks", variable=self.generalist_tactical_masks_var).grid(
             row=4, column=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="Fusion mask (model self-fuse)", variable=self.generalist_fusion_action_mask_eval_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=6, pady=3
         )
 
         actions = ttk.Frame(content)
@@ -1104,8 +1117,10 @@ class PvZDashboard:
         self._add_labeled_entry(rewards, 1, 0, "Legal execution reward", self.human_coach_bonus_var)
         self._add_labeled_entry(rewards, 2, 0, "Match reward", self.human_coach_match_bonus_var)
         self._add_labeled_entry(rewards, 3, 0, "Override penalty", self.human_coach_override_penalty_var)
-        self._add_labeled_value(rewards, 4, "Human reward total", self.human_coach_reward_total_var, width=32)
-        self._add_labeled_value(rewards, 5, "Stream reward total", self.stream_coach_reward_total_var, width=32)
+        self._add_labeled_entry(rewards, 4, 0, "Fusion success reward", self.human_coach_fusion_reward_var)
+        self._add_labeled_entry(rewards, 5, 0, "Tactical usefulness reward", self.human_coach_tactical_reward_var)
+        self._add_labeled_value(rewards, 6, "Human reward total", self.human_coach_reward_total_var, width=32)
+        self._add_labeled_value(rewards, 7, "Stream reward total", self.stream_coach_reward_total_var, width=32)
 
         fusion = ttk.LabelFrame(content, text="Fusion Bridge Controls")
         fusion.grid(row=3, column=1, sticky="nsew", padx=(4, 8), pady=3)
@@ -1784,6 +1799,8 @@ class PvZDashboard:
             self.generalist_tactical_masks_var,
             self.generalist_wallnut_mask_var,
             self.generalist_cherrybomb_mask_var,
+            self.generalist_fusion_action_mask_train_var,
+            self.generalist_fusion_action_mask_eval_var,
             self.generalist_curriculum_var,
             self.level3_mode_var,
             self.level3_target_level_var,
@@ -1804,6 +1821,8 @@ class PvZDashboard:
             self.human_coach_bonus_var,
             self.human_coach_match_bonus_var,
             self.human_coach_override_penalty_var,
+            self.human_coach_fusion_reward_var,
+            self.human_coach_tactical_reward_var,
             self.human_coach_log_path_var,
             self.human_coach_command_path_var,
             self.stream_coach_enabled_var,
@@ -1908,6 +1927,8 @@ class PvZDashboard:
             self._add_optional_value(command, "--coach-legal-execution-reward", self.human_coach_bonus_var.get())
             self._add_optional_value(command, "--coach-match-reward", self.human_coach_match_bonus_var.get())
             self._add_optional_value(command, "--coach-override-penalty", self.human_coach_override_penalty_var.get())
+            self._add_optional_value(command, "--coach-fusion-success-reward", self.human_coach_fusion_reward_var.get())
+            self._add_optional_value(command, "--coach-tactical-usefulness-reward", self.human_coach_tactical_reward_var.get())
             self._add_optional_value(command, "--human-coach-log-path", self.human_coach_log_path_var.get())
             self._add_optional_value(command, "--human-coach-command-path", self.human_coach_command_path_var.get())
 
@@ -2057,6 +2078,7 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--tactical-masks", self.generalist_tactical_masks_var.get())
         self._add_enabled_flag(command, "--wallnut-tactical-mask", self.generalist_wallnut_mask_var.get())
         self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.generalist_cherrybomb_mask_var.get())
+        self._add_enabled_flag(command, "--fusion-action-mask-enabled", self.generalist_fusion_action_mask_train_var.get())
         resume_model_path = self.generalist_resume_model_path_var.get().strip()
         if resume_model_path:
             command.extend(["--resume-model-path", str(self._resolve_text_path(resume_model_path))])
@@ -2098,6 +2120,7 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--tactical-masks", self.generalist_tactical_masks_var.get())
         self._add_enabled_flag(command, "--wallnut-tactical-mask", self.generalist_wallnut_mask_var.get())
         self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.generalist_cherrybomb_mask_var.get())
+        self._add_enabled_flag(command, "--fusion-action-mask-enabled", self.generalist_fusion_action_mask_eval_var.get())
         run_dir = self.generalist_run_dir_var.get().strip()
         if run_dir:
             command.extend(["--run-dir", run_dir])
@@ -2387,6 +2410,8 @@ class PvZDashboard:
         ttk.Checkbutton(masks, text="tactical masks", variable=self.generalist_tactical_masks_var).grid(row=1, column=0, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(masks, text="WallNut mask", variable=self.generalist_wallnut_mask_var).grid(row=1, column=1, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(masks, text="CherryBomb mask", variable=self.generalist_cherrybomb_mask_var).grid(row=1, column=2, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(masks, text="fusion mask (train)", variable=self.generalist_fusion_action_mask_train_var).grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(masks, text="fusion mask (eval)", variable=self.generalist_fusion_action_mask_eval_var).grid(row=2, column=1, sticky="w", padx=6, pady=3)
 
         preview = ttk.LabelFrame(scroll_content, text="Command Preview")
         preview.grid(row=5, column=0, sticky="ew", padx=8, pady=(3, 3))
@@ -3595,6 +3620,7 @@ class PvZDashboard:
                     ("col", self._first_value(payload, ["agent.col", "agent.decoded_action.col", "col"])),
                     ("legal_count", self._first_value(payload, ["agent.legal_count", "agent.legal_action_count", "legal_action_count", "legal_count"])),
                     ("tactical_mask", self._first_value(payload, ["tactical_mask_enabled", "summary.tactical_mask_enabled", "eval.tactical_mask_enabled"])),
+                    ("fusion_mask", self._first_value(payload, ["fusion_action_mask_enabled", "fusion.fusion_action_mask_enabled", "summary.fusion_action_mask_enabled", "eval.fusion_action_mask_enabled"])),
                     ("wallnut_masked", self._first_value(payload, ["summary.wallnut_actions_masked", "eval.wallnut_actions_masked"])),
                     ("cherry_masked", self._first_value(payload, ["summary.cherrybomb_actions_masked", "eval.cherrybomb_actions_masked"])),
                     ("decoder", self._first_value(payload, ["agent.action_decoder_version", "action_decoder_version", "compatibility.action_decoder_version"])),
@@ -3645,14 +3671,18 @@ class PvZDashboard:
             lines_from_pairs(
                 [
                     ("policy", self._first_value(payload, ["fusion.fusion_policy", "fusion_policy"])),
+                    ("action_mask", self._first_value(payload, ["fusion.fusion_action_mask_enabled", "fusion_action_mask_enabled"])),
                     ("available", self._first_value(payload, ["fusion.fusion_available", "fusion_available"])),
                     ("candidates", self._first_value(payload, ["fusion.fusion_candidate_count", "fusion_candidate_count"])),
+                    ("mask_legal", self._first_value(payload, ["fusion.fusion_actions_available_count", "fusion_actions_available_count", "mask_diagnostics.fusion_actions_available_count"])),
+                    ("mask_incompat", self._first_value(payload, ["fusion.fusion_actions_masked_incompatible_count", "fusion_actions_masked_incompatible_count", "mask_diagnostics.fusion_actions_masked_incompatible_count"])),
                     ("top", self._first_value(payload, ["fusion.fusion_top_candidate", "fusion_top_candidate"])),
                     ("attempts", self._first_value(payload, ["fusion.fusion_attempted_count", "fusion_attempted_count"])),
                     ("successes", self._first_value(payload, ["fusion.fusion_success_count", "fusion_success_count"])),
                     ("failures", self._first_value(payload, ["fusion.fusion_failed_count", "fusion_failed_count"])),
                     ("rejections", self._first_value(payload, ["fusion.fusion_rejected_count", "fusion_rejected_count"])),
                     ("last_reject", self._first_value(payload, ["fusion.fusion_last_rejected_reason", "fusion_last_rejected_reason"])),
+                    ("last_incompat", self._first_value(payload, ["fusion.fusion_last_incompatible_pair", "fusion_last_incompatible_pair"])),
                     ("reasons", fusion.get("fusion_rejected_reasons", payload.get("fusion_rejected_reasons"))),
                 ]
             ),
@@ -4023,6 +4053,7 @@ class PvZDashboard:
                 ("wallnut_useful", self._adventure_first(payload, ["summary.wallnut_threatened_lane_placements", "eval.wallnut_threatened_lane_placements"])),
                 ("wallnut_useless", self._adventure_first(payload, ["summary.wallnut_useless_placements", "eval.wallnut_useless_placements"])),
                 ("tactical_mask", self._adventure_first(payload, ["tactical_mask_enabled", "summary.tactical_mask_enabled", "eval.tactical_mask_enabled"])),
+                ("fusion_mask", self._adventure_first(payload, ["fusion_action_mask_enabled", "fusion.fusion_action_mask_enabled", "summary.fusion_action_mask_enabled", "eval.fusion_action_mask_enabled"])),
                 ("wallnut_mask", self._adventure_first(payload, ["wallnut_tactical_mask_enabled", "summary.wallnut_tactical_mask_enabled", "eval.wallnut_tactical_mask_enabled"])),
                 ("cherry_mask", self._adventure_first(payload, ["cherrybomb_tactical_mask_enabled", "summary.cherrybomb_tactical_mask_enabled", "eval.cherrybomb_tactical_mask_enabled"])),
                 ("wallnut_masked", self._adventure_first(payload, ["summary.wallnut_actions_masked", "eval.wallnut_actions_masked"])),

@@ -7,8 +7,9 @@ remains the final source of legality for any actual fusion execution.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 FUSION_POLICY_NONE = "none"
@@ -71,6 +72,282 @@ CONEHEAD_TYPES = {2, 12}
 BUCKETHEAD_TYPES = {4, 13}
 
 
+# ---------------------------------------------------------------------------
+# Centralized fusion compatibility (single source of truth)
+# ---------------------------------------------------------------------------
+#
+# This is the ONE place that decides whether an existing plant and a selected
+# seed packet form a legal fusion pair.  Every consumer -- the model action
+# mask, model action execution, manual coach validation, stream coach
+# validation, fusion diagnostics, and fusion reward gating -- must consult the
+# helpers below instead of hard-coding pairs.  Do not scatter compatibility
+# checks across modules.
+#
+# Plant identity ids match configs/plant_registry.json.
+
+PEASHOOTER_ID = 0
+SUNFLOWER_ID = 1
+CHERRYBOMB_ID = 2
+WALLNUT_ID = 3
+
+# Canonical/alias plant name -> plant id.  Keys are normalized (lowercase,
+# alphanumeric only) by ``_normalize_name_key`` before lookup.
+PLANT_NAME_TO_ID: Dict[str, int] = {
+    "peashooter": PEASHOOTER_ID,
+    "pea": PEASHOOTER_ID,
+    "sunflower": SUNFLOWER_ID,
+    "sun": SUNFLOWER_ID,
+    "cherrybomb": CHERRYBOMB_ID,
+    "cherry": CHERRYBOMB_ID,
+    "wallnut": WALLNUT_ID,
+    "nut": WALLNUT_ID,
+    "repeater": 1030,
+    "gatlingpea": 1032,
+    "twinsunflower": 1033,
+}
+
+# The authoritative compatibility table, keyed by plant id.  Relationships are
+# treated as symmetric (see ``_FUSION_COMPATIBILITY_SYMMETRIC``); list a pair in
+# either direction and both directions become legal.  Compatibility is
+# explicit: a pair that does not appear here is NOT fusable.
+FUSION_COMPATIBILITY: Dict[int, Set[int]] = {
+    SUNFLOWER_ID: {PEASHOOTER_ID},
+    PEASHOOTER_ID: {SUNFLOWER_ID, CHERRYBOMB_ID},
+    CHERRYBOMB_ID: {PEASHOOTER_ID},
+}
+
+# Human-readable rejection reasons used by ``get_fusion_illegal_reason`` and
+# surfaced verbatim by the coaches and diagnostics.
+FUSION_ILLEGAL_NONE = ""
+FUSION_ILLEGAL_DISABLED = "fusion_disabled"
+FUSION_ILLEGAL_BRIDGE_UNAVAILABLE = "fusion_bridge_unavailable"
+FUSION_ILLEGAL_INVALID_ROW = "invalid_row"
+FUSION_ILLEGAL_INVALID_COL = "invalid_col"
+FUSION_ILLEGAL_INVALID_SEED_SLOT = "invalid_seed_slot"
+FUSION_ILLEGAL_EMPTY_TILE = "empty_tile"
+FUSION_ILLEGAL_INCOMPATIBLE = "incompatible_pair"
+FUSION_ILLEGAL_SEED_UNAVAILABLE = "seed_unavailable"
+FUSION_ILLEGAL_COOLDOWN = "cooldown_not_ready"
+FUSION_ILLEGAL_INSUFFICIENT_SUN = "insufficient_sun"
+
+
+def _symmetric_closure(table: Dict[int, Set[int]]) -> Dict[int, Set[int]]:
+    closure: Dict[int, Set[int]] = {}
+    for source, partners in table.items():
+        for partner in partners:
+            closure.setdefault(int(source), set()).add(int(partner))
+            closure.setdefault(int(partner), set()).add(int(source))
+    return closure
+
+
+_FUSION_COMPATIBILITY_SYMMETRIC: Dict[int, Set[int]] = _symmetric_closure(FUSION_COMPATIBILITY)
+
+
+def _normalize_name_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def normalize_plant_name_or_id(value: Any) -> Optional[int]:
+    """Convert a plant name/id/seed-slot/plant dict into a canonical plant id.
+
+    Returns ``None`` when the value cannot be resolved to a plant id.  Accepts
+    raw ints, numeric strings, canonical names/aliases, and dicts shaped like a
+    seed slot (``plantType``) or a board plant (``type``).
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):  # avoid treating True/False as 1/0
+        return None
+    if isinstance(value, int):
+        return int(value) if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 else None
+    if isinstance(value, dict):
+        for key in ("plantType", "type", "plant_type", "plantTypeId", "plant_type_id"):
+            if value.get(key) is not None:
+                resolved = normalize_plant_name_or_id(value.get(key))
+                if resolved is not None:
+                    return resolved
+        for key in ("plantTypeName", "typeName", "name", "plant_name", "canonical_name"):
+            if value.get(key):
+                resolved = normalize_plant_name_or_id(value.get(key))
+                if resolved is not None:
+                    return resolved
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lstrip("-").isdigit():
+        ivalue = int(text)
+        return ivalue if ivalue >= 0 else None
+    return PLANT_NAME_TO_ID.get(_normalize_name_key(text))
+
+
+def are_fusion_compatible(existing_plant: Any, selected_seed: Any) -> bool:
+    """Return True only if existing plant and selected seed are a legal pair.
+
+    The relationship is symmetric: existing SunFlower + selected Peashooter and
+    existing Peashooter + selected SunFlower are both legal.
+    """
+
+    existing = normalize_plant_name_or_id(existing_plant)
+    selected = normalize_plant_name_or_id(selected_seed)
+    if existing is None or selected is None:
+        return False
+    if selected in _FUSION_COMPATIBILITY_SYMMETRIC.get(existing, ()):  # type: ignore[arg-type]
+        return True
+    return existing in _FUSION_COMPATIBILITY_SYMMETRIC.get(selected, ())  # type: ignore[arg-type]
+
+
+def fusion_compatibility_table() -> Dict[str, List[str]]:
+    """Name-keyed, sorted view of the symmetric compatibility table.
+
+    Intended for diagnostics/UI; the ids in ``FUSION_COMPATIBILITY`` remain the
+    machine-readable source of truth.
+    """
+
+    table: Dict[str, List[str]] = {}
+    for plant_id, partners in sorted(_FUSION_COMPATIBILITY_SYMMETRIC.items()):
+        table[plant_name(plant_id)] = sorted(plant_name(partner) for partner in partners)
+    return table
+
+
+def plant_type_at_cell(observation: Dict[str, Any], row: int, col: int) -> Optional[int]:
+    """Return the plant type occupying (row, col), or None if the tile is empty."""
+
+    if not isinstance(observation, dict):
+        return None
+    for key in ("plants", "visiblePlants"):
+        values = observation.get(key) or []
+        if not isinstance(values, list):
+            continue
+        for plant in values:
+            if not isinstance(plant, dict):
+                continue
+            if key == "visiblePlants" and (
+                not bool(plant.get("activeInHierarchy", True))
+                or not bool(plant.get("inBoardBounds", True))
+            ):
+                continue
+            prow = _safe_int(plant.get("row"), default=-1)
+            pcol = _safe_int(plant.get("column"), plant.get("col"), default=-1)
+            if prow == int(row) and pcol == int(col):
+                plant_type = _safe_int(plant.get("type"), plant.get("plantType"), default=-1)
+                return plant_type if plant_type >= 0 else None
+    return None
+
+
+def seed_slot_entry(
+    observation: Dict[str, Any],
+    seed_slot: int,
+    plant_types: Optional[Iterable[int]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a seed-slot index to its observation slot dict (by slotIndex)."""
+
+    slots = observation.get("seedSlots") if isinstance(observation, dict) else None
+    if isinstance(slots, list):
+        for slot in slots:
+            if isinstance(slot, dict) and _safe_int(slot.get("slotIndex"), default=-999) == int(seed_slot):
+                return slot
+        if 0 <= int(seed_slot) < len(slots) and isinstance(slots[int(seed_slot)], dict):
+            return slots[int(seed_slot)]
+    plant_type_list = list(plant_types or [])
+    if plant_type_list and 0 <= int(seed_slot) < len(plant_type_list):
+        return {"slotIndex": int(seed_slot), "plantType": int(plant_type_list[int(seed_slot)])}
+    return None
+
+
+def seed_plant_type_for_slot(
+    observation: Dict[str, Any],
+    seed_slot: int,
+    plant_types: Optional[Iterable[int]] = None,
+) -> Optional[int]:
+    slot = seed_slot_entry(observation, seed_slot, plant_types)
+    if not isinstance(slot, dict):
+        return None
+    plant_type = _safe_int(slot.get("plantType"), slot.get("type"), default=-1)
+    return plant_type if plant_type >= 0 else None
+
+
+def _seed_resource_reason(observation: Dict[str, Any], slot: Dict[str, Any]) -> str:
+    if not bool(slot.get("usable", True)):
+        return FUSION_ILLEGAL_SEED_UNAVAILABLE
+    if bool(slot.get("disabled", False)):
+        return FUSION_ILLEGAL_SEED_UNAVAILABLE
+    if not bool(slot.get("ready", True)):
+        return FUSION_ILLEGAL_COOLDOWN
+    current_cooldown = _safe_float(slot.get("currentCooldown"), default=0.0)
+    full_cooldown = _safe_float(slot.get("fullCooldown"), default=0.0)
+    if full_cooldown > 0.05 and current_cooldown > 0.05:
+        return FUSION_ILLEGAL_COOLDOWN
+    sun = _safe_int(observation.get("sun"), default=0)
+    cost = max(0, _safe_int(slot.get("seedCost"), default=0))
+    if sun < cost:
+        return FUSION_ILLEGAL_INSUFFICIENT_SUN
+    return FUSION_ILLEGAL_NONE
+
+
+def get_fusion_illegal_reason(
+    observation: Dict[str, Any],
+    row: int,
+    col: int,
+    seed_slot: int,
+    *,
+    fusion_enabled: bool = True,
+    fusion_bridge_available: bool = True,
+    plant_types: Optional[Iterable[int]] = None,
+    check_seed_resources: bool = True,
+) -> str:
+    """Return "" if fusion is legal, else a human-readable rejection reason.
+
+    Legality order (most fundamental first): fusion enabled -> bridge available
+    -> row/col/seed-slot valid -> tile occupied -> compatible pair -> seed
+    available/cooldown/sun.  Empty-tile and incompatible-pair are reported
+    before transient resource reasons so callers get the stable signal.
+    """
+
+    observation = observation if isinstance(observation, dict) else {}
+    if not fusion_enabled:
+        return FUSION_ILLEGAL_DISABLED
+    if not fusion_bridge_available:
+        return FUSION_ILLEGAL_BRIDGE_UNAVAILABLE
+    rows = _safe_int(observation.get("rowCount"), default=5)
+    cols = _safe_int(observation.get("columnCount"), default=10)
+    if not (0 <= int(row) < rows):
+        return FUSION_ILLEGAL_INVALID_ROW
+    if not (0 <= int(col) < cols):
+        return FUSION_ILLEGAL_INVALID_COL
+    slot = seed_slot_entry(observation, seed_slot, plant_types)
+    if slot is None:
+        return FUSION_ILLEGAL_INVALID_SEED_SLOT
+    seed_type = _safe_int(slot.get("plantType"), slot.get("type"), default=-1)
+    if seed_type < 0:
+        return FUSION_ILLEGAL_INVALID_SEED_SLOT
+    existing_type = plant_type_at_cell(observation, int(row), int(col))
+    if existing_type is None:
+        return FUSION_ILLEGAL_EMPTY_TILE
+    if not are_fusion_compatible(existing_type, seed_type):
+        return FUSION_ILLEGAL_INCOMPATIBLE
+    if check_seed_resources:
+        resource_reason = _seed_resource_reason(observation, slot)
+        if resource_reason:
+            return resource_reason
+    return FUSION_ILLEGAL_NONE
+
+
+def is_legal_fusion_action(
+    observation: Dict[str, Any],
+    row: int,
+    col: int,
+    seed_slot: int,
+    **kwargs: Any,
+) -> bool:
+    """Return True only if the fusion is fully legal (see get_fusion_illegal_reason)."""
+
+    return get_fusion_illegal_reason(observation, row, col, seed_slot, **kwargs) == FUSION_ILLEGAL_NONE
+
+
 def normalize_fusion_policy(value: Any) -> str:
     policy = str(value or FUSION_POLICY_NONE).strip().lower()
     policy = FUSION_POLICY_ALIASES.get(policy, policy)
@@ -95,6 +372,34 @@ def default_fusion_diagnostics(policy: str = FUSION_POLICY_NONE) -> Dict[str, An
         "fusion_candidate_count": 0,
         "fusion_candidates": [],
         "fusion_top_candidate": None,
+        # Standardized live fusion-availability / incompatibility diagnostics.
+        "fusion_actions_available_count": 0,
+        "fusion_candidate_tiles": [],
+        "fusion_last_illegal_reason": "",
+        "fusion_last_incompatible_pair": None,
+        "fusion_actions_masked_empty_tile": 0,
+        "fusion_actions_masked_incompatible_count": 0,
+        "fusion_actions_masked_disabled_count": 0,
+        "fusion_actions_masked_cooldown_count": 0,
+        "fusion_actions_masked_sun_count": 0,
+        "fusion_compatibility_table": fusion_compatibility_table(),
+        # Fusion reward accounting (populated by the env reward policy each step).
+        "fusion_reward_total": 0.0,
+        "fusion_attempt_reward_total": 0.0,
+        "fusion_success_reward_total": 0.0,
+        "fusion_threatened_row_bonus_total": 0.0,
+        "fusion_active_wave_bonus_total": 0.0,
+        "fusion_defensive_value_bonus_total": 0.0,
+        "fusion_incompatible_penalty_total": 0.0,
+        "fusion_empty_tile_penalty_total": 0.0,
+        "fusion_failed_penalty_total": 0.0,
+        "fusion_bridge_error_penalty_total": 0.0,
+        "fusion_spam_penalty_total": 0.0,
+        "fusion_reward_capped": False,
+        "fusion_last_reward_delta": 0.0,
+        "fusion_last_reward_reason": "",
+        "fusion_last_usefulness_bonus": 0.0,
+        "fusion_last_source": "",
         "fusion_last_attempt": None,
         "fusion_last_result": None,
         "fusion_last_execution_mode": "",
@@ -143,7 +448,15 @@ def build_fusion_diagnostics(
     candidates = scan_fusion_candidates(observation, bridge_probe=bridge_probe)
     diag["fusion_candidates"] = candidates
     diag["fusion_candidate_count"] = len(candidates)
-    diag["fusion_available"] = any(bool(candidate.get("fusion_legal")) for candidate in candidates)
+    legal_candidates = [candidate for candidate in candidates if bool(candidate.get("fusion_legal"))]
+    diag["fusion_available"] = bool(legal_candidates)
+    diag["fusion_actions_available_count"] = len(legal_candidates)
+    diag["fusion_candidate_tiles"] = sorted(
+        {
+            (int(candidate.get("source_row", -1)), int(candidate.get("source_col", -1)))
+            for candidate in legal_candidates
+        }
+    )
     if candidates:
         top = max(candidates, key=lambda item: float(item.get("strategic_score") or 0.0))
         diag["fusion_top_candidate"] = compact_candidate(top)
@@ -379,6 +692,20 @@ def apply_fusion_attempt_result(
         reasons[rejected_reason] += 1
         diag["fusion_rejected_count"] = int(diag.get("fusion_rejected_count") or 0) + 1
         diag["fusion_last_rejected_reason"] = rejected_reason
+        diag["fusion_last_illegal_reason"] = rejected_reason
+        if rejected_reason == FUSION_ILLEGAL_INCOMPATIBLE and isinstance(candidate, dict):
+            diag["fusion_actions_masked_incompatible_count"] = (
+                int(diag.get("fusion_actions_masked_incompatible_count") or 0) + 1
+            )
+            diag["fusion_last_incompatible_pair"] = {
+                "existing": str(candidate.get("source_plant_name") or plant_name(candidate.get("source_plant_type"))),
+                "selected": str(
+                    candidate.get("target_or_ingredient_name")
+                    or plant_name(candidate.get("target_or_ingredient_type"))
+                ),
+                "row": _safe_int(candidate.get("source_row"), default=-1),
+                "col": _safe_int(candidate.get("source_col"), default=-1),
+            }
         if rejected_reason in {"unsafe_state", "not_gameplay", "gameplay_not_ready", "terminal_or_transition_state"}:
             diag["fusion_unsafe_state_block_count"] = int(diag.get("fusion_unsafe_state_block_count") or 0) + 1
     if result is not None:
@@ -484,6 +811,28 @@ def merge_episode_fusion_stats(target: Any, diagnostics: Dict[str, Any]) -> None
         for key, value in (diagnostics.get(name) or {}).items():
             current[str(key)] = int(current.get(str(key), 0)) + int(value)
         setattr(target, name, dict(sorted(current.items())))
+    # Fusion reward component totals are cumulative per-episode values supplied by
+    # the env each step, so take the latest (set, do not sum). fusion_reward_total
+    # itself is owned by accumulate_reward_episode_totals via the reward breakdown.
+    for name in (
+        "fusion_attempt_reward_total",
+        "fusion_success_reward_total",
+        "fusion_threatened_row_bonus_total",
+        "fusion_active_wave_bonus_total",
+        "fusion_defensive_value_bonus_total",
+        "fusion_incompatible_penalty_total",
+        "fusion_empty_tile_penalty_total",
+        "fusion_failed_penalty_total",
+        "fusion_bridge_error_penalty_total",
+        "fusion_spam_penalty_total",
+    ):
+        if name in diagnostics:
+            try:
+                setattr(target, name, float(diagnostics.get(name) or 0.0))
+            except (TypeError, ValueError):
+                pass
+    if diagnostics.get("fusion_reward_capped"):
+        setattr(target, "fusion_reward_capped", True)
     setattr(target, "fusion_policy", str(diagnostics.get("fusion_policy") or getattr(target, "fusion_policy", "none")))
 
 
@@ -494,6 +843,34 @@ def fusion_live_fields(diagnostics: Optional[Dict[str, Any]], policy: str = FUSI
         "fusion_available": bool(diag.get("fusion_available")),
         "fusion_candidate_count": int(diag.get("fusion_candidate_count") or 0),
         "fusion_top_candidate": diag.get("fusion_top_candidate"),
+        "fusion_actions_available_count": int(diag.get("fusion_actions_available_count") or 0),
+        "fusion_candidate_tiles": list(diag.get("fusion_candidate_tiles") or []),
+        "fusion_last_illegal_reason": str(
+            diag.get("fusion_last_illegal_reason") or diag.get("fusion_last_rejected_reason") or ""
+        ),
+        "fusion_last_incompatible_pair": diag.get("fusion_last_incompatible_pair"),
+        "fusion_actions_masked_empty_tile": int(diag.get("fusion_actions_masked_empty_tile") or 0),
+        "fusion_actions_masked_incompatible_count": int(diag.get("fusion_actions_masked_incompatible_count") or 0),
+        "fusion_actions_masked_disabled_count": int(diag.get("fusion_actions_masked_disabled_count") or 0),
+        "fusion_actions_masked_cooldown_count": int(diag.get("fusion_actions_masked_cooldown_count") or 0),
+        "fusion_actions_masked_sun_count": int(diag.get("fusion_actions_masked_sun_count") or 0),
+        "fusion_compatibility_table": diag.get("fusion_compatibility_table") or fusion_compatibility_table(),
+        "fusion_reward_total": float(diag.get("fusion_reward_total") or 0.0),
+        "fusion_attempt_reward_total": float(diag.get("fusion_attempt_reward_total") or 0.0),
+        "fusion_success_reward_total": float(diag.get("fusion_success_reward_total") or 0.0),
+        "fusion_threatened_row_bonus_total": float(diag.get("fusion_threatened_row_bonus_total") or 0.0),
+        "fusion_active_wave_bonus_total": float(diag.get("fusion_active_wave_bonus_total") or 0.0),
+        "fusion_defensive_value_bonus_total": float(diag.get("fusion_defensive_value_bonus_total") or 0.0),
+        "fusion_incompatible_penalty_total": float(diag.get("fusion_incompatible_penalty_total") or 0.0),
+        "fusion_empty_tile_penalty_total": float(diag.get("fusion_empty_tile_penalty_total") or 0.0),
+        "fusion_failed_penalty_total": float(diag.get("fusion_failed_penalty_total") or 0.0),
+        "fusion_bridge_error_penalty_total": float(diag.get("fusion_bridge_error_penalty_total") or 0.0),
+        "fusion_spam_penalty_total": float(diag.get("fusion_spam_penalty_total") or 0.0),
+        "fusion_reward_capped": bool(diag.get("fusion_reward_capped")),
+        "fusion_last_reward_delta": float(diag.get("fusion_last_reward_delta") or 0.0),
+        "fusion_last_reward_reason": str(diag.get("fusion_last_reward_reason") or ""),
+        "fusion_last_usefulness_bonus": float(diag.get("fusion_last_usefulness_bonus") or 0.0),
+        "fusion_last_source": str(diag.get("fusion_last_source") or ""),
         "fusion_last_attempt": diag.get("fusion_last_attempt"),
         "fusion_last_result": diag.get("fusion_last_result"),
         "fusion_last_execution_mode": str(diag.get("fusion_last_execution_mode") or ""),

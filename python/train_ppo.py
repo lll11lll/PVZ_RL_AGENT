@@ -1275,6 +1275,10 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         ),
         "debug_sun_sample_interval": int(pick(args, raw_config, "debug_sun_sample_interval", 25)),
         "fusion_policy": fusion_policy,
+        "fusion_action_mask_enabled": bool(
+            getattr(args, "fusion_action_mask_enabled", False)
+            or raw_config.get("fusion_action_mask_enabled", False)
+        ),
         "run_mode": run_mode,
         "target_level": int(target_level),
         "tactical_masks": bool(getattr(args, "tactical_masks", False) or raw_config.get("tactical_masks", False)),
@@ -1441,6 +1445,7 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         debug_sun=config.get("debug_sun", False),
         debug_sun_sample_interval=config.get("debug_sun_sample_interval", 25),
         fusion_policy=str(config.get("fusion_policy", FUSION_POLICY_NONE)),
+        fusion_action_mask_enabled=bool(config.get("fusion_action_mask_enabled", False)),
         run_mode=str(config.get("run_mode", "fixed_train")),
         target_level=int(config.get("target_level", 0) or 0),
         tactical_masks=bool(config.get("tactical_masks", False)),
@@ -2309,6 +2314,7 @@ def write_eval_live_status(
         (summary or {}).get("fusion") if isinstance(summary, dict) else None,
         str(config.get("fusion_policy", FUSION_POLICY_NONE)),
     )
+    fusion_fields["fusion_action_mask_enabled"] = bool(config.get("fusion_action_mask_enabled", False))
     if isinstance(summary, dict):
         for key in (
             "fusion_policy",
@@ -2340,6 +2346,7 @@ def write_eval_live_status(
         "plant_types": list(config.get("plant_types", [])),
         "action_count": action_count_for_config(config),
         "tactical_mask_enabled": bool(config.get("tactical_masks") or config.get("wallnut_tactical_mask") or config.get("cherrybomb_tactical_mask")),
+        "fusion_action_mask_enabled": bool(config.get("fusion_action_mask_enabled", False)),
         "recent_win_rate": (summary or {}).get("win_rate") if isinstance(summary, dict) else None,
         "recent_avg_wave": (summary or {}).get("avg_wave") if isinstance(summary, dict) else None,
         "recent_avg_kills": (summary or {}).get("avg_kills") if isinstance(summary, dict) else None,
@@ -2442,6 +2449,7 @@ def write_runtime_live_status(
         "plant_types": list(config.get("plant_types", [])),
         "action_count": action_count_for_config(config),
         "tactical_mask_enabled": bool(config.get("tactical_masks") or config.get("wallnut_tactical_mask") or config.get("cherrybomb_tactical_mask")),
+        "fusion_action_mask_enabled": bool(config.get("fusion_action_mask_enabled", False)),
         "current_episode": current_episode,
         "current_step": current_step,
         "current_wave": current_wave,
@@ -4172,6 +4180,12 @@ def main() -> int:
     parser.add_argument("--coach-allow-fusion-planning", action="store_true", help="Allow coach !fuse planning via fusion probe when available.")
     parser.add_argument("--fusion-bridge-enabled", action="store_true", help="Enable fusion bridge probe routing for coach commands.")
     parser.add_argument("--fusion-policy", choices=("none", "observe", "scripted", "assist"), default=None)
+    parser.add_argument(
+        "--fusion-action-mask-enabled",
+        action="store_true",
+        help="Expose occupied compatible tiles as legal fuse actions in the model action mask "
+        "(and route those placements to the fusion bridge). Off by default.",
+    )
     parser.add_argument("--tactical-masks", action="store_true")
     parser.add_argument("--wallnut-tactical-mask", action="store_true")
     parser.add_argument("--cherrybomb-tactical-mask", action="store_true")

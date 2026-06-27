@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -23,6 +24,14 @@ from pvzrl_action_space import (
     decode_policy_action,
     legacy_action_to_policy_action,
     normalize_action_space_mode,
+)
+from pvzrl_fusion import (
+    FUSION_ILLEGAL_EMPTY_TILE,
+    FUSION_ILLEGAL_INCOMPATIBLE,
+    are_fusion_compatible,
+    plant_name as fusion_plant_name,
+    plant_type_at_cell,
+    seed_plant_type_for_slot,
 )
 
 
@@ -47,6 +56,9 @@ COACH_REJECTION_FUSION_TARGET_NOT_AVAILABLE = "fusion_target_not_available"
 COACH_REJECTION_FUSION_BRIDGE_REJECTED = "fusion_bridge_rejected"
 COACH_REJECTION_FUSION_INVALID_STATE = "fusion_invalid_state"
 COACH_REJECTION_FUSION_DIRECT_NOT_IMPLEMENTED = "fusion_direct_command_not_implemented"
+# Centralized compatibility rejections (shared with the model mask via pvzrl_fusion).
+COACH_REJECTION_FUSION_INCOMPATIBLE = FUSION_ILLEGAL_INCOMPATIBLE  # "incompatible_pair"
+COACH_REJECTION_FUSION_EMPTY_TILE = FUSION_ILLEGAL_EMPTY_TILE  # "empty_tile"
 COACH_REJECTION_INSUFFICIENT_SUN = "insufficient_sun"
 COACH_REJECTION_COOLDOWN_NOT_READY = "cooldown_not_ready"
 COACH_REJECTION_SLOT_NOT_USABLE = "slot_not_usable"
@@ -1460,6 +1472,10 @@ def validate_coach_command(
             return _validation(command, False, rejected_reason=bounds_reason)
         if not fusion_enabled:
             return _validation(command, False, rejected_reason=COACH_REJECTION_FUSION_DISABLED)
+        compat_reason, compat_diag = _fusion_compatibility_rejection(command, observation, plant_types)
+        if compat_reason:
+            _log_fusion_rejection(command, compat_reason, compat_diag)
+            return _validation(command, False, rejected_reason=compat_reason, diagnostics=compat_diag)
         if fusion_bridge_probe is None:
             return _validation(command, False, rejected_reason=COACH_REJECTION_FUSION_DIRECT_NOT_IMPLEMENTED)
         bridge_command, rejected_reason, diagnostics = fusion_bridge_probe(command, observation, plant_types, spec)
@@ -1713,6 +1729,64 @@ def _seed_slot_block_reason(observation: Dict[str, Any], slot: Optional[Dict[str
     if sun < cost:
         return COACH_REJECTION_INSUFFICIENT_SUN
     return ""
+
+
+def _fusion_compatibility_rejection(
+    command: CoachCommand,
+    observation: Dict[str, Any],
+    plant_types: Sequence[int],
+) -> Tuple[str, Dict[str, Any]]:
+    """Centralized existing-plant/seed compatibility gate for fuse commands.
+
+    Returns (reason, diagnostics).  Uses the shared pvzrl_fusion compatibility
+    table so manual and stream coaches reject exactly the pairs the model action
+    mask blocks.  Transient resource blocks (cooldown/sun) are intentionally
+    deferred to the bridge-probe path so they can become pending retries.
+    """
+
+    row = int(command.row if command.row is not None else -1)
+    col = int(command.col if command.col is not None else -1)
+    seed_index = int(command.seed_index if command.seed_index is not None else -1)
+    selected_type = seed_plant_type_for_slot(observation, seed_index, plant_types)
+    existing_type = plant_type_at_cell(observation, row, col)
+    has_board = isinstance(observation.get("plants"), list) or isinstance(
+        observation.get("visiblePlants"), list
+    )
+    diagnostics: Dict[str, Any] = {
+        "fusion_existing_plant_type": int(existing_type) if existing_type is not None else -1,
+        "fusion_existing_plant_name": fusion_plant_name(existing_type) if existing_type is not None else "",
+        "fusion_selected_seed_type": int(selected_type) if selected_type is not None else -1,
+        "fusion_selected_seed_name": fusion_plant_name(selected_type) if selected_type is not None else "",
+        "fusion_row": row,
+        "fusion_col": col,
+    }
+    if existing_type is None:
+        # Only assert emptiness when the board is readable; otherwise defer to bridge.
+        if has_board:
+            return COACH_REJECTION_FUSION_EMPTY_TILE, diagnostics
+        return "", diagnostics
+    if selected_type is None:
+        return "", diagnostics  # cannot resolve the seed's plant type; let the bridge decide
+    if not are_fusion_compatible(existing_type, selected_type):
+        diagnostics["fusion_incompatible_pair"] = {
+            "existing": diagnostics["fusion_existing_plant_name"],
+            "selected": diagnostics["fusion_selected_seed_name"],
+            "row": row,
+            "col": col,
+        }
+        return COACH_REJECTION_FUSION_INCOMPATIBLE, diagnostics
+    return "", diagnostics
+
+
+def _log_fusion_rejection(command: CoachCommand, reason: str, diagnostics: Dict[str, Any]) -> None:
+    existing = str(diagnostics.get("fusion_existing_plant_name") or "") or "none"
+    selected = str(diagnostics.get("fusion_selected_seed_name") or "") or "none"
+    # Logged to stderr so machine-readable stdout (e.g. live-status JSON) stays clean.
+    print(
+        f"[coach] fusion rejected: {reason} existing={existing} selected={selected} "
+        f"row={diagnostics.get('fusion_row')} col={diagnostics.get('fusion_col')}",
+        file=sys.stderr,
+    )
 
 
 def _cell_occupied_for_validation(observation: Dict[str, Any], *, row: int, col: int) -> bool:

@@ -14,23 +14,28 @@ import re
 import socket
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from pvzrl_fusion import (
+    FUSION_ILLEGAL_INCOMPATIBLE,
     FUSION_POLICY_NONE,
     FUSION_POLICY_SCRIPTED,
     apply_fusion_attempt_result,
+    are_fusion_compatible,
     build_fusion_diagnostics,
     choose_scripted_fusion_candidate,
     compact_candidate,
     count_tough_zombies_by_row,
     default_fusion_diagnostics,
+    fusion_compatibility_table,
     fusion_live_fields,
+    get_fusion_illegal_reason,
     merge_episode_fusion_stats,
     normalize_fusion_policy,
+    plant_name as fusion_plant_name,
     validate_scripted_fusion_candidate,
 )
 
@@ -129,6 +134,9 @@ REWARD_COMPONENT_FIELDS = (
     "coach_override_penalty",
     "coach_fusion_success_reward",
     "coach_tactical_usefulness_reward",
+    # Net, per-episode-capped shaped reward for fusion events (model/coach/scripted).
+    # The per-component breakdown is tracked separately in fusion diagnostics.
+    "fusion_reward",
 )
 REWARD_EPISODE_TOTAL_FIELDS = tuple(f"{field}_total" for field in REWARD_COMPONENT_FIELDS)
 
@@ -199,6 +207,20 @@ class RewardConfig:
     coach_override_penalty: float = -0.01
     coach_fusion_success_reward: float = 0.03
     coach_tactical_usefulness_reward: float = 0.01
+    # Fusion reward policy. Applies to every confirmed fusion event regardless of
+    # source (model / human coach / stream coach / assist / scripted). Modest by
+    # design: fusion should help the policy, not dominate the reward function.
+    fusion_attempt_reward: float = 0.02
+    fusion_success_reward: float = 0.50
+    fusion_threatened_row_bonus: float = 0.15
+    fusion_active_wave_bonus: float = 0.10
+    fusion_defensive_value_bonus: float = 0.10
+    fusion_incompatible_penalty: float = -0.10
+    fusion_empty_tile_penalty: float = -0.08
+    fusion_failed_penalty: float = -0.10
+    fusion_bridge_error_penalty: float = -0.25
+    fusion_spam_penalty: float = -0.05
+    max_fusion_reward_per_episode: float = 3.0
     # Legacy config field kept for old configs; absolute proximity punishment is no longer applied.
     proximity_penalty: float = 0.01
     win_reward: float = 10.0
@@ -232,6 +254,11 @@ class PvZEnvConfig:
     debug_sun: bool = False
     debug_sun_sample_interval: int = 25
     fusion_policy: str = FUSION_POLICY_NONE
+    # When True, occupied tiles holding a fusion-compatible plant become legal
+    # *fuse* actions in the model action mask (and the model's placement action
+    # on such a tile is routed to the fusion bridge).  Default False preserves
+    # the historical behavior where every occupied tile is illegal.
+    fusion_action_mask_enabled: bool = False
     run_mode: str = RUN_MODE_FIXED_TRAIN
     target_level: int = 0
     tactical_masks: bool = False
@@ -452,6 +479,21 @@ class EpisodeLog:
     fusion_avg_kills_after_use: float = 0.0
     fusion_bridge_error_count: int = 0
     fusion_unsafe_state_block_count: int = 0
+    # Fusion reward accounting (episode totals). fusion_reward_total also arrives
+    # via the reward breakdown; the component totals below are merged from the
+    # cumulative fusion diagnostics at episode end.
+    fusion_reward_total: float = 0.0
+    fusion_attempt_reward_total: float = 0.0
+    fusion_success_reward_total: float = 0.0
+    fusion_threatened_row_bonus_total: float = 0.0
+    fusion_active_wave_bonus_total: float = 0.0
+    fusion_defensive_value_bonus_total: float = 0.0
+    fusion_incompatible_penalty_total: float = 0.0
+    fusion_empty_tile_penalty_total: float = 0.0
+    fusion_failed_penalty_total: float = 0.0
+    fusion_bridge_error_penalty_total: float = 0.0
+    fusion_spam_penalty_total: float = 0.0
+    fusion_reward_capped: bool = False
 
 
 class PvZBridgeClient:
@@ -975,6 +1017,7 @@ class PvZGymEnv:
         self._all_active_threatened_rows_coverage_rewarded = False
         self._pending_cherry_events: List[Dict[str, Any]] = []
         self._last_fusion_diagnostics: Dict[str, Any] = default_fusion_diagnostics(self.config.fusion_policy)
+        self._reset_fusion_reward_tracking()
         rows = max(0, int(self.config.row_count))
         self.undefended_threat_age_by_row = [0 for _ in range(rows)]
         self.max_undefended_threat_age_by_row = [0 for _ in range(rows)]
@@ -4168,6 +4211,405 @@ class PvZGymEnv:
                 return result, diagnostics
         return None, diagnostics
 
+    def _maybe_execute_model_fusion(
+        self,
+        pre_observation: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+        requested_action: int,
+        executed_action: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Route a model placement action onto an occupied compatible tile to fusion.
+
+        Only fires when the model-fusion action mask is enabled.  The mask has
+        already verified compatibility, occupancy, and seed readiness, so this
+        simply rebuilds the candidate from the chosen action and asks the bridge
+        to perform the fusion (mirroring the scripted fusion path).
+        """
+
+        if not self._fusion_action_mask_enabled():
+            return None, diagnostics
+        if int(executed_action) <= 0:
+            return None, diagnostics
+        decoded = decode_action(int(executed_action), pre_observation, self.config.plant_types)
+        if int(decoded.get("kind", -1)) != 1:
+            return None, diagnostics
+        row = int(decoded.get("row", -1))
+        col = int(decoded.get("column", -1))
+        seed_type = int(decoded.get("plant_type", -1))
+        slot_index = int(decoded.get("slot_index", -1))
+        occupied, existing_type = self._cell_occupancy(pre_observation, row, col)
+        if not occupied:
+            return None, diagnostics  # empty tile -> normal placement, let bridge step handle it
+        if not are_fusion_compatible(existing_type, seed_type):
+            # Mask should have blocked this; record and decline to plant over a plant.
+            candidate = {
+                "source_plant_type": int(existing_type),
+                "source_plant_name": fusion_plant_name(existing_type),
+                "source_row": row,
+                "source_col": col,
+                "target_or_ingredient_type": int(seed_type),
+                "target_or_ingredient_name": fusion_plant_name(seed_type),
+                "ingredient_seed_slot_index": slot_index,
+            }
+            diagnostics = apply_fusion_attempt_result(
+                diagnostics, candidate, None, rejected_reason=FUSION_ILLEGAL_INCOMPATIBLE
+            )
+            self._last_fusion_diagnostics = diagnostics
+            return None, diagnostics
+        source_plant = self._plant_at_cell(pre_observation, row, col)
+        slots = seed_slots_from_observation(pre_observation, self.config.plant_types)
+        slot = slots[slot_index] if 0 <= slot_index < len(slots) else {}
+        candidate = {
+            "source_plant_type": int(existing_type),
+            "source_plant_name": str((source_plant or {}).get("typeName") or fusion_plant_name(existing_type)),
+            "source_instance_id": self._safe_int(
+                (source_plant or {}).get("instanceId"), (source_plant or {}).get("instanceID"), default=0
+            ),
+            "source_row": row,
+            "source_col": col,
+            "target_or_ingredient_type": int(seed_type),
+            "target_or_ingredient_name": str(slot.get("plantTypeName") or fusion_plant_name(seed_type)),
+            "ingredient_seed_slot_index": int(slot.get("slotIndex", slot_index)),
+            "ingredient_card_instance_id": self._safe_int(slot.get("cardInstanceId"), default=0),
+            "predicted_result_type": -1,
+            "predicted_result_name": "",
+            "fusion_legal": True,
+            "fusion_blocked_reason": "",
+        }
+        try:
+            result = self.client.request(
+                "fusion_step",
+                source_instance_id=int(candidate.get("source_instance_id") or 0),
+                source_row=row,
+                source_col=col,
+                source_plant_type=int(existing_type),
+                ingredient_seed_slot_index=int(candidate.get("ingredient_seed_slot_index")),
+                ingredient_plant_type=int(seed_type),
+                predicted_result_type=-1,
+                predicted_result_name="",
+                return_observation=False,
+            )
+        except Exception as exc:
+            diagnostics = apply_fusion_attempt_result(
+                diagnostics, candidate, None, rejected_reason="exception", bridge_error=str(exc)
+            )
+            self._last_fusion_diagnostics = diagnostics
+            return None, diagnostics
+        if isinstance(result, dict):
+            result["requestedAction"] = int(requested_action)
+            result["executedAction"] = int(executed_action)
+            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
+            result["fusionExecutionSource"] = "model_action_mask"
+            result["fusionCandidate"] = compact_candidate(candidate)
+            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
+            self._last_fusion_diagnostics = diagnostics
+            # The model deliberately chose a fusion (occupied tile); return the
+            # bridge outcome whether it succeeded or was cleanly rejected so we
+            # never fall through to planting a normal seed over an existing plant.
+            return result, diagnostics
+        return None, diagnostics
+
+    def _plant_at_cell(self, observation: Dict[str, Any], row: int, column: int) -> Optional[Dict[str, Any]]:
+        for plant in observation.get("plants", []) or []:
+            if not isinstance(plant, dict):
+                continue
+            if self._safe_int(plant.get("row"), default=-1) == int(row) and self._safe_int(
+                plant.get("column"), default=-1
+            ) == int(column):
+                return plant
+        return None
+
+    # ------------------------------------------------------------------
+    # Fusion reward policy (shared by model / coach / scripted fusion paths)
+    # ------------------------------------------------------------------
+
+    _FUSION_REWARD_COMPONENT_NAMES = (
+        "fusion_attempt_reward",
+        "fusion_success_reward",
+        "fusion_threatened_row_bonus",
+        "fusion_active_wave_bonus",
+        "fusion_defensive_value_bonus",
+        "fusion_incompatible_penalty",
+        "fusion_empty_tile_penalty",
+        "fusion_failed_penalty",
+        "fusion_bridge_error_penalty",
+        "fusion_spam_penalty",
+    )
+
+    def _reset_fusion_reward_tracking(self) -> None:
+        """Reset fusion reward counters/accounting at episode (attempt) start."""
+        self._fusion_reward_total = 0.0
+        self._fusion_reward_positive_total = 0.0
+        self._fusion_reward_capped = False
+        self._fusion_reward_component_totals: Dict[str, float] = {
+            name: 0.0 for name in self._FUSION_REWARD_COMPONENT_NAMES
+        }
+        self._fusion_last_reward_delta = 0.0
+        self._fusion_last_reward_reason = ""
+        self._fusion_last_usefulness_bonus = 0.0
+        self._fusion_last_source = ""
+        self._recent_fusion_attempts: Deque[Tuple[int, int, int, str, int]] = deque(maxlen=20)
+        self._fusion_event_counter = 0
+
+    def _record_fusion_reward_component(self, name: str, value: float) -> None:
+        """Track a fusion reward component contribution for diagnostics/metrics."""
+        if not value:
+            return
+        totals = getattr(self, "_fusion_reward_component_totals", None)
+        if isinstance(totals, dict) and name in totals:
+            totals[name] = float(totals.get(name, 0.0)) + float(value)
+
+    def _apply_fusion_reward_cap(self, positive_delta: float) -> float:
+        """Cap cumulative positive fusion reward per episode; return the allowed amount."""
+        cap = float(getattr(self.config.reward, "max_fusion_reward_per_episode", 0.0) or 0.0)
+        if positive_delta <= 0.0:
+            return 0.0
+        if cap <= 0.0:
+            self._fusion_reward_positive_total += positive_delta
+            return positive_delta
+        remaining = max(0.0, cap - float(getattr(self, "_fusion_reward_positive_total", 0.0)))
+        allowed = min(positive_delta, remaining)
+        if allowed < positive_delta - 1e-9:
+            self._fusion_reward_capped = True
+        self._fusion_reward_positive_total = float(getattr(self, "_fusion_reward_positive_total", 0.0)) + allowed
+        return allowed
+
+    def _is_fusion_spam(self, row: int, col: int, seed_slot: int, reason: str) -> bool:
+        """Detect repeated low-value/rejected fusion attempts in the recent window."""
+        recent = getattr(self, "_recent_fusion_attempts", None)
+        if not recent:
+            return False
+        key = (int(row), int(col), int(seed_slot))
+        same_location = sum(1 for (r, c, s, _reason, _step) in recent if (r, c, s) == key)
+        recent_rejections = sum(1 for (_r, _c, _s, rs, _step) in recent if rs)
+        if same_location >= 2:
+            return True
+        if reason and recent_rejections >= 3:
+            return True
+        return False
+
+    def _fusion_usefulness_bonus(
+        self,
+        row: int,
+        col: int,
+        existing_plant: int,
+        selected_plant: int,
+        result: Dict[str, Any],
+        observation: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        """Estimate whether a successful fusion was strategically useful.
+
+        Returns a dict of {component_name: bonus_value}. Uses existing row
+        diagnostics (threat rows, shooter counts, lane danger); intentionally
+        simple to avoid over-fitting the reward.
+        """
+        del existing_plant, selected_plant, result
+        cfg = self.config.reward
+        obs = observation if isinstance(observation, dict) else {}
+        bonuses: Dict[str, float] = {}
+        if not (0 <= int(row) < max(1, self._row_count(obs))):
+            return bonuses
+        threat_rows = set(self._active_threat_rows(obs))
+        in_threatened_row = int(row) in threat_rows
+        if in_threatened_row:
+            bonuses["fusion_threatened_row_bonus"] = float(cfg.fusion_threatened_row_bonus)
+        zombies_active = self._row_has_active_zombies(obs, int(row)) or int(obs.get("zombieCount", 0) or 0) > 0
+        if zombies_active:
+            bonuses["fusion_active_wave_bonus"] = float(cfg.fusion_active_wave_bonus)
+        shooters = self._shooter_counts_by_row(obs).get(int(row), 0)
+        wallnuts = self._wallnut_blocker_count(obs, int(row))
+        weakly_defended = (shooters + wallnuts) <= 1
+        if in_threatened_row and weakly_defended:
+            bonuses["fusion_defensive_value_bonus"] = float(cfg.fusion_defensive_value_bonus)
+        return bonuses
+
+    def _row_has_active_zombies(self, observation: Dict[str, Any], row: int) -> bool:
+        for zombie in observation.get("zombies", []) or []:
+            if not isinstance(zombie, dict):
+                continue
+            if self._safe_int(zombie.get("row"), default=-1) == int(row) and bool(zombie.get("alive", True)):
+                return True
+        for lane in observation.get("lanes", []) or []:
+            if isinstance(lane, dict) and self._safe_int(lane.get("row"), default=-1) == int(row):
+                if self._safe_int(lane.get("zombieCount"), default=0) > 0:
+                    return True
+        return False
+
+    def _compute_fusion_reward(self, fusion_event: Dict[str, Any]) -> float:
+        """Compute shaped reward for a fusion event and update reward accounting.
+
+        Reward is only awarded for a confirmed, board-changing fusion. Illegal /
+        incompatible / empty / failed / bridge-error events receive (modest)
+        penalties only. Positive reward is capped per episode.
+        """
+        if not isinstance(fusion_event, dict):
+            return 0.0
+        cfg = self.config.reward
+        row = self._safe_int(fusion_event.get("row"), default=-1)
+        col = self._safe_int(fusion_event.get("col"), default=-1)
+        seed_slot = self._safe_int(fusion_event.get("seed_slot"), default=-1)
+        success = bool(fusion_event.get("success"))
+        board_changed = bool(fusion_event.get("board_changed", success))
+        reason = str(fusion_event.get("reason") or "")
+        source = str(fusion_event.get("source") or "model")
+        observation = fusion_event.get("observation") if isinstance(fusion_event.get("observation"), dict) else {}
+        self._fusion_last_source = source
+        self._fusion_last_usefulness_bonus = 0.0
+
+        spam = self._is_fusion_spam(row, col, seed_slot, reason if not (success and board_changed) else "")
+        self._recent_fusion_attempts.append((row, col, seed_slot, reason if not success else "", self._fusion_event_counter))
+        self._fusion_event_counter += 1
+
+        positive = 0.0
+        negative = 0.0
+        reasons: List[str] = []
+
+        if success and board_changed:
+            positive += float(cfg.fusion_attempt_reward)
+            self._record_fusion_reward_component("fusion_attempt_reward", cfg.fusion_attempt_reward)
+            positive += float(cfg.fusion_success_reward)
+            self._record_fusion_reward_component("fusion_success_reward", cfg.fusion_success_reward)
+            bonuses = self._fusion_usefulness_bonus(
+                row,
+                col,
+                self._safe_int(fusion_event.get("existing_plant"), default=-1),
+                self._safe_int(fusion_event.get("selected_seed"), default=-1),
+                fusion_event.get("result") if isinstance(fusion_event.get("result"), dict) else {},
+                observation,
+            )
+            for name, value in bonuses.items():
+                positive += float(value)
+                self._record_fusion_reward_component(name, value)
+                self._fusion_last_usefulness_bonus += float(value)
+            reasons.append("success")
+        else:
+            penalty_reason = reason or "failed"
+            if penalty_reason == FUSION_ILLEGAL_INCOMPATIBLE:
+                negative += float(cfg.fusion_incompatible_penalty)
+                self._record_fusion_reward_component("fusion_incompatible_penalty", cfg.fusion_incompatible_penalty)
+            elif penalty_reason == "empty_tile":
+                negative += float(cfg.fusion_empty_tile_penalty)
+                self._record_fusion_reward_component("fusion_empty_tile_penalty", cfg.fusion_empty_tile_penalty)
+            elif penalty_reason in {"exception", "bridge_error", "fusion_bridge_unavailable", "fusion_probe_failed"}:
+                negative += float(cfg.fusion_bridge_error_penalty)
+                self._record_fusion_reward_component("fusion_bridge_error_penalty", cfg.fusion_bridge_error_penalty)
+            elif penalty_reason in {
+                "cooldown_not_ready",
+                "insufficient_sun",
+                "fusion_disabled",
+                "seed_unavailable",
+                "fusion_policy_none",
+                "fusion_not_available",
+            }:
+                # Pre-condition blocks are not the model's fault: no penalty, no reward.
+                penalty_reason = ""
+            else:
+                negative += float(cfg.fusion_failed_penalty)
+                self._record_fusion_reward_component("fusion_failed_penalty", cfg.fusion_failed_penalty)
+            if penalty_reason:
+                reasons.append(penalty_reason)
+
+        if spam:
+            negative += float(cfg.fusion_spam_penalty)
+            self._record_fusion_reward_component("fusion_spam_penalty", cfg.fusion_spam_penalty)
+            reasons.append("spam")
+
+        capped_positive = self._apply_fusion_reward_cap(positive)
+        net = capped_positive + negative
+        self._fusion_reward_total = float(getattr(self, "_fusion_reward_total", 0.0)) + net
+        self._fusion_last_reward_delta = net
+        self._fusion_last_reward_reason = ",".join(reasons)
+        return net
+
+    def _fusion_source_from_result(self, action_result: Dict[str, Any]) -> str:
+        source = str(action_result.get("fusionExecutionSource") or "")
+        if source == "model_action_mask":
+            return "model"
+        coach_source = str(action_result.get("coach_command_source") or action_result.get("coachCommandSource") or "")
+        if coach_source in {"human", "gui", "human_coach"}:
+            return "human_coach"
+        if coach_source in {"stream", "stream_coach"}:
+            return "stream_coach"
+        if action_result.get("coachFusionOverrideApplied") is not None or action_result.get("executed_from_fresh_coach_command"):
+            return "human_coach"
+        if isinstance(action_result.get("fusionCandidate"), dict) and "fusionOverrideApplied" in action_result:
+            return "scripted"
+        return source or "model"
+
+    def _fusion_event_from_action_result(
+        self,
+        action_result: Optional[Dict[str, Any]],
+        observation: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(action_result, dict):
+            return None
+        decoded = action_result.get("decoded") if isinstance(action_result.get("decoded"), dict) else {}
+        candidate = action_result.get("fusionCandidate") if isinstance(action_result.get("fusionCandidate"), dict) else {}
+        is_fusion = (
+            "fusionSucceeded" in action_result
+            or "fusionAttempted" in action_result
+            or "fusion_success" in action_result
+            or bool(action_result.get("fusionExecutionSource"))
+            or str(decoded.get("kind") or "") == "fusion"
+            or bool(candidate)
+            or bool(action_result.get("fusionRejectedReason"))
+        )
+        if not is_fusion:
+            return None
+        success = bool(action_result.get("fusionSucceeded") or action_result.get("fusion_success"))
+        changed = self._safe_int(action_result.get("changedTileCount"), action_result.get("changed_tile_count"), default=(1 if success else 0))
+        reason = "" if success else str(
+            action_result.get("fusionRejectedReason")
+            or action_result.get("illegalReason")
+            or action_result.get("bridgeResultReason")
+            or "failed"
+        )
+        return {
+            "source": self._fusion_source_from_result(action_result),
+            "success": success,
+            "board_changed": success and changed > 0,
+            "reason": reason,
+            "row": self._safe_int(decoded.get("row"), action_result.get("sourceRow"), candidate.get("source_row"), default=-1),
+            "col": self._safe_int(decoded.get("column"), action_result.get("sourceCol"), candidate.get("source_col"), default=-1),
+            "existing_plant": self._safe_int(decoded.get("sourcePlantType"), action_result.get("sourcePlantType"), candidate.get("source_plant_type"), default=-1),
+            "selected_seed": self._safe_int(decoded.get("ingredientPlantType"), action_result.get("ingredientPlantType"), candidate.get("target_or_ingredient_type"), default=-1),
+            "seed_slot": self._safe_int(candidate.get("ingredient_seed_slot_index"), action_result.get("ingredientSeedSlotIndex"), default=-1),
+            "result": action_result,
+            "observation": observation if isinstance(observation, dict) else {},
+        }
+
+    def _compute_step_fusion_reward(
+        self,
+        observation: Optional[Dict[str, Any]],
+        action_result: Optional[Dict[str, Any]],
+    ) -> float:
+        fusion_event = self._fusion_event_from_action_result(action_result, observation)
+        if fusion_event is None:
+            return 0.0
+        return self._compute_fusion_reward(fusion_event)
+
+    def _fusion_reward_live_fields(self) -> Dict[str, Any]:
+        """Cumulative per-episode fusion reward accounting for diagnostics/metrics."""
+        totals = getattr(self, "_fusion_reward_component_totals", {}) or {}
+        return {
+            "fusion_reward_total": round(float(getattr(self, "_fusion_reward_total", 0.0)), 6),
+            "fusion_attempt_reward_total": round(float(totals.get("fusion_attempt_reward", 0.0)), 6),
+            "fusion_success_reward_total": round(float(totals.get("fusion_success_reward", 0.0)), 6),
+            "fusion_threatened_row_bonus_total": round(float(totals.get("fusion_threatened_row_bonus", 0.0)), 6),
+            "fusion_active_wave_bonus_total": round(float(totals.get("fusion_active_wave_bonus", 0.0)), 6),
+            "fusion_defensive_value_bonus_total": round(float(totals.get("fusion_defensive_value_bonus", 0.0)), 6),
+            "fusion_incompatible_penalty_total": round(float(totals.get("fusion_incompatible_penalty", 0.0)), 6),
+            "fusion_empty_tile_penalty_total": round(float(totals.get("fusion_empty_tile_penalty", 0.0)), 6),
+            "fusion_failed_penalty_total": round(float(totals.get("fusion_failed_penalty", 0.0)), 6),
+            "fusion_bridge_error_penalty_total": round(float(totals.get("fusion_bridge_error_penalty", 0.0)), 6),
+            "fusion_spam_penalty_total": round(float(totals.get("fusion_spam_penalty", 0.0)), 6),
+            "fusion_reward_capped": bool(getattr(self, "_fusion_reward_capped", False)),
+            "fusion_last_reward_delta": round(float(getattr(self, "_fusion_last_reward_delta", 0.0)), 6),
+            "fusion_last_reward_reason": str(getattr(self, "_fusion_last_reward_reason", "")),
+            "fusion_last_usefulness_bonus": round(float(getattr(self, "_fusion_last_usefulness_bonus", 0.0)), 6),
+            "fusion_last_source": str(getattr(self, "_fusion_last_source", "")),
+        }
+
     def _coach_command_id_from_bridge_command(self, coach_bridge_command: Dict[str, Any]) -> Optional[int]:
         try:
             command_id = int(coach_bridge_command.get("coach_command_id") or 0)
@@ -4682,6 +5124,13 @@ class PvZGymEnv:
         )
         fusion_action_result: Optional[Dict[str, Any]] = coach_fusion_action_result
         if fusion_action_result is None:
+            fusion_action_result, fusion_diagnostics = self._maybe_execute_model_fusion(
+                pre_observation,
+                fusion_diagnostics,
+                requested_action,
+                executed_action,
+            )
+        if fusion_action_result is None:
             fusion_action_result, fusion_diagnostics = self._maybe_execute_scripted_fusion(
                 pre_observation,
                 fusion_diagnostics,
@@ -4821,6 +5270,15 @@ class PvZGymEnv:
             ):
                 print(f"[corruption] {event_name}: {event}")
         reward_breakdown = self.compute_reward_breakdown(self.previous_observation, observation, action_result)
+        # Shaped fusion reward is computed once here (not inside compute_reward_breakdown,
+        # which is side-effect free and may run on non-step paths). Covers every fusion
+        # source because model/coach/scripted fusions all surface as this step's action_result.
+        fusion_reward_delta = self._compute_step_fusion_reward(self.previous_observation, action_result)
+        if fusion_reward_delta:
+            reward_breakdown["fusion_reward"] = float(reward_breakdown.get("fusion_reward", 0.0)) + fusion_reward_delta
+            reward_breakdown["reward_total"] = float(reward_breakdown.get("reward_total", 0.0)) + fusion_reward_delta
+        if isinstance(fusion_diagnostics, dict):
+            fusion_diagnostics.update(self._fusion_reward_live_fields())
         reward = reward_breakdown["reward_total"]
         done = bool(observation.get("done", False))
         terminal_hint = str(observation.get("terminalHint") or "")
@@ -5729,6 +6187,7 @@ class PvZGymEnv:
             "python_legal_action_count": sum(1 for allowed in current_mask if allowed),
             "bridge_legal_action_count": len(bridge_actions),
             "slot_readiness_by_seed_slot": self._slot_readiness_by_seed_slot(obs),
+            **self._fusion_mask_diagnostics(obs),
             **tactical_diag,
         }
 
@@ -5952,14 +6411,92 @@ class PvZGymEnv:
         cost = max(0, self._safe_int(slot.get("seedCost"), default=0))
         if int(observation.get("sun", 0) or 0) < cost:
             return False, "insufficient_sun"
-        if self._cell_occupied(observation, row, column):
-            return False, "occupied_cell"
+        occupied, existing_type = self._cell_occupancy(observation, row, column)
+        if occupied:
+            # Occupied tile: a normal plant action is illegal here, but a *fuse*
+            # action may be legal when fusion is enabled and the selected seed is
+            # compatible with the plant already on the tile.  Fusion actions are
+            # not present in the bridge's normal placement legal-actions set, so
+            # we deliberately do not require bridge membership for them; the step
+            # path routes the placement to the fusion bridge instead.
+            if not self._fusion_action_mask_enabled():
+                return False, "occupied_cell"
+            seed_type = self._safe_int(slot.get("plantType"), default=-1)
+            if not are_fusion_compatible(existing_type, seed_type):
+                return False, FUSION_ILLEGAL_INCOMPATIBLE
+            return True, ""
         legal_set = set(int(item) for item in (bridge_actions if bridge_actions is not None else self.bridge_legal_actions(observation)))
         if action_id not in legal_set:
             return False, "bridge_legal_actions_missing"
         return True, ""
 
+    def _fusion_action_mask_enabled(self) -> bool:
+        return bool(getattr(self.config, "fusion_action_mask_enabled", False))
+
+    def _fusion_mask_diagnostics(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+        """Classify occupied-tile/seed pairings into fusion mask diagnostics counts."""
+
+        enabled = self._fusion_action_mask_enabled()
+        out: Dict[str, Any] = {
+            "fusion_action_mask_enabled": bool(enabled),
+            "fusion_actions_available_count": 0,
+            "fusion_candidate_tiles": [],
+            "fusion_actions_masked_empty_tile": 0,
+            "fusion_actions_masked_incompatible_count": 0,
+            "fusion_actions_masked_disabled_count": 0,
+            "fusion_actions_masked_cooldown_count": 0,
+            "fusion_actions_masked_sun_count": 0,
+            "fusion_compatibility_table": fusion_compatibility_table(),
+        }
+        rows = int(observation.get("rowCount") or 0)
+        cols = int(observation.get("columnCount") or 0)
+        if rows <= 0 or cols <= 0:
+            return out
+        slots = seed_slots_from_observation(observation, self.config.plant_types)
+        occupied_cells: Dict[Tuple[int, int], int] = {}
+        for plant in observation.get("plants", []) or []:
+            if not isinstance(plant, dict):
+                continue
+            prow = self._safe_int(plant.get("row"), default=-1)
+            pcol = self._safe_int(plant.get("column"), default=-1)
+            if 0 <= prow < rows and 0 <= pcol < cols:
+                occupied_cells[(prow, pcol)] = self._safe_int(plant.get("type"), plant.get("plantType"), default=-1)
+        available_tiles: set = set()
+        for (prow, pcol), _existing in occupied_cells.items():
+            for slot_index, slot in enumerate(slots):
+                seed_slot_index = int(slot.get("slotIndex", slot_index))
+                # Always classify as if fusion were enabled so the disabled case
+                # can report how many compatible fusions are being suppressed.
+                reason = get_fusion_illegal_reason(
+                    observation,
+                    prow,
+                    pcol,
+                    seed_slot_index,
+                    fusion_enabled=True,
+                    plant_types=self.config.plant_types,
+                )
+                if reason == "incompatible_pair":
+                    out["fusion_actions_masked_incompatible_count"] += 1
+                elif reason == "cooldown_not_ready":
+                    out["fusion_actions_masked_cooldown_count"] += 1
+                elif reason in ("insufficient_sun",):
+                    out["fusion_actions_masked_sun_count"] += 1
+                elif reason == "":
+                    if enabled:
+                        out["fusion_actions_available_count"] += 1
+                        available_tiles.add((prow, pcol))
+                    else:
+                        out["fusion_actions_masked_disabled_count"] += 1
+        out["fusion_candidate_tiles"] = sorted(available_tiles)
+        return out
+
     def _cell_occupied(self, observation: Dict[str, Any], row: int, column: int) -> bool:
+        occupied, _ = self._cell_occupancy(observation, row, column)
+        return occupied
+
+    def _cell_occupancy(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, int]:
+        """Return (occupied, plant_type) for a cell; plant_type is -1 when empty."""
+
         for key in ("plants", "visiblePlants"):
             values = observation.get(key, []) or []
             if not isinstance(values, list):
@@ -5974,10 +6511,10 @@ class PvZGymEnv:
                     continue
                 try:
                     if int(plant.get("row", -1)) == row and int(plant.get("column", -1)) == column:
-                        return True
+                        return True, self._safe_int(plant.get("type"), plant.get("plantType"), default=-1)
                 except (TypeError, ValueError):
                     continue
-        return False
+        return False, -1
 
     def _legal_actions_by_seed_slot(self, observation: Dict[str, Any], actions_or_mask: Any) -> Dict[str, int]:
         slots = seed_slots_from_observation(observation, self.config.plant_types)
