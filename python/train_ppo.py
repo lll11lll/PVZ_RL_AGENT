@@ -1154,6 +1154,11 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         getattr(args, "human_coach_enabled", False)
         or raw_config.get("human_coach_enabled", False)
     )
+    human_coach_command_mode = str(
+        getattr(args, "human_coach_command_mode", None)
+        or raw_config.get("human_coach_command_mode", "override")
+        or "override"
+    ).strip().lower()
     stream_coach_enabled = bool(
         getattr(args, "stream_coach_enabled", False)
         or raw_config.get("stream_coach_enabled", False)
@@ -1337,6 +1342,11 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         ),
         "human_coach_fusion_enabled": bool(human_coach_fusion_enabled),
         "human_coach_platform": str(raw_config.get("human_coach_platform", "mock") or "mock"),
+        "human_coach_command_mode": human_coach_command_mode,
+        "intervention_log_path": str(
+            getattr(args, "intervention_log_path", None)
+            or raw_config.get("intervention_log_path", "logs/interventions/interventions.jsonl")
+        ),
         "stream_coach_enabled": bool(stream_coach_enabled),
         "stream_coach_mode": stream_coach_mode,
         "stream_coach_platform": str(
@@ -1444,6 +1454,8 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         human_coach_reward=bool(config.get("human_coach_reward", False)),
         human_coach_fusion_enabled=bool(config.get("human_coach_fusion_enabled", False)),
         human_coach_platform=str(config.get("human_coach_platform", "mock") or "mock"),
+        human_coach_command_mode=str(config.get("human_coach_command_mode", "override") or "override"),
+        intervention_log_path=str(config.get("intervention_log_path", "logs/interventions/interventions.jsonl")),
         stream_coach_enabled=bool(config.get("stream_coach_enabled", False)),
         stream_coach_mode=str(config.get("stream_coach_mode", config.get("stream_coach_platform", "mock")) or "mock"),
         stream_coach_platform=str(config.get("stream_coach_platform", "mock") or "mock"),
@@ -4116,6 +4128,18 @@ def main() -> int:
     parser.add_argument("--adventure-frontier-win-streak-required", type=int, default=None)
     parser.add_argument("--live-status-path", type=Path, default=Path("runs/live_status.json"))
     parser.add_argument("--human-coach-enabled", action="store_true", help="Enable local/mock human coach action overrides.")
+    parser.add_argument(
+        "--human-coach-command-mode",
+        choices=("override", "assist", "coach_only", "viewer_suggestion"),
+        default=None,
+        help="How approved human commands interact with the model action.",
+    )
+    parser.add_argument(
+        "--intervention-log-path",
+        type=Path,
+        default=None,
+        help="JSONL path for unified assisted intervention records.",
+    )
     parser.add_argument("--human-coach-command-path", type=Path, default=None, help="Plain text or JSONL file of local coach commands.")
     parser.add_argument("--human-coach-log-path", type=Path, default=None, help="JSONL log path for human coach decisions.")
     parser.add_argument("--human-coach-reward", action="store_true", help="Apply small optional coach reward shaping.")

@@ -16,6 +16,20 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
+from pvzrl_assisted_coach import (
+    LAWN_COLS,
+    LAWN_ROWS,
+    SEED_PACKET_SLOTS,
+    AssistedCoachCommand,
+    AssistedCommandQueue,
+    AssistedCommandStatus,
+    AssistedCommandType,
+    AssistedCommandValidator,
+    AssistedExecutionMode,
+    InterventionJSONLLogger,
+    queue_rows,
+)
+
 
 POLL_MS = 1000
 LOG_POLL_MS = 100
@@ -27,12 +41,16 @@ DEFAULT_LIVE_STATUS_PATH = Path("runs") / "live_status.json"
 DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
 DEFAULT_HUMAN_COACH_LOG_PATH = Path("runs") / "human_coach.jsonl"
 DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
+DEFAULT_INTERVENTION_LOG_PATH = Path("logs") / "interventions" / "dashboard_interventions.jsonl"
 LIVE_MAX_AGE_SECONDS = 5.0
 STALE_MAX_AGE_SECONDS = 30.0
 MISSING = object()
 ADVENTURE_DEFAULT_PLANT_TYPES = "1,0,3,2"
 FUSION_POLICY_CHOICES = ("none", "observe", "scripted", "assist")
 STREAM_COACH_PLATFORMS = ("mock", "twitch", "youtube")
+STRUCTURED_COACH_COMMANDS = tuple(command.value for command in AssistedCommandType)
+ASSISTED_EXECUTION_MODES = tuple(mode.value for mode in AssistedExecutionMode)
+LAB_MODES = ("Normal", "Assisted", "Fusion", "Curriculum")
 LEVEL3_SEED_LIST = "SunFlower,Peashooter,WallNut,CherryBomb"
 LEVEL3_PLANT_TYPES = "1,0,3,2"
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
@@ -88,6 +106,33 @@ def row_panel_lines(rows: Dict[str, Any]) -> str:
     return "\n".join(output) if output else "-"
 
 
+class _Tooltip:
+    """Small dependency-free hover tooltip for compact dashboard controls."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.popup: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event: Any = None) -> None:
+        if self.popup is not None or not self.text:
+            return
+        popup = tk.Toplevel(self.widget)
+        popup.wm_overrideredirect(True)
+        popup.wm_geometry(f"+{self.widget.winfo_rootx() + 18}+{self.widget.winfo_rooty() + 22}")
+        label = ttk.Label(popup, text=self.text, justify="left", padding=(7, 4), relief="solid")
+        label.pack()
+        self.popup = popup
+
+    def _hide(self, _event: Any = None) -> None:
+        if self.popup is not None:
+            self.popup.destroy()
+            self.popup = None
+
+
 class PvZDashboard:
     def __init__(self, root: tk.Tk, live_status_path: Path):
         self.root = root
@@ -95,8 +140,8 @@ class PvZDashboard:
         self.repo_root = self.project_root
         self.live_status_path = self._resolve_path(live_status_path)
         self.root.title("PvZRL Dashboard")
-        self.root.geometry("850x550")
-        self.root.minsize(760, 500)
+        self.root.geometry("1180x780")
+        self.root.minsize(980, 650)
 
         default_model = self._find_newest_model_zip()
         default_adventure_model = self._find_newest_usable_model_zip() or default_model
@@ -197,6 +242,21 @@ class PvZDashboard:
         self.human_coach_log_path_var = tk.StringVar(value=str(DEFAULT_HUMAN_COACH_LOG_PATH))
         self.human_coach_command_path_var = tk.StringVar(value=str(DEFAULT_COACH_COMMAND_QUEUE_PATH))
         self.human_coach_command_input_var = tk.StringVar(value="")
+        self.structured_command_type_var = tk.StringVar(value=AssistedCommandType.PLANT.value)
+        self.structured_row_var = tk.StringVar(value="2")
+        self.structured_col_var = tk.StringVar(value="4")
+        self.structured_seed_slot_var = tk.StringVar(value="0")
+        self.structured_custom_text_var = tk.StringVar(value="")
+        self.structured_preview_var = tk.StringVar(value="PLANT 2 4 0")
+        self.assisted_command_source_var = tk.StringVar(value="dashboard")
+        self.assisted_command_user_var = tk.StringVar(value="local")
+        self.assisted_execution_mode_var = tk.StringVar(value=AssistedExecutionMode.OVERRIDE.value)
+        self.train_lab_mode_var = tk.StringVar(value="Normal")
+        self.eval_lab_mode_var = tk.StringVar(value="Normal")
+        self.intervention_log_path_var = tk.StringVar(value=str(DEFAULT_INTERVENTION_LOG_PATH))
+        self.assisted_queue_summary_var = tk.StringVar(value="pending=0 approved=0 rejected=0 executed=0")
+        self.command_enablement_var = tk.StringVar(value="Coach commands off | Viewer commands off | mode=override")
+        self.fusion_command_feedback_var = tk.StringVar(value="Fusion legality is checked against the live bridge at execution.")
         self.stream_coach_enabled_var = tk.BooleanVar(value=False)
         self.stream_coach_platform_var = tk.StringVar(value=STREAM_COACH_PLATFORMS[0])
         self.stream_coach_window_sec_var = tk.StringVar(value="3")
@@ -249,8 +309,35 @@ class PvZDashboard:
         self.diagnostics_status_var = tk.StringVar(value="MISSING - no live status has been read")
         self.schema_keys_var = tk.StringVar(value="Schema keys: -")
         self.active_run_var = tk.StringVar(value="Active run: unknown")
+        self.train_advanced_expanded_var = tk.BooleanVar(value=False)
+        self.log_filter_var = tk.StringVar(value="")
+        self.log_severity_var = tk.StringVar(value="All")
+        self.log_pause_autoscroll_var = tk.BooleanVar(value=False)
+        self.fusion_selected_seed_var = tk.StringVar(value="0")
+        self.fusion_selected_tile_var = tk.StringVar(value="Selected tile: none")
+        self.fusion_command_preview_var = tk.StringVar(value="Select a seed slot, then click lawn tiles.")
+        self.diagnostic_visibility_vars: Dict[str, tk.BooleanVar] = {
+            title: tk.BooleanVar(value=title in {"Gameplay", "Agent", "Reward Breakdown", "Human Interventions", "Viewer Queue Stats"})
+            for title in (
+                "Adventure",
+                "Gameplay",
+                "Agent",
+                "Rows",
+                "Eval",
+                "Fusion",
+                "Seed Inventory / Compatibility",
+                "Reward Breakdown",
+                "Action Distribution",
+                "Plant Usage",
+                "Fusion Usage",
+                "Human Interventions",
+                "Failed Episodes",
+                "Viewer Queue Stats",
+            )
+        }
 
         self.panels: Dict[str, tk.Text] = {}
+        self.diagnostic_panel_frames: Dict[str, ttk.LabelFrame] = {}
         self.last_panel_content: Dict[str, str] = {}
         self.last_adventure_status_content = ""
         self.last_generalist_status_content = ""
@@ -264,6 +351,19 @@ class PvZDashboard:
         self.level3_preview: Optional[scrolledtext.ScrolledText] = None
         self.adventure_status_text: Optional[tk.Text] = None
         self.generalist_status_text: Optional[tk.Text] = None
+        self.train_advanced_frame: Optional[ttk.LabelFrame] = None
+        self.log_history: List[str] = []
+        self.fusion_grid: Dict[Tuple[int, int], str] = {}
+        self.fusion_tile_buttons: Dict[Tuple[int, int], ttk.Button] = {}
+        self.fusion_selected_tile: Optional[Tuple[int, int]] = None
+        self.structured_row_widget: Optional[ttk.Spinbox] = None
+        self.structured_col_widget: Optional[ttk.Spinbox] = None
+        self.structured_seed_widget: Optional[ttk.Spinbox] = None
+        self.structured_custom_widget: Optional[ttk.Entry] = None
+        self.assisted_queue_tree: Optional[ttk.Treeview] = None
+        self._structured_raw_copy_value = ""
+        self.assisted_command_queue = AssistedCommandQueue()
+        self.intervention_logger = InterventionJSONLLogger(self._resolve_path(DEFAULT_INTERVENTION_LOG_PATH))
         self.log_queue: queue.Queue[Any] = queue.Queue()
         self.active_process: Optional[subprocess.Popen[str]] = None
         self.active_process_name = ""
@@ -386,34 +486,34 @@ class PvZDashboard:
 
         train_tab = ttk.Frame(notebook)
         eval_tab = ttk.Frame(notebook)
-        level3_tab = ttk.Frame(notebook)
-        adventure_tab = ttk.Frame(notebook)
-        generalist_tab = ttk.Frame(notebook)
         coach_tab = ttk.Frame(notebook)
         diagnostics_tab = ttk.Frame(notebook)
         runs_tab = ttk.Frame(notebook)
-        logs_tab = ttk.Frame(notebook)
         notebook.add(train_tab, text="Train")
         notebook.add(eval_tab, text="Eval")
-        notebook.add(level3_tab, text="Level 3")
-        notebook.add(adventure_tab, text="Adventure")
-        notebook.add(generalist_tab, text="Adventure Generalist")
         notebook.add(coach_tab, text="Coach")
         notebook.add(diagnostics_tab, text="Diagnostics")
         notebook.add(runs_tab, text="Runs/Models")
-        notebook.add(logs_tab, text="Logs")
 
         self._build_train_tab(train_tab)
         self._build_eval_tab(eval_tab)
-        self._build_level3_tab(level3_tab)
-        self._build_adventure_tab(adventure_tab)
-        self._build_adventure_generalist_tab(generalist_tab)
         self._build_coach_tab(coach_tab)
         self._build_diagnostics_tab(diagnostics_tab)
-        self._build_runs_tab(runs_tab)
-        self._build_logs_tab(logs_tab)
+        self._build_runs_models_tab(runs_tab)
         self._build_status_bar()
         self._build_log_panel()
+
+    def _build_runs_models_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(parent)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        runs = ttk.Frame(notebook)
+        fusion = ttk.Frame(notebook)
+        notebook.add(runs, text="Runs and Models")
+        notebook.add(fusion, text="Fusion Planner")
+        self._build_runs_tab(runs)
+        self._build_fusion_tab(fusion)
 
     def _build_status_bar(self) -> None:
         frame = ttk.Frame(self.root)
@@ -428,98 +528,285 @@ class PvZDashboard:
     def _build_log_panel(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Subprocess logs")
         frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 4))
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Search").grid(row=0, column=0, sticky="w")
+        ttk.Entry(toolbar, textvariable=self.log_filter_var, width=28).grid(
+            row=0, column=1, sticky="ew", padx=(5, 8)
+        )
+        ttk.Label(toolbar, text="Severity").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            toolbar,
+            textvariable=self.log_severity_var,
+            values=("All", "ERROR", "Warning", "Live status", "Process"),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=3, sticky="w", padx=(5, 8))
+        ttk.Checkbutton(
+            toolbar,
+            text="Pause autoscroll",
+            variable=self.log_pause_autoscroll_var,
+        ).grid(row=0, column=4, sticky="w", padx=(0, 8))
+        ttk.Button(toolbar, text="Copy selected", command=self.copy_selected_logs).grid(
+            row=0, column=5, sticky="w", padx=(0, 5)
+        )
+        ttk.Button(toolbar, text="Clear", command=self.clear_logs).grid(row=0, column=6, sticky="w")
         self.log_text = scrolledtext.ScrolledText(frame, height=5, wrap="word", font=("Consolas", 9))
-        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.grid(row=1, column=0, sticky="nsew")
         self.log_text.configure(state="disabled")
+        self.log_filter_var.trace_add("write", lambda *_args: self._refresh_log_view())
+        self.log_severity_var.trace_add("write", lambda *_args: self._refresh_log_view())
 
     def _build_train_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(5, weight=1)
+        content = self._make_scrollable_container(parent)
+        content.columnconfigure(0, weight=1)
 
-        profile = ttk.LabelFrame(parent, text="Profile and Seeds")
-        profile.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        profile.columnconfigure(1, weight=1)
-        ttk.Label(profile, text="Profile").grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        combo = ttk.Combobox(profile, textvariable=self.profile_var, values=list(PROFILES), state="readonly", width=22)
-        combo.grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
-        self._add_labeled_entry(profile, 1, 0, "Seed list", self.seed_list_var, width=50)
+        status = ttk.LabelFrame(content, text="Adventure Generalist Training")
+        status.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
+        status.columnconfigure(1, weight=1)
+        ttk.Label(status, text="Mode", style="Heading.TLabel").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(
+            status,
+            text=f"{ADVENTURE_GENERALIST_MODEL_FAMILY} · 14-slot identity-aware policy",
+        ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(status, text="Process").grid(row=0, column=2, sticky="e", padx=(6, 2), pady=3)
+        ttk.Label(status, textvariable=self.process_status_var).grid(row=0, column=3, sticky="w", padx=(2, 6), pady=3)
+        ttk.Label(status, text="Lab mode").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            status, textvariable=self.train_lab_mode_var, values=LAB_MODES, state="readonly", width=13
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(status, text="Streamer mode", variable=self.stream_coach_enabled_var).grid(
+            row=1, column=2, sticky="e", padx=6, pady=3
+        )
+        ttk.Label(status, textvariable=self.assisted_execution_mode_var).grid(
+            row=1, column=3, sticky="w", padx=6, pady=3
+        )
+        ttk.Label(status, textvariable=self.command_enablement_var).grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 3)
+        )
 
-        settings = ttk.LabelFrame(parent, text="Training Settings")
-        settings.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
+        core = ttk.LabelFrame(content, text="Core Training Settings")
+        core.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
         for column in (1, 3):
-            settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Timesteps", self.total_timesteps_var)
-        self._add_labeled_entry(settings, 0, 2, "Max steps", self.max_steps_var)
-        self._add_labeled_entry(settings, 1, 0, "Step seconds", self.step_seconds_var)
-        self._add_labeled_entry(settings, 1, 2, "Game speed", self.game_speed_var)
-        self._add_labeled_entry(settings, 2, 0, "Start sun", self.start_sun_var)
-        self._add_labeled_entry(settings, 2, 2, "Checkpoint freq", self.checkpoint_freq_var)
-        self._add_labeled_entry(settings, 3, 0, "Board timeout", self.board_timeout_var)
-        self._add_labeled_entry(settings, 3, 2, "Ready timeout", self.gameplay_ready_timeout_var)
+            core.columnconfigure(column, weight=1)
+        self._add_labeled_entry(
+            core, 0, 0, "Timesteps", self.generalist_total_timesteps_var,
+            tooltip="Total PPO environment steps for this Adventure Generalist run.",
+        )
+        self._add_labeled_entry(
+            core, 0, 2, "Initial loadout", self.generalist_initial_loadout_var, width=42,
+            tooltip="Fixed bootstrap loadout used before Adventure unlocks expand the seed inventory.",
+        )
+        self._add_labeled_entry(
+            core, 1, 0, "Start level", self.generalist_start_level_var,
+            tooltip="First Adventure level eligible for the curriculum frontier.",
+        )
+        self._add_labeled_entry(
+            core, 1, 2, "Max levels", self.generalist_max_levels_var,
+            tooltip="Highest Adventure level included in this training run.",
+        )
+        self._add_labeled_entry(
+            core, 2, 0, "Max attempts", self.generalist_max_attempts_var,
+            tooltip="Maximum failed attempts allowed per level before the run blocks.",
+        )
+        self._add_labeled_entry(
+            core, 2, 2, "Game speed", self.generalist_game_speed_var,
+            tooltip="PvZ simulation speed multiplier used by the bridge.",
+        )
 
-        run = ttk.LabelFrame(parent, text="Run / Resume")
+        run = ttk.LabelFrame(content, text="Model / Run Paths")
         run.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
         run.columnconfigure(1, weight=1)
-        self._add_labeled_entry(run, 0, 0, "Run dir", self.run_dir_var, width=50)
-        self._add_labeled_entry(run, 1, 0, "Run suffix", self.run_name_var, width=50)
-        self._add_labeled_entry(run, 2, 0, "Resume model", self.model_path_var, width=50)
+        self._add_labeled_entry(
+            run, 0, 0, "Run directory", self.generalist_run_dir_var, width=68,
+            tooltip="Optional output directory. Blank lets train_ppo.py create the run folder.",
+        )
+        ttk.Button(run, text="Browse", command=self.browse_run_folder).grid(row=0, column=2, padx=(0, 6), pady=2)
+        self._add_labeled_entry(
+            run, 1, 0, "Resume model .zip", self.generalist_resume_model_path_var, width=68,
+            tooltip="Existing compatible 14-slot model. Leave blank for a fresh initialization.",
+        )
+        ttk.Button(run, text="Browse", command=self.browse_generalist_resume_model).grid(row=1, column=2, padx=(0, 4), pady=2)
+        ttk.Button(run, text="Refresh", command=self.refresh_generalist_resume_model).grid(row=1, column=3, padx=(0, 6), pady=2)
 
-        options = ttk.LabelFrame(parent, text="Options")
-        options.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
-        self._add_options(options)
+        actions = ttk.Frame(content)
+        actions.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
+        self._add_launch_button(actions, "Start Training", self.start_adventure_generalist_train).grid(
+            row=0, column=0, sticky="w", padx=(0, 5)
+        )
+        self._add_launch_button(actions, "Resume Training", self.resume_training).grid(
+            row=0, column=1, sticky="w", padx=(0, 5)
+        )
+        self._add_stop_button(actions, "Stop Process").grid(row=0, column=2, sticky="w", padx=(0, 5))
+        ttk.Button(actions, text="Advanced Settings ▸", command=self._toggle_train_advanced).grid(
+            row=0, column=3, sticky="w"
+        )
 
-        actions = ttk.Frame(parent)
-        actions.grid(row=4, column=0, sticky="ew", padx=8, pady=3)
-        self._add_launch_button(actions, "Start Training", self.start_training).grid(row=0, column=0, sticky="w", padx=(0, 5))
-        self._add_launch_button(actions, "Resume Training", self.resume_training).grid(row=0, column=1, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Models", command=self.refresh_models).grid(row=0, column=2, sticky="w", padx=(0, 5))
-        self._add_stop_button(actions, "Stop Active Process").grid(row=0, column=3, sticky="w")
+        advanced = ttk.LabelFrame(content, text="Advanced Settings")
+        advanced.grid(row=4, column=0, sticky="ew", padx=8, pady=3)
+        for column in (1, 3):
+            advanced.columnconfigure(column, weight=1)
+        self.train_advanced_frame = advanced
+        self._add_labeled_entry(
+            advanced, 0, 0, "Checkpoint frequency", self.generalist_checkpoint_freq_var,
+            tooltip="Environment-step interval between saved PPO checkpoints.",
+        )
+        self._add_labeled_entry(
+            advanced, 0, 2, "Step seconds", self.generalist_step_seconds_var,
+            tooltip="Wall-clock delay between bridge actions.",
+        )
+        self._add_labeled_entry(
+            advanced, 1, 0, "Board timeout", self.generalist_board_timeout_var,
+            tooltip="Seconds allowed for the board to reach a usable state.",
+        )
+        self._add_labeled_entry(
+            advanced, 1, 2, "Soft / hard max steps", self.generalist_soft_max_steps_var,
+            tooltip="Soft episode step budget; the hard cap is configured beside it.",
+        )
+        ttk.Entry(advanced, textvariable=self.generalist_hard_max_steps_var, width=12).grid(
+            row=1, column=4, sticky="w", padx=6, pady=2
+        )
+        ttk.Label(advanced, text="Curriculum ⓘ").grid(row=2, column=0, sticky="w", padx=6, pady=2)
+        curriculum = ttk.Combobox(
+            advanced,
+            textvariable=self.generalist_curriculum_var,
+            values=("conservative", "varied"),
+            state="readonly",
+            width=15,
+        )
+        curriculum.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+        _Tooltip(curriculum, "Controls how aggressively cleared levels and the current frontier are sampled.")
+        self._add_labeled_entry(advanced, 2, 2, "Unlock delay", self.generalist_unlock_delay_var)
+        self._add_labeled_entry(advanced, 3, 0, "Frontier probability", self.generalist_frontier_prob_var)
+        self._add_labeled_entry(advanced, 3, 2, "Recent / maintenance", self.generalist_recent_prob_var)
+        ttk.Entry(advanced, textvariable=self.generalist_maintenance_prob_var, width=12).grid(
+            row=3, column=4, sticky="w", padx=6, pady=2
+        )
+        self._add_labeled_entry(advanced, 4, 0, "New plant min probability", self.generalist_new_plant_prob_var)
+        self._add_labeled_entry(advanced, 4, 2, "Promotion win streak", self.generalist_frontier_win_streak_required_var)
+        option_specs = (
+            ("Unlock-aware curriculum", self.generalist_unlock_curriculum_var),
+            ("Replay cleared levels", self.generalist_replay_cleared_var),
+            ("Randomize seed order", self.generalist_randomize_seed_order_var),
+            ("Wait for gameplay", self.generalist_wait_gameplay_ready_var),
+            ("Quick wait", self.generalist_quick_wait_var),
+            ("Final-wave extension", self.generalist_final_wave_extension_var),
+            ("Tactical masks", self.generalist_tactical_masks_var),
+            ("WallNut mask", self.generalist_wallnut_mask_var),
+            ("CherryBomb mask", self.generalist_cherrybomb_mask_var),
+        )
+        for index, (label, variable) in enumerate(option_specs):
+            ttk.Checkbutton(advanced, text=label, variable=variable).grid(
+                row=5 + index // 3, column=index % 3, sticky="w", padx=6, pady=2
+            )
+        advanced.grid_remove()
 
-        preview = ttk.LabelFrame(parent, text="Command Preview")
-        preview.grid(row=5, column=0, sticky="nsew", padx=8, pady=(3, 6))
+        preview = ttk.LabelFrame(content, text="Command Preview")
+        preview.grid(row=5, column=0, sticky="ew", padx=8, pady=(3, 6))
         preview.rowconfigure(0, weight=1)
         preview.columnconfigure(0, weight=1)
-        self.train_preview = self._preview_box(preview, height=4)
+        self.train_preview = self._preview_box(preview, height=6)
 
     def _build_eval_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(5, weight=1)
+        content = self._make_scrollable_container(parent)
+        content.columnconfigure(0, weight=1)
 
-        model = ttk.LabelFrame(parent, text="Model")
-        model.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
+        header = ttk.LabelFrame(content, text="Adventure Generalist Evaluation")
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
+        header.columnconfigure(1, weight=1)
+        ttk.Label(
+            header,
+            text="Compatibility",
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(
+            header,
+            text=f"Requires family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count=701, max_seed_slots=14",
+        ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(header, text="Lab mode").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            header, textvariable=self.eval_lab_mode_var, values=LAB_MODES, state="readonly", width=13
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(header, text="Streamer mode", variable=self.stream_coach_enabled_var).grid(
+            row=1, column=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Label(header, textvariable=self.command_enablement_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 3)
+        )
+
+        model = ttk.LabelFrame(content, text="Model / Run")
+        model.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
         model.columnconfigure(1, weight=1)
-        self._add_labeled_entry(model, 0, 0, "Model .zip", self.model_path_var, width=56)
-        self._add_labeled_entry(model, 1, 0, "Run dir", self.run_dir_var, width=56)
+        self._add_labeled_entry(
+            model, 0, 0, "Model .zip", self.generalist_eval_model_path_var, width=68,
+            tooltip="Metadata-backed Adventure Generalist checkpoint selected for evaluation.",
+        )
+        ttk.Button(model, text="Browse model", command=self.browse_generalist_eval_model).grid(
+            row=0, column=2, padx=(0, 4), pady=2
+        )
+        ttk.Button(model, text="Refresh", command=self.refresh_generalist_eval_model).grid(
+            row=0, column=3, padx=(0, 6), pady=2
+        )
+        self._add_labeled_entry(
+            model, 1, 0, "Run directory", self.generalist_run_dir_var, width=68,
+            tooltip="Optional output directory for evaluation metrics and live status.",
+        )
+        ttk.Button(model, text="Browse run", command=self.browse_run_folder).grid(
+            row=1, column=2, padx=(0, 6), pady=2
+        )
 
-        settings = ttk.LabelFrame(parent, text="Evaluation Settings")
-        settings.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
+        settings = ttk.LabelFrame(content, text="Evaluation Settings")
+        settings.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
         for column in (1, 3):
             settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Episodes", self.episodes_var)
-        self._add_labeled_entry(settings, 0, 2, "Max steps", self.max_steps_var)
-        self._add_labeled_entry(settings, 1, 0, "Step seconds", self.step_seconds_var)
-        self._add_labeled_entry(settings, 1, 2, "Game speed", self.game_speed_var)
-        self._add_labeled_entry(settings, 2, 0, "Seed list", self.seed_list_var, width=48, columnspan=3)
+        self._add_labeled_entry(settings, 0, 0, "Episodes", self.generalist_eval_episodes_var)
+        self._add_labeled_entry(settings, 0, 2, "Initial loadout", self.generalist_initial_loadout_var, width=42)
+        self._add_labeled_entry(settings, 1, 0, "Start level", self.generalist_start_level_var)
+        self._add_labeled_entry(settings, 1, 2, "Max levels", self.generalist_max_levels_var)
+        self._add_labeled_entry(settings, 2, 0, "Max attempts", self.generalist_max_attempts_var)
+        self._add_labeled_entry(settings, 2, 2, "Game speed", self.generalist_game_speed_var)
+        self._add_labeled_entry(settings, 3, 0, "Step seconds", self.generalist_step_seconds_var)
+        self._add_labeled_entry(settings, 3, 2, "Board timeout", self.generalist_board_timeout_var)
+        ttk.Checkbutton(settings, text="Wait for gameplay", variable=self.generalist_wait_gameplay_ready_var).grid(
+            row=4, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="Quick wait", variable=self.generalist_quick_wait_var).grid(
+            row=4, column=1, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="Tactical masks", variable=self.generalist_tactical_masks_var).grid(
+            row=4, column=2, sticky="w", padx=6, pady=3
+        )
 
-        options = ttk.LabelFrame(parent, text="Options")
-        options.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        self._add_options(options)
-
-        actions = ttk.Frame(parent)
+        actions = ttk.Frame(content)
         actions.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
-        self._add_launch_button(actions, "Run Eval", self.run_eval).grid(row=0, column=0, sticky="w", padx=(0, 5))
-        self._add_launch_button(actions, "Run 25-Episode Eval", self.run_25_episode_eval).grid(row=0, column=1, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Models", command=self.refresh_models).grid(row=0, column=2, sticky="w", padx=(0, 5))
-        self._add_stop_button(actions, "Stop Active Process").grid(row=0, column=3, sticky="w")
+        self._add_launch_button(actions, "Start Evaluation", self.start_adventure_generalist_eval).grid(
+            row=0, column=0, sticky="w", padx=(0, 5)
+        )
+        self._add_stop_button(actions, "Stop Process").grid(row=0, column=1, sticky="w", padx=(0, 5))
 
-        preview = ttk.LabelFrame(parent, text="Command Preview")
-        preview.grid(row=4, column=0, sticky="nsew", padx=8, pady=(3, 6))
+        utilities = ttk.LabelFrame(content, text="Model / Run Utilities")
+        utilities.grid(row=4, column=0, sticky="ew", padx=8, pady=3)
+        utility_specs = (
+            ("Browse model", self.browse_generalist_eval_model),
+            ("Browse run folder", self.browse_run_folder),
+            ("Open run folder", self.open_run_folder),
+            ("Refresh models", self.refresh_generalist_models),
+            ("Analyze selected run", self.analyze_selected_run),
+            ("Show charts", self.show_charts),
+        )
+        for index, (label, command) in enumerate(utility_specs):
+            ttk.Button(utilities, text=label, command=command).grid(
+                row=index // 3, column=index % 3, sticky="ew", padx=4, pady=3
+            )
+            utilities.columnconfigure(index % 3, weight=1)
+
+        preview = ttk.LabelFrame(content, text="Command Preview")
+        preview.grid(row=5, column=0, sticky="ew", padx=8, pady=(3, 6))
         preview.rowconfigure(0, weight=1)
         preview.columnconfigure(0, weight=1)
-        self.eval_preview = self._preview_box(preview, height=4)
+        self.eval_preview = self._preview_box(preview, height=6)
 
     def _build_level3_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -566,153 +853,262 @@ class PvZDashboard:
 
     def _build_diagnostics_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
-        actions = ttk.LabelFrame(parent, text="Diagnostic Commands")
-        actions.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        for column in range(4):
-            actions.columnconfigure(column, weight=1)
-        self._add_launch_button(actions, "Auto reset test", self.auto_reset_test).grid(row=0, column=0, sticky="ew", padx=4, pady=4)
-        self._add_launch_button(actions, "Seed selection test", self.seed_selection_test).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        self._add_launch_button(actions, "Cooldown test", self.cooldown_test).grid(row=0, column=2, sticky="ew", padx=4, pady=4)
-        self._add_launch_button(actions, "Bridge/perf diagnostic", self.bridge_perf_diagnostic).grid(row=0, column=3, sticky="ew", padx=4, pady=4)
-        ttk.Button(actions, text="Refresh Diagnostics Now", command=self.refresh_diagnostics_now).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4)
-        )
-        ttk.Button(actions, text="Show Raw Live JSON", command=self.show_raw_live_json).grid(
-            row=1, column=2, columnspan=2, sticky="ew", padx=4, pady=(0, 4)
-        )
+        parent.rowconfigure(3, weight=1)
 
-        status = ttk.Frame(parent)
-        status.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
-        status.columnconfigure(0, weight=3)
-        status.columnconfigure(1, weight=2)
-        status.columnconfigure(2, weight=2)
-        ttk.Label(status, textvariable=self.diagnostics_status_var, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Label(status, textvariable=self.schema_keys_var, anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Label(status, textvariable=self.active_run_var, anchor="w").grid(row=0, column=2, sticky="ew")
+        toolbar = ttk.Frame(parent)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
+        toolbar.columnconfigure(2, weight=1)
+        ttk.Button(toolbar, text="Refresh Now", command=self.refresh_diagnostics_now).grid(
+            row=0, column=0, sticky="w", padx=(0, 5)
+        )
+        ttk.Button(toolbar, text="Show Raw JSON", command=self.show_raw_live_json).grid(
+            row=0, column=1, sticky="w", padx=(0, 10)
+        )
+        ttk.Label(toolbar, textvariable=self.diagnostics_status_var, anchor="w").grid(
+            row=0, column=2, sticky="ew", padx=(0, 10)
+        )
+        ttk.Label(toolbar, textvariable=self.active_run_var, anchor="e").grid(row=0, column=3, sticky="e")
+
+        visibility = ttk.LabelFrame(parent, text="Visible Panels")
+        visibility.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
+        for index, title in enumerate(self.diagnostic_visibility_vars):
+            ttk.Checkbutton(
+                visibility,
+                text=title,
+                variable=self.diagnostic_visibility_vars[title],
+                command=self._toggle_diagnostic_panels,
+            ).grid(row=index // 4, column=index % 4, sticky="w", padx=6, pady=2)
+            visibility.columnconfigure(index % 4, weight=1)
+
+        tests = ttk.Frame(parent)
+        tests.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
+        ttk.Label(tests, text="Targeted tests:").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        for index, (label, command) in enumerate(
+            (
+                ("Auto reset", self.auto_reset_test),
+                ("Seed selection", self.seed_selection_test),
+                ("Cooldown", self.cooldown_test),
+                ("Bridge / perf", self.bridge_perf_diagnostic),
+            ),
+            start=1,
+        ):
+            self._add_launch_button(tests, label, command).grid(row=0, column=index, sticky="w", padx=(0, 5))
 
         grid = ttk.Frame(parent)
-        grid.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        grid.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        self.diagnostic_panel_container = grid
         for column in range(3):
             grid.columnconfigure(column, weight=1)
-        for row in range(3):
+        for row in range(2):
             grid.rowconfigure(row, weight=1)
 
-        panel_specs = [
-            ("Adventure", 0, 0),
-            ("Gameplay", 0, 1),
-            ("Agent", 0, 2),
-            ("Rows", 1, 0),
-            ("Reward", 1, 1),
-            ("Eval", 1, 2),
-            ("Fusion", 2, 0),
-            ("Seed Inventory / Compatibility", 2, 1),
-        ]
-        for title, row, column in panel_specs:
+        for title in self.diagnostic_visibility_vars:
             frame = ttk.LabelFrame(grid, text=title)
-            frame.grid(row=row, column=column, columnspan=2 if title == "Seed Inventory / Compatibility" else 1, sticky="nsew", padx=4, pady=4)
             frame.rowconfigure(0, weight=1)
             frame.columnconfigure(0, weight=1)
             text = tk.Text(frame, height=5, wrap="word", font=("Consolas", 9))
             text.grid(row=0, column=0, sticky="nsew")
             text.configure(state="disabled")
             self.panels[title] = text
+            self.diagnostic_panel_frames[title] = frame
+        self._toggle_diagnostic_panels()
 
     def _build_coach_tab(self, parent: ttk.Frame) -> None:
         content = self._make_scrollable_container(parent)
         content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
 
-        queue_frame = ttk.LabelFrame(content, text="Command Queue")
-        queue_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        queue_frame.columnconfigure(1, weight=1)
-        self._add_labeled_entry(queue_frame, 0, 0, "Queue path", self.human_coach_command_path_var, width=58)
-        self._add_labeled_value(queue_frame, 1, "Queue status", self.coach_queue_status_var, width=58)
+        structured = ttk.LabelFrame(content, text="Structured Coach Command")
+        structured.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 3))
+        structured.columnconfigure(1, weight=1)
+        structured.columnconfigure(7, weight=1)
+        ttk.Label(structured, text="Command").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        command_combo = ttk.Combobox(
+            structured,
+            textvariable=self.structured_command_type_var,
+            values=STRUCTURED_COACH_COMMANDS,
+            state="readonly",
+            width=11,
+        )
+        command_combo.grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        _Tooltip(command_combo, "Select the coach command type to serialize.")
 
-        human = ttk.LabelFrame(content, text="Human Coach")
-        human.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
-        human.columnconfigure(1, weight=1)
-        human.columnconfigure(3, weight=1)
-        ttk.Checkbutton(human, text="Enable Human Coach", variable=self.human_coach_enabled_var).grid(
-            row=0, column=0, sticky="w", padx=6, pady=3
+        ttk.Label(structured, text="Row").grid(row=0, column=2, sticky="w", padx=(12, 3), pady=3)
+        self.structured_row_widget = ttk.Spinbox(
+            structured,
+            textvariable=self.structured_row_var,
+            from_=0,
+            to=LAWN_ROWS - 1,
+            width=5,
         )
-        ttk.Checkbutton(human, text="Human coach reward", variable=self.human_coach_reward_var).grid(
-            row=0, column=1, sticky="w", padx=6, pady=3
-        )
-        self._add_labeled_entry(human, 1, 0, "Human coach bonus", self.human_coach_bonus_var)
-        self._add_labeled_entry(human, 1, 2, "Human coach match bonus", self.human_coach_match_bonus_var)
-        self._add_labeled_entry(human, 2, 0, "Override penalty", self.human_coach_override_penalty_var)
-        self._add_labeled_entry(human, 2, 2, "Human coach log path", self.human_coach_log_path_var, width=30)
+        self.structured_row_widget.grid(row=0, column=3, sticky="w", padx=3, pady=3)
+        _Tooltip(self.structured_row_widget, f"Lawn row, from 0 through {LAWN_ROWS - 1}.")
 
-        command_frame = ttk.Frame(human)
-        command_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 2))
-        command_frame.columnconfigure(1, weight=1)
-        ttk.Label(command_frame, text="Command input").grid(row=0, column=0, sticky="w")
-        command_entry = ttk.Entry(command_frame, textvariable=self.human_coach_command_input_var, width=58)
-        command_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(command_frame, text="Send Command", command=self.send_human_coach_command).grid(row=0, column=2, sticky="w")
+        ttk.Label(structured, text="Column").grid(row=0, column=4, sticky="w", padx=(12, 3), pady=3)
+        self.structured_col_widget = ttk.Spinbox(
+            structured,
+            textvariable=self.structured_col_var,
+            from_=0,
+            to=LAWN_COLS - 1,
+            width=5,
+        )
+        self.structured_col_widget.grid(row=0, column=5, sticky="w", padx=3, pady=3)
+        _Tooltip(self.structured_col_widget, f"Lawn column, from 0 through {LAWN_COLS - 1}.")
 
-        human_live = ttk.LabelFrame(human, text="Human Coach Live Diagnostics")
-        human_live.grid(row=4, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 6))
-        human_live.columnconfigure(1, weight=1)
-        self._add_labeled_value(human_live, 0, "Enabled (live)", self.human_coach_enabled_status_var)
-        self._add_labeled_value(human_live, 1, "Last command", self.human_coach_last_command_var)
-        self._add_labeled_value(human_live, 2, "Last parsed action", self.human_coach_last_action_var)
-        self._add_labeled_value(human_live, 3, "Last error", self.human_coach_last_error_var)
-        self._add_labeled_value(human_live, 4, "Override count", self.human_coach_override_count_var)
-        self._add_labeled_value(human_live, 5, "Match count", self.human_coach_match_count_var)
-        self._add_labeled_value(human_live, 6, "Reward total", self.human_coach_reward_total_var)
+        ttk.Label(structured, text="Seed packet").grid(row=0, column=6, sticky="w", padx=(12, 3), pady=3)
+        self.structured_seed_widget = ttk.Spinbox(
+            structured,
+            textvariable=self.structured_seed_slot_var,
+            from_=0,
+            to=SEED_PACKET_SLOTS - 1,
+            width=5,
+        )
+        self.structured_seed_widget.grid(row=0, column=7, sticky="w", padx=3, pady=3)
+        _Tooltip(
+            self.structured_seed_widget,
+            f"Adventure Generalist seed slot, from 0 through {SEED_PACKET_SLOTS - 1}.",
+        )
 
-        stream = ttk.LabelFrame(content, text="Stream Coach")
-        stream.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        stream.columnconfigure(1, weight=1)
-        stream.columnconfigure(3, weight=1)
-        ttk.Checkbutton(stream, text="Enable Stream Coach", variable=self.stream_coach_enabled_var).grid(
-            row=0, column=0, sticky="w", padx=6, pady=3
+        ttk.Label(structured, text="Plant / target").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        self.structured_custom_widget = ttk.Entry(
+            structured,
+            textvariable=self.structured_custom_text_var,
+            state="normal",
         )
-        ttk.Checkbutton(stream, text="Stream coach reward", variable=self.stream_coach_reward_var).grid(
-            row=0, column=1, sticky="w", padx=6, pady=3
-        )
-        ttk.Checkbutton(stream, text="Dry-run stream commands", variable=self.stream_coach_dry_run_var).grid(
-            row=0, column=2, sticky="w", padx=6, pady=3
-        )
-        ttk.Label(stream, text="Platform").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        self.structured_custom_widget.grid(row=1, column=1, columnspan=7, sticky="ew", padx=6, pady=3)
+        _Tooltip(self.structured_custom_widget, "Optional plant/fusion target. PLANT/FUSE use the numeric seed slot above.")
+
+        ttk.Label(structured, text="Preview").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        ttk.Entry(
+            structured,
+            textvariable=self.structured_preview_var,
+            state="readonly",
+            font=("Consolas", 9),
+        ).grid(row=2, column=1, columnspan=5, sticky="ew", padx=6, pady=3)
+        ttk.Button(
+            structured,
+            text="Send Structured Command",
+            command=self.send_structured_coach_command,
+        ).grid(row=2, column=6, sticky="ew", padx=4, pady=3)
+        ttk.Button(
+            structured,
+            text="Copy to Raw Input",
+            command=self.copy_structured_command_to_raw,
+        ).grid(row=2, column=7, sticky="ew", padx=(4, 6), pady=3)
+
+        quick = ttk.Frame(structured)
+        quick.grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(2, 3))
+        ttk.Label(quick, text="Source").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Entry(quick, textvariable=self.assisted_command_source_var, width=12).grid(row=0, column=1, padx=(0, 6))
+        ttk.Label(quick, text="User").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ttk.Entry(quick, textvariable=self.assisted_command_user_var, width=12).grid(row=0, column=3, padx=(0, 8))
+        ttk.Label(quick, text="Execution mode").grid(row=0, column=4, sticky="w", padx=(0, 4))
         ttk.Combobox(
-            stream,
+            quick,
+            textvariable=self.assisted_execution_mode_var,
+            values=ASSISTED_EXECUTION_MODES,
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=5, padx=(0, 8))
+        ttk.Label(quick, text="Intervention log").grid(row=0, column=6, sticky="w", padx=(0, 4))
+        ttk.Entry(quick, textvariable=self.intervention_log_path_var, width=36).grid(row=0, column=7, sticky="ew")
+        quick.columnconfigure(7, weight=1)
+        ttk.Label(quick, text="Quick:").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        for index, (label, command) in enumerate(
+            (("Save Sun", "SAVE_SUN"), ("Pause Agent", "PAUSE_AGENT"), ("Resume Agent", "RESUME_AGENT"), ("Force Eval", "FORCE_EVAL")),
+            start=1,
+        ):
+            ttk.Button(
+                quick,
+                text=label,
+                command=lambda value=command: self._set_structured_command_type(value),
+            ).grid(row=1, column=index, sticky="w", padx=(0, 4))
+        ttk.Label(
+            structured,
+            text="Format: COMMAND ROW COL TARGET. Example: PLANT 2 4 0",
+        ).grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 4))
+        ttk.Label(structured, textvariable=self.coach_queue_status_var, anchor="e").grid(
+            row=4, column=4, columnspan=4, sticky="ew", padx=6, pady=(2, 4)
+        )
+
+        queue_frame = ttk.LabelFrame(content, text="Assisted Command Queue")
+        queue_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=3)
+        queue_frame.columnconfigure(0, weight=1)
+        columns = ("time", "source", "command", "row", "col", "target", "status")
+        self.assisted_queue_tree = ttk.Treeview(queue_frame, columns=columns, show="headings", height=6)
+        for name, width in (("time", 75), ("source", 150), ("command", 120), ("row", 45), ("col", 45), ("target", 90), ("status", 80)):
+            self.assisted_queue_tree.heading(name, text=name.title())
+            self.assisted_queue_tree.column(name, width=width, stretch=name in {"source", "command", "target"})
+        self.assisted_queue_tree.grid(row=0, column=0, columnspan=5, sticky="ew", padx=6, pady=4)
+        for index, (label, callback) in enumerate(
+            (("Approve", self.approve_assisted_command), ("Reject", self.reject_assisted_command),
+             ("Modify", self.modify_assisted_command), ("Execute", self.execute_assisted_command))
+        ):
+            ttk.Button(queue_frame, text=label, command=callback).grid(row=1, column=index, padx=(6 if index == 0 else 2, 2), pady=(0, 5), sticky="w")
+        ttk.Label(queue_frame, textvariable=self.assisted_queue_summary_var, anchor="e").grid(
+            row=1, column=4, sticky="e", padx=6, pady=(0, 5)
+        )
+
+        manual = ttk.LabelFrame(content, text="Raw Manual Command")
+        manual.grid(row=2, column=0, sticky="nsew", padx=(8, 4), pady=3)
+        manual.columnconfigure(1, weight=1)
+        ttk.Checkbutton(manual, text="Enable human coach", variable=self.human_coach_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6, pady=3
+        )
+        self._add_labeled_entry(manual, 1, 0, "Command queue", self.human_coach_command_path_var, width=42)
+        self._add_labeled_value(manual, 2, "Queue status", self.coach_queue_status_var, width=42)
+        command_row = ttk.Frame(manual)
+        command_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=3)
+        command_row.columnconfigure(0, weight=1)
+        ttk.Entry(command_row, textvariable=self.human_coach_command_input_var).grid(
+            row=0, column=0, sticky="ew", padx=(0, 5)
+        )
+        ttk.Button(command_row, text="Send command", command=self.send_human_coach_command).grid(row=0, column=1)
+        ttk.Label(
+            manual,
+            text="Raw input keeps the existing parser syntax and queue behavior.",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+
+        streamer = ttk.LabelFrame(content, text="Streamer Coach")
+        streamer.grid(row=2, column=1, sticky="nsew", padx=(4, 8), pady=3)
+        streamer.columnconfigure(1, weight=1)
+        ttk.Checkbutton(streamer, text="Enable stream coach", variable=self.stream_coach_enabled_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(streamer, text="Dry run", variable=self.stream_coach_dry_run_var).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+        ttk.Label(streamer, text="Platform").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Combobox(
+            streamer,
             textvariable=self.stream_coach_platform_var,
             values=STREAM_COACH_PLATFORMS,
             state="readonly",
             width=14,
         ).grid(row=1, column=1, sticky="w", padx=6, pady=2)
-        self._add_labeled_entry(stream, 1, 2, "Voting window sec", self.stream_coach_window_sec_var)
-        self._add_labeled_entry(stream, 2, 0, "Minimum votes", self.stream_coach_min_votes_var)
-        self._add_labeled_entry(stream, 2, 2, "Max actions/min", self.stream_coach_max_actions_per_minute_var)
-        self._add_labeled_entry(stream, 3, 0, "Stream coach log path", self.stream_coach_log_path_var, width=48, columnspan=3)
-        self._add_labeled_entry(stream, 4, 0, "Mock script path", self.stream_coach_mock_script_var, width=48, columnspan=3)
+        self._add_labeled_entry(streamer, 2, 0, "Mock script", self.stream_coach_mock_script_var, width=42)
+        self._add_labeled_entry(streamer, 3, 0, "Stream log", self.stream_coach_log_path_var, width=42)
+        self._add_labeled_entry(streamer, 4, 0, "Voting window", self.stream_coach_window_sec_var)
+        self._add_labeled_entry(streamer, 5, 0, "Minimum votes", self.stream_coach_min_votes_var)
+        self._add_labeled_entry(streamer, 6, 0, "Max actions / min", self.stream_coach_max_actions_per_minute_var)
 
-        stream_live = ttk.LabelFrame(stream, text="Stream Coach Live Diagnostics")
-        stream_live.grid(row=5, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 6))
-        stream_live.columnconfigure(1, weight=1)
-        self._add_labeled_value(stream_live, 0, "Enabled (live)", self.stream_coach_enabled_status_var)
-        self._add_labeled_value(stream_live, 1, "Mode (live)", self.stream_coach_platform_status_var)
-        self._add_labeled_value(stream_live, 2, "Dry-run / apply", self.stream_coach_dry_run_status_var)
-        self._add_labeled_value(stream_live, 3, "Alive", self.stream_coach_alive_status_var)
-        self._add_labeled_value(stream_live, 4, "Last message", self.stream_coach_last_message_var)
-        self._add_labeled_value(stream_live, 5, "Last parsed command", self.stream_coach_last_parsed_command_var)
-        self._add_labeled_value(stream_live, 6, "Last applied command", self.stream_coach_last_applied_command_var)
-        self._add_labeled_value(stream_live, 7, "Accepted / rejected", self.stream_coach_accept_reject_var)
-        self._add_labeled_value(stream_live, 8, "Last reject reason", self.stream_coach_last_reject_reason_var)
-        self._add_labeled_value(stream_live, 9, "Pending count", self.stream_coach_pending_count_var)
-        self._add_labeled_value(stream_live, 10, "Top command", self.stream_coach_top_command_var)
-        self._add_labeled_value(stream_live, 11, "Last selected command", self.stream_coach_last_selected_command_var)
-        self._add_labeled_value(stream_live, 12, "Last selected action", self.stream_coach_last_action_var)
-        self._add_labeled_value(stream_live, 13, "Rejected command count", self.stream_coach_rejected_count_var)
-        self._add_labeled_value(stream_live, 14, "Last vote count", self.stream_coach_last_vote_count_var)
-        self._add_labeled_value(stream_live, 15, "Override count", self.stream_coach_override_count_var)
-        self._add_labeled_value(stream_live, 16, "Match count", self.stream_coach_match_count_var)
-        self._add_labeled_value(stream_live, 17, "Reward total", self.stream_coach_reward_total_var)
+        rewards = ttk.LabelFrame(content, text="Coach Rewards")
+        rewards.grid(row=3, column=0, sticky="nsew", padx=(8, 4), pady=3)
+        rewards.columnconfigure(1, weight=1)
+        ttk.Checkbutton(rewards, text="Human coach reward", variable=self.human_coach_reward_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(rewards, text="Stream coach reward", variable=self.stream_coach_reward_var).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+        self._add_labeled_entry(rewards, 1, 0, "Legal execution reward", self.human_coach_bonus_var)
+        self._add_labeled_entry(rewards, 2, 0, "Match reward", self.human_coach_match_bonus_var)
+        self._add_labeled_entry(rewards, 3, 0, "Override penalty", self.human_coach_override_penalty_var)
+        self._add_labeled_value(rewards, 4, "Human reward total", self.human_coach_reward_total_var, width=32)
+        self._add_labeled_value(rewards, 5, "Stream reward total", self.stream_coach_reward_total_var, width=32)
 
-        fusion = ttk.LabelFrame(content, text="Fusion Coach")
-        fusion.grid(row=3, column=0, sticky="ew", padx=8, pady=(3, 6))
+        fusion = ttk.LabelFrame(content, text="Fusion Bridge Controls")
+        fusion.grid(row=3, column=1, sticky="nsew", padx=(4, 8), pady=3)
         fusion.columnconfigure(1, weight=1)
         ttk.Checkbutton(fusion, text="Enable fusion planning", variable=self.coach_allow_fusion_planning_var).grid(
             row=0, column=0, sticky="w", padx=6, pady=3
@@ -720,14 +1116,366 @@ class PvZDashboard:
         ttk.Checkbutton(fusion, text="Enable fusion bridge", variable=self.fusion_bridge_enabled_var).grid(
             row=0, column=1, sticky="w", padx=6, pady=3
         )
-        self._add_labeled_value(fusion, 1, "Fusion bridge available", self.fusion_bridge_available_var)
-        self._add_labeled_value(fusion, 2, "Fusion bridge enabled (live)", self.fusion_bridge_enabled_status_var)
-        self._add_labeled_value(fusion, 3, "Last fusion command", self.fusion_last_command_var)
-        self._add_labeled_value(fusion, 4, "Last fusion result", self.fusion_last_result_var)
-        self._add_labeled_value(fusion, 5, "Fusion attempt count", self.fusion_attempt_count_var)
-        self._add_labeled_value(fusion, 6, "Fusion success count", self.fusion_success_count_var)
-        self._add_labeled_value(fusion, 7, "Fusion failure count", self.fusion_failure_count_var)
-        self._add_labeled_value(fusion, 8, "Fusion rejected count", self.fusion_rejected_count_var)
+        self._add_labeled_value(fusion, 1, "Bridge available", self.fusion_bridge_available_var, width=36)
+        self._add_labeled_value(fusion, 2, "Bridge enabled live", self.fusion_bridge_enabled_status_var, width=36)
+        self._add_labeled_value(fusion, 3, "Last fusion command", self.fusion_last_command_var, width=36)
+        self._add_labeled_value(fusion, 4, "Last fusion result", self.fusion_last_result_var, width=36)
+        self._add_labeled_value(fusion, 5, "Attempts / successes", self.fusion_attempt_count_var, width=36)
+        self._add_labeled_value(fusion, 6, "Failures / rejected", self.fusion_failure_count_var, width=36)
+        ttk.Label(fusion, textvariable=self.fusion_command_feedback_var, wraplength=460).grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 5)
+        )
+
+        live = ttk.LabelFrame(content, text="Live Coach Diagnostics")
+        live.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(3, 6))
+        for column in range(3):
+            live.columnconfigure(column, weight=1)
+
+        human_live = ttk.LabelFrame(live, text="Manual")
+        human_live.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=4)
+        human_live.columnconfigure(1, weight=1)
+        for row, (label, variable) in enumerate(
+            (
+                ("Enabled", self.human_coach_enabled_status_var),
+                ("Last command", self.human_coach_last_command_var),
+                ("Last action", self.human_coach_last_action_var),
+                ("Last error", self.human_coach_last_error_var),
+                ("Overrides", self.human_coach_override_count_var),
+                ("Matches", self.human_coach_match_count_var),
+                ("Reward total", self.human_coach_reward_total_var),
+            )
+        ):
+            self._add_labeled_value(human_live, row, label, variable, width=28)
+
+        stream_live = ttk.LabelFrame(live, text="Streamer")
+        stream_live.grid(row=0, column=1, sticky="nsew", padx=2, pady=4)
+        stream_live.columnconfigure(1, weight=1)
+        for row, (label, variable) in enumerate(
+            (
+                ("Enabled", self.stream_coach_enabled_status_var),
+                ("Mode", self.stream_coach_platform_status_var),
+                ("Dry-run / apply", self.stream_coach_dry_run_status_var),
+                ("Alive", self.stream_coach_alive_status_var),
+                ("Last message", self.stream_coach_last_message_var),
+                ("Parsed", self.stream_coach_last_parsed_command_var),
+                ("Applied", self.stream_coach_last_applied_command_var),
+                ("Accepted / rejected", self.stream_coach_accept_reject_var),
+                ("Reject reason", self.stream_coach_last_reject_reason_var),
+                ("Pending", self.stream_coach_pending_count_var),
+                ("Top command", self.stream_coach_top_command_var),
+                ("Selected command", self.stream_coach_last_selected_command_var),
+                ("Selected action", self.stream_coach_last_action_var),
+                ("Rejected count", self.stream_coach_rejected_count_var),
+                ("Vote count", self.stream_coach_last_vote_count_var),
+                ("Overrides", self.stream_coach_override_count_var),
+                ("Matches", self.stream_coach_match_count_var),
+                ("Reward total", self.stream_coach_reward_total_var),
+            )
+        ):
+            self._add_labeled_value(stream_live, row, label, variable, width=28)
+
+        fusion_live = ttk.LabelFrame(live, text="Fusion")
+        fusion_live.grid(row=0, column=2, sticky="nsew", padx=(2, 4), pady=4)
+        fusion_live.columnconfigure(1, weight=1)
+        for row, (label, variable) in enumerate(
+            (
+                ("Available", self.fusion_bridge_available_var),
+                ("Enabled", self.fusion_bridge_enabled_status_var),
+                ("Last command", self.fusion_last_command_var),
+                ("Last result", self.fusion_last_result_var),
+                ("Attempts", self.fusion_attempt_count_var),
+                ("Successes", self.fusion_success_count_var),
+                ("Failures", self.fusion_failure_count_var),
+                ("Rejected", self.fusion_rejected_count_var),
+            )
+        ):
+            self._add_labeled_value(fusion_live, row, label, variable, width=28)
+
+        for variable in (
+            self.structured_command_type_var,
+            self.structured_row_var,
+            self.structured_col_var,
+            self.structured_seed_slot_var,
+            self.structured_custom_text_var,
+        ):
+            variable.trace_add("write", self._update_structured_command_preview)
+        self._update_structured_command_preview()
+
+    def _set_structured_command_type(self, command: str) -> None:
+        self.structured_command_type_var.set(command)
+
+    # Serialization and validation stay outside Tk widget construction so
+    # future stream/chat adapters can share the same typed command schema.
+    def _structured_command_object(self) -> AssistedCoachCommand:
+        command_type = AssistedCommandType(self.structured_command_type_var.get().strip().upper())
+        needs_position = command_type in AssistedCommandValidator.POSITION_COMMANDS
+        needs_seed = command_type in {AssistedCommandType.PLANT, AssistedCommandType.FUSE}
+
+        def optional_int(value: str, required: bool) -> Optional[int]:
+            text = value.strip()
+            if not required:
+                return None
+            return int(text)
+
+        if needs_seed:
+            target = self.structured_seed_slot_var.get().strip()
+        elif command_type == AssistedCommandType.BOOST:
+            target = self.structured_custom_text_var.get().strip()
+        else:
+            target = ""
+        return AssistedCoachCommand(
+            command_type=command_type,
+            source=self.assisted_command_source_var.get().strip() or "dashboard",
+            user=self.assisted_command_user_var.get().strip() or "local",
+            row=optional_int(self.structured_row_var.get(), needs_position),
+            col=optional_int(self.structured_col_var.get(), needs_position),
+            target=target,
+        )
+
+    def _build_structured_coach_command(self) -> str:
+        try:
+            return self._structured_command_object().display_text()
+        except (ValueError, TypeError):
+            return ""
+
+    def _update_structured_command_preview(self, *_args: Any) -> None:
+        try:
+            command_type = AssistedCommandType(self.structured_command_type_var.get().strip().upper())
+        except ValueError:
+            command_type = AssistedCommandType.PLANT
+        requires_position = command_type in AssistedCommandValidator.POSITION_COMMANDS
+        requires_seed = command_type in {AssistedCommandType.PLANT, AssistedCommandType.FUSE}
+        uses_target = command_type == AssistedCommandType.BOOST
+        for widget, enabled in (
+            (self.structured_row_widget, requires_position),
+            (self.structured_col_widget, requires_position),
+            (self.structured_seed_widget, requires_seed),
+            (self.structured_custom_widget, uses_target),
+        ):
+            if widget is not None:
+                widget.configure(state="normal" if enabled else "disabled")
+        try:
+            command = self._structured_command_object()
+            self.structured_preview_var.set(command.display_text())
+            if command.command_type == AssistedCommandType.FUSE:
+                self.fusion_command_feedback_var.set("Fusion will be revalidated against bridge availability and board legality at execution.")
+        except (ValueError, TypeError):
+            self.structured_preview_var.set("Invalid numeric field")
+
+    def _structured_coach_validation_error(self) -> str:
+        try:
+            result = AssistedCommandValidator.validate(self._structured_command_object())
+        except (ValueError, TypeError) as exc:
+            return f"Invalid command field: {exc}"
+        return "" if result.valid else result.reason
+
+    def _structured_parser_command(self) -> str:
+        try:
+            result = AssistedCommandValidator.validate(self._structured_command_object())
+        except (ValueError, TypeError):
+            return ""
+        return result.backend_command
+
+    def send_structured_coach_command(self) -> None:
+        """Validate and submit a command to the moderation queue."""
+        error = self._structured_coach_validation_error()
+        if error:
+            self.coach_queue_status_var.set(f"Queue error: {error}")
+            self._append_log(f"ERROR: assisted command rejected: {error}\n")
+            return
+        command = self._structured_command_object()
+        self.assisted_command_queue.submit(command)
+        self.coach_queue_status_var.set(f"Queued {command.command_id}: {command.display_text()}")
+        self._append_log(f"[coach] queued {command.command_id} from {command.source}/{command.user}: {command.display_text()}\n")
+        self._log_dashboard_intervention(command, AssistedCommandStatus.PENDING.value)
+        self._refresh_assisted_queue()
+
+    def copy_structured_command_to_raw(self) -> None:
+        command = self._build_structured_coach_command()
+        self.human_coach_command_input_var.set(command)
+        self._structured_raw_copy_value = command
+
+    def _selected_assisted_command(self) -> Optional[AssistedCoachCommand]:
+        if self.assisted_queue_tree is None:
+            return None
+        selection = self.assisted_queue_tree.selection()
+        if not selection:
+            self.coach_queue_status_var.set("Queue error: select a command first")
+            return None
+        return self.assisted_command_queue.get(str(selection[0]))
+
+    def _refresh_assisted_queue(self) -> None:
+        if self.assisted_queue_tree is not None:
+            selected = self.assisted_queue_tree.selection()
+            for item_id in self.assisted_queue_tree.get_children():
+                self.assisted_queue_tree.delete(item_id)
+            for row in queue_rows(self.assisted_command_queue.all()):
+                self.assisted_queue_tree.insert("", "end", iid=row[0], values=row[1:])
+            if selected and self.assisted_queue_tree.exists(selected[0]):
+                self.assisted_queue_tree.selection_set(selected[0])
+        counts = self.assisted_command_queue.counts()
+        self.assisted_queue_summary_var.set(" ".join(f"{name}={counts[name]}" for name in ("pending", "approved", "rejected", "executed")))
+
+    def approve_assisted_command(self) -> None:
+        command = self._selected_assisted_command()
+        if command is None:
+            return
+        self.assisted_command_queue.set_status(command.command_id, AssistedCommandStatus.APPROVED, "approved locally")
+        self.coach_queue_status_var.set(f"Approved {command.command_id}")
+        self._log_dashboard_intervention(command, AssistedCommandStatus.APPROVED.value)
+        self._refresh_assisted_queue()
+
+    def reject_assisted_command(self) -> None:
+        command = self._selected_assisted_command()
+        if command is None:
+            return
+        self.assisted_command_queue.set_status(command.command_id, AssistedCommandStatus.REJECTED, "rejected locally")
+        self.coach_queue_status_var.set(f"Rejected {command.command_id}")
+        self._log_dashboard_intervention(command, AssistedCommandStatus.REJECTED.value)
+        self._refresh_assisted_queue()
+
+    def modify_assisted_command(self) -> None:
+        command = self._selected_assisted_command()
+        if command is None:
+            return
+        error = self._structured_coach_validation_error()
+        if error:
+            self.coach_queue_status_var.set(f"Modify error: {error}")
+            self._append_log(f"ERROR: assisted command modify failed: {error}\n")
+            return
+        self.assisted_command_queue.modify(command.command_id, self._structured_command_object())
+        self.coach_queue_status_var.set(f"Modified {command.command_id}; approval reset")
+        self._refresh_assisted_queue()
+
+    def execute_assisted_command(self) -> None:
+        command = self._selected_assisted_command()
+        if command is None:
+            return
+        if command.status != AssistedCommandStatus.APPROVED:
+            self.coach_queue_status_var.set("Execute error: command must be approved first")
+            self._append_log("ERROR: assisted command must be approved before execution\n")
+            return
+        validation = AssistedCommandValidator.validate(command)
+        if not validation.backend_supported:
+            reason = f"{command.command_type.value} has no safe game-loop adapter yet"
+            self.assisted_command_queue.set_status(command.command_id, AssistedCommandStatus.REJECTED, reason)
+            self.coach_queue_status_var.set(f"Execute rejected: {reason}")
+            self._append_log(f"ERROR: {reason}\n")
+            self._log_dashboard_intervention(command, AssistedCommandStatus.REJECTED.value, note=reason)
+            self._refresh_assisted_queue()
+            return
+        queued = self._queue_coach_command(
+            command.display_text(),
+            source=f"assisted:{command.source}:{command.user}",
+            parser_command=validation.backend_command,
+        )
+        if not queued:
+            return
+        self.assisted_command_queue.set_status(command.command_id, AssistedCommandStatus.EXECUTED, "queued for runtime validation")
+        self._log_dashboard_intervention(command, AssistedCommandStatus.EXECUTED.value)
+        if command.command_type == AssistedCommandType.FUSE:
+            self.fusion_command_feedback_var.set("Fusion queued; final legality/result will appear in Live Coach Diagnostics.")
+        self._refresh_assisted_queue()
+
+    def _log_dashboard_intervention(
+        self,
+        command: AssistedCoachCommand,
+        status: str,
+        *,
+        note: str = "",
+    ) -> None:
+        try:
+            path = self._resolve_text_path(self.intervention_log_path_var.get() or str(DEFAULT_INTERVENTION_LOG_PATH))
+            self.intervention_logger = InterventionJSONLLogger(path)
+            live = self.last_good_status if isinstance(self.last_good_status, dict) else {}
+            self.intervention_logger.log(
+                run_id=str(live.get("run_id") or live.get("run_name") or self.active_process_name or "dashboard"),
+                episode_id=int(live.get("episode") or live.get("episode_id") or 0),
+                step=int(live.get("step") or live.get("global_step") or 0),
+                mode=str(live.get("mode") or "dashboard"),
+                model_action=live.get("last_action"),
+                human_command=command.to_dict(),
+                command_source=f"{command.source}/{command.user}",
+                status=status,
+                board_state_summary=live.get("board_state_summary") if isinstance(live.get("board_state_summary"), dict) else {},
+                metadata={"execution_mode": self.assisted_execution_mode_var.get(), "note": note},
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._append_log(f"ERROR: intervention log write failed: {exc}\n")
+
+    def _build_fusion_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=4)
+        parent.columnconfigure(1, weight=2)
+        parent.rowconfigure(0, weight=1)
+
+        lawn = ttk.LabelFrame(parent, text="Fusion Lawn · click a tile to assign the selected seed slot")
+        lawn.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        for column in range(LAWN_COLS):
+            lawn.columnconfigure(column, weight=1)
+        for row in range(LAWN_ROWS):
+            lawn.rowconfigure(row, weight=1)
+            for column in range(LAWN_COLS):
+                button = ttk.Button(
+                    lawn,
+                    text=f"r{row} c{column}\n—",
+                    command=lambda r=row, c=column: self._assign_fusion_tile(r, c),
+                )
+                button.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
+                self.fusion_tile_buttons[(row, column)] = button
+
+        controls = ttk.LabelFrame(parent, text="Planner Controls")
+        controls.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(controls, text="Selected seed packet").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Combobox(
+            controls,
+            textvariable=self.fusion_selected_seed_var,
+            values=tuple(str(index) for index in range(SEED_PACKET_SLOTS)),
+            state="normal",
+            width=20,
+        ).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Label(controls, textvariable=self.fusion_selected_tile_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Button(controls, text="Clear tile", command=self._clear_fusion_tile).grid(
+            row=2, column=0, sticky="ew", padx=6, pady=3
+        )
+        ttk.Button(controls, text="Clear board", command=self._clear_fusion_board).grid(
+            row=2, column=1, sticky="ew", padx=6, pady=3
+        )
+        ttk.Button(controls, text="Preview fusion command", command=self._refresh_fusion_preview).grid(
+            row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=3
+        )
+        ttk.Button(controls, text="Queue fusion command", command=self.queue_fusion_commands).grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=3
+        )
+        ttk.Checkbutton(
+            controls,
+            text="Enable fusion bridge",
+            variable=self.fusion_bridge_enabled_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=6, pady=3)
+
+        preview = ttk.LabelFrame(controls, text="Command Preview")
+        preview.grid(row=6, column=0, columnspan=2, sticky="nsew", padx=6, pady=6)
+        preview.columnconfigure(0, weight=1)
+        ttk.Label(
+            preview,
+            textvariable=self.fusion_command_preview_var,
+            justify="left",
+            wraplength=330,
+            font=("Consolas", 9),
+        ).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+        diagnostics = ttk.LabelFrame(controls, text="Fusion Diagnostics")
+        diagnostics.grid(row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        diagnostics.columnconfigure(1, weight=1)
+        self._add_labeled_value(diagnostics, 0, "Bridge available", self.fusion_bridge_available_var, width=28)
+        self._add_labeled_value(diagnostics, 1, "Last command", self.fusion_last_command_var, width=28)
+        self._add_labeled_value(diagnostics, 2, "Last result", self.fusion_last_result_var, width=28)
+        self._add_labeled_value(diagnostics, 3, "Attempts", self.fusion_attempt_count_var, width=28)
+        self._add_labeled_value(diagnostics, 4, "Successes", self.fusion_success_count_var, width=28)
+        self._add_labeled_value(diagnostics, 5, "Failures", self.fusion_failure_count_var, width=28)
+        self._add_labeled_value(diagnostics, 6, "Rejected", self.fusion_rejected_count_var, width=28)
 
     def _build_runs_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -755,6 +1503,99 @@ class PvZDashboard:
         actions.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
         ttk.Button(actions, text="Clear logs", command=self.clear_logs).grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
+    def _toggle_train_advanced(self) -> None:
+        frame = self.train_advanced_frame
+        if frame is None:
+            return
+        expanded = not self.train_advanced_expanded_var.get()
+        self.train_advanced_expanded_var.set(expanded)
+        if expanded:
+            frame.grid()
+        else:
+            frame.grid_remove()
+
+    def _toggle_diagnostic_panels(self) -> None:
+        visible_titles = [
+            title for title, variable in self.diagnostic_visibility_vars.items() if variable.get()
+        ]
+        for frame in self.diagnostic_panel_frames.values():
+            frame.grid_remove()
+        for index, title in enumerate(visible_titles):
+            frame = self.diagnostic_panel_frames.get(title)
+            if frame is None:
+                continue
+            frame.grid(
+                row=index // 3,
+                column=index % 3,
+                sticky="nsew",
+                padx=4,
+                pady=4,
+            )
+
+    def _assign_fusion_tile(self, row: int, column: int) -> None:
+        seed = self.fusion_selected_seed_var.get().strip()
+        if not seed:
+            self._append_log("ERROR: Select a seed packet before assigning a Fusion tile.\n")
+            return
+        self.fusion_selected_tile = (row, column)
+        self.fusion_grid[(row, column)] = seed
+        self.fusion_selected_tile_var.set(f"Selected tile: row {row}, column {column}")
+        button = self.fusion_tile_buttons.get((row, column))
+        if button is not None:
+            button.configure(text=f"r{row} c{column}\nslot {seed}")
+        self._refresh_fusion_preview()
+
+    def _clear_fusion_tile(self) -> None:
+        tile = self.fusion_selected_tile
+        if tile is None:
+            return
+        self.fusion_grid.pop(tile, None)
+        button = self.fusion_tile_buttons.get(tile)
+        if button is not None:
+            button.configure(text=f"r{tile[0]} c{tile[1]}\n—")
+        self._refresh_fusion_preview()
+
+    def _clear_fusion_board(self) -> None:
+        self.fusion_grid.clear()
+        for (row, column), button in self.fusion_tile_buttons.items():
+            button.configure(text=f"r{row} c{column}\n—")
+        self.fusion_selected_tile = None
+        self.fusion_selected_tile_var.set("Selected tile: none")
+        self._refresh_fusion_preview()
+
+    def _build_fusion_command_from_grid(self) -> str:
+        """Keep planner serialization isolated from the Fusion tab layout."""
+        commands = [
+            f"fuse {seed} {row} {column}"
+            for (row, column), seed in sorted(self.fusion_grid.items())
+        ]
+        return "\n".join(commands)
+
+    def _refresh_fusion_preview(self) -> None:
+        command = self._build_fusion_command_from_grid()
+        self.fusion_command_preview_var.set(command or "Select a seed slot, then click lawn tiles.")
+
+    def queue_fusion_commands(self) -> None:
+        command_text = self._build_fusion_command_from_grid()
+        if not command_text:
+            self._append_log("ERROR: Fusion board is empty; nothing was queued.\n")
+            return
+        try:
+            queue_path = self._coach_command_queue_path()
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            with queue_path.open("a", encoding="utf-8") as handle:
+                for command in command_text.splitlines():
+                    payload = {"timestamp": timestamp, "source": "gui_fusion", "command": command}
+                    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        except (OSError, ValueError) as exc:
+            self.coach_queue_status_var.set(f"Queue error: fusion write failed ({exc})")
+            self._append_log(f"ERROR: Failed to queue Fusion commands: {exc}\n")
+            return
+        count = len(command_text.splitlines())
+        self.coach_queue_status_var.set(f"Queued {count} Fusion command(s) at {time.strftime('%H:%M:%S')}")
+        self._append_log(f"Queued {count} Fusion command(s) to {queue_path}.\n")
+
     def _add_options(self, parent: ttk.Frame) -> None:
         ttk.Checkbutton(parent, text="quick-wait", variable=self.quick_wait_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(parent, text="wait gameplay", variable=self.wait_gameplay_ready_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
@@ -779,8 +1620,12 @@ class PvZDashboard:
         variable: tk.StringVar,
         width: int = 16,
         columnspan: int = 1,
+        tooltip: str = "",
     ) -> ttk.Entry:
-        ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w", padx=6, pady=2)
+        label_widget = ttk.Label(parent, text=f"{label} ⓘ" if tooltip else label)
+        label_widget.grid(row=row, column=column, sticky="w", padx=6, pady=2)
+        if tooltip:
+            _Tooltip(label_widget, tooltip)
         entry = ttk.Entry(parent, textvariable=variable, width=width)
         entry.grid(row=row, column=column + 1, columnspan=columnspan, sticky="ew", padx=6, pady=2)
         return entry
@@ -972,9 +1817,33 @@ class PvZDashboard:
             self.stream_coach_mock_script_var,
             self.coach_allow_fusion_planning_var,
             self.fusion_bridge_enabled_var,
+            self.assisted_execution_mode_var,
+            self.train_lab_mode_var,
+            self.eval_lab_mode_var,
+            self.intervention_log_path_var,
         ]
         for variable in variables:
             variable.trace_add("write", lambda *_args: self._update_command_previews())
+        for variable in (
+            self.human_coach_enabled_var,
+            self.stream_coach_enabled_var,
+            self.train_lab_mode_var,
+            self.eval_lab_mode_var,
+            self.assisted_execution_mode_var,
+        ):
+            variable.trace_add("write", self._update_command_enablement)
+        self._update_command_enablement()
+
+    def _update_command_enablement(self, *_args: Any) -> None:
+        train_lab = self.train_lab_mode_var.get().strip().lower()
+        eval_lab = self.eval_lab_mode_var.get().strip().lower()
+        coach_enabled = bool(self.human_coach_enabled_var.get()) or train_lab in {"assisted", "fusion"} or eval_lab in {"assisted", "fusion"}
+        viewer_enabled = bool(self.stream_coach_enabled_var.get())
+        self.command_enablement_var.set(
+            f"Coach commands {'enabled' if coach_enabled else 'off'} | "
+            f"Viewer commands {'enabled' if viewer_enabled else 'off'} | "
+            f"mode={self.assisted_execution_mode_var.get()}"
+        )
 
     def _on_profile_selected(self, _event: Any = None) -> None:
         seed_list = PROFILES.get(self.profile_var.get())
@@ -1017,13 +1886,24 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--auto-select-seeds", self.auto_select_seeds_var.get())
         self._add_enabled_flag(command, "--debug-perf", self.debug_perf_var.get())
         command.extend(["--fusion-policy", self.fusion_policy_var.get().strip() or "none"])
-        self._append_coach_flags(command)
+        lab_var_name = "eval_lab_mode_var" if any("eval" in part for part in command) else "train_lab_mode_var"
+        lab_mode = getattr(self, lab_var_name, _FallbackStringVar("Normal")).get()
+        self._append_coach_flags(command, lab_mode=lab_mode)
 
-    def _append_coach_flags(self, command: List[str]) -> None:
-        human_enabled = bool(self.human_coach_enabled_var.get())
+    def _append_coach_flags(self, command: List[str], *, lab_mode: str = "") -> None:
+        selected_lab_mode = str(lab_mode or "Normal").strip().lower()
+        human_enabled = bool(self.human_coach_enabled_var.get()) or selected_lab_mode in {"assisted", "fusion"}
         stream_enabled = bool(self.stream_coach_enabled_var.get())
         self._add_enabled_flag(command, "--human-coach-enabled", human_enabled)
         if human_enabled:
+            command_mode = getattr(self, "assisted_execution_mode_var", _FallbackStringVar("override")).get()
+            intervention_path = getattr(
+                self,
+                "intervention_log_path_var",
+                _FallbackStringVar(str(DEFAULT_INTERVENTION_LOG_PATH)),
+            ).get()
+            command.extend(["--human-coach-command-mode", command_mode or "override"])
+            self._add_optional_value(command, "--intervention-log-path", intervention_path)
             self._add_enabled_flag(command, "--human-coach-reward", self.human_coach_reward_var.get())
             self._add_optional_value(command, "--coach-legal-execution-reward", self.human_coach_bonus_var.get())
             self._add_optional_value(command, "--coach-match-reward", self.human_coach_match_bonus_var.get())
@@ -1058,8 +1938,9 @@ class PvZDashboard:
                 "" if mock_script_var is None else mock_script_var.get(),
             )
 
-        self._add_enabled_flag(command, "--coach-allow-fusion-planning", self.coach_allow_fusion_planning_var.get())
-        self._add_enabled_flag(command, "--fusion-bridge-enabled", self.fusion_bridge_enabled_var.get())
+        fusion_enabled = selected_lab_mode == "fusion"
+        self._add_enabled_flag(command, "--coach-allow-fusion-planning", self.coach_allow_fusion_planning_var.get() or fusion_enabled)
+        self._add_enabled_flag(command, "--fusion-bridge-enabled", self.fusion_bridge_enabled_var.get() or fusion_enabled)
 
     def _append_live_status_arg(self, command: List[str]) -> None:
         command.extend(["--live-status-path", self._path_for_command(self.live_status_path)])
@@ -1129,7 +2010,10 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--wallnut-tactical-mask", self.adventure_wallnut_mask_var.get())
         self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.adventure_cherrybomb_mask_var.get())
         command.extend(["--fusion-policy", self.adventure_fusion_policy_var.get().strip() or "none"])
-        self._append_coach_flags(command)
+        self._append_coach_flags(
+            command,
+            lab_mode=getattr(self, "eval_lab_mode_var", _FallbackStringVar("Normal")).get(),
+        )
         self._append_live_status_arg(command)
         return command
 
@@ -1179,7 +2063,10 @@ class PvZDashboard:
         run_dir = self.generalist_run_dir_var.get().strip()
         if run_dir:
             command.extend(["--run-dir", run_dir])
-        self._append_coach_flags(command)
+        self._append_coach_flags(
+            command,
+            lab_mode=getattr(self, "train_lab_mode_var", _FallbackStringVar("Normal")).get(),
+        )
         self._append_live_status_arg(command)
         return command
 
@@ -1214,7 +2101,10 @@ class PvZDashboard:
         run_dir = self.generalist_run_dir_var.get().strip()
         if run_dir:
             command.extend(["--run-dir", run_dir])
-        self._append_coach_flags(command)
+        self._append_coach_flags(
+            command,
+            lab_mode=getattr(self, "eval_lab_mode_var", _FallbackStringVar("Normal")).get(),
+        )
         self._append_live_status_arg(command)
         return command
 
@@ -1251,29 +2141,33 @@ class PvZDashboard:
 
     def _update_command_previews(self) -> None:
         if self.train_preview is not None:
+            resume_model_path = self.generalist_resume_model_path_var.get().strip()
             lines = [
-                "Start Training:",
-                self._command_text(self._build_train_command(resume=False)),
+                "Adventure Generalist Train:",
+                self._command_text(self._build_adventure_generalist_command()),
                 "",
-                "Resume Training:",
+                f"Model family: {ADVENTURE_GENERALIST_MODEL_FAMILY}",
+                "Resume mode: " + (
+                    self._path_for_display(resume_model_path)
+                    if resume_model_path
+                    else "fresh initialization (resume model is blank)"
+                ),
             ]
-            if self.model_path_var.get().strip():
-                lines.append(self._command_text(self._build_train_command(resume=True)))
-            else:
-                lines.append("model_path is required for resume")
-            if self.fast_only_var.get():
-                lines.extend(["", "Note: --fast-only is supported by pvzrl_env.py diagnostics only; omitted from train_ppo.py commands."])
             self._set_text_widget(self.train_preview, "\n".join(lines))
         if self.eval_preview is not None:
             lines = [
-                "Run Eval:",
-                self._command_text(self._build_eval_command()),
-                "",
-                "Run 25-Episode Eval:",
-                self._command_text(self._build_eval_command(episodes_override="25")),
+                "Adventure Generalist Eval:",
             ]
-            if self.fast_only_var.get():
-                lines.extend(["", "Note: --fast-only is supported by pvzrl_env.py diagnostics only; omitted from train_ppo.py commands."])
+            if self.generalist_eval_model_path_var.get().strip():
+                lines.append(self._command_text(self._build_adventure_generalist_eval_command()))
+            else:
+                lines.append("model_path is required for Adventure Generalist evaluation")
+            lines.extend(
+                [
+                    "",
+                    f"Compatibility: family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count=701, max_seed_slots=14",
+                ]
+            )
             self._set_text_widget(self.eval_preview, "\n".join(lines))
         if self.adventure_preview is not None:
             lines = [
@@ -1518,23 +2412,34 @@ class PvZDashboard:
         raw_path = self.human_coach_command_path_var.get().strip() or str(DEFAULT_COACH_COMMAND_QUEUE_PATH)
         return self._resolve_text_path(raw_path)
 
-    def send_human_coach_command(self) -> None:
-        raw_command = self.human_coach_command_input_var.get().strip()
-        if not raw_command:
+    def _queue_coach_command(
+        self,
+        raw_command: str,
+        source: str = "gui",
+        *,
+        parser_command: str = "",
+    ) -> bool:
+        """Append one command to the shared JSONL coach queue."""
+        command = str(raw_command or "").strip()
+        if not command:
             self.coach_queue_status_var.set("Queue error: command input is empty")
             self._append_log("ERROR: Coach command input is empty.\n")
-            return
+            return False
         try:
             queue_path = self._coach_command_queue_path()
         except (OSError, ValueError) as exc:
             self.coach_queue_status_var.set(f"Queue error: invalid queue path ({exc})")
             self._append_log(f"ERROR: Invalid coach command queue path: {exc}\n")
-            return
+            return False
+
         payload = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "gui",
-            "command": raw_command,
+            "source": str(source or "gui"),
+            "command": command,
         }
+        normalized = str(parser_command or "").strip()
+        if normalized and normalized != command:
+            payload["parser_command"] = normalized
         try:
             queue_path.parent.mkdir(parents=True, exist_ok=True)
             with queue_path.open("a", encoding="utf-8") as handle:
@@ -1542,12 +2447,22 @@ class PvZDashboard:
         except OSError as exc:
             self.coach_queue_status_var.set(f"Queue error: write failed ({exc})")
             self._append_log(f"ERROR: Failed to append coach command to queue: {exc}\n")
-            return
-        self.human_coach_command_input_var.set("")
+            return False
+
         self.coach_queue_status_var.set(
             f"Queued command at {time.strftime('%H:%M:%S')} (pending environment parse)"
         )
-        self._append_log(f"Queued coach command to {queue_path}: {raw_command}\n")
+        self._append_log(f"Queued coach command to {queue_path}: {command}\n")
+        return True
+
+    def send_human_coach_command(self) -> None:
+        raw_command = self.human_coach_command_input_var.get().strip()
+        parser_command = ""
+        if raw_command and raw_command == getattr(self, "_structured_raw_copy_value", ""):
+            parser_command = self._structured_parser_command()
+        if self._queue_coach_command(raw_command, source="gui", parser_command=parser_command):
+            self.human_coach_command_input_var.set("")
+            self._structured_raw_copy_value = ""
 
     def start_training(self) -> None:
         if self.fast_only_var.get():
@@ -1555,17 +2470,15 @@ class PvZDashboard:
         self.launch_process("Start Training", self._build_train_command(resume=False))
 
     def resume_training(self) -> None:
-        raw_model_path = self.model_path_var.get().strip()
+        raw_model_path = self.generalist_resume_model_path_var.get().strip()
         if not raw_model_path:
-            self._append_log("ERROR: Resume requires model_path.\n")
+            self._append_log("ERROR: Adventure Generalist resume requires a resume model .zip.\n")
             return
         model_path = self._resolve_text_path(raw_model_path)
         if not model_path.exists():
             self._append_log(f"ERROR: Resume model does not exist: {model_path}\n")
             return
-        if self.fast_only_var.get():
-            self._append_log("Note: --fast-only omitted from resume; train_ppo.py does not support it.\n")
-        self.launch_process("Resume Training", self._build_train_command(resume=True))
+        self.start_adventure_generalist_train()
 
     def run_eval(self) -> None:
         self._launch_eval("Run Eval", self._build_eval_command())
@@ -1895,7 +2808,17 @@ class PvZDashboard:
         )
         if dirname:
             self.run_dir_var.set(dirname)
+            self.generalist_run_dir_var.set(dirname)
             self._append_log(f"Selected run directory: {dirname}\n")
+
+    def refresh_generalist_models(self) -> None:
+        model = self._find_newest_usable_model_zip()
+        if model is None:
+            self._append_log("Refresh Models: no metadata-backed Adventure Generalist model found.\n")
+            return
+        self.generalist_eval_model_path_var.set(str(model))
+        self.generalist_resume_model_path_var.set(str(model))
+        self._append_log(f"Refresh Models: selected Adventure Generalist model: {model}\n")
 
     def refresh_models(self) -> None:
         model = self._find_newest_model_zip()
@@ -1948,8 +2871,17 @@ class PvZDashboard:
             self._append_log(f"ERROR: Failed to open folder {path}: {exc}\n")
 
     def _selected_run_dir(self) -> Optional[Path]:
-        run_dir = self.run_dir_var.get().strip()
-        model_path = self.model_path_var.get().strip()
+        generalist_run_var = getattr(self, "generalist_run_dir_var", None)
+        generalist_eval_var = getattr(self, "generalist_eval_model_path_var", None)
+        generalist_resume_var = getattr(self, "generalist_resume_model_path_var", None)
+        run_dir = (
+            generalist_run_var.get().strip() if generalist_run_var is not None else ""
+        ) or self.run_dir_var.get().strip()
+        model_path = (
+            (generalist_eval_var.get().strip() if generalist_eval_var is not None else "")
+            or (generalist_resume_var.get().strip() if generalist_resume_var is not None else "")
+            or self.model_path_var.get().strip()
+        )
         if run_dir:
             return self._resolve_text_path(run_dir)
         if model_path:
@@ -2203,6 +3135,9 @@ class PvZDashboard:
         plt.close(fig)
 
     def clear_logs(self) -> None:
+        history = getattr(self, "log_history", None)
+        if history is not None:
+            history.clear()
         if self.log_text is None:
             return
         self.log_text.configure(state="normal")
@@ -2210,12 +3145,65 @@ class PvZDashboard:
         self.log_text.configure(state="disabled")
 
     def _append_log(self, text: str) -> None:
+        if not hasattr(self, "log_history"):
+            self.log_history = []
+        self.log_history.append(text)
+        if len(self.log_history) > 5000:
+            del self.log_history[: len(self.log_history) - 5000]
         if self.log_text is None:
+            return
+        filter_var = getattr(self, "log_filter_var", None)
+        severity_var = getattr(self, "log_severity_var", None)
+        pause_var = getattr(self, "log_pause_autoscroll_var", None)
+        if (filter_var is not None and filter_var.get().strip()) or (
+            severity_var is not None and severity_var.get() != "All"
+        ):
+            self._refresh_log_view()
             return
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text)
-        self.log_text.see("end")
+        if pause_var is None or not pause_var.get():
+            self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _refresh_log_view(self) -> None:
+        if self.log_text is None:
+            return
+        search = self.log_filter_var.get().strip().lower()
+        severity = self.log_severity_var.get()
+        lines = "".join(self.log_history).splitlines(keepends=True)
+
+        def matches(line: str) -> bool:
+            lowered = line.lower()
+            if search and search not in lowered:
+                return False
+            if severity == "ERROR":
+                return "error" in lowered
+            if severity == "Warning":
+                return "warning" in lowered or "warn" in lowered
+            if severity == "Live status":
+                return "live status" in lowered
+            if severity == "Process":
+                return any(token in lowered for token in ("process", "starting subprocess", "exited", "terminate"))
+            return True
+
+        filtered = "".join(line for line in lines if matches(line))
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("1.0", filtered)
+        if not self.log_pause_autoscroll_var.get():
+            self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def copy_selected_logs(self) -> None:
+        if self.log_text is None:
+            return
+        try:
+            selected = self.log_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
 
     def _set_panel(self, title: str, content: str) -> None:
         text = self.panels.get(title)
@@ -2616,7 +3604,7 @@ class PvZDashboard:
         )
         self._set_panel("Rows", self._row_panel_lines(payload))
         self._set_panel(
-            "Reward",
+            "Reward Breakdown",
             lines_from_pairs(
                 [
                     ("episode", self._first_value(payload, ["reward.episode", "reward.episode_reward", "current_reward", "episode_reward", "reward_total"])),
@@ -2698,6 +3686,70 @@ class PvZDashboard:
                     ("required_avail", seed_inventory.get("required_available_ratio")),
                     ("legal_count", seed_inventory.get("legal_action_count")),
                     ("mask_blocks", seed_inventory.get("mask_block_reason_counts")),
+                ]
+            ),
+        )
+        self._set_panel(
+            "Action Distribution",
+            lines_from_pairs(
+                [
+                    ("actions", self._first_value(payload, ["action_distribution", "summary.action_distribution", "eval.action_distribution"])),
+                    ("legal", self._first_value(payload, ["legal_action_count", "agent.legal_action_count"])),
+                    ("illegal", self._first_value(payload, ["illegal_actions", "eval.illegal_actions"])),
+                    ("last", self._first_value(payload, ["last_action", "agent.last_action"])),
+                ]
+            ),
+        )
+        self._set_panel(
+            "Plant Usage",
+            lines_from_pairs(
+                [
+                    ("by_type", self._first_value(payload, ["plants_by_type", "summary.plants_by_type", "eval.plants_by_type"])),
+                    ("sunflowers", self._first_value(payload, ["summary.sunflowers_planted", "eval.sunflowers_planted"])),
+                    ("peashooters", self._first_value(payload, ["summary.peashooters_planted", "eval.peashooters_planted"])),
+                    ("wallnuts", self._first_value(payload, ["summary.wallnuts_planted", "eval.wallnuts_planted"])),
+                    ("cherrybombs", self._first_value(payload, ["summary.cherrybombs_planted", "eval.cherrybombs_planted"])),
+                ]
+            ),
+        )
+        self._set_panel("Fusion Usage", self.last_panel_content.get("Fusion", "No fusion diagnostics available."))
+        self._set_panel(
+            "Human Interventions",
+            lines_from_pairs(
+                [
+                    ("command_mode", self._first_value(payload, ["human_coach_command_mode", "human_coach.human_coach_command_mode"], default=self.assisted_execution_mode_var.get())),
+                    ("last_command", self._first_value(payload, ["human_coach_last_command", "human_coach.command"])),
+                    ("last_action", self._first_value(payload, ["human_coach_last_action", "human_coach.selected_action"])),
+                    ("overrides", self._first_value(payload, ["human_coach_override_count", "stream_coach_override_count"])),
+                    ("matches", self._first_value(payload, ["human_coach_match_count", "stream_coach_match_count"])),
+                    ("rejected", self._first_value(payload, ["human_coach_rejected_count", "stream_coach_rejected_count"])),
+                    ("local_queue", self.assisted_command_queue.counts()),
+                    ("log", self.intervention_log_path_var.get()),
+                ]
+            ),
+        )
+        self._set_panel(
+            "Failed Episodes",
+            lines_from_pairs(
+                [
+                    ("losses", self._first_value(payload, ["adventure.losses", "eval.losses", "losses"])),
+                    ("reset_failures", self._first_value(payload, ["eval.reset_failures", "reset_failures"])),
+                    ("bridge_errors", self._first_value(payload, ["eval.bridge_errors", "bridge_errors"])),
+                    ("blocked_reason", self._first_value(payload, ["blocked_reason", "adventure.blocked_reason"])),
+                    ("last_result", self._first_value(payload, ["last_result", "adventure.last_result"])),
+                ]
+            ),
+        )
+        self._set_panel(
+            "Viewer Queue Stats",
+            lines_from_pairs(
+                [
+                    ("local", self.assisted_command_queue.counts()),
+                    ("pending_stream", self._first_value(payload, ["pending_stream_commands", "stream_coach.pending_count"])),
+                    ("messages_seen", self._first_value(payload, ["mock_stream_messages_seen", "stream_coach_messages_seen"])),
+                    ("accepted", self._first_value(payload, ["mock_stream_commands_accepted", "stream_coach_commands_accepted"])),
+                    ("rejected", self._first_value(payload, ["mock_stream_commands_rejected", "stream_coach_commands_rejected"])),
+                    ("top", self._first_value(payload, ["stream_coach_top_commands"])),
                 ]
             ),
         )

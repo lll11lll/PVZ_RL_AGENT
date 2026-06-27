@@ -126,7 +126,10 @@ def command_from_payload(payload: Any) -> Optional[StreamCoachCommand]:
     if not isinstance(payload, dict):
         return None
     data = payload
-    raw_message = payload.get("message", payload.get("raw_text", payload.get("text")))
+    raw_message = payload.get(
+        "parser_command",
+        payload.get("message", payload.get("raw_text", payload.get("text"))),
+    )
     if raw_message:
         parsed_from_text = _stream_command_from_raw_text(
             str(raw_message),
@@ -331,7 +334,10 @@ class JsonlCoachCommandSource:
             return 0
 
     def _payload_to_source_messages(self, payload: Dict[str, Any]) -> List[StreamCoachSourceMessage]:
-        raw_message = payload.get("message", payload.get("raw_text", payload.get("text")))
+        raw_message = payload.get(
+            "parser_command",
+            payload.get("message", payload.get("raw_text", payload.get("text"))),
+        )
         base_user = str(
             payload.get("user")
             or payload.get("username")
@@ -361,7 +367,7 @@ class JsonlCoachCommandSource:
                     text=str(raw_message).strip(),
                     published_at=float(published_at) if published_at > 0.0 else None,
                     received_at=float(received_at),
-                    metadata={key: value for key, value in payload.items() if key not in {"message", "raw_text", "text"}},
+                    metadata={key: value for key, value in payload.items() if key not in {"parser_command", "message", "raw_text", "text"}},
                 )
             ]
 

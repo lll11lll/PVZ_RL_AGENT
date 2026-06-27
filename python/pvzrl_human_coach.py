@@ -27,6 +27,7 @@ from pvzrl_action_space import (
 
 
 COACH_COMMANDS = {"plant", "fuse", "wait", "defend", "economy"}
+COACH_COMMAND_MODES = {"override", "assist", "coach_only", "viewer_suggestion"}
 COACH_MATCH_REWARD = 0.02
 COACH_EXECUTED_REWARD = 0.01
 COACH_OVERRIDE_PENALTY = -0.01
@@ -343,6 +344,7 @@ class HumanCoachConfig:
     reward_enabled: bool = False
     fusion_enabled: bool = False
     platform: str = "mock"
+    command_mode: str = "override"
     match_reward: float = COACH_MATCH_REWARD
     legal_execution_reward: float = COACH_EXECUTED_REWARD
     override_penalty: float = COACH_OVERRIDE_PENALTY
@@ -451,6 +453,7 @@ class HumanCoachOverrideHook:
         reward_enabled: bool = False,
         fusion_enabled: bool = False,
         platform: str = "mock",
+        command_mode: str = "override",
         match_reward: float = COACH_MATCH_REWARD,
         legal_execution_reward: float = COACH_EXECUTED_REWARD,
         override_penalty: float = COACH_OVERRIDE_PENALTY,
@@ -461,6 +464,8 @@ class HumanCoachOverrideHook:
         self.source = source
         self.reward_enabled = bool(reward_enabled)
         self.fusion_enabled = bool(fusion_enabled)
+        normalized_mode = str(command_mode or "override").strip().lower()
+        self.command_mode = normalized_mode if normalized_mode in COACH_COMMAND_MODES else "override"
         self.match_reward = float(match_reward)
         self.legal_execution_reward = float(legal_execution_reward)
         self.override_penalty = float(override_penalty)
@@ -485,6 +490,7 @@ class HumanCoachOverrideHook:
             reward_enabled=bool(config.reward_enabled),
             fusion_enabled=bool(config.fusion_enabled),
             platform=str(config.platform or "mock"),
+            command_mode=str(config.command_mode or "override"),
             match_reward=float(config.match_reward),
             legal_execution_reward=float(config.legal_execution_reward),
             override_penalty=float(config.override_penalty),
@@ -560,6 +566,20 @@ class HumanCoachOverrideHook:
         if command is None:
             self.stats.pending_coach_command = None
             self.stats.selected_bridge_command = None
+            if self.command_mode == "coach_only":
+                observation = getattr(env, "_last_observation", None)
+                if not isinstance(observation, dict):
+                    observation = {}
+                wait_action = self._wait_action_for_env(env, observation=observation, fallback=ppo_action)
+                return CoachDecision(
+                    enabled=True,
+                    ppo_action=ppo_action,
+                    selected_action=int(wait_action),
+                    override_applied=int(wait_action) != ppo_action,
+                    coach_match=int(wait_action) == ppo_action,
+                    selected_action_label="coach_only_wait",
+                    event="coach_only_wait",
+                )
             return CoachDecision(enabled=True, ppo_action=ppo_action, selected_action=ppo_action, event="no_command")
         command = self._ensure_command_id(command)
 
@@ -685,6 +705,27 @@ class HumanCoachOverrideHook:
         self.stats.pending_coach_command = None
         selected_action = int(validation.policy_action)
         selected_bridge_command = dict(validation.bridge_command) if isinstance(validation.bridge_command, dict) else None
+        if self.command_mode in {"assist", "viewer_suggestion"}:
+            self._issued_command_ids.add(int(command.coach_command_id))
+            self.stats.selected_bridge_command = None
+            self.stats.last_command = command.to_dict()
+            self.stats.last_action = int(ppo_action)
+            self.stats.last_vote_count = 1
+            self.stats.last_rejected_reason = ""
+            self.stats.last_error = ""
+            decision = CoachDecision(
+                enabled=True,
+                ppo_action=ppo_action,
+                selected_action=ppo_action,
+                command=command,
+                validation=validation,
+                selected_action_label=f"suggestion:{selected_action}",
+                override_applied=False,
+                coach_match=selected_action == ppo_action,
+                event="coach_suggestion",
+            )
+            self.logger.log("coach_suggestion", command_mode=self.command_mode, decision=decision.to_dict())
+            return decision
         if selected_bridge_command is not None:
             selected_bridge_command["coach_command_id"] = int(command.coach_command_id)
             selected_bridge_command["coach_command_timestamp"] = float(command.timestamp)
@@ -799,7 +840,9 @@ class HumanCoachOverrideHook:
 
     def live_status_fields(self) -> Dict[str, Any]:
         self.stats.enabled = bool(self.enabled)
-        return self.stats.live_status_fields()
+        fields = self.stats.live_status_fields()
+        fields["human_coach_command_mode"] = self.command_mode
+        return fields
 
     def apply_step_outcome(self, decision: CoachDecision, info: Dict[str, Any]) -> float:
         components = dict(decision.reward_components or {})
@@ -811,7 +854,14 @@ class HumanCoachOverrideHook:
             COACH_REWARD_TACTICAL_USEFULNESS_COMPONENT,
         ):
             components[key] = float(components.get(key, 0.0))
-        if decision.command is not None and decision.validation is not None and decision.validation.legal:
+        if decision.event == "coach_suggestion":
+            self.stats.selected_bridge_command = None
+            return 0.0
+        if (
+            decision.command is not None
+            and decision.validation is not None
+            and decision.validation.legal
+        ):
             self.stats.last_executed_coach_command_id = int(decision.command.coach_command_id)
         self.stats.selected_bridge_command = None
         if decision.command is not None and decision.command.kind == "fuse" and decision.validation is not None and decision.validation.legal:
@@ -2582,7 +2632,7 @@ def _command_text_from_line(line: str) -> str:
             # Ignore malformed JSONL records (including partial writes).
             return ""
         if isinstance(payload, dict):
-            for key in ("raw_text", "text", "command"):
+            for key in ("parser_command", "raw_text", "text", "command"):
                 value = payload.get(key)
                 if value:
                     return str(value).strip()

@@ -62,6 +62,7 @@ from pvzrl_seed_inventory import (
     seed_inventory_v2_features,
 )
 from pvzrl_stream_coach import StreamCoachController
+from pvzrl_assisted_coach import InterventionJSONLLogger
 
 
 @dataclass
@@ -112,6 +113,8 @@ class PvZSB3Config:
     human_coach_reward: bool = False
     human_coach_fusion_enabled: bool = False
     human_coach_platform: str = "mock"
+    human_coach_command_mode: str = "override"
+    intervention_log_path: str = "logs/interventions/interventions.jsonl"
     stream_coach_enabled: bool = False
     stream_coach_mode: str = "mock"
     stream_coach_platform: str = "mock"
@@ -300,6 +303,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._reset_requires_seed_flow_next = False
         self.human_coach_hook: Optional[HumanCoachOverrideHook] = None
         self.stream_coach_controller: Optional[StreamCoachController] = None
+        self.intervention_logger = InterventionJSONLLogger(
+            Path(self.config.intervention_log_path or "logs/interventions/interventions.jsonl")
+        )
         self._stream_coach_source_path = str(self.config.stream_coach_command_path or "")
         self._fusion_probe = build_env_fusion_probe(self)
         if self.config.human_coach_enabled:
@@ -311,6 +317,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 reward_enabled=bool(self.config.human_coach_reward),
                 fusion_enabled=bool(self.config.human_coach_fusion_enabled),
                 platform=self.config.human_coach_platform or "mock",
+                command_mode=self.config.human_coach_command_mode or "override",
                 match_reward=float(getattr(self.config.reward, "coach_match_reward", 0.02)),
                 legal_execution_reward=float(getattr(self.config.reward, "coach_legal_execution_reward", 0.01)),
                 override_penalty=float(getattr(self.config.reward, "coach_override_penalty", -0.01)),
@@ -774,6 +781,41 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 "rejected_reason": "",
                 "command": None,
             }
+        intervention_command: Any = None
+        intervention_source = ""
+        intervention_status = ""
+        if coach_decision is not None and coach_decision.command is not None:
+            intervention_command = coach_decision.command.to_dict()
+            intervention_source = str(coach_decision.command.source or "human")
+            intervention_status = (
+                "rejected" if coach_decision.rejected else
+                ("approved" if coach_decision.event == "coach_suggestion" else
+                 ("pending" if coach_decision.event == "coach_pending" else "executed"))
+            )
+        elif stream_decision is not None and isinstance(stream_decision.selected_command, dict):
+            intervention_command = dict(stream_decision.selected_command)
+            intervention_source = "stream"
+            intervention_status = "executed" if stream_decision.selected else "rejected"
+        if intervention_command is not None:
+            board = observation if isinstance(observation, dict) else {}
+            self.intervention_logger.log(
+                run_id=str(getattr(self.config, "run_id", "") or self.config.run_mode),
+                episode_id=int(self._episode_index),
+                step=int(self._global_step_count),
+                mode="eval" if "eval" in str(self.config.run_mode).lower() else "train",
+                model_action=int(ppo_action),
+                human_command=intervention_command,
+                command_source=intervention_source,
+                status=intervention_status,
+                board_state_summary={
+                    "sun": board.get("sun"),
+                    "wave": board.get("wave"),
+                    "plant_count": len(board.get("plants", [])) if isinstance(board.get("plants"), list) else None,
+                    "zombie_count": len(board.get("zombies", [])) if isinstance(board.get("zombies"), list) else None,
+                },
+                reward_after=float(reward),
+                metadata={"selected_action": int(policy_action), "command_mode": self.config.human_coach_command_mode},
+            )
         self._last_observation = observation
         self._step_count += 1
         self._global_step_count += 1
