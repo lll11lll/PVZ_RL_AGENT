@@ -26,6 +26,7 @@ from pvzrl_env import (
     plant_type_name,
     registry_entries,
 )
+from pvzrl_human_coach import human_coach_live_status_from_hook
 from pvzrl_model_router import ModelRouter
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_seed_inventory import inventory_from_runtime_sources
@@ -50,6 +51,23 @@ POST_WIN_RECOVERY_TIMEOUT_SECONDS = 35.0
 POST_WIN_RECOVERY_POLL_SECONDS = 0.25
 DEFAULT_ADVENTURE_SOFT_MAX_STEPS = 2000
 DEFAULT_ADVENTURE_HARD_MAX_STEPS = 3500
+LEVEL_IDENTITY_POST_WIN_STATES = {"level_complete_trophy", "reward_unlock", "reward_screen"}
+LEVEL_IDENTITY_TRANSITIONAL_STATES = {
+    *LEVEL_IDENTITY_POST_WIN_STATES,
+    "seed_selection",
+    "loading",
+    "loading_or_menu",
+    "transition",
+}
+LEVEL_IDENTITY_CHALLENGE_MODE_MARKERS = (
+    "challenge",
+    "mini_game",
+    "minigame",
+    "survival",
+    "puzzle",
+    "vase",
+    "iz",
+)
 
 
 @dataclass
@@ -163,7 +181,7 @@ class LiveStatusWriter:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_index += 1
-        tmp_path = self.path.with_name(f"{self.path.name}.tmp")
+        tmp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.{id(self)}.{self._write_index}.tmp")
         with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
@@ -965,12 +983,161 @@ def update_attempt_progress(
     context["required_consecutive_wins_remaining"] = int(remaining)
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _first_positive_int(state: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[int]:
+    for key in keys:
+        value = _positive_int_or_none(state.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def adventure_screen_state_name(state: Dict[str, Any]) -> str:
+    return str(state.get("screenState") or state.get("screen_state") or "")
+
+
+def adventure_seed_selection_detected(state: Dict[str, Any]) -> bool:
+    screen_state = adventure_screen_state_name(state)
+    return bool(
+        state.get("isSeedSelectionScreen")
+        or state.get("seedSelectionActive")
+        or state.get("seedSelectionPanelActive")
+        or screen_state == "seed_selection"
+    )
+
+
+def adventure_gameplay_ready_detected(state: Dict[str, Any]) -> bool:
+    screen_state = adventure_screen_state_name(state)
+    return bool(
+        (state.get("isGameplayReady") or state.get("gameplayReady") or screen_state == "gameplay")
+        and not adventure_seed_selection_detected(state)
+    )
+
+
+def adventure_bridge_detected_level(state: Dict[str, Any]) -> Optional[int]:
+    return _first_positive_int(state, ("currentAdventureLevel", "bridgeDetectedLevel", "detectedAdventureLevel"))
+
+
+def adventure_profile_adventure_level(state: Dict[str, Any]) -> Optional[int]:
+    return _first_positive_int(
+        state,
+        (
+            "profileAdventureLevel",
+            "profile_adventure_level",
+            "profileCurrentAdventureLevel",
+            "profile_current_adventure_level",
+        ),
+    )
+
+
+def adventure_ui_world_level_text(state: Dict[str, Any]) -> str:
+    for key in (
+        "uiWorldLevelText",
+        "ui_world_level_text",
+        "uiLevelText",
+        "ui_level_text",
+        "levelText",
+        "level_text",
+    ):
+        value = str(state.get(key) or "").strip()
+        if value:
+            return value
+    world = _positive_int_or_none(state.get("currentWorldOrStage"))
+    stage = _positive_int_or_none(state.get("currentDayLevel"))
+    if world is not None and stage is not None:
+        return f"{world}-{stage}"
+    return ""
+
+
+def adventure_current_mode_text(state: Dict[str, Any]) -> str:
+    return str(
+        state.get("currentMode")
+        or state.get("current_mode")
+        or state.get("gameBoardType")
+        or state.get("game_board_type")
+        or ""
+    )
+
+
+def adventure_challenge_mode_context(state: Dict[str, Any]) -> bool:
+    mode = adventure_current_mode_text(state).replace("-", "_").replace(" ", "_").lower()
+    screen_state = adventure_screen_state_name(state).replace("-", "_").lower()
+    return any(marker in mode or marker in screen_state for marker in LEVEL_IDENTITY_CHALLENGE_MODE_MARKERS)
+
+
+def adventure_level_identity_diagnostics(
+    state: Dict[str, Any],
+    expected_level: Optional[int],
+    *,
+    stable_screen_states: Tuple[str, ...] = ("seed_selection", "gameplay"),
+    transitional_screen_states: Tuple[str, ...] = (),
+) -> Dict[str, Any]:
+    expected = _positive_int_or_none(expected_level)
+    detected = adventure_bridge_detected_level(state)
+    profile_level = adventure_profile_adventure_level(state)
+    screen_state = adventure_screen_state_name(state)
+    seed_selection = adventure_seed_selection_detected(state)
+    gameplay_ready = adventure_gameplay_ready_detected(state)
+    stable = screen_state in stable_screen_states or (seed_selection and "seed_selection" in stable_screen_states) or (
+        gameplay_ready and "gameplay" in stable_screen_states
+    )
+    transitional = screen_state in transitional_screen_states
+    challenge_context = adventure_challenge_mode_context(state)
+    mismatches: List[str] = []
+    if expected is not None and detected is not None and detected != expected:
+        mismatches.append(f"bridge_detected_level:{detected}!={expected}")
+    if expected is not None and profile_level is not None and profile_level != expected:
+        mismatches.append(f"profile_adventure_level:{profile_level}!={expected}")
+    source_available = detected is not None or profile_level is not None
+    reliable = bool(stable and source_available and not transitional and not challenge_context and not mismatches)
+    if challenge_context:
+        reason = "challenge_mode_context"
+    elif transitional:
+        reason = "transitional_screen_state"
+    elif mismatches:
+        reason = "level_source_mismatch"
+    elif stable and not source_available:
+        reason = "level_source_unavailable"
+    elif stable:
+        reason = "ok"
+    else:
+        reason = "navigation_or_unstable_screen"
+    return {
+        "wrapper_expected_level": expected,
+        "bridge_detected_level": detected,
+        "profile_adventure_level": profile_level,
+        "profile_adventure_level_source": str(
+            state.get("profileAdventureLevelSource") or state.get("profile_adventure_level_source") or ""
+        ),
+        "ui_world_level_text": adventure_ui_world_level_text(state),
+        "screenState": screen_state,
+        "currentMode": adventure_current_mode_text(state),
+        "seedSelectionDetected": bool(seed_selection),
+        "gameplayReadyDetected": bool(gameplay_ready),
+        "level_identity_reliable": bool(reliable),
+        "level_identity_reason": reason,
+        "level_identity_mismatches": mismatches,
+        "challenge_mode_context": bool(challenge_context),
+        "transitional_screen_state": bool(transitional),
+    }
+
+
 def replay_current_level_after_validation_win(
     env: PvZMaskedPPOEnv,
     writer: LiveStatusWriter,
     context: Dict[str, Any],
     timeout: float = 8.0,
     expected_level: Optional[int] = None,
+    seed_selection_callback: Optional[Callable[[Dict[str, Any], List[str]], Tuple[List[str], str]]] = None,
 ) -> Tuple[bool, str]:
     run_mode = str(context.get("run_mode") or context.get("mode") or "")
     log_prefix = "[adventure-generalist]" if "generalist" in run_mode else "[adventure]"
@@ -988,28 +1155,144 @@ def replay_current_level_after_validation_win(
         except (TypeError, ValueError):
             expected_level_int = None
 
+    def observed_positive_level(state: Dict[str, Any]) -> Optional[int]:
+        raw_level = state.get("currentAdventureLevel")
+        if raw_level in (None, ""):
+            return None
+        try:
+            level = int(raw_level)
+        except (TypeError, ValueError):
+            return None
+        return level if level > 0 else None
+
     def level_mismatch(state: Dict[str, Any]) -> bool:
         if expected_level_int is None:
             return False
-        raw_level = state.get("currentAdventureLevel")
-        if raw_level in (None, ""):
+        actual_level = observed_positive_level(state)
+        if actual_level is None:
             return False
-        try:
-            return int(raw_level) != int(expected_level_int)
-        except (TypeError, ValueError):
-            return False
+        return int(actual_level) != int(expected_level_int)
 
     def blocked_for_level_mismatch(state: Dict[str, Any]) -> Tuple[bool, str]:
         if not level_mismatch(state):
             return False, ""
-        actual_level = state.get("currentAdventureLevel")
+        actual_level = observed_positive_level(state)
+        diagnostics = adventure_level_identity_diagnostics(
+            state,
+            expected_level_int,
+            stable_screen_states=("gameplay",),
+            transitional_screen_states=tuple(LEVEL_IDENTITY_TRANSITIONAL_STATES),
+        )
         context["frontier_replay_level_after_win"] = actual_level
-        context["frontier_replay_last_state"] = _snapshot_post_win_state(state)
+        context["frontier_replay_last_state"] = _post_win_last_state(state)
+        context["frontier_replay_level_identity"] = diagnostics
+        context["level_identity"] = diagnostics
+        context["wrapper_expected_level"] = diagnostics.get("wrapper_expected_level")
+        context["bridge_detected_level"] = diagnostics.get("bridge_detected_level")
+        context["profile_adventure_level"] = diagnostics.get("profile_adventure_level")
+        context["ui_world_level_text"] = diagnostics.get("ui_world_level_text", "")
+        context["level_identity_reliable"] = bool(diagnostics.get("level_identity_reliable"))
+        if not replay_level_check_authoritative(state):
+            context["frontier_replay_ignored_level_mismatch"] = (
+                f"{actual_level}!={expected_level_int} screenState={screen_state_name(state) or 'unknown'}"
+            )
+            print(
+                f"{log_prefix} same_level_replay level_mismatch_ignored "
+                f"screenState={screen_state_name(state) or 'unknown'} "
+                f"expected_level={expected_level_int} "
+                f"detected_level={actual_level} "
+                f"profile_adventure_level={diagnostics.get('profile_adventure_level') or 'unknown'} "
+                f"ui_world_level_text={diagnostics.get('ui_world_level_text') or 'unknown'} "
+                "level_identity_reliable=false "
+                f"reason={diagnostics.get('level_identity_reason') or 'unknown'}"
+            )
+            return False, ""
         return True, f"same_level_replay_advanced_to_unexpected_level:{actual_level}!={expected_level_int}"
+
+    def screen_state_name(state: Dict[str, Any]) -> str:
+        return str(state.get("screenState") or state.get("screen_state") or "")
+
+    def raw_level_text(state: Dict[str, Any]) -> str:
+        raw_level = state.get("currentAdventureLevel")
+        return "unknown" if raw_level in (None, "") else str(raw_level)
+
+    def seed_selection_visible(state: Dict[str, Any]) -> bool:
+        return bool(
+            state.get("isSeedSelectionScreen")
+            or state.get("seedSelectionActive")
+            or screen_state_name(state) == "seed_selection"
+        )
+
+    def gameplay_ready_visible(state: Dict[str, Any]) -> bool:
+        return bool(
+            (state.get("isGameplayReady") or state.get("gameplayReady") or screen_state_name(state) == "gameplay")
+            and not seed_selection_visible(state)
+        )
+
+    def startup_popup_visible(state: Dict[str, Any]) -> bool:
+        return bool(
+            state.get("startupPopupVisible")
+            or state.get("startupOkButtonVisible")
+            or screen_state_name(state) == "startup_popup"
+        )
+
+    def actual_adventure_menu_visible(state: Dict[str, Any]) -> bool:
+        screen_state = screen_state_name(state)
+        return bool(
+            state.get("isAdventureButtonVisible")
+            and screen_state in {"main_menu", "loading_or_menu", "adventure_menu"}
+            and not _is_post_win_continue_state(state)
+            and not startup_popup_visible(state)
+            and not seed_selection_visible(state)
+            and not gameplay_ready_visible(state)
+        )
+
+    last_logged_state_key: Optional[Tuple[str, str, bool, bool, bool, bool]] = None
+
+    def log_replay_state(state: Dict[str, Any], *, reason: str) -> None:
+        nonlocal last_logged_state_key
+        key = (
+            screen_state_name(state),
+            raw_level_text(state),
+            bool(seed_selection_visible(state)),
+            bool(gameplay_ready_visible(state)),
+            bool(state.get("isAdventureButtonVisible")),
+            bool(startup_popup_visible(state)),
+        )
+        if key == last_logged_state_key:
+            return
+        last_logged_state_key = key
+        print(
+            f"{log_prefix} same_level_replay state "
+            f"reason={reason} "
+            f"screenState={key[0] or 'unknown'} "
+            f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+            f"detected_level={key[1]} "
+            f"seedSelectionDetected={'true' if key[2] else 'false'} "
+            f"gameplayReadyDetected={'true' if key[3] else 'false'} "
+            f"adventureButtonVisible={'true' if key[4] else 'false'} "
+            f"profile_adventure_level={adventure_profile_adventure_level(state) or 'unknown'} "
+            f"ui_world_level_text={adventure_ui_world_level_text(state) or 'unknown'} "
+            f"level_identity_reliable={'true' if adventure_level_identity_diagnostics(state, expected_level_int, stable_screen_states=('gameplay',), transitional_screen_states=tuple(LEVEL_IDENTITY_TRANSITIONAL_STATES)).get('level_identity_reliable') else 'false'}"
+        )
+
+    def replay_state_is_recoverable(state: Dict[str, Any]) -> bool:
+        return bool(
+            state.get("startupPopupVisible")
+            or state.get("startupOkButtonVisible")
+            or state.get("isAdventureButtonVisible")
+            or state.get("isSeedSelectionScreen")
+            or state.get("seedSelectionActive")
+            or state.get("isGameplayReady")
+            or state.get("gameplayReady")
+        )
+
+    def replay_level_check_authoritative(state: Dict[str, Any]) -> bool:
+        return bool(gameplay_ready_visible(state) and screen_state_name(state) not in LEVEL_IDENTITY_TRANSITIONAL_STATES)
 
     try:
         before_state = env.base.adventure_screen_state()
-        context["frontier_replay_last_state"] = _snapshot_post_win_state(before_state)
+        context["frontier_replay_last_state"] = _post_win_last_state(before_state)
         print(
             f"{log_prefix} reset "
             "reason=same_level_replay "
@@ -1018,6 +1301,12 @@ def replay_current_level_after_validation_win(
             "seed_selection_expected=True "
             f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'}"
         )
+        if _is_post_win_continue_state(before_state):
+            print(
+                f"{log_prefix} same_level_replay post_win_ui_detected "
+                f"screenState={screen_state_name(before_state) or 'unknown'} "
+                "action=auto_reset_hook"
+            )
         writer.write(build_live_status(env, context, adventure_state=before_state))
         mismatch, reason = blocked_for_level_mismatch(before_state)
         if mismatch:
@@ -1032,17 +1321,62 @@ def replay_current_level_after_validation_win(
         context["last_error"] = str(exc)
         return False, "win_replay_reset_failed"
     context["last_ui_action"] = replay
+    context["frontier_replay_auto_reset"] = replay
+    context["frontier_replay_auto_reset_ok"] = bool(replay.get("ok", True))
+    context["frontier_replay_auto_reset_method"] = str(replay.get("methodUsed") or "")
+    print(
+        f"{log_prefix} same_level_replay auto_reset "
+        f"ok={bool(replay.get('ok', True))} "
+        f"method={replay.get('methodUsed')} "
+        f"message={replay.get('message', '')}"
+    )
     if not replay.get("ok", True):
-        return False, str(replay.get("message") or "win_replay_reset_failed")
-    replay_observation = replay.get("observation", {}) if isinstance(replay, dict) else {}
-    if isinstance(replay_observation, dict) and replay_observation.get("gameplayReady") and not replay_observation.get("seedSelectionActive"):
-        state = env.base.adventure_screen_state()
+        try:
+            state = env.base.adventure_screen_state()
+        except Exception:
+            state = replay.get("observation", {}) if isinstance(replay.get("observation"), dict) else {}
+        context["frontier_replay_last_state"] = _post_win_last_state(state)
         mismatch, reason = blocked_for_level_mismatch(state)
         if mismatch:
             return False, reason
+        if replay_state_is_recoverable(state):
+            context["frontier_replay_auto_reset_warning"] = str(replay.get("message") or "auto_reset_failed_recoverable_state")
+            print(
+                f"{log_prefix} same_level_replay auto_reset_failed "
+                f"screenState={screen_state_name(state) or 'unknown'} "
+                f"recoverable=true "
+                f"message={replay.get('message', '')}"
+            )
+        return False, str(replay.get("message") or "win_replay_reset_failed")
+    replay_observation = replay.get("observation", {}) if isinstance(replay, dict) else {}
+    if isinstance(replay_observation, dict):
+        context["frontier_replay_reset_observation"] = _post_win_last_state(replay_observation)
+        print(
+            f"{log_prefix} same_level_replay reset_observation "
+            f"screenState={screen_state_name(replay_observation) or 'unknown'} "
+            f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+            f"detected_level={raw_level_text(replay_observation)} "
+            f"seedSelectionDetected={'true' if seed_selection_visible(replay_observation) else 'false'} "
+            f"gameplayReadyDetected={'true' if gameplay_ready_visible(replay_observation) else 'false'}"
+        )
+    if isinstance(replay_observation, dict) and gameplay_ready_visible(replay_observation):
+        state = env.base.adventure_screen_state()
+        context["frontier_replay_last_state"] = _post_win_last_state(state)
+        log_replay_state(state, reason="gameplay_ready_after_auto_reset")
+        mismatch, reason = blocked_for_level_mismatch(state)
+        if mismatch:
+            return False, reason
+        print(
+            f"{log_prefix} same_level_replay gameplayReady detected "
+            f"screenState={screen_state_name(state) or 'unknown'} "
+            f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+            f"detected_level={raw_level_text(state)}"
+        )
         return True, ""
 
     deadline = time.monotonic() + max(0.5, timeout)
+    adventure_skip_logged = False
+    seed_selection_attempts = 0
     while time.monotonic() < deadline:
         try:
             state = env.base.adventure_screen_state()
@@ -1050,20 +1384,139 @@ def replay_current_level_after_validation_win(
             context["last_error"] = str(exc)
             return False, "win_replay_reset_failed"
         writer.write(build_live_status(env, context, adventure_state=state))
+        context["frontier_replay_last_state"] = _post_win_last_state(state)
+        log_replay_state(state, reason="poll")
         mismatch, reason = blocked_for_level_mismatch(state)
         if mismatch:
             return False, reason
-        if state.get("isSeedSelectionScreen") or state.get("seedSelectionActive"):
+        if _is_post_win_continue_state(state):
+            context["state"] = "REPLAY_CURRENT_LEVEL_WAIT_RESET"
+            context["reset_phase"] = "wait_reset_hook"
+            if state.get("isAdventureButtonVisible") and not actual_adventure_menu_visible(state) and not adventure_skip_logged:
+                adventure_skip_logged = True
+                context["frontier_replay_press_adventure_skipped"] = True
+                context["frontier_replay_press_adventure_skip_reason"] = "reset_hook_succeeded_not_menu"
+                print(
+                    f"{log_prefix} same_level_replay press_adventure skipped "
+                    "reason=reset_hook_succeeded_not_menu "
+                    f"screenState={screen_state_name(state) or 'unknown'} "
+                    f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+                    f"detected_level={raw_level_text(state)}"
+                )
+            time.sleep(max(0.05, poll_seconds))
+            continue
+        if startup_popup_visible(state):
+            context["state"] = "REPLAY_CURRENT_LEVEL_STARTUP_POPUP"
+            context["reset_phase"] = "dismiss_startup_popup"
+            try:
+                click = env.base.click_startup_ok_once()
+            except Exception as exc:
+                context["last_error"] = str(exc)
+                return False, "win_replay_startup_popup_failed"
+            context["last_ui_action"] = click
+            if not click.get("ok", False):
+                return False, "win_replay_startup_popup_failed"
+            time.sleep(max(0.05, poll_seconds))
+            continue
+        if actual_adventure_menu_visible(state):
+            context["state"] = "REPLAY_CURRENT_LEVEL_ADVENTURE_MENU"
+            context["reset_phase"] = "press_adventure"
+            try:
+                click = env.base.press_adventure_once()
+            except Exception as exc:
+                context["last_error"] = str(exc)
+                context["frontier_replay_press_adventure_warning"] = f"exception:{exc}"
+                print(
+                    f"{log_prefix} same_level_replay press_adventure warning "
+                    f"ok=false method= exception={exc}"
+                )
+                time.sleep(max(0.1, poll_seconds))
+                continue
+            context["last_ui_action"] = click
+            print(
+                f"{log_prefix} same_level_replay press_adventure "
+                "used=true "
+                f"ok={click.get('ok')} method={click.get('methodUsed')}"
+            )
+            if not click.get("ok", False):
+                context["frontier_replay_press_adventure_warning"] = "win_replay_press_adventure_failed"
+                print(
+                    f"{log_prefix} same_level_replay press_adventure warning "
+                    "reason=win_replay_press_adventure_failed "
+                    f"screenState={screen_state_name(state) or 'unknown'}"
+                )
+                time.sleep(max(0.1, poll_seconds))
+                continue
+            time.sleep(max(0.1, poll_seconds))
+            continue
+        if state.get("isAdventureButtonVisible") and not adventure_skip_logged:
+            adventure_skip_logged = True
+            context["frontier_replay_press_adventure_skipped"] = True
+            context["frontier_replay_press_adventure_skip_reason"] = "not_main_menu"
+            print(
+                f"{log_prefix} same_level_replay press_adventure skipped "
+                "reason=not_main_menu "
+                f"screenState={screen_state_name(state) or 'unknown'} "
+                f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+                f"detected_level={raw_level_text(state)}"
+            )
+        if seed_selection_visible(state):
             context["state"] = "REPLAY_CURRENT_LEVEL_SEED_SELECTION"
             context["reset_phase"] = "seed_selection"
+            context["frontier_replay_seed_selection_detected"] = True
+            print(
+                f"{log_prefix} same_level_replay seed_selection detected "
+                f"screenState={screen_state_name(state) or 'unknown'} "
+                f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+                f"detected_level={raw_level_text(state)}"
+            )
+            if level_mismatch(state) and not replay_level_check_authoritative(state):
+                context["frontier_replay_waiting_for_reliable_level_identity"] = True
+                time.sleep(max(0.05, poll_seconds))
+                continue
+            seed_selection_attempts += 1
+            context["frontier_replay_seed_selection_attempts"] = seed_selection_attempts
+            if seed_selection_callback is not None:
+                try:
+                    callback_seed_list, callback_blocked_reason = seed_selection_callback(state, list(seed_names))
+                except Exception as exc:
+                    callback_seed_list, callback_blocked_reason = [], f"seed_selection_callback_failed:{exc}"
+                if callback_blocked_reason:
+                    return False, str(callback_blocked_reason)
+                if callback_seed_list:
+                    seed_names = [str(seed).strip() for seed in callback_seed_list if str(seed).strip()]
             try:
                 selection = env.base.auto_select_seeds(seed_list=seed_names, start_level=True)
             except Exception as exc:
                 context["last_error"] = str(exc)
-                return False, "win_replay_seed_selection_failed"
+                context["frontier_replay_last_seed_selection_message"] = f"exception:{exc}"
+                print(
+                    f"{log_prefix} same_level_replay seed_selection warning "
+                    f"attempt={seed_selection_attempts} ok=false exception={exc}"
+                )
+                time.sleep(max(0.1, poll_seconds))
+                continue
             context["last_seed_selection"] = selection
+            context["frontier_replay_last_seed_selection_ok"] = bool(selection.get("ok", False))
+            context["frontier_replay_last_seed_selection_message"] = str(selection.get("message", ""))
+            context["frontier_replay_last_seed_selection_actions"] = list(selection.get("actions", []) or [])[-8:]
+            context["frontier_replay_last_seed_selection_start_log"] = dict(selection.get("startLog", {}) or {})
             if not selection.get("ok", False):
-                return False, "win_replay_seed_selection_failed"
+                selection_state = selection.get("after") or selection.get("afterStart") or selection.get("afterSelectionBeforeStart") or state
+                if isinstance(selection_state, dict):
+                    context["frontier_replay_last_state"] = _post_win_last_state(selection_state)
+                    mismatch, reason = blocked_for_level_mismatch(selection_state)
+                    if mismatch:
+                        return False, reason
+                print(
+                    f"{log_prefix} same_level_replay seed_selection warning "
+                    f"attempt={seed_selection_attempts} ok=false "
+                    f"message={selection.get('message', '')} "
+                    f"actions={list(selection.get('actions', []) or [])[-4:]}"
+                )
+                writer.write(build_live_status(env, context, adventure_state=selection_state if isinstance(selection_state, dict) else state))
+                time.sleep(max(0.2, poll_seconds, float(getattr(env.config, "seed_click_delay", 0.35) or 0.35)))
+                continue
             try:
                 observation = env.base.wait_for_gameplay_ready(
                     timeout=max(1.0, min(timeout, deadline - time.monotonic() + 1.0)),
@@ -1073,23 +1526,56 @@ def replay_current_level_after_validation_win(
                 )
             except Exception as exc:
                 context["last_error"] = str(exc)
-                return False, "win_replay_gameplay_ready_failed"
+                print(
+                    f"{log_prefix} same_level_replay gameplay_ready warning "
+                    f"attempt={seed_selection_attempts} exception={exc}"
+                )
+                time.sleep(max(0.1, poll_seconds))
+                continue
             state = env.base.adventure_screen_state()
-            context["frontier_replay_last_state"] = _snapshot_post_win_state(state)
+            context["frontier_replay_last_state"] = _post_win_last_state(state)
+            log_replay_state(state, reason="after_seed_selection")
             mismatch, reason = blocked_for_level_mismatch(state)
             if mismatch:
                 return False, reason
-            if observation.get("gameplayReady") and not observation.get("seedSelectionActive"):
+            if gameplay_ready_visible(observation) or gameplay_ready_visible(state):
                 context["state"] = "REPLAY_CURRENT_LEVEL_READY"
                 context["reset_phase"] = "done"
+                context["frontier_replay_gameplay_ready_detected"] = True
+                print(
+                    f"{log_prefix} same_level_replay gameplayReady detected "
+                    f"screenState={screen_state_name(state) or screen_state_name(observation) or 'unknown'} "
+                    f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+                    f"detected_level={raw_level_text(state)}"
+                )
                 return True, ""
-            return False, "win_replay_gameplay_ready_failed"
-        if state.get("isGameplayReady") or state.get("gameplayReady"):
+            print(
+                f"{log_prefix} same_level_replay gameplay_ready warning "
+                f"attempt={seed_selection_attempts} ready=false "
+                f"screenState={screen_state_name(state) or screen_state_name(observation) or 'unknown'}"
+            )
+            time.sleep(max(0.1, poll_seconds))
+            continue
+        if gameplay_ready_visible(state):
             context["state"] = "REPLAY_CURRENT_LEVEL_READY"
             context["reset_phase"] = "done"
+            context["frontier_replay_gameplay_ready_detected"] = True
+            print(
+                f"{log_prefix} same_level_replay gameplayReady detected "
+                f"screenState={screen_state_name(state) or 'unknown'} "
+                f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'} "
+                f"detected_level={raw_level_text(state)}"
+            )
             return True, ""
         time.sleep(max(0.05, poll_seconds))
-    return False, "win_replay_reset_failed"
+    context["frontier_replay_timeout"] = True
+    timeout_reason = "win_replay_seed_selection_or_gameplay_timeout"
+    print(
+        f"{log_prefix} same_level_replay timeout "
+        f"reason={timeout_reason} "
+        f"expected_level={expected_level_int if expected_level_int is not None else 'unknown'}"
+    )
+    return False, timeout_reason
 
 
 def dismiss_startup_popup_if_needed(
@@ -1675,6 +2161,21 @@ def build_live_status(
     reward_totals = getattr(env, "_episode_reward_totals", {})
     lane_diagnostics = last_info.get("lane_diagnostics", {}) if isinstance(last_info, dict) else {}
     summary = context.get("eval_summary", {})
+    if hasattr(env, "_coach_live_status"):
+        try:
+            coach_fields = dict(env._coach_live_status())  # type: ignore[attr-defined]
+        except Exception:
+            coach_fields = human_coach_live_status_from_hook(
+                getattr(env, "human_coach_hook", None),
+                enabled=bool(getattr(getattr(env, "config", None), "human_coach_enabled", False)),
+                platform=str(getattr(getattr(env, "config", None), "human_coach_platform", "mock") or "mock"),
+            )
+    else:
+        coach_fields = human_coach_live_status_from_hook(
+            getattr(env, "human_coach_hook", None),
+            enabled=bool(getattr(getattr(env, "config", None), "human_coach_enabled", False)),
+            platform=str(getattr(getattr(env, "config", None), "human_coach_platform", "mock") or "mock"),
+        )
     try:
         legal_action_count = int(env.action_masks().sum())
     except Exception:
@@ -1739,6 +2240,25 @@ def build_live_status(
     selected_loadout = list(context.get("selected_seeds", getattr(env.config, "seed_list", [])))
     selected_loadout_count = int(context.get("selected_loadout_count", len(selected_loadout)) or len(selected_loadout))
     selected_loadout_count = max(0, min(max_seed_slots, selected_loadout_count))
+    configured_seed_list = list(
+        context.get(
+            "configured_seed_list",
+            context.get("initial_loadout", getattr(env.config, "seed_list", [])),
+        )
+    )
+    model_seed_list = list(model_compatibility.get("model_seed_list", []))
+    dynamic_identity_loadout = "adventure_generalist_14slot" in run_mode
+    seed_order_metadata_mismatch = bool(
+        model_seed_list
+        and selected_loadout
+        and model_seed_list != selected_loadout
+        and not dynamic_identity_loadout
+    )
+    seed_order_warning = (
+        "model_metadata_seed_list_differs_from_runtime_selected_loadout"
+        if seed_order_metadata_mismatch
+        else ""
+    )
     observed_seed_bank_capacity = int(
         context.get("observed_seed_bank_capacity")
         or context.get("active_seed_slot_capacity")
@@ -1748,12 +2268,42 @@ def build_live_status(
         or 0
     )
     observed_seed_bank_capacity = max(0, min(max_seed_slots, observed_seed_bank_capacity))
+    bridge_reported_capacity = context.get("bridge_reported_capacity", None)
+    inferred_capacity_from_unlocks = int(
+        context.get("inferred_capacity_from_unlocks")
+        or observed_seed_bank_capacity
+        or 0
+    )
+    inferred_capacity_from_unlocks = max(0, min(max_seed_slots, inferred_capacity_from_unlocks))
+    effective_seed_capacity = int(
+        context.get("effective_seed_capacity")
+        or observed_seed_bank_capacity
+        or selected_loadout_count
+        or 0
+    )
+    effective_seed_capacity = max(0, min(max_seed_slots, effective_seed_capacity))
+    max_effective_seed_capacity_seen = int(
+        context.get("max_effective_seed_capacity_seen")
+        or effective_seed_capacity
+        or 0
+    )
+    max_effective_seed_capacity_seen = max(0, min(max_seed_slots, max_effective_seed_capacity_seen))
+    inferred_capacity_source = str(context.get("inferred_capacity_source", "") or "")
+    capacity_inference_reason = str(context.get("capacity_inference_reason", "") or "")
+    available_priority_seeds = list(context.get("available_priority_seeds", []) or [])
+    rejected_priority_seeds = list(context.get("rejected_priority_seeds", []) or [])
     active_seed_slot_count = int(selected_loadout_count)
     inactive_seed_slot_count = max(0, max_seed_slots - active_seed_slot_count)
     inactive_model_slots = max(0, max_seed_slots - selected_loadout_count)
     eligible_seeds = list(context.get("eligible_seeds", []))
     selectable_seeds = list(context.get("selectable_seeds", available_seeds))
     cleared_levels = list(context.get("cleared_levels", []))
+    startup_validation = context.get("startup_validation", {})
+    if not isinstance(startup_validation, dict):
+        startup_validation = {}
+    level_identity = context.get("level_identity", startup_validation.get("level_identity", {}))
+    if not isinstance(level_identity, dict):
+        level_identity = {}
     return {
         "mode": run_mode,
         "run_mode": run_mode,
@@ -1764,13 +2314,29 @@ def build_live_status(
         "model_family": context.get("current_model_family", context.get("model_family", "")),
         "action_count": compatibility["action_count"],
         "max_seed_slots": max_seed_slots,
+        "observed_capacity": observed_seed_bank_capacity,
         "observed_seed_bank_capacity": observed_seed_bank_capacity,
         "active_seed_slot_capacity": observed_seed_bank_capacity,
         "current_seed_bank_capacity": observed_seed_bank_capacity,
+        "bridge_reported_capacity": bridge_reported_capacity,
+        "inferred_capacity_from_unlocks": inferred_capacity_from_unlocks,
+        "effective_seed_capacity": effective_seed_capacity,
+        "max_effective_seed_capacity_seen": max_effective_seed_capacity_seen,
+        "inferred_capacity_source": inferred_capacity_source,
+        "capacity_inference_reason": capacity_inference_reason,
+        "available_priority_seeds": available_priority_seeds,
+        "rejected_priority_seeds": rejected_priority_seeds,
         "active_seed_slot_count": active_seed_slot_count,
         "inactive_seed_slot_count": inactive_seed_slot_count,
         "selected_loadout_count": selected_loadout_count,
         "inactive_model_slots": inactive_model_slots,
+        "configured_seed_list": configured_seed_list,
+        "seed_order_source": context.get("seed_order_source", ""),
+        "seed_order_preserved": bool(context.get("seed_order_preserved", True)),
+        "seed_order_blocked_reason": context.get("seed_order_blocked_reason", ""),
+        "seed_order_metadata_mismatch": seed_order_metadata_mismatch,
+        "seed_order_warning": seed_order_warning,
+        "randomize_seed_order": bool(context.get("randomize_seed_order", False)),
         "episode_sample_source": context.get("episode_sample_source", ""),
         "requested_episode_sample_source": context.get("requested_episode_sample_source", ""),
         "level_replay_supported": bool(context.get("level_replay_supported", False)),
@@ -1791,12 +2357,42 @@ def build_live_status(
             context.get("frontier_replay_supported", context.get("level_replay_supported", False))
         ),
         "frontier_replay_blocked_reason": context.get("frontier_replay_blocked_reason", ""),
+        "frontier_replay_seed_selection_attempts": int(context.get("frontier_replay_seed_selection_attempts", 0) or 0),
+        "frontier_replay_last_seed_selection_ok": context.get("frontier_replay_last_seed_selection_ok", None),
+        "frontier_replay_last_seed_selection_message": context.get("frontier_replay_last_seed_selection_message", ""),
+        "frontier_replay_last_seed_selection_actions": context.get("frontier_replay_last_seed_selection_actions", []),
+        "frontier_replay_last_seed_selection_start_log": context.get("frontier_replay_last_seed_selection_start_log", {}),
         "frontier_mastered_levels": list(context.get("frontier_mastered_levels", [])),
         "post_win_decision": context.get("post_win_decision", ""),
         "post_win_transition_allowed": bool(context.get("post_win_transition_allowed", False)),
         "expected_transition_target": context.get("expected_transition_target", ""),
         "seed_selection_expected": bool(context.get("seed_selection_expected", False)),
         "reset_phase": context.get("reset_phase", context.get("last_reset_phase", "")),
+        "startup_validation": startup_validation,
+        "startup_validation_ok": startup_validation.get("ok", context.get("startup_validation_ok", None)),
+        "startup_validation_reason": startup_validation.get("reason", context.get("startup_validation_reason", "")),
+        "level_identity": level_identity,
+        "wrapper_expected_level": level_identity.get("wrapper_expected_level", context.get("wrapper_expected_level", None)),
+        "bridge_detected_level": level_identity.get("bridge_detected_level", context.get("bridge_detected_level", None)),
+        "profile_adventure_level": level_identity.get("profile_adventure_level", context.get("profile_adventure_level", None)),
+        "profile_adventure_level_source": level_identity.get(
+            "profile_adventure_level_source",
+            context.get("profile_adventure_level_source", ""),
+        ),
+        "ui_world_level_text": level_identity.get("ui_world_level_text", context.get("ui_world_level_text", "")),
+        "screenState": level_identity.get("screenState", adventure_state.get("screenState", observation.get("screenState", ""))),
+        "seedSelectionDetected": level_identity.get(
+            "seedSelectionDetected",
+            bool(adventure_state.get("isSeedSelectionScreen") or adventure_state.get("seedSelectionActive")),
+        ),
+        "gameplayReadyDetected": level_identity.get(
+            "gameplayReadyDetected",
+            bool(adventure_state.get("isGameplayReady") or adventure_state.get("gameplayReady")),
+        ),
+        "level_identity_reliable": level_identity.get(
+            "level_identity_reliable",
+            context.get("level_identity_reliable", None),
+        ),
         "adventure_phase": context.get("state", adventure_state.get("screenState", "unknown")),
         "latest_terminal_result": context.get("latest_terminal_result", context.get("last_result", "")),
         "frontier_level": context.get("frontier_level", context.get("current_level", "")),
@@ -1918,9 +2514,16 @@ def build_live_status(
             "timeout_classification": context.get("timeout_classification", "none"),
             "soft_timeout_extension_reason": context.get("soft_timeout_extension_reason", ""),
             "unlocked_seeds": sorted(context.get("unlocked_seeds", [])),
+            "configured_seed_list": configured_seed_list,
             "selected_seeds": selected_loadout,
             "selected_loadout": selected_loadout,
             "selected_loadout_count": selected_loadout_count,
+            "seed_order_source": context.get("seed_order_source", ""),
+            "seed_order_preserved": bool(context.get("seed_order_preserved", True)),
+            "seed_order_blocked_reason": context.get("seed_order_blocked_reason", ""),
+            "seed_order_metadata_mismatch": seed_order_metadata_mismatch,
+            "seed_order_warning": seed_order_warning,
+            "randomize_seed_order": bool(context.get("randomize_seed_order", False)),
             "eligible_seeds": eligible_seeds,
             "selectable_seeds": selectable_seeds,
             "loadout_reason": context.get("loadout_reason", ""),
@@ -1928,9 +2531,18 @@ def build_live_status(
             "active_seed_slot_count": active_seed_slot_count,
             "inactive_seed_slot_count": inactive_seed_slot_count,
             "max_seed_slots": max_seed_slots,
+            "observed_capacity": observed_seed_bank_capacity,
             "observed_seed_bank_capacity": observed_seed_bank_capacity,
             "active_seed_slot_capacity": observed_seed_bank_capacity,
             "current_seed_bank_capacity": observed_seed_bank_capacity,
+            "bridge_reported_capacity": bridge_reported_capacity,
+            "inferred_capacity_from_unlocks": inferred_capacity_from_unlocks,
+            "effective_seed_capacity": effective_seed_capacity,
+            "max_effective_seed_capacity_seen": max_effective_seed_capacity_seen,
+            "inferred_capacity_source": inferred_capacity_source,
+            "capacity_inference_reason": capacity_inference_reason,
+            "available_priority_seeds": available_priority_seeds,
+            "rejected_priority_seeds": rejected_priority_seeds,
             "inactive_model_slots": inactive_model_slots,
             "available_seeds": available_seeds,
             "conservative_seeds": bool(context.get("conservative_seeds", True)),
@@ -1962,12 +2574,36 @@ def build_live_status(
                 context.get("frontier_replay_supported", context.get("level_replay_supported", False))
             ),
             "frontier_replay_blocked_reason": context.get("frontier_replay_blocked_reason", ""),
+            "frontier_replay_seed_selection_attempts": int(context.get("frontier_replay_seed_selection_attempts", 0) or 0),
+            "frontier_replay_last_seed_selection_ok": context.get("frontier_replay_last_seed_selection_ok", None),
+            "frontier_replay_last_seed_selection_message": context.get("frontier_replay_last_seed_selection_message", ""),
+            "frontier_replay_last_seed_selection_actions": context.get("frontier_replay_last_seed_selection_actions", []),
+            "frontier_replay_last_seed_selection_start_log": context.get("frontier_replay_last_seed_selection_start_log", {}),
             "frontier_mastered_levels": list(context.get("frontier_mastered_levels", [])),
             "post_win_decision": context.get("post_win_decision", ""),
             "post_win_transition_allowed": bool(context.get("post_win_transition_allowed", False)),
             "expected_transition_target": context.get("expected_transition_target", ""),
             "seed_selection_expected": bool(context.get("seed_selection_expected", False)),
             "reset_phase": context.get("reset_phase", context.get("last_reset_phase", "")),
+            "startup_validation": startup_validation,
+            "startup_validation_ok": startup_validation.get("ok", context.get("startup_validation_ok", None)),
+            "startup_validation_reason": startup_validation.get("reason", context.get("startup_validation_reason", "")),
+            "level_identity": level_identity,
+            "wrapper_expected_level": level_identity.get("wrapper_expected_level", context.get("wrapper_expected_level", None)),
+            "bridge_detected_level": level_identity.get("bridge_detected_level", context.get("bridge_detected_level", None)),
+            "profile_adventure_level": level_identity.get("profile_adventure_level", context.get("profile_adventure_level", None)),
+            "profile_adventure_level_source": level_identity.get(
+                "profile_adventure_level_source",
+                context.get("profile_adventure_level_source", ""),
+            ),
+            "ui_world_level_text": level_identity.get("ui_world_level_text", context.get("ui_world_level_text", "")),
+            "screenState": level_identity.get("screenState", adventure_state.get("screenState", observation.get("screenState", ""))),
+            "seedSelectionDetected": level_identity.get("seedSelectionDetected", False),
+            "gameplayReadyDetected": level_identity.get("gameplayReadyDetected", False),
+            "level_identity_reliable": level_identity.get(
+                "level_identity_reliable",
+                context.get("level_identity_reliable", None),
+            ),
             "missing_required_unlocked": seed_inventory.get("missing_required_unlocked", []),
             "missing_required_available": seed_inventory.get("missing_required_available", []),
             "post_win_transition": context.get("post_win_transition", {}),
@@ -2015,6 +2651,9 @@ def build_live_status(
         "seed_inventory": seed_inventory,
         "model_compatibility": model_compatibility,
         "compatibility": compatibility,
+        "coach": dict(coach_fields),
+        "human_coach": dict(coach_fields),
+        "stream_coach": dict(coach_fields),
         "agent": build_agent_payload(env, context, last_info),
         "rows": build_rows_payload(observation, lane_diagnostics),
         "reward": {
@@ -2022,6 +2661,7 @@ def build_live_status(
             **{field: float(reward_totals.get(field, 0.0) or 0.0) for field in REWARD_EPISODE_TOTAL_FIELDS},
         },
         "eval": summary,
+        **coach_fields,
     }
 
 

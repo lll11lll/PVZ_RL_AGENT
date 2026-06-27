@@ -24,11 +24,15 @@ ROLLING_WIN_WINDOW = 20
 MODEL_ZIP_NAMES = {"model.zip", "final_model.zip"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LIVE_STATUS_PATH = Path("runs") / "live_status.json"
+DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
+DEFAULT_HUMAN_COACH_LOG_PATH = Path("runs") / "human_coach.jsonl"
+DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
 LIVE_MAX_AGE_SECONDS = 5.0
 STALE_MAX_AGE_SECONDS = 30.0
 MISSING = object()
 ADVENTURE_DEFAULT_PLANT_TYPES = "1,0,3,2"
 FUSION_POLICY_CHOICES = ("none", "observe", "scripted", "assist")
+STREAM_COACH_PLATFORMS = ("mock", "twitch", "youtube")
 LEVEL3_SEED_LIST = "SunFlower,Peashooter,WallNut,CherryBomb"
 LEVEL3_PLANT_TYPES = "1,0,3,2"
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
@@ -39,6 +43,17 @@ PROFILES = {
     "2-slot stable": "SunFlower,Peashooter",
     "4-slot duplicate": "SunFlower,SunFlower,Peashooter,Peashooter",
 }
+
+
+class _FallbackStringVar:
+    def __init__(self, value: str = "n/a") -> None:
+        self._value = str(value)
+
+    def get(self) -> str:
+        return self._value
+
+    def set(self, value: Any) -> None:
+        self._value = fmt_value(value)
 
 
 def fmt_value(value: Any) -> str:
@@ -147,6 +162,7 @@ class PvZDashboard:
         self.generalist_unlock_delay_var = tk.StringVar(value="0")
         self.generalist_new_plant_prob_var = tk.StringVar(value="0.15")
         self.generalist_run_dir_var = tk.StringVar(value="")
+        self.generalist_resume_model_path_var = tk.StringVar(value="")
         self.generalist_eval_model_path_var = tk.StringVar(value=str(default_adventure_model) if default_adventure_model else "")
         self.generalist_eval_episodes_var = tk.StringVar(value="5")
         self.generalist_unlock_curriculum_var = tk.BooleanVar(value=True)
@@ -158,6 +174,7 @@ class PvZDashboard:
         self.generalist_wallnut_mask_var = tk.BooleanVar(value=True)
         self.generalist_cherrybomb_mask_var = tk.BooleanVar(value=True)
         self.generalist_curriculum_var = tk.StringVar(value="conservative")
+        self.generalist_randomize_seed_order_var = tk.BooleanVar(value=False)
         self.level3_mode_var = tk.StringVar(value="train")
         self.level3_target_level_var = tk.StringVar(value="3")
         self.level3_model_path_var = tk.StringVar(value=str(default_model) if default_model else "")
@@ -172,6 +189,59 @@ class PvZDashboard:
         self.level3_tactical_masks_var = tk.BooleanVar(value=True)
         self.level3_wallnut_mask_var = tk.BooleanVar(value=True)
         self.level3_cherrybomb_mask_var = tk.BooleanVar(value=True)
+        self.human_coach_enabled_var = tk.BooleanVar(value=False)
+        self.human_coach_reward_var = tk.BooleanVar(value=False)
+        self.human_coach_bonus_var = tk.StringVar(value="")
+        self.human_coach_match_bonus_var = tk.StringVar(value="")
+        self.human_coach_override_penalty_var = tk.StringVar(value="")
+        self.human_coach_log_path_var = tk.StringVar(value=str(DEFAULT_HUMAN_COACH_LOG_PATH))
+        self.human_coach_command_path_var = tk.StringVar(value=str(DEFAULT_COACH_COMMAND_QUEUE_PATH))
+        self.human_coach_command_input_var = tk.StringVar(value="")
+        self.stream_coach_enabled_var = tk.BooleanVar(value=False)
+        self.stream_coach_platform_var = tk.StringVar(value=STREAM_COACH_PLATFORMS[0])
+        self.stream_coach_window_sec_var = tk.StringVar(value="3")
+        self.stream_coach_min_votes_var = tk.StringVar(value="2")
+        self.stream_coach_max_actions_per_minute_var = tk.StringVar(value="20")
+        self.stream_coach_reward_var = tk.BooleanVar(value=False)
+        self.stream_coach_dry_run_var = tk.BooleanVar(value=True)
+        self.stream_coach_log_path_var = tk.StringVar(value=str(DEFAULT_STREAM_COACH_LOG_PATH))
+        self.stream_coach_mock_script_var = tk.StringVar(value="")
+        self.coach_allow_fusion_planning_var = tk.BooleanVar(value=False)
+        self.fusion_bridge_enabled_var = tk.BooleanVar(value=False)
+        self.human_coach_enabled_status_var = tk.StringVar(value="n/a")
+        self.human_coach_last_command_var = tk.StringVar(value="n/a")
+        self.human_coach_last_action_var = tk.StringVar(value="n/a")
+        self.human_coach_last_error_var = tk.StringVar(value="n/a")
+        self.human_coach_override_count_var = tk.StringVar(value="n/a")
+        self.human_coach_match_count_var = tk.StringVar(value="n/a")
+        self.human_coach_reward_total_var = tk.StringVar(value="n/a")
+        self.stream_coach_enabled_status_var = tk.StringVar(value="n/a")
+        self.stream_coach_platform_status_var = tk.StringVar(value="n/a")
+        self.stream_coach_dry_run_status_var = tk.StringVar(value="n/a")
+        self.stream_coach_alive_status_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_message_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_parsed_command_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_applied_command_var = tk.StringVar(value="n/a")
+        self.stream_coach_accept_reject_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_reject_reason_var = tk.StringVar(value="n/a")
+        self.stream_coach_pending_count_var = tk.StringVar(value="n/a")
+        self.stream_coach_top_command_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_selected_command_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_action_var = tk.StringVar(value="n/a")
+        self.stream_coach_rejected_count_var = tk.StringVar(value="n/a")
+        self.stream_coach_last_vote_count_var = tk.StringVar(value="n/a")
+        self.stream_coach_override_count_var = tk.StringVar(value="n/a")
+        self.stream_coach_match_count_var = tk.StringVar(value="n/a")
+        self.stream_coach_reward_total_var = tk.StringVar(value="n/a")
+        self.fusion_bridge_available_var = tk.StringVar(value="n/a")
+        self.fusion_bridge_enabled_status_var = tk.StringVar(value="n/a")
+        self.fusion_last_command_var = tk.StringVar(value="n/a")
+        self.fusion_last_result_var = tk.StringVar(value="n/a")
+        self.fusion_attempt_count_var = tk.StringVar(value="n/a")
+        self.fusion_success_count_var = tk.StringVar(value="n/a")
+        self.fusion_failure_count_var = tk.StringVar(value="n/a")
+        self.fusion_rejected_count_var = tk.StringVar(value="n/a")
+        self.coach_queue_status_var = tk.StringVar(value="Queue idle")
         self.process_status_var = tk.StringVar(value="Idle")
         self.live_status_var = tk.StringVar(
             value=f"Live: {self.live_status_path} | exists=no | size=- | age=- | health=MISSING"
@@ -209,6 +279,7 @@ class PvZDashboard:
         self._build()
         self._append_log(f"Project root: {self.project_root}\n")
         self._append_log(f"Live status path: {self.live_status_path}\n")
+        self._append_log(f"[gui] polling diagnostics every {POLL_MS} ms\n")
         self._bind_command_preview_updates()
         self._update_command_previews()
         if default_model is not None:
@@ -318,6 +389,7 @@ class PvZDashboard:
         level3_tab = ttk.Frame(notebook)
         adventure_tab = ttk.Frame(notebook)
         generalist_tab = ttk.Frame(notebook)
+        coach_tab = ttk.Frame(notebook)
         diagnostics_tab = ttk.Frame(notebook)
         runs_tab = ttk.Frame(notebook)
         logs_tab = ttk.Frame(notebook)
@@ -326,6 +398,7 @@ class PvZDashboard:
         notebook.add(level3_tab, text="Level 3")
         notebook.add(adventure_tab, text="Adventure")
         notebook.add(generalist_tab, text="Adventure Generalist")
+        notebook.add(coach_tab, text="Coach")
         notebook.add(diagnostics_tab, text="Diagnostics")
         notebook.add(runs_tab, text="Runs/Models")
         notebook.add(logs_tab, text="Logs")
@@ -335,6 +408,7 @@ class PvZDashboard:
         self._build_level3_tab(level3_tab)
         self._build_adventure_tab(adventure_tab)
         self._build_adventure_generalist_tab(generalist_tab)
+        self._build_coach_tab(coach_tab)
         self._build_diagnostics_tab(diagnostics_tab)
         self._build_runs_tab(runs_tab)
         self._build_logs_tab(logs_tab)
@@ -544,6 +618,117 @@ class PvZDashboard:
             text.configure(state="disabled")
             self.panels[title] = text
 
+    def _build_coach_tab(self, parent: ttk.Frame) -> None:
+        content = self._make_scrollable_container(parent)
+        content.columnconfigure(0, weight=1)
+
+        queue_frame = ttk.LabelFrame(content, text="Command Queue")
+        queue_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
+        queue_frame.columnconfigure(1, weight=1)
+        self._add_labeled_entry(queue_frame, 0, 0, "Queue path", self.human_coach_command_path_var, width=58)
+        self._add_labeled_value(queue_frame, 1, "Queue status", self.coach_queue_status_var, width=58)
+
+        human = ttk.LabelFrame(content, text="Human Coach")
+        human.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
+        human.columnconfigure(1, weight=1)
+        human.columnconfigure(3, weight=1)
+        ttk.Checkbutton(human, text="Enable Human Coach", variable=self.human_coach_enabled_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(human, text="Human coach reward", variable=self.human_coach_reward_var).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+        self._add_labeled_entry(human, 1, 0, "Human coach bonus", self.human_coach_bonus_var)
+        self._add_labeled_entry(human, 1, 2, "Human coach match bonus", self.human_coach_match_bonus_var)
+        self._add_labeled_entry(human, 2, 0, "Override penalty", self.human_coach_override_penalty_var)
+        self._add_labeled_entry(human, 2, 2, "Human coach log path", self.human_coach_log_path_var, width=30)
+
+        command_frame = ttk.Frame(human)
+        command_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 2))
+        command_frame.columnconfigure(1, weight=1)
+        ttk.Label(command_frame, text="Command input").grid(row=0, column=0, sticky="w")
+        command_entry = ttk.Entry(command_frame, textvariable=self.human_coach_command_input_var, width=58)
+        command_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(command_frame, text="Send Command", command=self.send_human_coach_command).grid(row=0, column=2, sticky="w")
+
+        human_live = ttk.LabelFrame(human, text="Human Coach Live Diagnostics")
+        human_live.grid(row=4, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 6))
+        human_live.columnconfigure(1, weight=1)
+        self._add_labeled_value(human_live, 0, "Enabled (live)", self.human_coach_enabled_status_var)
+        self._add_labeled_value(human_live, 1, "Last command", self.human_coach_last_command_var)
+        self._add_labeled_value(human_live, 2, "Last parsed action", self.human_coach_last_action_var)
+        self._add_labeled_value(human_live, 3, "Last error", self.human_coach_last_error_var)
+        self._add_labeled_value(human_live, 4, "Override count", self.human_coach_override_count_var)
+        self._add_labeled_value(human_live, 5, "Match count", self.human_coach_match_count_var)
+        self._add_labeled_value(human_live, 6, "Reward total", self.human_coach_reward_total_var)
+
+        stream = ttk.LabelFrame(content, text="Stream Coach")
+        stream.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
+        stream.columnconfigure(1, weight=1)
+        stream.columnconfigure(3, weight=1)
+        ttk.Checkbutton(stream, text="Enable Stream Coach", variable=self.stream_coach_enabled_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(stream, text="Stream coach reward", variable=self.stream_coach_reward_var).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(stream, text="Dry-run stream commands", variable=self.stream_coach_dry_run_var).grid(
+            row=0, column=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Label(stream, text="Platform").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Combobox(
+            stream,
+            textvariable=self.stream_coach_platform_var,
+            values=STREAM_COACH_PLATFORMS,
+            state="readonly",
+            width=14,
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        self._add_labeled_entry(stream, 1, 2, "Voting window sec", self.stream_coach_window_sec_var)
+        self._add_labeled_entry(stream, 2, 0, "Minimum votes", self.stream_coach_min_votes_var)
+        self._add_labeled_entry(stream, 2, 2, "Max actions/min", self.stream_coach_max_actions_per_minute_var)
+        self._add_labeled_entry(stream, 3, 0, "Stream coach log path", self.stream_coach_log_path_var, width=48, columnspan=3)
+        self._add_labeled_entry(stream, 4, 0, "Mock script path", self.stream_coach_mock_script_var, width=48, columnspan=3)
+
+        stream_live = ttk.LabelFrame(stream, text="Stream Coach Live Diagnostics")
+        stream_live.grid(row=5, column=0, columnspan=4, sticky="ew", padx=6, pady=(4, 6))
+        stream_live.columnconfigure(1, weight=1)
+        self._add_labeled_value(stream_live, 0, "Enabled (live)", self.stream_coach_enabled_status_var)
+        self._add_labeled_value(stream_live, 1, "Mode (live)", self.stream_coach_platform_status_var)
+        self._add_labeled_value(stream_live, 2, "Dry-run / apply", self.stream_coach_dry_run_status_var)
+        self._add_labeled_value(stream_live, 3, "Alive", self.stream_coach_alive_status_var)
+        self._add_labeled_value(stream_live, 4, "Last message", self.stream_coach_last_message_var)
+        self._add_labeled_value(stream_live, 5, "Last parsed command", self.stream_coach_last_parsed_command_var)
+        self._add_labeled_value(stream_live, 6, "Last applied command", self.stream_coach_last_applied_command_var)
+        self._add_labeled_value(stream_live, 7, "Accepted / rejected", self.stream_coach_accept_reject_var)
+        self._add_labeled_value(stream_live, 8, "Last reject reason", self.stream_coach_last_reject_reason_var)
+        self._add_labeled_value(stream_live, 9, "Pending count", self.stream_coach_pending_count_var)
+        self._add_labeled_value(stream_live, 10, "Top command", self.stream_coach_top_command_var)
+        self._add_labeled_value(stream_live, 11, "Last selected command", self.stream_coach_last_selected_command_var)
+        self._add_labeled_value(stream_live, 12, "Last selected action", self.stream_coach_last_action_var)
+        self._add_labeled_value(stream_live, 13, "Rejected command count", self.stream_coach_rejected_count_var)
+        self._add_labeled_value(stream_live, 14, "Last vote count", self.stream_coach_last_vote_count_var)
+        self._add_labeled_value(stream_live, 15, "Override count", self.stream_coach_override_count_var)
+        self._add_labeled_value(stream_live, 16, "Match count", self.stream_coach_match_count_var)
+        self._add_labeled_value(stream_live, 17, "Reward total", self.stream_coach_reward_total_var)
+
+        fusion = ttk.LabelFrame(content, text="Fusion Coach")
+        fusion.grid(row=3, column=0, sticky="ew", padx=8, pady=(3, 6))
+        fusion.columnconfigure(1, weight=1)
+        ttk.Checkbutton(fusion, text="Enable fusion planning", variable=self.coach_allow_fusion_planning_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(fusion, text="Enable fusion bridge", variable=self.fusion_bridge_enabled_var).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3
+        )
+        self._add_labeled_value(fusion, 1, "Fusion bridge available", self.fusion_bridge_available_var)
+        self._add_labeled_value(fusion, 2, "Fusion bridge enabled (live)", self.fusion_bridge_enabled_status_var)
+        self._add_labeled_value(fusion, 3, "Last fusion command", self.fusion_last_command_var)
+        self._add_labeled_value(fusion, 4, "Last fusion result", self.fusion_last_result_var)
+        self._add_labeled_value(fusion, 5, "Fusion attempt count", self.fusion_attempt_count_var)
+        self._add_labeled_value(fusion, 6, "Fusion success count", self.fusion_success_count_var)
+        self._add_labeled_value(fusion, 7, "Fusion failure count", self.fusion_failure_count_var)
+        self._add_labeled_value(fusion, 8, "Fusion rejected count", self.fusion_rejected_count_var)
+
     def _build_runs_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         paths = ttk.LabelFrame(parent, text="Runs and Models")
@@ -599,6 +784,19 @@ class PvZDashboard:
         entry = ttk.Entry(parent, textvariable=variable, width=width)
         entry.grid(row=row, column=column + 1, columnspan=columnspan, sticky="ew", padx=6, pady=2)
         return entry
+
+    def _add_labeled_value(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        width: int = 64,
+    ) -> ttk.Label:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
+        value = ttk.Label(parent, textvariable=variable, anchor="w", width=width)
+        value.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
+        return value
 
     def _add_launch_button(self, parent: ttk.Frame, text: str, command: Any) -> ttk.Button:
         button = ttk.Button(parent, text=text, command=command)
@@ -730,6 +928,7 @@ class PvZDashboard:
             self.generalist_unlock_delay_var,
             self.generalist_new_plant_prob_var,
             self.generalist_run_dir_var,
+            self.generalist_resume_model_path_var,
             self.generalist_eval_model_path_var,
             self.generalist_eval_episodes_var,
             self.generalist_unlock_curriculum_var,
@@ -755,6 +954,24 @@ class PvZDashboard:
             self.level3_tactical_masks_var,
             self.level3_wallnut_mask_var,
             self.level3_cherrybomb_mask_var,
+            self.human_coach_enabled_var,
+            self.human_coach_reward_var,
+            self.human_coach_bonus_var,
+            self.human_coach_match_bonus_var,
+            self.human_coach_override_penalty_var,
+            self.human_coach_log_path_var,
+            self.human_coach_command_path_var,
+            self.stream_coach_enabled_var,
+            self.stream_coach_platform_var,
+            self.stream_coach_window_sec_var,
+            self.stream_coach_min_votes_var,
+            self.stream_coach_max_actions_per_minute_var,
+            self.stream_coach_reward_var,
+            self.stream_coach_dry_run_var,
+            self.stream_coach_log_path_var,
+            self.stream_coach_mock_script_var,
+            self.coach_allow_fusion_planning_var,
+            self.fusion_bridge_enabled_var,
         ]
         for variable in variables:
             variable.trace_add("write", lambda *_args: self._update_command_previews())
@@ -800,6 +1017,49 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--auto-select-seeds", self.auto_select_seeds_var.get())
         self._add_enabled_flag(command, "--debug-perf", self.debug_perf_var.get())
         command.extend(["--fusion-policy", self.fusion_policy_var.get().strip() or "none"])
+        self._append_coach_flags(command)
+
+    def _append_coach_flags(self, command: List[str]) -> None:
+        human_enabled = bool(self.human_coach_enabled_var.get())
+        stream_enabled = bool(self.stream_coach_enabled_var.get())
+        self._add_enabled_flag(command, "--human-coach-enabled", human_enabled)
+        if human_enabled:
+            self._add_enabled_flag(command, "--human-coach-reward", self.human_coach_reward_var.get())
+            self._add_optional_value(command, "--coach-legal-execution-reward", self.human_coach_bonus_var.get())
+            self._add_optional_value(command, "--coach-match-reward", self.human_coach_match_bonus_var.get())
+            self._add_optional_value(command, "--coach-override-penalty", self.human_coach_override_penalty_var.get())
+            self._add_optional_value(command, "--human-coach-log-path", self.human_coach_log_path_var.get())
+            self._add_optional_value(command, "--human-coach-command-path", self.human_coach_command_path_var.get())
+
+        self._add_enabled_flag(command, "--stream-coach-enabled", stream_enabled)
+        if stream_enabled:
+            command.extend(["--stream-coach-mode", self.stream_coach_platform_var.get().strip() or STREAM_COACH_PLATFORMS[0]])
+            command.extend(["--stream-coach-platform", self.stream_coach_platform_var.get().strip() or STREAM_COACH_PLATFORMS[0]])
+            self._add_optional_value(command, "--stream-coach-window-sec", self.stream_coach_window_sec_var.get())
+            self._add_optional_value(command, "--stream-coach-min-votes", self.stream_coach_min_votes_var.get())
+            self._add_optional_value(
+                command,
+                "--stream-coach-max-actions-per-minute",
+                self.stream_coach_max_actions_per_minute_var.get(),
+            )
+            self._add_enabled_flag(command, "--stream-coach-reward", self.stream_coach_reward_var.get())
+            dry_run_var = getattr(self, "stream_coach_dry_run_var", None)
+            dry_run_enabled = True if dry_run_var is None else bool(dry_run_var.get())
+            if dry_run_enabled:
+                command.append("--stream-coach-dry-run")
+            else:
+                command.append("--stream-coach-apply")
+            self._add_optional_value(command, "--stream-coach-command-path", self.human_coach_command_path_var.get())
+            self._add_optional_value(command, "--stream-coach-log-path", self.stream_coach_log_path_var.get())
+            mock_script_var = getattr(self, "stream_coach_mock_script_var", None)
+            self._add_optional_value(
+                command,
+                "--stream-coach-mock-script",
+                "" if mock_script_var is None else mock_script_var.get(),
+            )
+
+        self._add_enabled_flag(command, "--coach-allow-fusion-planning", self.coach_allow_fusion_planning_var.get())
+        self._add_enabled_flag(command, "--fusion-bridge-enabled", self.fusion_bridge_enabled_var.get())
 
     def _append_live_status_arg(self, command: List[str]) -> None:
         command.extend(["--live-status-path", self._path_for_command(self.live_status_path)])
@@ -869,6 +1129,7 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--wallnut-tactical-mask", self.adventure_wallnut_mask_var.get())
         self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.adventure_cherrybomb_mask_var.get())
         command.extend(["--fusion-policy", self.adventure_fusion_policy_var.get().strip() or "none"])
+        self._append_coach_flags(command)
         self._append_live_status_arg(command)
         return command
 
@@ -877,6 +1138,7 @@ class PvZDashboard:
         self._add_optional_value(command, "--total-timesteps", self.generalist_total_timesteps_var.get())
         self._add_optional_value(command, "--checkpoint-freq", self.generalist_checkpoint_freq_var.get())
         self._add_optional_value(command, "--initial-loadout", self.generalist_initial_loadout_var.get())
+        self._add_optional_value(command, "--seed-list", self.generalist_initial_loadout_var.get())
         command.extend(["--action-space-mode", ADVENTURE_GENERALIST_ACTION_SPACE_MODE])
         self._add_optional_value(command, "--max-seed-slots", self.generalist_max_seed_slots_var.get())
         self._add_optional_value(command, "--adventure-start-level", self.generalist_start_level_var.get())
@@ -896,6 +1158,7 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--wait-gameplay-ready", self.generalist_wait_gameplay_ready_var.get())
         self._add_enabled_flag(command, "--unlock-aware-seed-curriculum", self.generalist_unlock_curriculum_var.get())
         self._add_optional_value(command, "--seed-curriculum", self.generalist_curriculum_var.get())
+        self._add_enabled_flag(command, "--randomize-seed-order", self.generalist_randomize_seed_order_var.get())
         self._add_optional_value(command, "--unlock-introduction-delay", self.generalist_unlock_delay_var.get())
         self._add_optional_value(command, "--new-plant-min-inclusion-prob", self.generalist_new_plant_prob_var.get())
         self._add_enabled_flag(command, "--adventure-replay-cleared-levels", self.generalist_replay_cleared_var.get())
@@ -910,9 +1173,13 @@ class PvZDashboard:
         self._add_enabled_flag(command, "--tactical-masks", self.generalist_tactical_masks_var.get())
         self._add_enabled_flag(command, "--wallnut-tactical-mask", self.generalist_wallnut_mask_var.get())
         self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.generalist_cherrybomb_mask_var.get())
+        resume_model_path = self.generalist_resume_model_path_var.get().strip()
+        if resume_model_path:
+            command.extend(["--resume-model-path", str(self._resolve_text_path(resume_model_path))])
         run_dir = self.generalist_run_dir_var.get().strip()
         if run_dir:
             command.extend(["--run-dir", run_dir])
+        self._append_coach_flags(command)
         self._append_live_status_arg(command)
         return command
 
@@ -923,6 +1190,7 @@ class PvZDashboard:
             command.extend(["--model-path", str(self._resolve_text_path(model_path))])
         self._add_optional_value(command, "--episodes", self.generalist_eval_episodes_var.get())
         self._add_optional_value(command, "--initial-loadout", self.generalist_initial_loadout_var.get())
+        self._add_optional_value(command, "--seed-list", self.generalist_initial_loadout_var.get())
         command.extend(["--action-space-mode", ADVENTURE_GENERALIST_ACTION_SPACE_MODE])
         self._add_optional_value(command, "--max-seed-slots", self.generalist_max_seed_slots_var.get())
         self._add_optional_value(command, "--adventure-start-level", self.generalist_start_level_var.get())
@@ -946,6 +1214,7 @@ class PvZDashboard:
         run_dir = self.generalist_run_dir_var.get().strip()
         if run_dir:
             command.extend(["--run-dir", run_dir])
+        self._append_coach_flags(command)
         self._append_live_status_arg(command)
         return command
 
@@ -1015,6 +1284,7 @@ class PvZDashboard:
                 lines.extend(["", "Note: --adventure-eval is required for this launch button."])
             self._set_text_widget(self.adventure_preview, "\n".join(lines))
         if self.generalist_preview is not None:
+            resume_model_path = self.generalist_resume_model_path_var.get().strip()
             lines = [
                 "Adventure Generalist Train:",
                 self._command_text(self._build_adventure_generalist_command()),
@@ -1025,11 +1295,15 @@ class PvZDashboard:
                 lines.append(self._command_text(self._build_adventure_generalist_eval_command()))
             else:
                 lines.append("model_path is required for Adventure Generalist eval")
+            if resume_model_path:
+                lines.extend(["", f"Resume training model zip: {self._path_for_display(resume_model_path)}"])
+            else:
+                lines.extend(["", "Resume training model zip: (blank -> fresh model initialization)"])
             lines.extend(
                 [
                     "",
                     f"Model family: {ADVENTURE_GENERALIST_MODEL_FAMILY}",
-                    "Fresh 14-slot identity architecture; not a 4-slot checkpoint continuation.",
+                    "Resume supported via --resume-model-path; eval uses the separate Eval model .zip field.",
                 ]
             )
             self._set_text_widget(self.generalist_preview, "\n".join(lines))
@@ -1160,12 +1434,27 @@ class PvZDashboard:
         self._add_labeled_entry(settings, 4, 0, "Soft Max Steps", self.generalist_soft_max_steps_var)
         self._add_labeled_entry(settings, 4, 2, "Hard Max Steps", self.generalist_hard_max_steps_var)
         self._add_labeled_entry(settings, 5, 0, "Run dir", self.generalist_run_dir_var, width=48, columnspan=3)
-        self._add_labeled_entry(settings, 6, 0, "Eval model .zip", self.generalist_eval_model_path_var, width=44, columnspan=2)
-        ttk.Button(settings, text="Browse", command=self.browse_generalist_eval_model).grid(row=6, column=3, sticky="w", padx=(0, 5), pady=2)
-        ttk.Button(settings, text="Refresh", command=self.refresh_generalist_eval_model).grid(row=6, column=4, sticky="w", padx=(0, 6), pady=2)
-        self._add_labeled_entry(settings, 7, 0, "Eval episodes", self.generalist_eval_episodes_var)
+        self._add_labeled_entry(
+            settings,
+            6,
+            0,
+            "Resume training model .zip",
+            self.generalist_resume_model_path_var,
+            width=44,
+            columnspan=2,
+        )
+        ttk.Button(settings, text="Browse", command=self.browse_generalist_resume_model).grid(
+            row=6, column=3, sticky="w", padx=(0, 5), pady=2
+        )
+        ttk.Button(settings, text="Refresh", command=self.refresh_generalist_resume_model).grid(
+            row=6, column=4, sticky="w", padx=(0, 6), pady=2
+        )
+        self._add_labeled_entry(settings, 7, 0, "Eval model .zip", self.generalist_eval_model_path_var, width=44, columnspan=2)
+        ttk.Button(settings, text="Browse", command=self.browse_generalist_eval_model).grid(row=7, column=3, sticky="w", padx=(0, 5), pady=2)
+        ttk.Button(settings, text="Refresh", command=self.refresh_generalist_eval_model).grid(row=7, column=4, sticky="w", padx=(0, 6), pady=2)
+        self._add_labeled_entry(settings, 8, 0, "Eval episodes", self.generalist_eval_episodes_var)
         self._add_launch_button(settings, "Start Adventure Generalist Eval", self.start_adventure_generalist_eval).grid(
-            row=7, column=2, sticky="w", padx=6, pady=2
+            row=8, column=2, sticky="w", padx=6, pady=2
         )
 
         curriculum = ttk.LabelFrame(scroll_content, text="Advanced Curriculum / Unlock Behavior")
@@ -1174,6 +1463,7 @@ class PvZDashboard:
             curriculum.columnconfigure(column, weight=1)
         ttk.Checkbutton(curriculum, text="unlock-aware", variable=self.generalist_unlock_curriculum_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(curriculum, text="replay cleared", variable=self.generalist_replay_cleared_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(curriculum, text="randomize seed order", variable=self.generalist_randomize_seed_order_var).grid(row=1, column=0, sticky="w", padx=6, pady=3)
         ttk.Label(curriculum, text="curriculum").grid(row=0, column=2, sticky="w", padx=6, pady=3)
         ttk.Combobox(
             curriculum,
@@ -1182,15 +1472,15 @@ class PvZDashboard:
             state="readonly",
             width=14,
         ).grid(row=0, column=3, sticky="w", padx=6, pady=3)
-        self._add_labeled_entry(curriculum, 1, 0, "Unlock delay", self.generalist_unlock_delay_var)
-        self._add_labeled_entry(curriculum, 1, 2, "New plant min prob", self.generalist_new_plant_prob_var)
-        self._add_labeled_entry(curriculum, 2, 0, "Frontier prob", self.generalist_frontier_prob_var)
-        self._add_labeled_entry(curriculum, 2, 2, "Recent prob", self.generalist_recent_prob_var)
-        self._add_labeled_entry(curriculum, 3, 0, "Maintenance prob", self.generalist_maintenance_prob_var)
+        self._add_labeled_entry(curriculum, 1, 2, "Unlock delay", self.generalist_unlock_delay_var)
+        self._add_labeled_entry(curriculum, 2, 0, "New plant min prob", self.generalist_new_plant_prob_var)
+        self._add_labeled_entry(curriculum, 2, 2, "Frontier prob", self.generalist_frontier_prob_var)
+        self._add_labeled_entry(curriculum, 3, 0, "Recent prob", self.generalist_recent_prob_var)
+        self._add_labeled_entry(curriculum, 3, 2, "Maintenance prob", self.generalist_maintenance_prob_var)
         self._add_labeled_entry(
             curriculum,
-            3,
-            2,
+            4,
+            0,
             "Wins in a row before level promotion",
             self.generalist_frontier_win_streak_required_var,
         )
@@ -1223,6 +1513,41 @@ class PvZDashboard:
         widget.delete("1.0", "end")
         widget.insert("1.0", content)
         widget.configure(state="disabled")
+
+    def _coach_command_queue_path(self) -> Path:
+        raw_path = self.human_coach_command_path_var.get().strip() or str(DEFAULT_COACH_COMMAND_QUEUE_PATH)
+        return self._resolve_text_path(raw_path)
+
+    def send_human_coach_command(self) -> None:
+        raw_command = self.human_coach_command_input_var.get().strip()
+        if not raw_command:
+            self.coach_queue_status_var.set("Queue error: command input is empty")
+            self._append_log("ERROR: Coach command input is empty.\n")
+            return
+        try:
+            queue_path = self._coach_command_queue_path()
+        except (OSError, ValueError) as exc:
+            self.coach_queue_status_var.set(f"Queue error: invalid queue path ({exc})")
+            self._append_log(f"ERROR: Invalid coach command queue path: {exc}\n")
+            return
+        payload = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "source": "gui",
+            "command": raw_command,
+        }
+        try:
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        except OSError as exc:
+            self.coach_queue_status_var.set(f"Queue error: write failed ({exc})")
+            self._append_log(f"ERROR: Failed to append coach command to queue: {exc}\n")
+            return
+        self.human_coach_command_input_var.set("")
+        self.coach_queue_status_var.set(
+            f"Queued command at {time.strftime('%H:%M:%S')} (pending environment parse)"
+        )
+        self._append_log(f"Queued coach command to {queue_path}: {raw_command}\n")
 
     def start_training(self) -> None:
         if self.fast_only_var.get():
@@ -1299,7 +1624,15 @@ class PvZDashboard:
         if self.generalist_max_seed_slots_var.get().strip() != "14":
             self._append_log("ERROR: Adventure Generalist training requires max seed slots = 14.\n")
             return
-        self._append_log("Launching Adventure Generalist training...\n")
+        raw_resume_path = self.generalist_resume_model_path_var.get().strip()
+        if raw_resume_path:
+            resume_path = self._resolve_text_path(raw_resume_path)
+            if not resume_path.exists():
+                self._append_log(f"ERROR: Adventure Generalist resume model does not exist: {resume_path}\n")
+                return
+            self._append_log(f"Launching Adventure Generalist training (resume): {resume_path}\n")
+        else:
+            self._append_log("Launching Adventure Generalist training (fresh model initialization)...\n")
         self.launch_process("Start Adventure Generalist Train", self._build_adventure_generalist_command())
 
     def start_adventure_generalist_eval(self) -> None:
@@ -1377,10 +1710,13 @@ class PvZDashboard:
             return
         self._append_log(f"\nStarting subprocess: {name}\n")
         model_path = self._command_arg(command, "--model-path")
+        resume_model_path = self._command_arg(command, "--resume-model-path")
         run_dir = self._command_arg(command, "--run-dir")
         live_status_arg = self._command_arg(command, "--live-status-path")
         if model_path:
             self._append_log(f"Selected model path: {model_path}\n")
+        if resume_model_path:
+            self._append_log(f"Selected resume model path: {resume_model_path}\n")
         if live_status_arg:
             try:
                 resolved_live_status = self._resolve_text_path(live_status_arg)
@@ -1540,6 +1876,17 @@ class PvZDashboard:
             self.generalist_eval_model_path_var.set(filename)
             self._append_log(f"Selected Adventure Generalist eval model path: {filename}\n")
 
+    def browse_generalist_resume_model(self) -> None:
+        initial_dir = self.repo_root / "runs"
+        filename = filedialog.askopenfilename(
+            title="Select Adventure Generalist resume model.zip",
+            initialdir=str(initial_dir if initial_dir.exists() else self.repo_root),
+            filetypes=[("Zip models", "*.zip"), ("All files", "*.*")],
+        )
+        if filename:
+            self.generalist_resume_model_path_var.set(filename)
+            self._append_log(f"Selected Adventure Generalist resume model path: {filename}\n")
+
     def browse_run_folder(self) -> None:
         initial_dir = self.repo_root / "runs"
         dirname = filedialog.askdirectory(
@@ -1573,6 +1920,14 @@ class PvZDashboard:
             return
         self.generalist_eval_model_path_var.set(str(model))
         self._append_log(f"Refresh Adventure Generalist eval model: selected newest metadata-backed model path: {model}\n")
+
+    def refresh_generalist_resume_model(self) -> None:
+        model = self._find_newest_usable_model_zip()
+        if model is None:
+            self._append_log("Refresh Adventure Generalist resume model: no metadata-backed .zip models found under runs.\n")
+            return
+        self.generalist_resume_model_path_var.set(str(model))
+        self._append_log(f"Refresh Adventure Generalist resume model: selected newest metadata-backed model path: {model}\n")
 
     def open_run_folder(self) -> None:
         path = self._selected_run_dir()
@@ -2135,6 +2490,7 @@ class PvZDashboard:
         message = f"No live status available ({health})."
         self._set_adventure_status(self._adventure_status_content({}, health=health, using_last_good=False))
         self._set_generalist_status(self._generalist_status_content({}, health=health, using_last_good=False))
+        self._set_coach_live_fields({})
         for title in list(self.panels):
             if title == "Rows":
                 self._set_panel(title, "No row diagnostics in live_status.json")
@@ -2168,6 +2524,7 @@ class PvZDashboard:
             compatibility = {**compatibility, **model_compatibility}
         self._set_adventure_status(self._adventure_status_content(payload, health=health, using_last_good=using_last_good))
         self._set_generalist_status(self._generalist_status_content(payload, health=health, using_last_good=using_last_good))
+        self._set_coach_live_fields(payload)
 
         self._set_panel(
             "Adventure",
@@ -2345,6 +2702,203 @@ class PvZDashboard:
             ),
         )
 
+    def _live_value_text(self, payload: Dict[str, Any], paths: List[str], default: str = "n/a") -> str:
+        value = self._first_value(payload, paths, default=MISSING)
+        if value is MISSING or value in (None, ""):
+            return default
+        return fmt_value(value)
+
+    def _set_coach_live_fields(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            payload = {}
+        for var_name in (
+            "human_coach_enabled_status_var",
+            "human_coach_last_command_var",
+            "human_coach_last_action_var",
+            "human_coach_last_error_var",
+            "human_coach_override_count_var",
+            "human_coach_match_count_var",
+            "human_coach_reward_total_var",
+            "stream_coach_enabled_status_var",
+            "stream_coach_platform_status_var",
+            "stream_coach_dry_run_status_var",
+            "stream_coach_alive_status_var",
+            "stream_coach_last_message_var",
+            "stream_coach_last_parsed_command_var",
+            "stream_coach_last_applied_command_var",
+            "stream_coach_accept_reject_var",
+            "stream_coach_last_reject_reason_var",
+            "stream_coach_pending_count_var",
+            "stream_coach_top_command_var",
+            "stream_coach_last_selected_command_var",
+            "stream_coach_last_action_var",
+            "stream_coach_rejected_count_var",
+            "stream_coach_last_vote_count_var",
+            "stream_coach_override_count_var",
+            "stream_coach_match_count_var",
+            "stream_coach_reward_total_var",
+            "fusion_bridge_available_var",
+            "fusion_bridge_enabled_status_var",
+            "fusion_last_command_var",
+            "fusion_last_result_var",
+            "fusion_attempt_count_var",
+            "fusion_success_count_var",
+            "fusion_failure_count_var",
+            "fusion_rejected_count_var",
+        ):
+            if not hasattr(self, var_name):
+                setattr(self, var_name, _FallbackStringVar())
+        self.human_coach_enabled_status_var.set(
+            self._live_value_text(payload, ["human_coach_enabled", "human_coach.human_coach_enabled"])
+        )
+        self.human_coach_last_command_var.set(
+            self._live_value_text(
+                payload,
+                [
+                    "human_coach_last_command",
+                    "human_coach.command",
+                    "human_coach.last_command",
+                ],
+            )
+        )
+        self.human_coach_last_action_var.set(
+            self._live_value_text(
+                payload,
+                [
+                    "human_coach_last_action",
+                    "human_coach.last_action",
+                    "human_coach.validation.policy_action",
+                ],
+            )
+        )
+        self.human_coach_last_error_var.set(
+            self._live_value_text(
+                payload,
+                [
+                    "human_coach_last_error",
+                    "human_coach.last_error",
+                    "human_coach_last_rejected_reason",
+                    "human_coach.last_rejected_reason",
+                    "human_coach.rejected_reason",
+                    "fusion_last_rejected_reason",
+                    "fusion_last_bridge_result_reason",
+                    "stream_fusion_last_bridge_result_reason",
+                ],
+            )
+        )
+        self.human_coach_override_count_var.set(
+            self._live_value_text(payload, ["human_coach_override_count", "human_coach.override_count"])
+        )
+        self.human_coach_match_count_var.set(
+            self._live_value_text(payload, ["human_coach_match_count", "human_coach.match_count"])
+        )
+        self.human_coach_reward_total_var.set(
+            self._live_value_text(payload, ["human_coach_reward_total", "human_coach.reward_total"])
+        )
+
+        self.stream_coach_enabled_status_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_enabled", "stream_coach.stream_coach_enabled", "stream_coach_enabled"])
+        )
+        self.stream_coach_platform_status_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_mode", "stream_coach.stream_coach_mode", "stream_coach_mode", "coach.stream_coach_platform", "stream_coach_platform", "stream_coach.stream_coach_platform"])
+        )
+        dry_run = self._first_value(
+            payload,
+            ["coach.stream_coach_dry_run", "stream_coach.stream_coach_dry_run", "stream_coach_dry_run"],
+            default="n/a",
+        )
+        apply_enabled = self._first_value(
+            payload,
+            ["coach.stream_coach_apply_enabled", "stream_coach.stream_coach_apply_enabled", "stream_coach_apply_enabled"],
+            default="n/a",
+        )
+        dry_run_status_var = getattr(self, "stream_coach_dry_run_status_var", None)
+        if dry_run_status_var is not None:
+            dry_run_status_var.set(f"dry-run={fmt_value(dry_run)} / apply={fmt_value(apply_enabled)}")
+        self.stream_coach_alive_status_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_alive_status", "stream_coach.stream_coach_alive_status", "stream_coach_alive_status", "coach.stream_coach_alive", "stream_coach.stream_coach_alive", "stream_coach_alive"])
+        )
+        self.stream_coach_last_message_var.set(
+            self._live_value_text(payload, ["coach.last_stream_message", "stream_coach.last_stream_message", "last_stream_message", "coach.stream_coach_last_message", "stream_coach_last_message", "stream_coach.stream_coach_last_message"])
+        )
+        self.stream_coach_last_parsed_command_var.set(
+            self._live_value_text(payload, ["coach.last_stream_parsed_command", "stream_coach.last_stream_parsed_command", "last_stream_parsed_command", "coach.stream_coach_last_parsed_command", "stream_coach_last_parsed_command", "stream_coach.stream_coach_last_parsed_command"])
+        )
+        self.stream_coach_last_applied_command_var.set(
+            self._live_value_text(payload, ["coach.last_applied_coach_command", "stream_coach.last_applied_coach_command", "last_applied_coach_command", "coach.stream_coach_last_applied_command", "stream_coach_last_applied_command", "stream_coach.stream_coach_last_applied_command"])
+        )
+        accepted = self._first_value(
+            payload,
+            ["coach.stream_commands_accepted", "stream_coach.stream_commands_accepted", "stream_commands_accepted", "coach.mock_stream_commands_accepted", "mock_stream_commands_accepted", "coach.stream_coach_commands_accepted", "stream_coach_commands_accepted", "stream_coach.stream_coach_commands_accepted"],
+            default="n/a",
+        )
+        rejected = self._first_value(
+            payload,
+            ["coach.stream_commands_rejected", "stream_coach.stream_commands_rejected", "stream_commands_rejected", "coach.mock_stream_commands_rejected", "mock_stream_commands_rejected", "coach.stream_coach_commands_rejected", "stream_coach_commands_rejected", "stream_coach.stream_coach_commands_rejected"],
+            default="n/a",
+        )
+        status = self._first_value(
+            payload,
+            ["coach.last_stream_command_status", "stream_coach.last_stream_command_status", "last_stream_command_status", "coach.stream_coach_last_command_status", "stream_coach_last_command_status", "stream_coach.stream_coach_last_command_status"],
+            default="n/a",
+        )
+        self.stream_coach_accept_reject_var.set(f"{accepted} / {rejected} ({status})")
+        self.stream_coach_last_reject_reason_var.set(
+            self._live_value_text(payload, ["coach.last_stream_reject_reason", "stream_coach.last_stream_reject_reason", "last_stream_reject_reason", "coach.stream_coach_last_reject_reason", "stream_coach_last_reject_reason", "stream_coach.stream_coach_last_reject_reason"])
+        )
+        self.stream_coach_pending_count_var.set(
+            self._live_value_text(payload, ["coach.pending_stream_commands", "stream_coach.pending_stream_commands", "pending_stream_commands", "stream_coach_pending_message_count"])
+        )
+        self.stream_coach_top_command_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_top_commands", "stream_coach.stream_coach_top_commands", "stream_coach_top_commands", "stream_coach.top_commands"])
+        )
+        self.stream_coach_last_selected_command_var.set(
+            self._live_value_text(payload, ["coach.last_validated_coach_command", "stream_coach.last_validated_coach_command", "last_validated_coach_command", "coach.stream_coach_last_command", "stream_coach_last_command", "stream_coach.stream_coach_last_command"])
+        )
+        self.stream_coach_last_action_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_last_action", "stream_coach.stream_coach_last_action", "stream_coach_last_action"])
+        )
+        self.stream_coach_rejected_count_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_rejected_count", "stream_coach.stream_coach_rejected_count", "stream_coach_rejected_count"])
+        )
+        self.stream_coach_last_vote_count_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_last_vote_count", "stream_coach.stream_coach_last_vote_count", "stream_coach_last_vote_count"])
+        )
+        self.stream_coach_override_count_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_override_count", "stream_coach.stream_coach_override_count", "stream_coach_override_count"])
+        )
+        self.stream_coach_match_count_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_match_count", "stream_coach.stream_coach_match_count", "stream_coach_match_count"])
+        )
+        self.stream_coach_reward_total_var.set(
+            self._live_value_text(payload, ["coach.stream_coach_reward_total", "stream_coach.stream_coach_reward_total", "stream_coach_reward_total"])
+        )
+
+        self.fusion_bridge_enabled_status_var.set(
+            self._live_value_text(payload, ["fusion_bridge_enabled", "fusion.fusion_bridge_enabled"])
+        )
+        self.fusion_bridge_available_var.set(
+            self._live_value_text(payload, ["fusion_bridge_available", "fusion.fusion_bridge_available", "fusion.fusion_available"])
+        )
+        self.fusion_last_command_var.set(
+            self._live_value_text(payload, ["fusion_last_command", "fusion.fusion_last_command", "stream_fusion_last_command", "stream_coach.stream_fusion_last_command"])
+        )
+        self.fusion_last_result_var.set(
+            self._live_value_text(payload, ["fusion_last_result", "fusion.fusion_last_result", "stream_fusion_last_result", "stream_coach.stream_fusion_last_result"])
+        )
+        self.fusion_attempt_count_var.set(
+            self._live_value_text(payload, ["fusion_attempted_count", "fusion.fusion_attempted_count", "stream_coach_fusion_attempt_count", "stream_coach.stream_coach_fusion_attempt_count"])
+        )
+        self.fusion_success_count_var.set(
+            self._live_value_text(payload, ["fusion_success_count", "fusion.fusion_success_count", "stream_coach_fusion_success_count", "stream_coach.stream_coach_fusion_success_count"])
+        )
+        self.fusion_failure_count_var.set(
+            self._live_value_text(payload, ["fusion_failed_count", "fusion.fusion_failed_count", "stream_coach_fusion_failure_count", "stream_coach.stream_coach_fusion_failure_count"])
+        )
+        self.fusion_rejected_count_var.set(
+            self._live_value_text(payload, ["fusion_rejected_count", "fusion.fusion_rejected_count", "stream_coach_fusion_rejected_count", "stream_coach.stream_coach_fusion_rejected_count"])
+        )
+
     def _adventure_status_content(self, payload: Dict[str, Any], health: str, using_last_good: bool) -> str:
         if not isinstance(payload, dict):
             payload = {}
@@ -2506,6 +3060,30 @@ class PvZDashboard:
                 ),
                 ("reset_phase", self._first_value(payload, ["reset_phase", "adventure.reset_phase"], default="n/a")),
                 (
+                    "startup_validation",
+                    self._first_value(payload, ["startup_validation_reason", "adventure.startup_validation_reason"], default="n/a"),
+                ),
+                (
+                    "level_identity",
+                    self._first_value(payload, ["level_identity_reliable", "adventure.level_identity_reliable"], default="n/a"),
+                ),
+                (
+                    "wrapper_expected_level",
+                    self._first_value(payload, ["wrapper_expected_level", "adventure.wrapper_expected_level"], default="n/a"),
+                ),
+                (
+                    "bridge_detected_level",
+                    self._first_value(payload, ["bridge_detected_level", "adventure.bridge_detected_level"], default="n/a"),
+                ),
+                (
+                    "profile_adventure_level",
+                    self._first_value(payload, ["profile_adventure_level", "adventure.profile_adventure_level"], default="n/a"),
+                ),
+                (
+                    "screen_state",
+                    self._first_value(payload, ["screenState", "adventure.screenState", "screen.screen_state"], default="n/a"),
+                ),
+                (
                     "expected_transition",
                     self._first_value(payload, ["expected_transition_target", "adventure.expected_transition_target"], default="n/a"),
                 ),
@@ -2514,17 +3092,54 @@ class PvZDashboard:
                     self._first_value(payload, ["seed_selection_expected", "adventure.seed_selection_expected"], default="n/a"),
                 ),
                 ("replay_support", replay_status),
+                ("replay_seed_attempts", self._first_value(payload, ["frontier_replay_seed_selection_attempts", "adventure.frontier_replay_seed_selection_attempts"], default="n/a")),
+                ("replay_seed_ok", self._first_value(payload, ["frontier_replay_last_seed_selection_ok", "adventure.frontier_replay_last_seed_selection_ok"], default="n/a")),
+                ("replay_seed_msg", self._first_value(payload, ["frontier_replay_last_seed_selection_message", "adventure.frontier_replay_last_seed_selection_message"], default="n/a")),
                 ("latest_unlock", self._first_value(payload, ["latest_unlock", "unlock.latest_unlock", "adventure.latest_unlock"], default="n/a")),
                 ("unlocked_seeds", self._first_value(payload, ["unlocked_seeds", "unlock.unlocked_seeds", "adventure.unlocked_seeds"], default="n/a")),
                 ("eligible_seeds", self._first_value(payload, ["eligible_seeds", "unlock.eligible_seeds", "adventure.eligible_seeds"], default="n/a")),
                 ("selectable_seeds", self._first_value(payload, ["selectable_seeds", "unlock.selectable_seeds", "adventure.selectable_seeds"], default="n/a")),
                 ("observed_capacity", self._first_value(payload, ["observed_seed_bank_capacity", "adventure.observed_seed_bank_capacity"], default="n/a")),
+                ("effective_capacity", self._first_value(payload, ["effective_seed_capacity", "adventure.effective_seed_capacity"], default="n/a")),
+                ("bridge_capacity", self._first_value(payload, ["bridge_reported_capacity", "adventure.bridge_reported_capacity"], default="n/a")),
+                ("inferred_capacity", self._first_value(payload, ["inferred_capacity_from_unlocks", "adventure.inferred_capacity_from_unlocks"], default="n/a")),
+                ("capacity_source", self._first_value(payload, ["inferred_capacity_source", "adventure.inferred_capacity_source"], default="n/a")),
+                ("capacity_reason", self._first_value(payload, ["capacity_inference_reason", "adventure.capacity_inference_reason"], default="n/a")),
+                ("rejected_priority", self._first_value(payload, ["rejected_priority_seeds", "adventure.rejected_priority_seeds"], default="n/a")),
+                ("configured_seed_list", self._first_value(payload, ["configured_seed_list", "adventure.configured_seed_list"], default="n/a")),
                 ("selected_loadout", self._first_value(payload, ["selected_loadout", "adventure.selected_loadout"], default="n/a")),
                 ("selected_count", self._first_value(payload, ["selected_loadout_count", "adventure.selected_loadout_count"], default="n/a")),
                 ("inactive_slots", self._first_value(payload, ["inactive_model_slots", "adventure.inactive_model_slots"], default="n/a")),
+                ("seed_order_source", self._first_value(payload, ["seed_order_source", "adventure.seed_order_source"], default="n/a")),
+                ("seed_order_preserved", self._first_value(payload, ["seed_order_preserved", "adventure.seed_order_preserved"], default="n/a")),
+                ("seed_order_block", self._first_value(payload, ["seed_order_blocked_reason", "adventure.seed_order_blocked_reason"], default="n/a")),
+                ("seed_order_warning", self._first_value(payload, ["seed_order_warning", "adventure.seed_order_warning"], default="n/a")),
                 ("loadout_reason", self._first_value(payload, ["loadout_reason", "adventure.loadout_reason"], default="n/a")),
                 ("last_reset_reason", self._first_value(payload, ["last_reset_reason", "adventure.last_reset_reason"], default="n/a")),
                 ("post_win_block", self._first_value(payload, ["post_win_blocked_reason", "adventure.post_win_blocked_reason"], default="n/a")),
+                ("stream_enabled", self._first_value(payload, ["stream_coach_enabled", "human_coach_enabled"], default="n/a")),
+                ("stream_mode", self._first_value(payload, ["stream_coach_mode", "stream_coach_platform", "human_coach_platform"], default="n/a")),
+                ("stream_alive", self._first_value(payload, ["stream_coach_alive_status", "stream_coach_alive"], default="n/a")),
+                ("stream_script", self._first_value(payload, ["mock_stream_script", "stream_coach.mock_stream_script"], default="n/a")),
+                ("stream_seen", self._first_value(payload, ["mock_stream_messages_seen", "stream_coach_messages_seen"], default="n/a")),
+                ("stream_parsed", self._first_value(payload, ["mock_stream_commands_parsed", "stream_coach_commands_parsed"], default="n/a")),
+                ("stream_accepted", self._first_value(payload, ["mock_stream_commands_accepted", "stream_coach_commands_accepted"], default="n/a")),
+                ("stream_rejected_msgs", self._first_value(payload, ["mock_stream_commands_rejected", "stream_coach_commands_rejected"], default="n/a")),
+                ("stream_pending", self._first_value(payload, ["pending_stream_commands"], default="n/a")),
+                ("stream_last_msg", self._first_value(payload, ["last_stream_message", "stream_coach_last_message"], default="n/a")),
+                ("stream_last_parsed", self._first_value(payload, ["last_stream_parsed_command", "stream_coach_last_parsed_command"], default="n/a")),
+                ("stream_last_status", self._first_value(payload, ["last_stream_command_status", "stream_coach_last_command_status"], default="n/a")),
+                ("stream_last_reason", self._first_value(payload, ["last_stream_reject_reason", "stream_coach_last_reject_reason"], default="n/a")),
+                ("stream_last_cmd", self._first_value(payload, ["stream_coach_last_command", "human_coach_last_command"], default="n/a")),
+                ("stream_last_applied", self._first_value(payload, ["last_applied_coach_command", "stream_coach_last_applied_command"], default="n/a")),
+                ("stream_last_action", self._first_value(payload, ["stream_coach_last_action", "human_coach_last_action"], default="n/a")),
+                ("stream_top", self._first_value(payload, ["stream_coach_top_commands"], default="n/a")),
+                ("stream_last_reject", self._first_value(payload, ["stream_coach_last_rejected_command", "human_coach_last_rejected_command"], default="n/a")),
+                ("stream_votes", self._first_value(payload, ["stream_coach_last_vote_count", "human_coach_last_vote_count"], default="n/a")),
+                ("stream_overrides", self._first_value(payload, ["stream_coach_override_count", "human_coach_override_count"], default="n/a")),
+                ("stream_matches", self._first_value(payload, ["stream_coach_match_count", "human_coach_match_count"], default="n/a")),
+                ("stream_rejected", self._first_value(payload, ["stream_coach_rejected_count", "human_coach_rejected_count"], default="n/a")),
+                ("stream_reward", self._first_value(payload, ["stream_coach_reward_total", "human_coach_reward_total"], default="n/a")),
             ]
         )
 

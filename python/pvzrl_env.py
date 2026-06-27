@@ -124,6 +124,11 @@ REWARD_COMPONENT_FIELDS = (
     "high_danger_unanswered_penalty",
     "mower_exposure_penalty",
     "minimum_viable_defense_reward",
+    "coach_match_reward",
+    "coach_legal_execution_reward",
+    "coach_override_penalty",
+    "coach_fusion_success_reward",
+    "coach_tactical_usefulness_reward",
 )
 REWARD_EPISODE_TOTAL_FIELDS = tuple(f"{field}_total" for field in REWARD_COMPONENT_FIELDS)
 
@@ -189,6 +194,11 @@ class RewardConfig:
     high_danger_unanswered_penalty: float = 0.0
     mower_exposure_penalty: float = 0.0
     minimum_viable_defense_reward: float = 0.0
+    coach_match_reward: float = 0.02
+    coach_legal_execution_reward: float = 0.01
+    coach_override_penalty: float = -0.01
+    coach_fusion_success_reward: float = 0.03
+    coach_tactical_usefulness_reward: float = 0.01
     # Legacy config field kept for old configs; absolute proximity punishment is no longer applied.
     proximity_penalty: float = 0.01
     win_reward: float = 10.0
@@ -376,6 +386,11 @@ class EpisodeLog:
     high_danger_unanswered_penalty_total: float = 0.0
     mower_exposure_penalty_total: float = 0.0
     minimum_viable_defense_reward_total: float = 0.0
+    coach_match_reward_total: float = 0.0
+    coach_legal_execution_reward_total: float = 0.0
+    coach_override_penalty_total: float = 0.0
+    coach_fusion_success_reward_total: float = 0.0
+    coach_tactical_usefulness_reward_total: float = 0.0
     wait_while_actionable_threat_count: int = 0
     wait_while_peashooter_affordable_ready_count: int = 0
     wait_while_wallnut_affordable_ready_count: int = 0
@@ -847,6 +862,13 @@ class PvZGymEnv:
         self._reset_reason = ""
         self._reset_generation_id = 0
         self._accepted_board_requires_seed_gate = False
+        self._coach_command_queue_cleared_on_reset = True
+        self._startup_command_blocked = False
+        self._pending_fusion_command: Optional[Dict[str, Any]] = None
+        self._selected_bridge_command: Optional[Dict[str, Any]] = None
+        self._executed_coach_command_ids: set[int] = set()
+        self._last_executed_coach_command_id: Optional[int] = None
+        self._coach_fusion_fresh_after_timestamp = time.time()
         self._reset_reward_episode_state()
 
     def _run_mode(self) -> str:
@@ -959,11 +981,28 @@ class PvZGymEnv:
         self.undefended_threat_age_sum_by_row = [0 for _ in range(rows)]
         self.undefended_threat_age_count_by_row = [0 for _ in range(rows)]
 
+    def clear_coach_runtime_state(
+        self,
+        *,
+        queue_cleared: bool = True,
+        startup_command_blocked: bool = False,
+        reason: str = "reset",
+    ) -> None:
+        del reason
+        self._pending_fusion_command = None
+        self._selected_bridge_command = None
+        self._executed_coach_command_ids.clear()
+        self._last_fusion_diagnostics = default_fusion_diagnostics(self.config.fusion_policy)
+        self._coach_command_queue_cleared_on_reset = bool(queue_cleared)
+        self._startup_command_blocked = bool(startup_command_blocked)
+        self._coach_fusion_fresh_after_timestamp = time.time()
+
     def begin_new_attempt(self, observation: Optional[Dict[str, Any]] = None, reason: str = "") -> None:
         """Reset per-attempt reward and corruption state at a verified board boundary."""
         previous_lost_mower_rows = sorted(getattr(self, "_episode_lost_mower_rows", set()))
         previous_observation = self.previous_observation if isinstance(self.previous_observation, dict) else {}
         self._reset_reward_episode_state()
+        self.clear_coach_runtime_state(queue_cleared=True, startup_command_blocked=False, reason=reason or "new_attempt")
         if isinstance(observation, dict):
             self.previous_observation = observation
             self._steps_since_seed_screen_check = 0
@@ -1247,6 +1286,7 @@ class PvZGymEnv:
             or timeout_requires_seed_flow
             or reset_reason in {"win", "post_win_pending"}
         )
+        self.clear_coach_runtime_state(queue_cleared=True, startup_command_blocked=False, reason=reset_reason)
         self._saw_seed_selection_this_reset = False
         self._clicked_lets_rock_this_reset = False
         self._reset_reason = reset_reason
@@ -1266,6 +1306,8 @@ class PvZGymEnv:
             "fixedTrainTerminalHardReset": False,
             "resetRequiresSeedFlow": bool(self._reset_requires_seed_flow),
             "resetGenerationId": int(self._reset_generation_id),
+            "coach_command_queue_cleared_on_reset": True,
+            "startup_command_blocked": False,
         }
         if level3_start_state:
             reset_result["level3SpecialistStartState"] = level3_start_state
@@ -4126,7 +4168,368 @@ class PvZGymEnv:
                 return result, diagnostics
         return None, diagnostics
 
-    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+    def _coach_command_id_from_bridge_command(self, coach_bridge_command: Dict[str, Any]) -> Optional[int]:
+        try:
+            command_id = int(coach_bridge_command.get("coach_command_id") or 0)
+        except (TypeError, ValueError):
+            command_id = 0
+        return int(command_id) if command_id > 0 else None
+
+    def _coach_command_age_seconds(self, coach_bridge_command: Dict[str, Any]) -> Optional[float]:
+        try:
+            timestamp = float(coach_bridge_command.get("coach_command_timestamp") or 0.0)
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        if timestamp <= 0.0:
+            return None
+        return max(0.0, time.time() - timestamp)
+
+    def _coach_fusion_freshness_rejection(
+        self,
+        pre_observation: Dict[str, Any],
+        coach_bridge_command: Dict[str, Any],
+    ) -> str:
+        if not bool(pre_observation.get("gameplayReady")):
+            return "gameplay_not_ready"
+        command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
+        if command_id is None:
+            return "startup_stale_command_blocked"
+        if command_id in self._executed_coach_command_ids:
+            return "coach_command_already_executed"
+        if not bool(coach_bridge_command.get("executed_from_fresh_coach_command")):
+            return "startup_stale_command_blocked"
+        try:
+            command_timestamp = float(coach_bridge_command.get("coach_command_timestamp") or 0.0)
+        except (TypeError, ValueError):
+            command_timestamp = 0.0
+        if command_timestamp > 0.0 and command_timestamp + 1e-6 < float(self._coach_fusion_fresh_after_timestamp):
+            return "startup_stale_command_blocked"
+        return ""
+
+    def _blocked_coach_fusion_result(
+        self,
+        *,
+        reason: str,
+        requested_action: int,
+        executed_action: int,
+        candidate: Dict[str, Any],
+        coach_bridge_command: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        startup_blocked = str(reason) == "startup_stale_command_blocked"
+        if startup_blocked:
+            self._startup_command_blocked = True
+        command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
+        age_seconds = self._coach_command_age_seconds(coach_bridge_command)
+        scope = "startup_stale_command_blocked" if startup_blocked else "unknown"
+        return {
+            "action": int(executed_action),
+            "requestedAction": int(requested_action),
+            "executedAction": int(executed_action),
+            "fusionAttempted": False,
+            "fusionSucceeded": False,
+            "fusion_success": False,
+            "fusionOverrideApplied": False,
+            "coachFusionOverrideApplied": False,
+            "illegalAction": True,
+            "illegalReason": str(reason),
+            "fusionRejectedReason": str(reason),
+            "bridgeResultReason": str(reason),
+            "bridge_result_reason": str(reason),
+            "fusionScope": scope,
+            "fusion_scope": scope,
+            "requestedSourceRow": int(candidate.get("source_row", -1)),
+            "requestedSourceCol": int(candidate.get("source_col", -1)),
+            "requestedSourceInstanceId": int(candidate.get("source_instance_id", 0) or 0),
+            "requested_source_row": int(candidate.get("source_row", -1)),
+            "requested_source_col": int(candidate.get("source_col", -1)),
+            "requested_source_instance_id": int(candidate.get("source_instance_id", 0) or 0),
+            "sourceTileOccupiedBefore": False,
+            "source_tile_occupied_before": False,
+            "sourcePlantBefore": None,
+            "source_plant_before": None,
+            "resultingPlantAfter": None,
+            "resulting_plant_after": None,
+            "changedTileCount": 0,
+            "changed_tile_count": 0,
+            "changedTiles": [],
+            "changed_tiles": [],
+            "nonSourceTilesChanged": False,
+            "non_source_tiles_changed": False,
+            "globalFusionSideEffect": False,
+            "global_fusion_side_effect": False,
+            "duplicateStackDetected": False,
+            "duplicate_stack_detected": False,
+            "bridgeMethodUsed": "none",
+            "bridge_method_used": "none",
+            "executed_from_fresh_coach_command": False,
+            "coach_command_age_seconds": age_seconds,
+            "startup_command_blocked": bool(startup_blocked),
+            "coach_command_queue_cleared_on_reset": bool(self._coach_command_queue_cleared_on_reset),
+            "executed_coach_command_id": command_id,
+            "last_executed_coach_command_id": self._last_executed_coach_command_id,
+            "fusionCandidate": compact_candidate(candidate),
+        }
+
+    def _enforce_fusion_scope_contract(self, result: Dict[str, Any]) -> None:
+        if not isinstance(result, dict):
+            return
+        reported_success = bool(result.get("fusionSucceeded") or result.get("fusion_success") or result.get("fusionOverrideApplied"))
+        changed_tile_count = self._safe_int(result.get("changedTileCount"), result.get("changed_tile_count"), default=0)
+        changed_tiles = result.get("changedTiles")
+        if not isinstance(changed_tiles, list):
+            changed_tiles = result.get("changed_tiles")
+        if not isinstance(changed_tiles, list):
+            changed_tiles = []
+        requested_row = self._safe_int(result.get("requestedSourceRow"), result.get("requested_source_row"), default=-1)
+        requested_col = self._safe_int(result.get("requestedSourceCol"), result.get("requested_source_col"), default=-1)
+        non_source_changed = bool(
+            result.get("nonSourceTilesChanged")
+            if "nonSourceTilesChanged" in result
+            else result.get("non_source_tiles_changed")
+        )
+        global_side_effect = bool(
+            result.get("globalFusionSideEffect")
+            if "globalFusionSideEffect" in result
+            else result.get("global_fusion_side_effect")
+        )
+        source_tile_changed = False
+        for tile in changed_tiles:
+            if not isinstance(tile, dict):
+                continue
+            row = self._safe_int(tile.get("row"), tile.get("sourceRow"), tile.get("source_row"), default=-1)
+            col = self._safe_int(tile.get("column"), tile.get("col"), tile.get("sourceCol"), tile.get("source_col"), default=-1)
+            if row == requested_row and col == requested_col:
+                source_tile_changed = True
+            else:
+                non_source_changed = True
+        if not reported_success and not (non_source_changed or global_side_effect or changed_tile_count > 1):
+            return
+        if changed_tile_count == 1 and source_tile_changed and not non_source_changed and not global_side_effect:
+            return
+        failure_reason = "global_fusion_side_effect" if non_source_changed or global_side_effect or changed_tile_count > 1 else "fusion_no_effect"
+        bridge_reason = "fusion_mutated_non_source_tiles" if failure_reason == "global_fusion_side_effect" else failure_reason
+        result["fusionSucceeded"] = False
+        result["fusion_success"] = False
+        result["fusionOverrideApplied"] = False
+        result["coachFusionOverrideApplied"] = False
+        result["illegalAction"] = True
+        result["illegalReason"] = failure_reason
+        result["fusionRejectedReason"] = failure_reason
+        result["bridgeResultReason"] = bridge_reason
+        result["bridge_result_reason"] = bridge_reason
+        result["changedTileCount"] = changed_tile_count
+        result["changed_tile_count"] = changed_tile_count
+        result["changedTiles"] = changed_tiles
+        result["changed_tiles"] = changed_tiles
+        result["nonSourceTilesChanged"] = bool(non_source_changed)
+        result["non_source_tiles_changed"] = bool(non_source_changed)
+        result["globalFusionSideEffect"] = bool(failure_reason == "global_fusion_side_effect")
+        result["global_fusion_side_effect"] = bool(failure_reason == "global_fusion_side_effect")
+        if failure_reason == "global_fusion_side_effect":
+            result["fusionScope"] = "global_side_effect_detected"
+            result["fusion_scope"] = "global_side_effect_detected"
+        placement = result.get("placement")
+        if isinstance(placement, dict):
+            placement.update(
+                {
+                    "success": False,
+                    "illegalReason": failure_reason,
+                    "bridgeResultReason": bridge_reason,
+                    "bridge_result_reason": bridge_reason,
+                    "changedTileCount": changed_tile_count,
+                    "changed_tile_count": changed_tile_count,
+                    "changedTiles": changed_tiles,
+                    "changed_tiles": changed_tiles,
+                    "nonSourceTilesChanged": bool(non_source_changed),
+                    "non_source_tiles_changed": bool(non_source_changed),
+                    "globalFusionSideEffect": bool(failure_reason == "global_fusion_side_effect"),
+                    "global_fusion_side_effect": bool(failure_reason == "global_fusion_side_effect"),
+                }
+            )
+            if failure_reason == "global_fusion_side_effect":
+                placement["fusionScope"] = "global_side_effect_detected"
+                placement["fusion_scope"] = "global_side_effect_detected"
+
+    def _maybe_execute_coach_fusion_command(
+        self,
+        pre_observation: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+        requested_action: int,
+        executed_action: int,
+        action_count: int,
+        coach_bridge_command: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        if not isinstance(coach_bridge_command, dict):
+            return None, diagnostics
+        if str(coach_bridge_command.get("command") or "").strip().lower() != "fusion_step":
+            return None, diagnostics
+        candidate = self._coach_fusion_candidate_from_bridge_command(coach_bridge_command)
+        freshness_rejection = self._coach_fusion_freshness_rejection(pre_observation, coach_bridge_command)
+        if freshness_rejection:
+            result = self._blocked_coach_fusion_result(
+                reason=freshness_rejection,
+                requested_action=requested_action,
+                executed_action=executed_action,
+                candidate=candidate,
+                coach_bridge_command=coach_bridge_command,
+            )
+            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result, rejected_reason=freshness_rejection)
+            self._last_fusion_diagnostics = diagnostics
+            return result, diagnostics
+        rejection = self._coach_fusion_rejection_reason(pre_observation, candidate, action_count=action_count)
+        if rejection:
+            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, None, rejected_reason=rejection)
+            self._last_fusion_diagnostics = diagnostics
+            return None, diagnostics
+        command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
+        command_age_seconds = self._coach_command_age_seconds(coach_bridge_command)
+        try:
+            result = self.client.request(
+                "fusion_step",
+                source_instance_id=int(coach_bridge_command.get("source_instance_id") or 0),
+                source_row=int(coach_bridge_command.get("source_row")),
+                source_col=int(coach_bridge_command.get("source_col")),
+                source_plant_type=int(coach_bridge_command.get("source_plant_type")),
+                ingredient_seed_slot_index=int(coach_bridge_command.get("ingredient_seed_slot_index")),
+                ingredient_plant_type=int(coach_bridge_command.get("ingredient_plant_type")),
+                predicted_result_type=int(coach_bridge_command.get("predicted_result_type") or -1),
+                predicted_result_name=str(coach_bridge_command.get("predicted_result_name") or ""),
+                coach_command_id=int(command_id or 0),
+                coach_command_timestamp=float(coach_bridge_command.get("coach_command_timestamp") or 0.0),
+                executed_from_fresh_coach_command=True,
+                coach_command_age_seconds=command_age_seconds,
+                coach_command_queue_cleared_on_reset=bool(self._coach_command_queue_cleared_on_reset),
+                startup_command_blocked=False,
+                return_observation=False,
+            )
+        except Exception as exc:
+            diagnostics = apply_fusion_attempt_result(
+                diagnostics,
+                candidate,
+                None,
+                rejected_reason="exception",
+                bridge_error=str(exc),
+            )
+            self._last_fusion_diagnostics = diagnostics
+            return None, diagnostics
+        if isinstance(result, dict):
+            self._enforce_fusion_scope_contract(result)
+            if command_id is not None:
+                self._executed_coach_command_ids.add(int(command_id))
+                self._last_executed_coach_command_id = int(command_id)
+            result["requestedAction"] = int(requested_action)
+            result["executedAction"] = int(executed_action)
+            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
+            result["coachFusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
+            result["executed_from_fresh_coach_command"] = True
+            result["coach_command_age_seconds"] = command_age_seconds
+            result["startup_command_blocked"] = False
+            result["coach_command_queue_cleared_on_reset"] = bool(self._coach_command_queue_cleared_on_reset)
+            result["executed_coach_command_id"] = command_id
+            result["last_executed_coach_command_id"] = self._last_executed_coach_command_id
+            result["fusionCandidate"] = compact_candidate(candidate)
+            result.setdefault(
+                "decoded",
+                {
+                    "kind": "fusion",
+                    "sourcePlantType": int(coach_bridge_command.get("source_plant_type", -1)),
+                    "ingredientPlantType": int(coach_bridge_command.get("ingredient_plant_type", -1)),
+                    "resultPlantType": int(coach_bridge_command.get("predicted_result_type", -1)),
+                    "row": int(coach_bridge_command.get("source_row", -1)),
+                    "column": int(coach_bridge_command.get("source_col", -1)),
+                },
+            )
+            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
+            self._last_fusion_diagnostics = diagnostics
+            return result, diagnostics
+        return None, diagnostics
+
+    def _coach_fusion_candidate_from_bridge_command(self, coach_bridge_command: Dict[str, Any]) -> Dict[str, Any]:
+        candidate = coach_bridge_command.get("candidate")
+        if isinstance(candidate, dict):
+            payload = dict(candidate)
+        else:
+            payload = {}
+        payload.setdefault("source_instance_id", int(coach_bridge_command.get("source_instance_id") or 0))
+        payload.setdefault("source_row", int(coach_bridge_command.get("source_row", -1)))
+        payload.setdefault("source_col", int(coach_bridge_command.get("source_col", -1)))
+        payload.setdefault("source_plant_type", int(coach_bridge_command.get("source_plant_type", -1)))
+        payload.setdefault("ingredient_seed_slot_index", int(coach_bridge_command.get("ingredient_seed_slot_index", -1)))
+        payload.setdefault("target_or_ingredient_type", int(coach_bridge_command.get("ingredient_plant_type", -1)))
+        payload.setdefault("predicted_result_type", int(coach_bridge_command.get("predicted_result_type", -1)))
+        payload.setdefault("predicted_result_name", str(coach_bridge_command.get("predicted_result_name") or ""))
+        payload.setdefault("fusion_legal", True)
+        payload.setdefault("fusion_blocked_reason", "")
+        return payload
+
+    def _coach_fusion_rejection_reason(
+        self,
+        observation: Dict[str, Any],
+        candidate: Dict[str, Any],
+        *,
+        action_count: int,
+    ) -> str:
+        del action_count
+        if bool(observation.get("done")) or bool(observation.get("over")):
+            return "terminal_or_transition_state"
+        if bool(observation.get("seedSelectionActive")):
+            return "seed_selection_active"
+        if not bool(observation.get("boardFound", True)):
+            return "not_gameplay"
+        if not bool(observation.get("gameplayReady")):
+            return "gameplay_not_ready"
+        row = int(candidate.get("source_row", -1))
+        col = int(candidate.get("source_col", -1))
+        rows = int(observation.get("rowCount") or self.config.row_count or 5)
+        cols = int(observation.get("columnCount") or self.config.column_count or 10)
+        if not (0 <= row < rows and 0 <= col < cols):
+            return "invalid_row_col"
+        source_type = int(candidate.get("source_plant_type", -1))
+        source_instance = int(candidate.get("source_instance_id", 0))
+        source_found = False
+        for plant in observation.get("plants", []) or []:
+            if not isinstance(plant, dict):
+                continue
+            if int(plant.get("row", -1)) != row or int(plant.get("column", -1)) != col:
+                continue
+            if int(plant.get("type", -1)) != source_type:
+                continue
+            plant_instance = int(plant.get("instanceId", plant.get("instanceID", 0)) or 0)
+            if source_instance > 0 and plant_instance > 0 and source_instance != plant_instance:
+                continue
+            source_found = True
+            break
+        if not source_found:
+            return "source_not_found"
+        slot_index = int(candidate.get("ingredient_seed_slot_index", -1))
+        ingredient_type = int(candidate.get("target_or_ingredient_type", -1))
+        slot_found = False
+        for slot in observation.get("seedSlots", []) or []:
+            if not isinstance(slot, dict):
+                continue
+            if int(slot.get("slotIndex", -1)) != slot_index:
+                continue
+            if int(slot.get("plantType", -1)) != ingredient_type:
+                return "target_not_available"
+            cost = int(slot.get("seedCost", 0) or 0)
+            sun = int(observation.get("sun", 0) or 0)
+            if not bool(slot.get("ready", True)) or not bool(slot.get("usable", True)) or bool(slot.get("disabled", False)):
+                return "target_not_available"
+            if sun < cost:
+                return "target_not_available"
+            slot_found = True
+            break
+        if not slot_found:
+            return "target_not_available"
+        return ""
+
+    def step(
+        self,
+        action: int,
+        *,
+        coach_bridge_command: Optional[Dict[str, Any]] = None,
+        coach_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         step_started = time.perf_counter()
         def restart_terminal_return(
             observation: Dict[str, Any],
@@ -4255,6 +4658,8 @@ class PvZGymEnv:
                 }
                 return restart_terminal_return(pre_observation, action_result)
         requested_action = int(action)
+        coach_bridge_payload = dict(coach_bridge_command) if isinstance(coach_bridge_command, dict) else None
+        coach_context_payload = dict(coach_context) if isinstance(coach_context, dict) else None
         executed_action = requested_action
         pre_step_mask = self.action_mask(pre_observation)
         pre_step_mask_blocked = False
@@ -4267,13 +4672,23 @@ class PvZGymEnv:
             executed_action = 0
 
         fusion_diagnostics = self._fusion_diagnostics_for_step(pre_observation)
-        fusion_action_result, fusion_diagnostics = self._maybe_execute_scripted_fusion(
+        coach_fusion_action_result, fusion_diagnostics = self._maybe_execute_coach_fusion_command(
             pre_observation,
             fusion_diagnostics,
             requested_action,
             executed_action,
             len(pre_step_mask),
+            coach_bridge_payload,
         )
+        fusion_action_result: Optional[Dict[str, Any]] = coach_fusion_action_result
+        if fusion_action_result is None:
+            fusion_action_result, fusion_diagnostics = self._maybe_execute_scripted_fusion(
+                pre_observation,
+                fusion_diagnostics,
+                requested_action,
+                executed_action,
+                len(pre_step_mask),
+            )
         try:
             action_result = fusion_action_result or self.client.request("step", action=executed_action, return_observation=False)
         except BridgeTimeoutError as exc:
@@ -4350,6 +4765,11 @@ class PvZGymEnv:
             action_result["preStepMaskBlockedAction"] = pre_step_mask_blocked
             action_result["fusionPolicy"] = fusion_diagnostics.get("fusion_policy")
             action_result["fusionDiagnostics"] = fusion_diagnostics
+            if coach_context_payload is not None:
+                human_coach_payload = dict(coach_context_payload)
+                if coach_bridge_payload is not None:
+                    human_coach_payload["bridgeCommand"] = dict(coach_bridge_payload)
+                action_result["humanCoach"] = human_coach_payload
             if pre_step_mask_blocked:
                 action_result["preStepMaskAudit"] = pre_step_audit
         time.sleep(self.config.step_seconds)
@@ -4528,6 +4948,11 @@ class PvZGymEnv:
             "pre_step_mask_blocked_action": pre_step_mask_blocked,
             "fusion_diagnostics": fusion_diagnostics,
             **fusion_live_fields(fusion_diagnostics, self.config.fusion_policy),
+            "coach_command_queue_cleared_on_reset": bool(self._coach_command_queue_cleared_on_reset),
+            "pending_coach_command": None,
+            "selected_bridge_command": None,
+            "last_executed_coach_command_id": self._last_executed_coach_command_id,
+            "startup_command_blocked": bool(self._startup_command_blocked),
             **safety_diagnostics,
         }
         if done_reason_override is not None:
@@ -6971,6 +7396,968 @@ def cooldown_test(env: PvZGymEnv) -> bool:
     return all(ok for _, ok, _ in checks)
 
 
+def fusion_semantics_test(env: PvZGymEnv) -> bool:
+    checks: List[Tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, message: str = "") -> None:
+        checks.append((name, ok, message))
+
+    def value_int(payload: Dict[str, Any], *keys: str, default: int = -1) -> int:
+        for key in keys:
+            try:
+                if key in payload:
+                    return int(payload.get(key))
+            except (TypeError, ValueError):
+                continue
+        return int(default)
+
+    def value_bool(payload: Dict[str, Any], *keys: str) -> bool:
+        for key in keys:
+            if key in payload:
+                return bool(payload.get(key))
+        return False
+
+    def slot_for_plant_type(obs_payload: Dict[str, Any], plant_type: int) -> Optional[Dict[str, Any]]:
+        for slot_item in obs_payload.get("seedSlots", []) or []:
+            if not isinstance(slot_item, dict):
+                continue
+            if int(slot_item.get("plantType", -1)) != int(plant_type):
+                continue
+            if not bool(slot_item.get("usable", True)):
+                continue
+            if bool(slot_item.get("disabled", False)):
+                continue
+            return slot_item
+        return None
+
+    def plant_at_cell(obs_payload: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
+        for plant_item in obs_payload.get("plants", []) or []:
+            if not isinstance(plant_item, dict):
+                continue
+            if int(plant_item.get("row", -1)) == int(row) and int(plant_item.get("column", -1)) == int(col):
+                return plant_item
+        return None
+
+    def first_empty_cells(obs_payload: Dict[str, Any], count: int) -> List[Tuple[int, int]]:
+        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+        occupied_cells = set()
+        for plant_item in obs_payload.get("plants", []) or []:
+            if not isinstance(plant_item, dict):
+                continue
+            occupied_cells.add((int(plant_item.get("row", -1)), int(plant_item.get("column", -1))))
+        selected: List[Tuple[int, int]] = []
+        for row_index in range(rows_local):
+            for col_index in range(cols_local):
+                if (row_index, col_index) in occupied_cells:
+                    continue
+                selected.append((row_index, col_index))
+                if len(selected) >= int(count):
+                    return selected
+        return selected
+
+    def placement_action_for(slot_index: int, row: int, col: int, obs_payload: Dict[str, Any]) -> int:
+        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+        return int(1 + int(slot_index) * rows_local * cols_local + int(row) * cols_local + int(col))
+
+    def wait_until_slot_ready(slot_index: int, min_sun: int, max_wait_steps: int = 600) -> Tuple[Dict[str, Any], int, str]:
+        current_observation = env.observe()
+        for step_index in range(int(max_wait_steps) + 1):
+            selected_slot = None
+            for slot_item in current_observation.get("seedSlots", []) or []:
+                if not isinstance(slot_item, dict):
+                    continue
+                if int(slot_item.get("slotIndex", -1)) == int(slot_index):
+                    selected_slot = slot_item
+                    break
+            ready = bool(selected_slot and selected_slot.get("ready", False))
+            usable = bool(selected_slot and selected_slot.get("usable", True) and not selected_slot.get("disabled", False))
+            sun_ok = int(current_observation.get("sun", 0) or 0) >= int(min_sun)
+            if ready and usable and sun_ok:
+                return current_observation, step_index, ""
+            current_observation, _, _, _, _ = env.step(0)
+        return current_observation, int(max_wait_steps), "timeout"
+
+    def select_probe_candidates(raw_probe: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], int]:
+        candidates = raw_probe.get("fusionCandidates") or raw_probe.get("fusion_candidates") or []
+        if not isinstance(candidates, list):
+            candidates = []
+        first_legal: Optional[Dict[str, Any]] = None
+        pea_sun_legal: Optional[Dict[str, Any]] = None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            is_legal = value_bool(candidate, "fusionLegal", "fusion_legal")
+            if is_legal and first_legal is None:
+                first_legal = candidate
+            source_type_probe = value_int(candidate, "sourcePlantType", "source_plant_type", default=-1)
+            ingredient_type_probe = value_int(candidate, "ingredientPlantType", "ingredient_plant_type", "targetPlantType", default=-1)
+            if is_legal and source_type_probe == 0 and ingredient_type_probe == 1:
+                pea_sun_legal = candidate
+                break
+        return first_legal, pea_sun_legal, len(candidates)
+
+    try:
+        env.configure()
+        observation = env.wait_for_gameplay_ready(timeout=30.0, poll_seconds=0.25, quiet=True, fail_on_terminal=False)
+        record("gameplay_ready", bool(observation.get("gameplayReady")), f"screenState={observation.get('screenState')}")
+    except Exception as exc:
+        record("gameplay_ready", False, str(exc))
+        print_smoke_results(checks)
+        return False
+
+    probe: Dict[str, Any] = {}
+    legal_candidate: Optional[Dict[str, Any]] = None
+    peashooter_sunflower_candidate: Optional[Dict[str, Any]] = None
+    try:
+        probe = env.client.request("fusion_probe")
+        legal_candidate, peashooter_sunflower_candidate, candidate_count = select_probe_candidates(probe)
+        record("fusion_probe_has_legal_candidate", legal_candidate is not None, f"candidate_count={candidate_count}")
+        record(
+            "fusion_probe_has_peashooter_sunflower_candidate",
+            peashooter_sunflower_candidate is not None,
+            (
+                f"candidate_count={candidate_count}, "
+                f"selected_source={value_int(peashooter_sunflower_candidate or {}, 'sourcePlantType', 'source_plant_type', default=-1)}, "
+                f"selected_ingredient={value_int(peashooter_sunflower_candidate or {}, 'ingredientPlantType', 'ingredient_plant_type', 'targetPlantType', default=-1)}"
+            ),
+        )
+    except Exception as exc:
+        record("fusion_probe_runtime", False, str(exc))
+        print_smoke_results(checks)
+        return False
+
+    if legal_candidate is None:
+        try:
+            rows = int(observation.get("rowCount") or env.config.row_count or 5)
+            cols = int(observation.get("columnCount") or env.config.column_count or 10)
+            occupied = set()
+            for plant in observation.get("plants", []) or []:
+                if isinstance(plant, dict):
+                    occupied.add((int(plant.get("row", -1)), int(plant.get("column", -1))))
+            empty_cell = None
+            for row in range(rows):
+                for col in range(cols):
+                    if (row, col) not in occupied:
+                        empty_cell = (row, col)
+                        break
+                if empty_cell is not None:
+                    break
+            peashooter_slot_index = -1
+            sunflower_slot_ready = False
+            for slot in observation.get("seedSlots", []) or []:
+                if not isinstance(slot, dict):
+                    continue
+                plant_type = int(slot.get("plantType", -1))
+                ready = bool(slot.get("ready", True))
+                usable = bool(slot.get("usable", True)) and not bool(slot.get("disabled", False))
+                cost = int(slot.get("seedCost", 0) or 0)
+                affordable = int(observation.get("sun", 0) or 0) >= cost
+                if plant_type == 0 and ready and usable and affordable:
+                    peashooter_slot_index = int(slot.get("slotIndex", -1))
+                if plant_type == 1 and ready and usable and affordable:
+                    sunflower_slot_ready = True
+            setup_ok = empty_cell is not None and peashooter_slot_index >= 0 and sunflower_slot_ready
+            if not setup_ok:
+                record(
+                    "fusion_probe_setup_for_peashooter_sunflower",
+                    False,
+                    f"empty_cell={empty_cell}, peashooter_slot={peashooter_slot_index}, sunflower_ready={sunflower_slot_ready}",
+                )
+            else:
+                setup_action = 1 + peashooter_slot_index * rows * cols + int(empty_cell[0]) * cols + int(empty_cell[1])
+                _obs, _reward, _terminated, _truncated, setup_info = env.step(int(setup_action))
+                setup_result = setup_info.get("action_result", {}) if isinstance(setup_info, dict) else {}
+                setup_legal = bool(setup_result.get("plantPlaced")) and not bool(setup_result.get("illegalAction"))
+                record(
+                    "fusion_probe_setup_for_peashooter_sunflower",
+                    setup_legal,
+                    (
+                        f"action={setup_action}, placed={setup_result.get('plantPlaced')}, "
+                        f"illegal={setup_result.get('illegalAction')}, reason={setup_result.get('illegalReason')}"
+                    ),
+                )
+                probe = env.client.request("fusion_probe")
+                legal_candidate, peashooter_sunflower_candidate, candidate_count = select_probe_candidates(probe)
+                record(
+                    "fusion_probe_after_setup_has_legal_candidate",
+                    legal_candidate is not None,
+                    f"candidate_count={candidate_count}",
+                )
+                record(
+                    "fusion_probe_after_setup_has_peashooter_sunflower_candidate",
+                    peashooter_sunflower_candidate is not None,
+                    (
+                        f"candidate_count={candidate_count}, "
+                        f"selected_source={value_int(peashooter_sunflower_candidate or {}, 'sourcePlantType', 'source_plant_type', default=-1)}, "
+                        f"selected_ingredient={value_int(peashooter_sunflower_candidate or {}, 'ingredientPlantType', 'ingredient_plant_type', 'targetPlantType', default=-1)}"
+                    ),
+                )
+        except Exception as exc:
+            record("fusion_probe_setup_runtime", False, str(exc))
+
+    if legal_candidate is None:
+        print_smoke_results(checks)
+        return False
+
+    selected_candidate = peashooter_sunflower_candidate or legal_candidate
+    source_row = value_int(selected_candidate, "sourceRow", "source_row")
+    source_col = value_int(selected_candidate, "sourceCol", "sourceColumn", "source_col")
+    source_type = value_int(selected_candidate, "sourcePlantType", "source_plant_type")
+    source_instance = value_int(selected_candidate, "sourceInstanceId", "source_instance_id", default=0)
+    slot_index = value_int(selected_candidate, "ingredientSeedSlotIndex", "ingredient_seed_slot_index")
+    ingredient_type = value_int(selected_candidate, "ingredientPlantType", "ingredient_plant_type", "targetPlantType", default=-1)
+    predicted_type = value_int(selected_candidate, "predictedResultType", "predicted_result_type", default=-1)
+    predicted_name = str(
+        selected_candidate.get("predictedResultName")
+        or selected_candidate.get("predicted_result_name")
+        or ""
+    )
+    predicted_resolution_source = str(
+        selected_candidate.get("predictedResultResolutionSource")
+        or selected_candidate.get("predicted_result_resolution_source")
+        or ""
+    )
+    mix_lookup_found = value_bool(selected_candidate, "mixLookupFound", "mix_lookup_found")
+    mix_lookup_key = str(
+        selected_candidate.get("mixLookupKey")
+        or selected_candidate.get("mix_lookup_key")
+        or ""
+    )
+    record(
+        "peashooter_sunflower_candidate_available_without_mutating_probe",
+        (
+            peashooter_sunflower_candidate is not None
+            and predicted_resolution_source != ""
+            and "checkmix" not in predicted_resolution_source.lower()
+        ),
+        (
+            f"source={source_type}, ingredient={ingredient_type}, predicted_type={predicted_type}, "
+            f"predicted_name={predicted_name}, resolution={predicted_resolution_source}, "
+            f"mix_lookup_found={mix_lookup_found}, mix_lookup_key={mix_lookup_key}"
+        ),
+    )
+
+    fusion_result: Dict[str, Any] = {}
+    try:
+        fusion_result = env.client.request(
+            "fusion_step",
+            source_instance_id=source_instance,
+            source_row=source_row,
+            source_col=source_col,
+            source_plant_type=source_type,
+            ingredient_seed_slot_index=slot_index,
+            ingredient_plant_type=ingredient_type,
+            predicted_result_type=predicted_type,
+            predicted_result_name=predicted_name,
+            return_observation=False,
+        )
+        bridge_method = str(fusion_result.get("bridgeMethodUsed") or "")
+        mode = str(fusion_result.get("fusionExecutionMode") or "")
+        duplicate_detected = bool(fusion_result.get("duplicateStackDetected"))
+        plant_count_after = int(fusion_result.get("plantCountOnTileAfter", 0) or 0)
+        record(
+            "fusion_uses_dedicated_execution_path",
+            mode == "dedicated_fusion" and "createplant.setplant" not in bridge_method.lower(),
+            f"mode={mode}, method={bridge_method}",
+        )
+        record(
+            "fuse_success_reports_diagnostics",
+            (
+                bool(fusion_result.get("fusionSucceeded"))
+                and bool(fusion_result.get("sourceTileOccupiedBefore"))
+                and int(fusion_result.get("plantCountOnTileBefore", 0) or 0) >= 1
+                and plant_count_after == 1
+                and isinstance(fusion_result.get("sourcePlantBefore"), dict)
+                and isinstance(fusion_result.get("resultingPlantAfter"), dict)
+                and not duplicate_detected
+                and str(fusion_result.get("predictedResultResolutionSource") or "") != ""
+                and int(fusion_result.get("preSourceType", -1)) >= 0
+                and str(fusion_result.get("preSourceName") or "") != ""
+                and int(fusion_result.get("ingredientType", -1)) >= 0
+                and str(fusion_result.get("ingredientName") or "") != ""
+                and int(fusion_result.get("postResultType", -1)) >= 0
+                and str(fusion_result.get("postResultName") or "") != ""
+            ),
+            (
+                f"succeeded={fusion_result.get('fusionSucceeded')}, "
+                f"before={fusion_result.get('plantCountOnTileBefore')}, after={plant_count_after}, "
+                f"duplicate={duplicate_detected}, reason={fusion_result.get('bridgeResultReason')}, "
+                f"prediction_source={fusion_result.get('predictedResultResolutionSource')}, "
+                f"mix_lookup={fusion_result.get('mixLookupFound')}/{fusion_result.get('mixLookupKey')}, "
+                f"post={fusion_result.get('postResultType')}:{fusion_result.get('postResultName')}"
+            ),
+        )
+    except Exception as exc:
+        record("fusion_step_runtime", False, str(exc))
+        print_smoke_results(checks)
+        return False
+
+    try:
+        rows = int(observation.get("rowCount") or env.config.row_count or 5)
+        cols = int(observation.get("columnCount") or env.config.column_count or 10)
+        occupied = set()
+        for plant in observation.get("plants", []) or []:
+            if isinstance(plant, dict):
+                occupied.add((int(plant.get("row", -1)), int(plant.get("column", -1))))
+        empty_cell = None
+        for row in range(rows):
+            for col in range(cols):
+                if (row, col) not in occupied:
+                    empty_cell = (row, col)
+                    break
+            if empty_cell is not None:
+                break
+        if empty_cell is None:
+            record("fusion_rejects_empty_source_tile", False, "no empty cell found to probe")
+        else:
+            empty_result = env.client.request(
+                "fusion_step",
+                source_instance_id=0,
+                source_row=int(empty_cell[0]),
+                source_col=int(empty_cell[1]),
+                source_plant_type=source_type,
+                ingredient_seed_slot_index=slot_index,
+                ingredient_plant_type=ingredient_type,
+                predicted_result_type=predicted_type,
+                predicted_result_name=predicted_name,
+                return_observation=False,
+            )
+            empty_reason = str(empty_result.get("illegalReason") or empty_result.get("fusionRejectedReason") or "")
+            record(
+                "fusion_rejects_empty_source_tile",
+                (not bool(empty_result.get("fusionSucceeded"))) and empty_reason in {"source_not_found", "source_tile_not_occupied"},
+                f"reason={empty_reason}",
+            )
+    except Exception as exc:
+        record("fusion_empty_source_runtime", False, str(exc))
+
+    try:
+        rows = int(observation.get("rowCount") or env.config.row_count or 5)
+        cols = int(observation.get("columnCount") or env.config.column_count or 10)
+        placement_action = 1 + slot_index * rows * cols + source_row * cols + source_col
+        _obs, _reward, _terminated, _truncated, info = env.step(int(placement_action))
+        action_result = info.get("action_result", {}) if isinstance(info, dict) else {}
+        action_audit = action_result.get("actionAudit") if isinstance(action_result, dict) else {}
+        if not isinstance(action_audit, dict):
+            action_audit = {}
+        occupied_rejected = (
+            bool(action_result.get("illegalAction")) and str(action_result.get("illegalReason") or "") == "occupied_cell"
+        ) or (
+            bool(action_result.get("preStepMaskBlockedAction"))
+            and str(action_audit.get("pythonFilterReason") or "") == "occupied_cell"
+        )
+        record(
+            "normal_placement_rejects_occupied_tile",
+            occupied_rejected,
+            (
+                f"illegal={action_result.get('illegalAction')}, reason={action_result.get('illegalReason')}, "
+                f"pre_step_blocked={action_result.get('preStepMaskBlockedAction')}, "
+                f"filter={action_audit.get('pythonFilterReason')}"
+            ),
+        )
+    except Exception as exc:
+        record("placement_occupied_runtime", False, str(exc))
+
+    try:
+        second_fuse = env.client.request(
+            "fusion_step",
+            source_instance_id=source_instance,
+            source_row=source_row,
+            source_col=source_col,
+            source_plant_type=source_type,
+            ingredient_seed_slot_index=slot_index,
+            ingredient_plant_type=ingredient_type,
+            predicted_result_type=predicted_type,
+            predicted_result_name=predicted_name,
+            return_observation=False,
+        )
+        duplicate_detected = bool(second_fuse.get("duplicateStackDetected"))
+        duplicate_handled = (not bool(second_fuse.get("fusionSucceeded"))) and str(second_fuse.get("illegalReason") or "") == "duplicate_stack_detected"
+        record(
+            "duplicate_stack_detection_is_failure_when_triggered",
+            (not duplicate_detected) or duplicate_handled,
+            (
+                f"duplicate={duplicate_detected}, fusionSucceeded={second_fuse.get('fusionSucceeded')}, "
+                f"illegalReason={second_fuse.get('illegalReason')}, plantCountAfter={second_fuse.get('plantCountOnTileAfter')}"
+            ),
+        )
+    except Exception as exc:
+        record("duplicate_detection_runtime", False, str(exc))
+
+    try:
+        scoped_observation = env.observe()
+        peashooter_slot = slot_for_plant_type(scoped_observation, 0)
+        sunflower_slot = slot_for_plant_type(scoped_observation, 1)
+        if peashooter_slot is None or sunflower_slot is None:
+            record(
+                "tile_scoped_fusion_setup",
+                False,
+                f"missing_slots peashooter={peashooter_slot is not None}, sunflower={sunflower_slot is not None}",
+            )
+        else:
+            peashooter_slot_index = int(peashooter_slot.get("slotIndex", -1))
+            sunflower_slot_index = int(sunflower_slot.get("slotIndex", -1))
+            peashooter_cost = int(peashooter_slot.get("seedCost", 0) or 0)
+            sunflower_cost = int(sunflower_slot.get("seedCost", 0) or 0)
+            if peashooter_slot_index < 0 or sunflower_slot_index < 0:
+                record(
+                    "tile_scoped_fusion_setup",
+                    False,
+                    f"invalid_slot_indices peashooter={peashooter_slot_index}, sunflower={sunflower_slot_index}",
+                )
+            else:
+                scoped_observation, wait_steps_1, wait_reason_1 = wait_until_slot_ready(
+                    peashooter_slot_index,
+                    min_sun=peashooter_cost,
+                )
+                empty_cells = first_empty_cells(scoped_observation, 2)
+                if wait_reason_1 or len(empty_cells) < 2:
+                    record(
+                        "tile_scoped_fusion_setup",
+                        False,
+                        f"wait_reason={wait_reason_1}, wait_steps={wait_steps_1}, empty_cells={empty_cells}",
+                    )
+                else:
+                    source_cell = empty_cells[0]
+                    control_cell = empty_cells[1]
+                    first_action = placement_action_for(peashooter_slot_index, source_cell[0], source_cell[1], scoped_observation)
+                    scoped_observation, _reward, _terminated, _truncated, first_place_info = env.step(first_action)
+                    first_action_result = first_place_info.get("action_result", {}) if isinstance(first_place_info, dict) else {}
+                    first_placed = bool(first_action_result.get("plantPlaced")) and not bool(first_action_result.get("illegalAction"))
+                    if not first_placed:
+                        record(
+                            "tile_scoped_fusion_setup",
+                            False,
+                            f"first_place_failed action={first_action}, illegal={first_action_result.get('illegalAction')}, reason={first_action_result.get('illegalReason')}",
+                        )
+                    else:
+                        scoped_observation, wait_steps_2, wait_reason_2 = wait_until_slot_ready(
+                            peashooter_slot_index,
+                            min_sun=peashooter_cost + sunflower_cost,
+                        )
+                        second_action = placement_action_for(peashooter_slot_index, control_cell[0], control_cell[1], scoped_observation)
+                        scoped_observation, _reward, _terminated, _truncated, second_place_info = env.step(second_action)
+                        second_action_result = second_place_info.get("action_result", {}) if isinstance(second_place_info, dict) else {}
+                        second_placed = bool(second_action_result.get("plantPlaced")) and not bool(second_action_result.get("illegalAction"))
+                        if wait_reason_2 or not second_placed:
+                            record(
+                                "tile_scoped_fusion_setup",
+                                False,
+                                (
+                                    f"wait_reason={wait_reason_2}, wait_steps={wait_steps_2}, "
+                                    f"second_place_failed action={second_action}, illegal={second_action_result.get('illegalAction')}, "
+                                    f"reason={second_action_result.get('illegalReason')}"
+                                ),
+                            )
+                        else:
+                            source_before = plant_at_cell(scoped_observation, source_cell[0], source_cell[1])
+                            control_before = plant_at_cell(scoped_observation, control_cell[0], control_cell[1])
+                            if source_before is None or control_before is None:
+                                record(
+                                    "tile_scoped_fusion_setup",
+                                    False,
+                                    f"missing_source_or_control source={source_before}, control={control_before}",
+                                )
+                            else:
+                                control_before_type = int(control_before.get("type", control_before.get("plantType", -1)))
+                                control_before_name = str(control_before.get("typeName") or control_before.get("plantTypeName") or "")
+                                control_before_id = int(control_before.get("instanceId", control_before.get("instanceID", 0)) or 0)
+                                scoped_observation, wait_steps_3, wait_reason_3 = wait_until_slot_ready(
+                                    sunflower_slot_index,
+                                    min_sun=sunflower_cost,
+                                )
+                                if wait_reason_3:
+                                    record(
+                                        "tile_scoped_fusion_setup",
+                                        False,
+                                        f"sunflower_wait_timeout steps={wait_steps_3}",
+                                    )
+                                else:
+                                    source_before = plant_at_cell(scoped_observation, source_cell[0], source_cell[1]) or source_before
+                                    source_before_type = int(source_before.get("type", source_before.get("plantType", -1)))
+                                    source_before_id = int(source_before.get("instanceId", source_before.get("instanceID", 0)) or 0)
+                                    scoped_fusion_result = env.client.request(
+                                        "fusion_step",
+                                        source_instance_id=source_before_id,
+                                        source_row=int(source_cell[0]),
+                                        source_col=int(source_cell[1]),
+                                        source_plant_type=source_before_type,
+                                        ingredient_seed_slot_index=sunflower_slot_index,
+                                        ingredient_plant_type=1,
+                                        predicted_result_type=predicted_type,
+                                        predicted_result_name=predicted_name,
+                                        return_observation=True,
+                                    )
+                                    changed_tile_count = int(
+                                        scoped_fusion_result.get("changedTileCount")
+                                        or scoped_fusion_result.get("changed_tile_count")
+                                        or 0
+                                    )
+                                    changed_tiles = scoped_fusion_result.get("changedTiles")
+                                    if not isinstance(changed_tiles, list):
+                                        changed_tiles = scoped_fusion_result.get("changed_tiles")
+                                    if not isinstance(changed_tiles, list):
+                                        changed_tiles = []
+                                    non_source_tiles_changed = bool(
+                                        scoped_fusion_result.get("nonSourceTilesChanged")
+                                        if "nonSourceTilesChanged" in scoped_fusion_result
+                                        else scoped_fusion_result.get("non_source_tiles_changed")
+                                    )
+                                    global_side_effect = bool(
+                                        scoped_fusion_result.get("globalFusionSideEffect")
+                                        if "globalFusionSideEffect" in scoped_fusion_result
+                                        else scoped_fusion_result.get("global_fusion_side_effect")
+                                    )
+                                    fusion_scope_value = str(
+                                        scoped_fusion_result.get("fusionScope")
+                                        or scoped_fusion_result.get("fusion_scope")
+                                        or ""
+                                    )
+                                    post_observation = scoped_fusion_result.get("observation")
+                                    if not isinstance(post_observation, dict):
+                                        post_observation = env.observe()
+                                    control_after = plant_at_cell(post_observation, control_cell[0], control_cell[1])
+                                    control_after_type = int(control_after.get("type", control_after.get("plantType", -1))) if isinstance(control_after, dict) else -1
+                                    control_after_name = str(control_after.get("typeName") or control_after.get("plantTypeName") or "") if isinstance(control_after, dict) else ""
+                                    control_after_id = int(control_after.get("instanceId", control_after.get("instanceID", 0)) or 0) if isinstance(control_after, dict) else 0
+                                    source_tile_changed_only = (
+                                        changed_tile_count == 1
+                                        and len(changed_tiles) == 1
+                                        and int(value_int(changed_tiles[0], "row", "source_row", default=-1)) == int(source_cell[0])
+                                        and int(value_int(changed_tiles[0], "column", "col", "source_col", default=-1)) == int(source_cell[1])
+                                        and not non_source_tiles_changed
+                                        and not global_side_effect
+                                    )
+                                    control_unchanged = (
+                                        isinstance(control_after, dict)
+                                        and control_after_type == control_before_type
+                                        and control_after_name == control_before_name
+                                        and (control_before_id <= 0 or control_after_id == control_before_id)
+                                    )
+                                    record(
+                                        "tile_scoped_fusion_only_changes_requested_tile",
+                                        bool(
+                                            scoped_fusion_result.get("fusionSucceeded")
+                                            and source_tile_changed_only
+                                            and fusion_scope_value == "tile_scoped"
+                                        ),
+                                        (
+                                            f"succeeded={scoped_fusion_result.get('fusionSucceeded')}, changed_count={changed_tile_count}, "
+                                            f"changed_tiles={changed_tiles}, non_source={non_source_tiles_changed}, "
+                                            f"global_side_effect={global_side_effect}, fusion_scope={fusion_scope_value}, "
+                                            f"bridge_reason={scoped_fusion_result.get('bridgeResultReason')}"
+                                        ),
+                                    )
+                                    record(
+                                        "tile_scoped_fusion_preserves_non_target_peashooter",
+                                        control_unchanged,
+                                        (
+                                            f"before={control_before_type}:{control_before_name}:{control_before_id}, "
+                                            f"after={control_after_type}:{control_after_name}:{control_after_id}, "
+                                            f"source_cell={source_cell}, control_cell={control_cell}"
+                                        ),
+                                    )
+    except Exception as exc:
+        record("tile_scoped_fusion_runtime", False, str(exc))
+
+    print_smoke_results(checks)
+    return all(ok for _, ok, _ in checks)
+
+
+def coach_fusion_scope_test(env: PvZGymEnv) -> bool:
+    """Live bridge entrypoint focused on coach-originated tile-scoped fusion."""
+    from pvzrl_human_coach import HumanCoachOverrideHook, QueueCoachCommandSource
+
+    checks: List[Tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, message: str = "") -> None:
+        checks.append((name, ok, message))
+
+    def value_int(payload: Dict[str, Any], *keys: str, default: int = -1) -> int:
+        for key in keys:
+            try:
+                if key in payload:
+                    return int(payload.get(key))
+            except (TypeError, ValueError):
+                continue
+        return int(default)
+
+    def slot_for_plant_type(obs_payload: Dict[str, Any], plant_type: int) -> Optional[Dict[str, Any]]:
+        for slot_item in obs_payload.get("seedSlots", []) or []:
+            if not isinstance(slot_item, dict):
+                continue
+            if int(slot_item.get("plantType", -1)) != int(plant_type):
+                continue
+            if not bool(slot_item.get("usable", True)):
+                continue
+            if bool(slot_item.get("disabled", False)):
+                continue
+            return slot_item
+        return None
+
+    def plant_at_cell(obs_payload: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
+        for plant_item in obs_payload.get("plants", []) or []:
+            if not isinstance(plant_item, dict):
+                continue
+            if int(plant_item.get("row", -1)) == int(row) and int(plant_item.get("column", -1)) == int(col):
+                return plant_item
+        return None
+
+    def first_empty_cells(obs_payload: Dict[str, Any], count: int) -> List[Tuple[int, int]]:
+        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+        occupied_cells = set()
+        for plant_item in obs_payload.get("plants", []) or []:
+            if not isinstance(plant_item, dict):
+                continue
+            occupied_cells.add((int(plant_item.get("row", -1)), int(plant_item.get("column", -1))))
+        selected: List[Tuple[int, int]] = []
+        for row_index in range(rows_local):
+            for col_index in range(cols_local):
+                if (row_index, col_index) in occupied_cells:
+                    continue
+                selected.append((row_index, col_index))
+                if len(selected) >= int(count):
+                    return selected
+        return selected
+
+    def placement_action_for(slot_index: int, row: int, col: int, obs_payload: Dict[str, Any]) -> int:
+        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+        return int(1 + int(slot_index) * rows_local * cols_local + int(row) * cols_local + int(col))
+
+    def wait_until_slot_ready(slot_index: int, min_sun: int, max_wait_steps: int = 600) -> Tuple[Dict[str, Any], int, str]:
+        current_observation = env.observe()
+        for step_index in range(int(max_wait_steps) + 1):
+            selected_slot = None
+            for slot_item in current_observation.get("seedSlots", []) or []:
+                if not isinstance(slot_item, dict):
+                    continue
+                if int(slot_item.get("slotIndex", -1)) == int(slot_index):
+                    selected_slot = slot_item
+                    break
+            ready = bool(selected_slot and selected_slot.get("ready", False))
+            usable = bool(selected_slot and selected_slot.get("usable", True) and not selected_slot.get("disabled", False))
+            sun_ok = int(current_observation.get("sun", 0) or 0) >= int(min_sun)
+            if ready and usable and sun_ok:
+                return current_observation, step_index, ""
+            current_observation, _, _, _, _ = env.step(0)
+        return current_observation, int(max_wait_steps), "timeout"
+
+    try:
+        env.configure()
+        observation = env.wait_for_gameplay_ready(timeout=30.0, poll_seconds=0.25, quiet=True, fail_on_terminal=False)
+        record("gameplay_ready", bool(observation.get("gameplayReady")), f"screenState={observation.get('screenState')}")
+    except Exception as exc:
+        record("gameplay_ready", False, str(exc))
+        print_smoke_results(checks)
+        return False
+
+    try:
+        if hasattr(env, "clear_coach_runtime_state"):
+            env.clear_coach_runtime_state(
+                queue_cleared=True,
+                startup_command_blocked=False,
+                reason="coach_fusion_scope_test_start",
+            )
+        startup_source = QueueCoachCommandSource(["!fuse 0 0 0"])
+        startup_hook = HumanCoachOverrideHook(
+            enabled=True,
+            source=startup_source,
+            fusion_enabled=True,
+            platform="mock",
+        )
+        startup_stale_detected = startup_hook.clear_pending_state(
+            clear_source=True,
+            reason="coach_fusion_scope_test_start",
+        )
+        startup_status = startup_hook.live_status_fields()
+        record(
+            "startup_queue_clear_reports_stale_only_when_stale_command_discarded",
+            (
+                bool(startup_stale_detected)
+                and startup_status.get("coach_command_queue_cleared_on_reset") is True
+                and startup_status.get("pending_coach_command") is None
+                and startup_status.get("selected_bridge_command") is None
+                and startup_status.get("startup_command_blocked") is True
+            ),
+            json.dumps(
+                {
+                    "stale_detected": startup_stale_detected,
+                    "coach_command_queue_cleared_on_reset": startup_status.get("coach_command_queue_cleared_on_reset"),
+                    "pending_coach_command": startup_status.get("pending_coach_command"),
+                    "selected_bridge_command": startup_status.get("selected_bridge_command"),
+                    "startup_command_blocked": startup_status.get("startup_command_blocked"),
+                },
+                sort_keys=True,
+            ),
+        )
+
+        clean_hook = HumanCoachOverrideHook(
+            enabled=True,
+            source=QueueCoachCommandSource(),
+            fusion_enabled=True,
+            platform="mock",
+        )
+        clean_stale_detected = clean_hook.clear_pending_state(
+            clear_source=True,
+            reason="coach_fusion_scope_test_clean_start",
+        )
+        clean_status = clean_hook.live_status_fields()
+        record(
+            "clean_startup_live_status_has_no_pending_or_selected_command",
+            (
+                not bool(clean_stale_detected)
+                and clean_status.get("coach_command_queue_cleared_on_reset") is True
+                and clean_status.get("pending_coach_command") is None
+                and clean_status.get("selected_bridge_command") is None
+                and clean_status.get("last_executed_coach_command_id") is None
+                and clean_status.get("startup_command_blocked") is False
+            ),
+            json.dumps(
+                {
+                    "stale_detected": clean_stale_detected,
+                    "coach_command_queue_cleared_on_reset": clean_status.get("coach_command_queue_cleared_on_reset"),
+                    "pending_coach_command": clean_status.get("pending_coach_command"),
+                    "selected_bridge_command": clean_status.get("selected_bridge_command"),
+                    "last_executed_coach_command_id": clean_status.get("last_executed_coach_command_id"),
+                    "startup_command_blocked": clean_status.get("startup_command_blocked"),
+                },
+                sort_keys=True,
+            ),
+        )
+        setattr(env, "_last_observation", observation)
+        no_cmd_observation, _reward, _terminated, _truncated, no_cmd_info = clean_hook.step_env(env, 0)
+        no_cmd_result = no_cmd_info.get("action_result", {}) if isinstance(no_cmd_info, dict) else {}
+        record(
+            "startup_no_automatic_fusion_before_fresh_command",
+            (
+                not bool(no_cmd_result.get("fusionAttempted"))
+                and not bool(no_cmd_result.get("fusionSucceeded"))
+                and clean_hook.live_status_fields().get("selected_bridge_command") is None
+                and clean_hook.live_status_fields().get("pending_coach_command") is None
+            ),
+            (
+                f"fusionAttempted={no_cmd_result.get('fusionAttempted')}, "
+                f"fusionSucceeded={no_cmd_result.get('fusionSucceeded')}, "
+                f"selected={clean_hook.live_status_fields().get('selected_bridge_command')}"
+            ),
+        )
+        observation = no_cmd_observation if isinstance(no_cmd_observation, dict) else env.observe()
+    except Exception as exc:
+        record("startup_queue_clear_runtime", False, str(exc))
+
+    try:
+        scoped_observation = env.observe()
+        peashooter_slot = slot_for_plant_type(scoped_observation, 0)
+        sunflower_slot = slot_for_plant_type(scoped_observation, 1)
+        if peashooter_slot is None or sunflower_slot is None:
+            record(
+                "coach_tile_scoped_fusion_setup",
+                False,
+                f"missing_slots peashooter={peashooter_slot is not None}, sunflower={sunflower_slot is not None}",
+            )
+        else:
+            peashooter_slot_index = int(peashooter_slot.get("slotIndex", -1))
+            sunflower_slot_index = int(sunflower_slot.get("slotIndex", -1))
+            peashooter_cost = int(peashooter_slot.get("seedCost", 0) or 0)
+            sunflower_cost = int(sunflower_slot.get("seedCost", 0) or 0)
+            if peashooter_slot_index < 0 or sunflower_slot_index < 0:
+                record(
+                    "coach_tile_scoped_fusion_setup",
+                    False,
+                    f"invalid_slot_indices peashooter={peashooter_slot_index}, sunflower={sunflower_slot_index}",
+                )
+            else:
+                scoped_observation, wait_steps_1, wait_reason_1 = wait_until_slot_ready(
+                    peashooter_slot_index,
+                    min_sun=peashooter_cost,
+                )
+                empty_cells = first_empty_cells(scoped_observation, 2)
+                if wait_reason_1 or len(empty_cells) < 2:
+                    record(
+                        "coach_tile_scoped_fusion_setup",
+                        False,
+                        f"wait_reason={wait_reason_1}, wait_steps={wait_steps_1}, empty_cells={empty_cells}",
+                    )
+                else:
+                    source_cell = empty_cells[0]
+                    control_cell = empty_cells[1]
+                    first_action = placement_action_for(peashooter_slot_index, source_cell[0], source_cell[1], scoped_observation)
+                    scoped_observation, _reward, _terminated, _truncated, first_place_info = env.step(first_action)
+                    first_action_result = first_place_info.get("action_result", {}) if isinstance(first_place_info, dict) else {}
+                    first_placed = bool(first_action_result.get("plantPlaced")) and not bool(first_action_result.get("illegalAction"))
+                    if not first_placed:
+                        record(
+                            "coach_tile_scoped_fusion_setup",
+                            False,
+                            f"first_place_failed action={first_action}, illegal={first_action_result.get('illegalAction')}, reason={first_action_result.get('illegalReason')}",
+                        )
+                    else:
+                        scoped_observation, wait_steps_2, wait_reason_2 = wait_until_slot_ready(
+                            peashooter_slot_index,
+                            min_sun=peashooter_cost + sunflower_cost,
+                        )
+                        second_action = placement_action_for(peashooter_slot_index, control_cell[0], control_cell[1], scoped_observation)
+                        scoped_observation, _reward, _terminated, _truncated, second_place_info = env.step(second_action)
+                        second_action_result = second_place_info.get("action_result", {}) if isinstance(second_place_info, dict) else {}
+                        second_placed = bool(second_action_result.get("plantPlaced")) and not bool(second_action_result.get("illegalAction"))
+                        if wait_reason_2 or not second_placed:
+                            record(
+                                "coach_tile_scoped_fusion_setup",
+                                False,
+                                (
+                                    f"wait_reason={wait_reason_2}, wait_steps={wait_steps_2}, "
+                                    f"second_place_failed action={second_action}, illegal={second_action_result.get('illegalAction')}, "
+                                    f"reason={second_action_result.get('illegalReason')}"
+                                ),
+                            )
+                        else:
+                            source_before = plant_at_cell(scoped_observation, source_cell[0], source_cell[1])
+                            control_before = plant_at_cell(scoped_observation, control_cell[0], control_cell[1])
+                            if source_before is None or control_before is None:
+                                record(
+                                    "coach_tile_scoped_fusion_setup",
+                                    False,
+                                    f"missing_source_or_control source={source_before}, control={control_before}",
+                                )
+                            else:
+                                control_before_type = int(control_before.get("type", control_before.get("plantType", -1)))
+                                control_before_name = str(control_before.get("typeName") or control_before.get("plantTypeName") or "")
+                                control_before_id = int(control_before.get("instanceId", control_before.get("instanceID", 0)) or 0)
+                                scoped_observation, wait_steps_3, wait_reason_3 = wait_until_slot_ready(
+                                    sunflower_slot_index,
+                                    min_sun=sunflower_cost,
+                                )
+                                if wait_reason_3:
+                                    record(
+                                        "coach_tile_scoped_fusion_setup",
+                                        False,
+                                        f"sunflower_wait_timeout steps={wait_steps_3}",
+                                    )
+                                else:
+                                    if hasattr(env, "clear_coach_runtime_state"):
+                                        env.clear_coach_runtime_state(
+                                            queue_cleared=True,
+                                            startup_command_blocked=False,
+                                            reason="coach_fusion_scope_test_before_fresh_command",
+                                        )
+                                    scoped_observation = env.observe()
+                                    source_before = plant_at_cell(scoped_observation, source_cell[0], source_cell[1]) or source_before
+                                    control_before = plant_at_cell(scoped_observation, control_cell[0], control_cell[1]) or control_before
+                                    source_before_id = int(source_before.get("instanceId", source_before.get("instanceID", 0)) or 0)
+                                    source_before_type = int(source_before.get("type", source_before.get("plantType", -1)))
+                                    command_source = QueueCoachCommandSource()
+                                    coach_hook = HumanCoachOverrideHook(
+                                        enabled=True,
+                                        source=command_source,
+                                        fusion_enabled=True,
+                                        platform="mock",
+                                    )
+                                    fresh_clear_stale = coach_hook.clear_pending_state(
+                                        clear_source=True,
+                                        reason="coach_fusion_scope_test_fresh_boundary",
+                                    )
+                                    command_source.submit(f"!fuse {sunflower_slot_index} {source_cell[0]} {source_cell[1]}")
+                                    setattr(env, "_last_observation", scoped_observation)
+                                    post_observation, _reward, _terminated, _truncated, info = coach_hook.step_env(env, 0)
+                                    action_result = info.get("action_result", {}) if isinstance(info, dict) else {}
+                                    changed_tile_count = int(
+                                        action_result.get("changedTileCount")
+                                        or action_result.get("changed_tile_count")
+                                        or 0
+                                    )
+                                    changed_tiles = action_result.get("changedTiles")
+                                    if not isinstance(changed_tiles, list):
+                                        changed_tiles = action_result.get("changed_tiles")
+                                    if not isinstance(changed_tiles, list):
+                                        changed_tiles = []
+                                    non_source_tiles_changed = bool(
+                                        action_result.get("nonSourceTilesChanged")
+                                        if "nonSourceTilesChanged" in action_result
+                                        else action_result.get("non_source_tiles_changed")
+                                    )
+                                    global_side_effect = bool(
+                                        action_result.get("globalFusionSideEffect")
+                                        if "globalFusionSideEffect" in action_result
+                                        else action_result.get("global_fusion_side_effect")
+                                    )
+                                    fusion_scope_value = str(
+                                        action_result.get("fusionScope")
+                                        or action_result.get("fusion_scope")
+                                        or ""
+                                    )
+                                    post_payload = post_observation if isinstance(post_observation, dict) else env.observe()
+                                    control_after = plant_at_cell(post_payload, control_cell[0], control_cell[1])
+                                    control_after_type = int(control_after.get("type", control_after.get("plantType", -1))) if isinstance(control_after, dict) else -1
+                                    control_after_name = str(control_after.get("typeName") or control_after.get("plantTypeName") or "") if isinstance(control_after, dict) else ""
+                                    control_after_id = int(control_after.get("instanceId", control_after.get("instanceID", 0)) or 0) if isinstance(control_after, dict) else 0
+                                    source_tile_changed_only = (
+                                        changed_tile_count == 1
+                                        and len(changed_tiles) == 1
+                                        and int(value_int(changed_tiles[0], "row", "source_row", default=-1)) == int(source_cell[0])
+                                        and int(value_int(changed_tiles[0], "column", "col", "source_col", default=-1)) == int(source_cell[1])
+                                        and not non_source_tiles_changed
+                                        and not global_side_effect
+                                    )
+                                    control_unchanged = (
+                                        isinstance(control_after, dict)
+                                        and control_after_type == control_before_type
+                                        and control_after_name == control_before_name
+                                        and (control_before_id <= 0 or control_after_id == control_before_id)
+                                    )
+                                    hook_status = coach_hook.live_status_fields()
+                                    record(
+                                        "coach_fuse_command_uses_fresh_single_bridge_command",
+                                        (
+                                            not bool(fresh_clear_stale)
+                                            and isinstance(info.get("human_coach"), dict)
+                                            and isinstance(info.get("human_coach", {}).get("selected_bridge_command"), dict)
+                                            and info.get("human_coach", {}).get("selected_bridge_command", {}).get("command") == "fusion_step"
+                                            and hook_status.get("selected_bridge_command") is None
+                                            and hook_status.get("pending_coach_command") is None
+                                            and hook_status.get("last_executed_coach_command_id") is not None
+                                        ),
+                                        (
+                                            f"fresh_clear_stale={fresh_clear_stale}, "
+                                            f"selected={info.get('human_coach', {}).get('selected_bridge_command')}, "
+                                            f"status_selected={hook_status.get('selected_bridge_command')}, "
+                                            f"last_id={hook_status.get('last_executed_coach_command_id')}"
+                                        ),
+                                    )
+                                    record(
+                                        "coach_tile_scoped_fusion_only_changes_requested_tile",
+                                        bool(
+                                            action_result.get("fusionSucceeded")
+                                            and source_tile_changed_only
+                                            and fusion_scope_value == "tile_scoped"
+                                        ),
+                                        (
+                                            f"succeeded={action_result.get('fusionSucceeded')}, changed_count={changed_tile_count}, "
+                                            f"changed_tiles={changed_tiles}, non_source={non_source_tiles_changed}, "
+                                            f"global_side_effect={global_side_effect}, fusion_scope={fusion_scope_value}, "
+                                            f"bridge_reason={action_result.get('bridgeResultReason')}, "
+                                            f"source_before={source_before_type}:{source_before_id}"
+                                        ),
+                                    )
+                                    record(
+                                        "coach_tile_scoped_fusion_preserves_second_source_plant",
+                                        control_unchanged,
+                                        (
+                                            f"before={control_before_type}:{control_before_name}:{control_before_id}, "
+                                            f"after={control_after_type}:{control_after_name}:{control_after_id}, "
+                                            f"source_cell={source_cell}, control_cell={control_cell}"
+                                        ),
+                                    )
+    except Exception as exc:
+        record("coach_tile_scoped_fusion_runtime", False, str(exc))
+
+    print_smoke_results(checks)
+    return all(ok for _, ok, _ in checks)
+
+
 def reset_cleanup_test(env: PvZGymEnv, episodes: int) -> bool:
     checks: List[Tuple[str, bool, str]] = []
 
@@ -9056,6 +10443,8 @@ def main() -> int:
     parser.add_argument("--adventure-state-smoke", action="store_true")
     parser.add_argument("--sun-cost-test", action="store_true")
     parser.add_argument("--cooldown-test", action="store_true")
+    parser.add_argument("--fusion-semantics-test", action="store_true")
+    parser.add_argument("--coach-fusion-scope-test", action="store_true")
     parser.add_argument("--reset-cleanup-test", action="store_true")
     parser.add_argument("--reset-state-machine-test", action="store_true")
     parser.add_argument("--reset-stress-test", action="store_true", help="Run repeated reset cycles with auto-select and mask/mower validation.")
@@ -9285,6 +10674,8 @@ def main() -> int:
             and not args.adventure_state_smoke
             and not args.sun_cost_test
             and not args.cooldown_test
+            and not args.fusion_semantics_test
+            and not args.coach_fusion_scope_test
             and not args.reset_cleanup_test
             and not args.reset_state_machine_test
             and not args.reset_stress_test
@@ -9336,6 +10727,12 @@ def main() -> int:
         if args.cooldown_test:
             prepare_active_board()
             exit_code = 0 if cooldown_test(env) else 1
+        if args.fusion_semantics_test:
+            prepare_active_board()
+            exit_code = 0 if fusion_semantics_test(env) else 1
+        if args.coach_fusion_scope_test:
+            prepare_active_board()
+            exit_code = 0 if coach_fusion_scope_test(env) else 1
         if args.reset_cleanup_test:
             prepare_active_board()
             exit_code = 0 if reset_cleanup_test(env, args.episodes) else 1

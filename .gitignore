@@ -3,7 +3,8 @@ runs/
 Game Files/
 cmdOutputs/
 run
-
+docs/
+configs\ppo_adventure_generalist_14slot_identity_v1.json
 # Model checkpoints and artifacts
 model.zip
 final_model.zip
@@ -79,3 +80,8 @@ desktop.ini
 # Diagnostic files
 diagnostics/
 *.jsonl
+configs/ppo_adventure_generalist_14slot_identity_v1.json
+configs/ppo_adventure_generalist_14slot_identity_v1.json
+configs/ppo_adventure_generalist_14slot_identity_v1.json
+configs/ppo_adventure_generalist_14slot_identity_v1.json
+configs/ppo_adventure_generalist_14slot_identity_v1.json

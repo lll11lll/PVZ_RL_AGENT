@@ -97,6 +97,15 @@ def default_fusion_diagnostics(policy: str = FUSION_POLICY_NONE) -> Dict[str, An
         "fusion_top_candidate": None,
         "fusion_last_attempt": None,
         "fusion_last_result": None,
+        "fusion_last_execution_mode": "",
+        "fusion_last_bridge_method_used": "",
+        "fusion_last_bridge_result_reason": "",
+        "fusion_last_duplicate_stack_detected": False,
+        "last_fusion_scope": "",
+        "last_fusion_changed_tile_count": 0,
+        "last_fusion_non_source_tiles_changed": False,
+        "last_fusion_global_side_effect": False,
+        "last_executed_coach_command_id": None,
         "fusion_last_rejected_reason": "",
         "fusion_attempted_count": 0,
         "fusion_success_count": 0,
@@ -402,7 +411,45 @@ def apply_fusion_attempt_result(
             "success": success,
             "illegalReason": result.get("illegalReason"),
             "fusionRejectedReason": result.get("fusionRejectedReason"),
+            "fusionExecutionMode": str(result.get("fusionExecutionMode") or ""),
+            "bridgeMethodUsed": str(result.get("bridgeMethodUsed") or ""),
+            "bridgeResultReason": str(result.get("bridgeResultReason") or ""),
+            "duplicateStackDetected": bool(result.get("duplicateStackDetected")),
+            "fusionScope": str(result.get("fusionScope") or result.get("fusion_scope") or ""),
+            "changedTileCount": _safe_int(result.get("changedTileCount"), result.get("changed_tile_count"), default=0),
+            "nonSourceTilesChanged": bool(
+                result.get("nonSourceTilesChanged")
+                if "nonSourceTilesChanged" in result
+                else result.get("non_source_tiles_changed")
+            ),
+            "globalFusionSideEffect": bool(
+                result.get("globalFusionSideEffect")
+                if "globalFusionSideEffect" in result
+                else result.get("global_fusion_side_effect")
+            ),
+            "plantCountOnTileBefore": _safe_int(result.get("plantCountOnTileBefore"), default=0),
+            "plantCountOnTileAfter": _safe_int(result.get("plantCountOnTileAfter"), default=0),
+            "sourceTileOccupiedBefore": bool(result.get("sourceTileOccupiedBefore")),
+            "sourcePlantBefore": result.get("sourcePlantBefore"),
+            "resultingPlantAfter": result.get("resultingPlantAfter"),
         }
+        diag["fusion_last_execution_mode"] = str(result.get("fusionExecutionMode") or "")
+        diag["fusion_last_bridge_method_used"] = str(result.get("bridgeMethodUsed") or "")
+        diag["fusion_last_bridge_result_reason"] = str(result.get("bridgeResultReason") or "")
+        diag["fusion_last_duplicate_stack_detected"] = bool(result.get("duplicateStackDetected"))
+        diag["last_fusion_scope"] = str(result.get("fusionScope") or result.get("fusion_scope") or "")
+        diag["last_fusion_changed_tile_count"] = _safe_int(result.get("changedTileCount"), result.get("changed_tile_count"), default=0)
+        diag["last_fusion_non_source_tiles_changed"] = bool(
+            result.get("nonSourceTilesChanged")
+            if "nonSourceTilesChanged" in result
+            else result.get("non_source_tiles_changed")
+        )
+        diag["last_fusion_global_side_effect"] = bool(
+            result.get("globalFusionSideEffect")
+            if "globalFusionSideEffect" in result
+            else result.get("global_fusion_side_effect")
+        )
+        diag["last_executed_coach_command_id"] = result.get("last_executed_coach_command_id", result.get("executed_coach_command_id"))
     diag["fusion_rejected_reasons"] = dict(sorted(reasons.items()))
     return diag
 
@@ -449,6 +496,15 @@ def fusion_live_fields(diagnostics: Optional[Dict[str, Any]], policy: str = FUSI
         "fusion_top_candidate": diag.get("fusion_top_candidate"),
         "fusion_last_attempt": diag.get("fusion_last_attempt"),
         "fusion_last_result": diag.get("fusion_last_result"),
+        "fusion_last_execution_mode": str(diag.get("fusion_last_execution_mode") or ""),
+        "fusion_last_bridge_method_used": str(diag.get("fusion_last_bridge_method_used") or ""),
+        "fusion_last_bridge_result_reason": str(diag.get("fusion_last_bridge_result_reason") or ""),
+        "fusion_last_duplicate_stack_detected": bool(diag.get("fusion_last_duplicate_stack_detected")),
+        "last_fusion_scope": str(diag.get("last_fusion_scope") or ""),
+        "last_fusion_changed_tile_count": int(diag.get("last_fusion_changed_tile_count") or 0),
+        "last_fusion_non_source_tiles_changed": bool(diag.get("last_fusion_non_source_tiles_changed")),
+        "last_fusion_global_side_effect": bool(diag.get("last_fusion_global_side_effect")),
+        "last_executed_coach_command_id": diag.get("last_executed_coach_command_id"),
         "fusion_last_rejected_reason": str(diag.get("fusion_last_rejected_reason") or ""),
         "fusion_attempted_count": int(diag.get("fusion_attempted_count") or 0),
         "fusion_success_count": int(diag.get("fusion_success_count") or 0),

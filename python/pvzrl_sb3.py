@@ -11,6 +11,7 @@ import json
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import gymnasium as gym
@@ -44,12 +45,23 @@ from pvzrl_env import (
     resolve_seed_list,
 )
 from pvzrl_fusion import FUSION_POLICY_NONE, merge_episode_fusion_stats, normalize_fusion_policy
+from pvzrl_human_coach import (
+    COACH_REWARD_LEGAL_EXECUTION_COMPONENT,
+    COACH_REWARD_MATCH_COMPONENT,
+    COACH_REWARD_OVERRIDE_PENALTY_COMPONENT,
+    FileCoachCommandSource,
+    HumanCoachOverrideHook,
+    build_env_fusion_probe,
+    human_coach_live_status_defaults,
+    human_coach_live_status_from_hook,
+)
 from pvzrl_seed_inventory import (
     adventure_identity_feature_count,
     adventure_identity_features,
     seed_inventory_v2_feature_count,
     seed_inventory_v2_features,
 )
+from pvzrl_stream_coach import StreamCoachController
 
 
 @dataclass
@@ -94,6 +106,25 @@ class PvZSB3Config:
     cherrybomb_tactical_mask: bool = False
     adventure_eval_mode: bool = False
     game_exe: Optional[str] = None
+    human_coach_enabled: bool = False
+    human_coach_log_path: str = ""
+    human_coach_command_path: str = ""
+    human_coach_reward: bool = False
+    human_coach_fusion_enabled: bool = False
+    human_coach_platform: str = "mock"
+    stream_coach_enabled: bool = False
+    stream_coach_mode: str = "mock"
+    stream_coach_platform: str = "mock"
+    stream_coach_window_sec: float = 3.0
+    stream_coach_min_votes: int = 2
+    stream_coach_max_actions_per_minute: int = 20
+    stream_coach_reward: bool = False
+    stream_coach_log_path: str = ""
+    stream_coach_command_path: str = ""
+    stream_coach_mock_script: str = ""
+    stream_coach_dry_run: bool = True
+    stream_coach_apply_enabled: bool = False
+    stream_coach_fusion_enabled: bool = False
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     def __post_init__(self) -> None:
@@ -140,6 +171,7 @@ class PvZSB3Config:
             "action_space_mode": spec.mode,
             "max_seed_slots": int(spec.max_seed_slots),
             "dynamic_seed_slots": bool(spec.dynamic_seed_slots),
+            "identity_seed_slots": bool(spec.identity_seed_slots),
             "observation_version": str(self.observation_version or spec.observation_version),
             "action_decoder_version": str(self.action_decoder_version or spec.action_decoder_version),
             "decoder_wait_action": int(spec.wait_action),
@@ -148,6 +180,21 @@ class PvZSB3Config:
             "cols": int(spec.cols),
             "cells_per_seed_slot": int(spec.rows) * int(spec.cols),
         }
+
+
+def _stream_raw_text(command: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(command, dict):
+        return ""
+    name = str(command.get("command") or "").strip().lower()
+    if name in {"plant", "fuse"}:
+        return f"!{name} {int(command.get('seed_index', -1))} {int(command.get('row', -1))} {int(command.get('col', -1))}"
+    if name == "defend":
+        return f"!defend {int(command.get('row', -1))}"
+    if name == "economy":
+        return "!economy"
+    if name == "wait":
+        return "!wait"
+    return ""
 
 
 class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
@@ -251,6 +298,61 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._last_episode_ended_by_timeout = False
         self._last_episode_ended_by_win = False
         self._reset_requires_seed_flow_next = False
+        self.human_coach_hook: Optional[HumanCoachOverrideHook] = None
+        self.stream_coach_controller: Optional[StreamCoachController] = None
+        self._stream_coach_source_path = str(self.config.stream_coach_command_path or "")
+        self._fusion_probe = build_env_fusion_probe(self)
+        if self.config.human_coach_enabled:
+            source = FileCoachCommandSource(self.config.human_coach_command_path) if self.config.human_coach_command_path else None
+            self.human_coach_hook = HumanCoachOverrideHook(
+                enabled=True,
+                source=source,
+                log_path=self.config.human_coach_log_path or None,
+                reward_enabled=bool(self.config.human_coach_reward),
+                fusion_enabled=bool(self.config.human_coach_fusion_enabled),
+                platform=self.config.human_coach_platform or "mock",
+                match_reward=float(getattr(self.config.reward, "coach_match_reward", 0.02)),
+                legal_execution_reward=float(getattr(self.config.reward, "coach_legal_execution_reward", 0.01)),
+                override_penalty=float(getattr(self.config.reward, "coach_override_penalty", -0.01)),
+                fusion_success_reward=float(getattr(self.config.reward, "coach_fusion_success_reward", 0.03)),
+                tactical_usefulness_reward=float(getattr(self.config.reward, "coach_tactical_usefulness_reward", 0.01)),
+            )
+        if self.config.stream_coach_enabled:
+            stream_command_path = None
+            if self.config.stream_coach_command_path:
+                stream_command_path = Path(self.config.stream_coach_command_path)
+            mock_script_path = None
+            if self.config.stream_coach_mock_script:
+                mock_script_path = Path(self.config.stream_coach_mock_script)
+            self.stream_coach_controller = StreamCoachController(
+                enabled=True,
+                mode=self.config.stream_coach_mode or self.config.stream_coach_platform or "mock",
+                platform=self.config.stream_coach_platform or "mock",
+                command_path=stream_command_path,
+                mock_script_path=mock_script_path,
+                dry_run=bool(self.config.stream_coach_dry_run),
+                apply_enabled=bool(self.config.stream_coach_apply_enabled),
+                window_sec=float(self.config.stream_coach_window_sec),
+                min_votes=int(self.config.stream_coach_min_votes),
+                max_actions_per_minute=int(self.config.stream_coach_max_actions_per_minute),
+                log_path=Path(self.config.stream_coach_log_path) if self.config.stream_coach_log_path else None,
+            )
+            self._stream_coach_source_path = str(stream_command_path or "")
+        print(f"[coach] human coach enabled={bool(self.config.human_coach_enabled)}")
+        print(
+            "[coach] command queue path="
+            f"{str(self.config.human_coach_command_path or self.config.stream_coach_command_path or '')}"
+        )
+        print(f"[coach] action_count={int(self.action_count)}")
+        print(f"[coach] decoder={self.action_spec.action_decoder_version}")
+        print(f"[coach] fusion bridge available={bool(self._fusion_probe is not None)}")
+        print(f"[coach] stream coach enabled={bool(self.config.stream_coach_enabled)}")
+        if self.config.stream_coach_enabled:
+            print(f"[coach] stream coach mode={self.config.stream_coach_mode or self.config.stream_coach_platform or 'mock'}")
+            print(f"[coach] stream coach dry_run={bool(self.config.stream_coach_dry_run)} apply_enabled={bool(self.config.stream_coach_apply_enabled)}")
+            print(f"[coach] stream command queue path={self._stream_coach_source_path}")
+            if self.config.stream_coach_mock_script:
+                print(f"[coach] mock stream script={self.config.stream_coach_mock_script}")
         self._reset_lane_episode_diagnostics({})
 
     def get_env_metadata(self) -> Dict[str, Any]:
@@ -259,9 +361,40 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         metadata["action_space_mode"] = self.action_spec.mode
         metadata["max_seed_slots"] = int(self.action_spec.max_seed_slots)
         metadata["dynamic_seed_slots"] = bool(self.action_spec.dynamic_seed_slots)
+        metadata["identity_seed_slots"] = bool(self.action_spec.identity_seed_slots)
         metadata["observation_version"] = self.action_spec.observation_version
         metadata["action_decoder_version"] = self.action_spec.action_decoder_version
         return metadata
+
+    def _clear_coach_command_state_on_reset(self, *, reason: str = "reset") -> bool:
+        stale_detected = False
+        if self.human_coach_hook is not None and hasattr(self.human_coach_hook, "clear_pending_state"):
+            try:
+                stale_detected = bool(
+                    self.human_coach_hook.clear_pending_state(
+                        clear_source=True,
+                        reason=reason,
+                        preserve_startup_blocked=str(reason or "").endswith("_ready"),
+                    )
+                    or stale_detected
+                )
+            except Exception:
+                stale_detected = True
+        if self.stream_coach_controller is not None and hasattr(self.stream_coach_controller, "clear_pending_state"):
+            try:
+                stale_detected = bool(
+                    self.stream_coach_controller.clear_pending_state(clear_source=True, reason=reason)
+                    or stale_detected
+                )
+            except Exception:
+                stale_detected = True
+        if hasattr(self.base, "clear_coach_runtime_state"):
+            self.base.clear_coach_runtime_state(
+                queue_cleared=True,
+                startup_command_blocked=bool(stale_detected),
+                reason=reason,
+            )
+        return bool(stale_detected)
 
     def reset(
         self,
@@ -280,6 +413,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._next_reset_reason = ""
         self._allow_active_gameplay_reset_next = False
         self._reset_requires_seed_flow_next = False
+        startup_stale_detected = self._clear_coach_command_state_on_reset(reason=f"{reset_reason or 'reset'}_start")
         if self.config.wait_for_board:
             self.base.wait_for_board(
                 timeout=self.config.board_timeout,
@@ -309,8 +443,20 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                     )
                 else:
                     raise
+        stale_detected = bool(
+            self._clear_coach_command_state_on_reset(reason=f"{reset_reason or 'reset'}_ready")
+            or startup_stale_detected
+        )
+        if bool(startup_stale_detected) and hasattr(self.base, "clear_coach_runtime_state"):
+            self.base.clear_coach_runtime_state(
+                queue_cleared=True,
+                startup_command_blocked=True,
+                reason=f"{reset_reason or 'reset'}_ready",
+            )
 
         reset_payload = reset_info.get("reset", {}) if isinstance(reset_info, dict) else {}
+        reset_payload["coach_command_queue_cleared_on_reset"] = True
+        reset_payload["startup_command_blocked"] = bool(stale_detected)
         if reset_requires_seed_flow:
             reset_payload["wrapperRequiredSeedFlow"] = True
         self._last_episode_ended_by_timeout = False
@@ -365,6 +511,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         reset_payload = reset_info.get("reset", {}) if isinstance(reset_info, dict) else {}
         method_used = str(reset_payload.get("methodUsed") or "adventure_existing_board")
         self.base.begin_new_attempt(observation, reason=f"adventure:{method_used}")
+        stale_detected = self._clear_coach_command_state_on_reset(reason=f"adventure_{method_used}_start")
+        reset_payload["coach_command_queue_cleared_on_reset"] = True
+        reset_payload["startup_command_blocked"] = bool(stale_detected)
         legal_actions_for_log = observation.get("legalActions", [])
         legal_action_count_for_log = observation.get("legalActionCount")
         if legal_action_count_for_log is None:
@@ -412,9 +561,149 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         return self._encode_observation(observation), {"raw_observation": observation, **reset_info}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        ppo_action = int(action)
         policy_action = int(action)
+        coach_decision = None
+        stream_decision = None
+        coach_context: Dict[str, Any] = {}
+        selected_bridge_command: Optional[Dict[str, Any]] = None
+
+        if self.human_coach_hook is not None:
+            coach_decision = self.human_coach_hook.select_action(self, policy_action)
+            policy_action = int(coach_decision.selected_action)
+            selected_bridge_command = (
+                dict(coach_decision.selected_bridge_command)
+                if isinstance(coach_decision.selected_bridge_command, dict)
+                else None
+            )
+            coach_context = {
+                "enabled": bool(coach_decision.enabled),
+                "source": "human",
+                "rewardEnabled": bool(self.config.human_coach_reward),
+                "event": str(coach_decision.event),
+                "overrideApplied": bool(coach_decision.override_applied),
+                "coachMatch": bool(coach_decision.coach_match),
+                "selectedAction": int(coach_decision.selected_action),
+                "ppoAction": int(coach_decision.ppo_action),
+                "command": coach_decision.command.to_dict() if coach_decision.command is not None else None,
+                "validation": coach_decision.validation.to_dict() if coach_decision.validation is not None else None,
+            }
+            command_payload = coach_decision.command.to_dict() if coach_decision.command is not None else None
+            print(
+                "[coach] source=human "
+                f"raw={command_payload.get('raw_text') if isinstance(command_payload, dict) else ''!r} "
+                f"parsed={command_payload} "
+                f"action={policy_action} "
+                f"legal={bool(not coach_decision.rejected)} "
+                f"outcome={coach_decision.event} "
+                f"reason={coach_decision.rejected_reason!r}"
+            )
+        elif self.stream_coach_controller is not None:
+            observation_for_stream = self._last_observation if isinstance(self._last_observation, dict) else {}
+            try:
+                action_mask = self.action_masks()
+            except Exception:
+                action_mask = None
+            legal_policy_actions = self._legal_actions_from_mask(action_mask)
+            self.stream_coach_controller.poll_source(
+                username="mock_source",
+                step_index=self._global_step_count,
+            )
+            stream_fusion_enabled = bool(
+                self.config.stream_coach_fusion_enabled
+                or self.config.human_coach_fusion_enabled
+                or self.fusion_policy != FUSION_POLICY_NONE
+            )
+            stream_decision = self.stream_coach_controller.choose_action(
+                observation=observation_for_stream,
+                legal_actions=legal_policy_actions,
+                action_space_mode=self.action_spec.mode,
+                ppo_action=ppo_action,
+                fusion_enabled=stream_fusion_enabled,
+                fusion_bridge_probe=self._fusion_probe,
+            )
+            stream_apply_enabled = bool(self.config.stream_coach_apply_enabled) and not bool(self.config.stream_coach_dry_run)
+            if stream_decision.selected and stream_decision.selected_policy_action is not None:
+                candidate_policy_action = int(stream_decision.selected_policy_action)
+                if stream_apply_enabled:
+                    policy_action = int(candidate_policy_action)
+                    selected_bridge_command = (
+                        dict(stream_decision.selected_bridge_command)
+                        if isinstance(stream_decision.selected_bridge_command, dict)
+                        else None
+                    )
+                elif self.stream_coach_controller is not None:
+                    self.stream_coach_controller.record_dry_run_decision(stream_decision)
+                stream_event = (
+                    "coach_pending"
+                    if bool(getattr(stream_decision, "pending", False))
+                    else (
+                        "coach_dry_run"
+                        if not stream_apply_enabled
+                        else ("coach_match" if bool(stream_decision.coach_match) else "coach_override")
+                    )
+                )
+                if stream_apply_enabled:
+                    coach_context = {
+                        "enabled": True,
+                        "source": "stream",
+                        "rewardEnabled": bool(self.config.stream_coach_reward),
+                        "event": stream_event,
+                        "overrideApplied": bool(stream_decision.override_applied),
+                        "coachMatch": bool(stream_decision.coach_match),
+                        "selectedAction": int(policy_action),
+                        "candidateAction": int(candidate_policy_action),
+                        "ppoAction": int(ppo_action),
+                        "dryRun": False,
+                        "applyEnabled": True,
+                        "command": dict(stream_decision.selected_command) if isinstance(stream_decision.selected_command, dict) else None,
+                        "voteCount": int(stream_decision.selected_vote_count or 0),
+                        "validation": {
+                            "legal": True,
+                            "policy_action": int(policy_action),
+                        },
+                    }
+                print(
+                    "[coach] source=stream "
+                    f"raw={_stream_raw_text(stream_decision.selected_command)!r} "
+                    f"parsed={stream_decision.selected_command} "
+                    f"action={candidate_policy_action} "
+                    f"dry_run={bool(not stream_apply_enabled)} "
+                    "legal=True "
+                    f"outcome={stream_event} "
+                    f"reason={str(stream_decision.rejected_reason or '')!r}"
+                )
+            else:
+                rejected_reason = str(stream_decision.rejected_reason or "")
+                if rejected_reason not in {"", "no_legal_command", "below_vote_threshold"}:
+                    print(
+                        "[coach] source=stream raw='' parsed=None "
+                        f"action={ppo_action} legal=False outcome=fallback_to_ppo "
+                        f"reason={rejected_reason!r}"
+                    )
         bridge_action = self._policy_action_to_bridge_action(policy_action)
-        observation, reward, done, _, info = self.base.step(bridge_action)
+        observation, reward, done, _, info = self.base.step(
+            bridge_action,
+            coach_bridge_command=selected_bridge_command,
+            coach_context=coach_context if coach_context else None,
+        )
+        if coach_decision is not None and self.human_coach_hook is not None:
+            coach_delta = float(self.human_coach_hook.apply_step_outcome(coach_decision, info if isinstance(info, dict) else {}))
+            if coach_delta != 0.0:
+                reward = float(reward) + coach_delta
+        elif (
+            stream_decision is not None
+            and stream_decision.selected
+            and bool(self.config.stream_coach_apply_enabled)
+            and not bool(self.config.stream_coach_dry_run)
+        ):
+            stream_delta = self._apply_stream_coach_reward(stream_decision, info if isinstance(info, dict) else {})
+            if self.stream_coach_controller is not None:
+                self.stream_coach_controller.apply_step_outcome(stream_decision, info if isinstance(info, dict) else {})
+            if stream_delta != 0.0:
+                reward = float(reward) + stream_delta
+                if self.stream_coach_controller is not None:
+                    self.stream_coach_controller.aggregator.add_reward(stream_delta)
         if self.action_spec.dynamic_seed_slots:
             info["policy_action"] = policy_action
             info["bridge_action"] = bridge_action
@@ -423,6 +712,68 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 action_result["policyAction"] = policy_action
                 action_result["bridgeAction"] = bridge_action
                 action_result["policyActionDecoderVersion"] = self.action_spec.action_decoder_version
+        if coach_decision is not None:
+            coach_payload = coach_decision.to_dict()
+            coach_status = self._coach_live_status()
+            info["human_coach"] = coach_payload
+            info["stream_coach"] = coach_status
+            action_result = info.get("action_result", {})
+            if isinstance(action_result, dict):
+                action_result["humanCoach"] = coach_payload
+                action_result["humanCoachStatus"] = coach_status
+        elif stream_decision is not None:
+            coach_status = self._coach_live_status()
+            info["stream_coach"] = coach_status
+            stream_payload = {
+                "enabled": bool(self.config.stream_coach_enabled),
+                "source": "stream",
+                "event": (
+                    "coach_pending"
+                    if bool(getattr(stream_decision, "pending", False))
+                    else (
+                        "coach_dry_run"
+                        if bool(self.config.stream_coach_dry_run) or not bool(self.config.stream_coach_apply_enabled)
+                        else (
+                            "coach_match"
+                            if bool(stream_decision.coach_match)
+                            else ("coach_override" if stream_decision.selected else "fallback_to_ppo")
+                        )
+                    )
+                ),
+                "dry_run": bool(self.config.stream_coach_dry_run) or not bool(self.config.stream_coach_apply_enabled),
+                "apply_enabled": bool(self.config.stream_coach_apply_enabled) and not bool(self.config.stream_coach_dry_run),
+                "ppo_action": int(ppo_action),
+                "selected_action": int(policy_action),
+                "candidate_action": int(stream_decision.selected_policy_action) if stream_decision.selected_policy_action is not None else int(ppo_action),
+                "override_applied": bool(stream_decision.override_applied)
+                and bool(self.config.stream_coach_apply_enabled)
+                and not bool(self.config.stream_coach_dry_run),
+                "coach_match": bool(stream_decision.coach_match),
+                "rejected": bool(not stream_decision.selected),
+                "rejected_reason": str(stream_decision.rejected_reason or ""),
+                "command": dict(stream_decision.selected_command) if isinstance(stream_decision.selected_command, dict) else None,
+                "vote_count": int(stream_decision.selected_vote_count or 0),
+            }
+            info["human_coach"] = stream_payload
+            action_result = info.get("action_result", {})
+            if isinstance(action_result, dict):
+                action_result["streamCoach"] = stream_payload
+                action_result["streamCoachStatus"] = coach_status
+        if "stream_coach" not in info:
+            info["stream_coach"] = self._coach_live_status()
+        if "human_coach" not in info:
+            info["human_coach"] = {
+                "enabled": bool(self.config.human_coach_enabled),
+                "source": "none",
+                "event": "no_command",
+                "ppo_action": int(ppo_action),
+                "selected_action": int(policy_action),
+                "override_applied": False,
+                "coach_match": False,
+                "rejected": False,
+                "rejected_reason": "",
+                "command": None,
+            }
         self._last_observation = observation
         self._step_count += 1
         self._global_step_count += 1
@@ -708,6 +1059,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             ),
             "fusion_bridge_error_count": self.fusion_bridge_error_count,
             "fusion_unsafe_state_block_count": self.fusion_unsafe_state_block_count,
+            "human_coach": self._coach_live_status(),
             "env_corruption_count": self._episode_env_corruption_count,
             "mower_respawn_detected_count": self._episode_mower_respawn_detected_count,
             "cooldown_reset_detected_count": self._episode_cooldown_reset_detected_count,
@@ -776,6 +1128,166 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info["episode_summary"] = episode_summary
 
         return self._encode_observation(observation), float(reward), terminated, truncated, info
+
+    def _legal_actions_from_mask(self, action_mask: Optional[np.ndarray]) -> Optional[List[int]]:
+        if action_mask is None:
+            return None
+        actions: List[int] = []
+        try:
+            for index, allowed in enumerate(action_mask):
+                if bool(allowed):
+                    actions.append(int(index))
+        except TypeError:
+            return None
+        return actions
+
+    def _apply_stream_coach_reward(self, decision: Any, info: Dict[str, Any]) -> float:
+        if (
+            not bool(self.config.stream_coach_reward)
+            or not bool(getattr(decision, "selected", False))
+            or bool(getattr(decision, "pending", False))
+        ):
+            return 0.0
+        components = {
+            COACH_REWARD_MATCH_COMPONENT: 0.0,
+            COACH_REWARD_LEGAL_EXECUTION_COMPONENT: float(getattr(self.config.reward, "coach_legal_execution_reward", 0.01)),
+            COACH_REWARD_OVERRIDE_PENALTY_COMPONENT: 0.0,
+        }
+        if bool(getattr(decision, "coach_match", False)):
+            components[COACH_REWARD_MATCH_COMPONENT] = float(getattr(self.config.reward, "coach_match_reward", 0.02))
+        if bool(getattr(decision, "override_applied", False)):
+            components[COACH_REWARD_OVERRIDE_PENALTY_COMPONENT] = float(
+                getattr(self.config.reward, "coach_override_penalty", -0.01)
+            )
+        delta = sum(float(value) for value in components.values())
+        if delta == 0.0:
+            return 0.0
+        breakdown = info.get("reward_breakdown")
+        if not isinstance(breakdown, dict):
+            breakdown = {}
+        for key, value in components.items():
+            breakdown[key] = float(breakdown.get(key) or 0.0) + float(value)
+        breakdown["reward_total"] = float(breakdown.get("reward_total") or 0.0) + float(delta)
+        info["reward_breakdown"] = breakdown
+        return float(delta)
+
+    def _coach_live_status(self) -> Dict[str, Any]:
+        human_fields = human_coach_live_status_from_hook(
+            self.human_coach_hook,
+            enabled=bool(self.config.human_coach_enabled),
+            platform=self.config.human_coach_platform or "mock",
+        )
+        payload = dict(human_fields)
+        if self.stream_coach_controller is not None:
+            stream_fields = self.stream_coach_controller.diagnostics_fields()
+            payload.update(stream_fields)
+        elif "stream_coach_enabled" not in payload:
+            payload.update(
+                human_coach_live_status_defaults(
+                    enabled=False,
+                    platform=str(self.config.stream_coach_platform or "mock"),
+                )
+            )
+        if self.stream_coach_controller is None and not bool(self.config.stream_coach_enabled):
+            payload["stream_coach_enabled"] = False
+            payload["stream_coach_mode"] = "off"
+            payload["stream_coach_alive"] = False
+            payload["stream_coach_alive_status"] = "off"
+        else:
+            payload.setdefault("stream_coach_mode", str(self.config.stream_coach_mode or self.config.stream_coach_platform or "mock"))
+            payload.setdefault("stream_coach_alive", bool(self.config.stream_coach_enabled))
+            payload.setdefault("stream_coach_alive_status", "alive" if bool(self.config.stream_coach_enabled) else "off")
+        payload.setdefault("stream_coach_command_path", str(self.config.stream_coach_command_path or ""))
+        payload.setdefault("mock_stream_script", str(self.config.stream_coach_mock_script or ""))
+        payload.setdefault("stream_coach_dry_run", bool(self.config.stream_coach_dry_run))
+        payload.setdefault("stream_coach_apply_enabled", bool(self.config.stream_coach_apply_enabled) and not bool(self.config.stream_coach_dry_run))
+        payload.setdefault("stream_coach_messages_seen", 0)
+        payload.setdefault("stream_coach_commands_parsed", 0)
+        payload.setdefault("stream_coach_commands_accepted", 0)
+        payload.setdefault("stream_coach_commands_rejected", 0)
+        payload.setdefault("stream_messages_seen", int(payload.get("stream_coach_messages_seen", 0) or 0))
+        payload.setdefault("stream_commands_parsed", int(payload.get("stream_coach_commands_parsed", 0) or 0))
+        payload.setdefault("stream_commands_accepted", int(payload.get("stream_coach_commands_accepted", 0) or 0))
+        payload.setdefault("stream_commands_rejected", int(payload.get("stream_coach_commands_rejected", 0) or 0))
+        payload.setdefault("stream_coach_validated_count", 0)
+        payload.setdefault("stream_coach_applied_count", 0)
+        payload.setdefault("stream_coach_dry_run_count", 0)
+        payload.setdefault("last_stream_user", str(payload.get("stream_coach_last_user") or ""))
+        payload.setdefault("stream_coach_last_message", "")
+        payload.setdefault("stream_coach_last_parsed_command", None)
+        payload.setdefault("stream_coach_last_command_status", "off" if not bool(self.config.stream_coach_enabled) else "idle")
+        payload.setdefault("stream_coach_last_reject_reason", "")
+        payload.setdefault("stream_coach_last_validated_command", "")
+        payload.setdefault("stream_coach_last_applied_command", "")
+        payload.setdefault("last_stream_message", str(payload.get("stream_coach_last_message") or ""))
+        payload.setdefault("last_stream_parsed_command", payload.get("stream_coach_last_parsed_command"))
+        payload.setdefault("last_stream_command_status", str(payload.get("stream_coach_last_command_status") or ""))
+        payload.setdefault("last_stream_reject_reason", str(payload.get("stream_coach_last_reject_reason") or ""))
+        payload.setdefault("last_validated_coach_command", str(payload.get("stream_coach_last_validated_command") or ""))
+        payload.setdefault("last_applied_coach_command", str(payload.get("stream_coach_last_applied_command") or ""))
+        payload.setdefault("pending_stream_commands", 0)
+        payload.setdefault("stream_coach_startup_stale_cleared", False)
+        payload.setdefault("stream_coach_stale_messages_cleared", 0)
+        payload.setdefault("stream_coach_clear_count", 0)
+        payload.setdefault("stream_coach_last_clear_reason", "")
+        payload.setdefault(
+            "fusion_bridge_enabled",
+            bool(self.config.human_coach_fusion_enabled or self.config.stream_coach_fusion_enabled),
+        )
+        if payload.get("fusion_bridge_available") is None:
+            payload["fusion_bridge_available"] = bool(self._fusion_probe is not None)
+        if "fusion_last_result" not in payload:
+            payload["fusion_last_result"] = ""
+        if "fusion_last_command" not in payload:
+            payload["fusion_last_command"] = None
+        payload.setdefault("fusion_last_execution_mode", "")
+        payload.setdefault("fusion_last_bridge_method_used", "")
+        payload.setdefault("fusion_last_bridge_result_reason", "")
+        payload.setdefault("fusion_last_duplicate_stack_detected", False)
+        payload.setdefault("fusion_last_source_tile_occupied_before", False)
+        payload.setdefault("fusion_last_plant_count_on_tile_before", 0)
+        payload.setdefault("fusion_last_plant_count_on_tile_after", 0)
+        payload.setdefault("fusion_last_source_plant_before", None)
+        payload.setdefault("fusion_last_resulting_plant_after", None)
+        payload.setdefault("fusion_last_predicted_result_resolution_source", "")
+        payload.setdefault("fusion_last_mix_lookup_found", False)
+        payload.setdefault("fusion_last_mix_lookup_key", "")
+        payload.setdefault("fusion_last_pre_source_type", -1)
+        payload.setdefault("fusion_last_pre_source_name", "")
+        payload.setdefault("fusion_last_ingredient_type", -1)
+        payload.setdefault("fusion_last_ingredient_name", "")
+        payload.setdefault("fusion_last_post_result_type", -1)
+        payload.setdefault("fusion_last_post_result_name", "")
+        payload.setdefault("fusion_last_no_effect_reason", "")
+        payload.setdefault("last_fusion_scope", "")
+        payload.setdefault("last_fusion_changed_tile_count", 0)
+        payload.setdefault("last_fusion_non_source_tiles_changed", False)
+        payload.setdefault("last_fusion_global_side_effect", False)
+        payload.setdefault("pending_coach_command", None)
+        payload.setdefault("selected_bridge_command", None)
+        payload.setdefault("last_executed_coach_command_id", None)
+        payload.setdefault("coach_command_queue_cleared_on_reset", True)
+        payload.setdefault("startup_command_blocked", False)
+        payload.setdefault("stream_fusion_last_execution_mode", "")
+        payload.setdefault("stream_fusion_last_bridge_method_used", "")
+        payload.setdefault("stream_fusion_last_bridge_result_reason", "")
+        payload.setdefault("stream_fusion_last_duplicate_stack_detected", False)
+        payload.setdefault("stream_fusion_last_source_tile_occupied_before", False)
+        payload.setdefault("stream_fusion_last_plant_count_on_tile_before", 0)
+        payload.setdefault("stream_fusion_last_plant_count_on_tile_after", 0)
+        payload.setdefault("stream_fusion_last_source_plant_before", None)
+        payload.setdefault("stream_fusion_last_resulting_plant_after", None)
+        payload.setdefault("stream_fusion_last_predicted_result_resolution_source", "")
+        payload.setdefault("stream_fusion_last_mix_lookup_found", False)
+        payload.setdefault("stream_fusion_last_mix_lookup_key", "")
+        payload.setdefault("stream_fusion_last_pre_source_type", -1)
+        payload.setdefault("stream_fusion_last_pre_source_name", "")
+        payload.setdefault("stream_fusion_last_ingredient_type", -1)
+        payload.setdefault("stream_fusion_last_ingredient_name", "")
+        payload.setdefault("stream_fusion_last_post_result_type", -1)
+        payload.setdefault("stream_fusion_last_post_result_name", "")
+        payload.setdefault("stream_fusion_last_no_effect_reason", "")
+        return payload
 
     def action_masks(self) -> np.ndarray:
         started = time.perf_counter()

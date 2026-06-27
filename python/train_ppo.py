@@ -28,13 +28,19 @@ from pvzrl_adventure_generalist import (
     ADVENTURE_GENERALIST_RUN_MODE_EVAL,
     ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
     AdventureGeneralistTrainingEnv,
+    SEED_CAPACITY_MAX,
+    SEED_ORDER_SOURCE_DEFAULT,
+    SEED_ORDER_SOURCE_EXPLICIT,
+    SEED_ORDER_SOURCE_RANDOMIZED,
     parse_initial_loadout,
 )
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ACTION_SPACE_DYNAMIC_14,
     ACTION_SPACE_FIXED,
+    ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
     ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_OBSERVATION_VERSION,
     DYNAMIC_WAIT_ACTION,
     action_count_for_config as action_space_count_for_config,
     build_action_space_spec,
@@ -49,6 +55,7 @@ from pvzrl_env import (
     RUN_MODE_LEVEL3_SPECIALIST,
 )
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields, normalize_fusion_policy
+from pvzrl_human_coach import human_coach_live_status_defaults
 from pvzrl_model_metadata import (
     CompatibilityCheck,
     apply_model_metadata_defaults,
@@ -529,6 +536,13 @@ def build_reward_config(args: argparse.Namespace, raw_config: Dict[str, Any]) ->
         key: pick_reward(args, raw_config, key, float(default_value))
         for key, default_value in defaults.items()
     }
+    # Backward-compatible coach reward aliases kept for existing GUI presets.
+    if getattr(args, "coach_legal_execution_reward", None) is None and getattr(args, "human_coach_bonus", None) is not None:
+        reward["coach_legal_execution_reward"] = float(getattr(args, "human_coach_bonus"))
+    if getattr(args, "coach_match_reward", None) is None and getattr(args, "human_coach_match_bonus", None) is not None:
+        reward["coach_match_reward"] = float(getattr(args, "human_coach_match_bonus"))
+    if getattr(args, "coach_override_penalty", None) is None and getattr(args, "human_coach_override_penalty", None) is not None:
+        reward["coach_override_penalty"] = float(getattr(args, "human_coach_override_penalty"))
     cli_level3_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower() == RUN_MODE_LEVEL3_SPECIALIST
     level3_requested = bool(getattr(args, "level3_train", False) or getattr(args, "level3_eval", False) or cli_level3_run_mode)
     configured_run_mode = str(raw_config.get("run_mode", "") or "").strip().lower()
@@ -790,6 +804,142 @@ def validate_loaded_model_compatibility(
     return compatibility_summary_from_report(result)
 
 
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _metadata_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def validate_adventure_generalist_model_compatibility(
+    model_path: Path,
+    config: Dict[str, Any],
+    context: str,
+    *,
+    model: Optional[Any] = None,
+    model_action_count: Optional[int] = None,
+    env_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    env_metadata = env_metadata or env_metadata_for_config(config)
+    loaded_action_count = _model_action_count(model) if model is not None else model_action_count
+    result = validate_model_metadata(
+        model_path,
+        config,
+        model_action_count=loaded_action_count,
+        env_metadata=env_metadata,
+        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
+    )
+    print_compatibility_report(f"[compat:{context}]", result)
+
+    model_metadata = result.model_metadata or result.actual or {}
+    model_family = str(model_metadata.get("model_family") or "")
+    raw_mode = model_metadata.get("action_space_mode", "")
+    try:
+        model_mode = normalize_action_space_mode(raw_mode)
+    except ValueError:
+        model_mode = str(raw_mode or "")
+    metadata_action_count = _metadata_int(model_metadata.get("action_count"), default=-1)
+    effective_action_count = _metadata_int(loaded_action_count, default=metadata_action_count)
+    model_max_seed_slots = _metadata_int(model_metadata.get("max_seed_slots"), default=-1)
+    model_observation_version = str(model_metadata.get("observation_version") or "")
+    model_decoder_version = str(model_metadata.get("action_decoder_version") or "")
+    model_identity_seed_slots = _metadata_bool(model_metadata.get("identity_seed_slots", False))
+    model_wait_action = _metadata_int(model_metadata.get("decoder_wait_action"), default=-1)
+    model_placement_range = model_metadata.get("placement_action_range")
+    model_seed_list = normalized_seed_list(model_metadata.get("seed_list", []))
+    runtime_seed_list = normalized_seed_list(env_metadata.get("resolved_seed_list", config.get("seed_list", [])))
+    run_mode = str(model_metadata.get("run_mode") or "")
+    expected_schema = "14_slots_x_50_cells_plus_wait"
+    actual_schema = (
+        f"mode={model_mode};wait={model_wait_action};range={model_placement_range};decoder={model_decoder_version}"
+    )
+
+    def _raise_incompatible_resume(mismatch_fields: List[str]) -> None:
+        raise SystemExit(
+            "blocked_reason=incompatible_resume_model\n"
+            f"model_path={model_path}\n"
+            f"expected_model_family={ADVENTURE_GENERALIST_MODEL_FAMILY}\n"
+            f"actual_model_family={model_family or 'missing'}\n"
+            f"expected_action_count={ADVENTURE_IDENTITY_ACTION_COUNT}\n"
+            f"actual_action_count={effective_action_count}\n"
+            f"expected_action_decoder_version={ADVENTURE_IDENTITY_ACTION_DECODER_VERSION}\n"
+            f"actual_action_decoder_version={model_decoder_version or 'missing'}\n"
+            f"expected_action_schema={expected_schema}\n"
+            f"actual_action_schema={actual_schema}\n"
+            f"expected_observation_schema={ADVENTURE_IDENTITY_OBSERVATION_VERSION}\n"
+            f"actual_observation_schema={model_observation_version or 'missing'}\n"
+            f"expected_max_seed_slots={SEED_CAPACITY_MAX}\n"
+            f"actual_max_seed_slots={model_max_seed_slots}\n"
+            f"expected_identity_seed_slots=True\n"
+            f"actual_identity_seed_slots={model_identity_seed_slots}\n"
+            f"expected_action_space_mode={ACTION_SPACE_ADVENTURE_14_IDENTITY}\n"
+            f"actual_action_space_mode={model_mode}\n"
+            f"expected_run_mode={ADVENTURE_GENERALIST_RUN_MODE_TRAIN}|{ADVENTURE_GENERALIST_RUN_MODE_EVAL}\n"
+            f"actual_run_mode={run_mode or 'missing'}\n"
+            f"expected_seed_list={','.join(runtime_seed_list) or 'missing'}\n"
+            f"actual_seed_list={','.join(model_seed_list) or 'missing'}\n"
+            f"mismatch_fields={','.join(mismatch_fields)}"
+        )
+
+    if not result.ok:
+        blocked_to_field = {
+            "action_count_mismatch": "action_count",
+            "action_decoder_mismatch": "action_decoder_version",
+            "observation_version_mismatch": "observation_version",
+            "max_seed_slots_mismatch": "max_seed_slots",
+            "action_space_mode_mismatch": "action_space_mode",
+            "seed_list_mismatch": "seed_list",
+        }
+        mapped = blocked_to_field.get(str(result.blocked_reason or ""))
+        if mapped:
+            _raise_incompatible_resume([mapped])
+        raise_if_incompatible(result)
+
+    strict_errors: List[str] = []
+    if model_family != ADVENTURE_GENERALIST_MODEL_FAMILY:
+        strict_errors.append("model_family")
+    if model_seed_list != runtime_seed_list:
+        strict_errors.append("seed_list")
+    if metadata_action_count != ADVENTURE_IDENTITY_ACTION_COUNT:
+        strict_errors.append("action_count")
+    if model_mode != ACTION_SPACE_ADVENTURE_14_IDENTITY:
+        strict_errors.append("action_space_mode")
+    if model_decoder_version != ADVENTURE_IDENTITY_ACTION_DECODER_VERSION:
+        strict_errors.append("action_decoder_version")
+    if model_observation_version != ADVENTURE_IDENTITY_OBSERVATION_VERSION:
+        strict_errors.append("observation_version")
+    if model_max_seed_slots != SEED_CAPACITY_MAX:
+        strict_errors.append("max_seed_slots")
+    if not model_identity_seed_slots:
+        strict_errors.append("identity_seed_slots")
+    if run_mode and run_mode not in {ADVENTURE_GENERALIST_RUN_MODE_TRAIN, ADVENTURE_GENERALIST_RUN_MODE_EVAL}:
+        strict_errors.append("run_mode")
+
+    if strict_errors:
+        _raise_incompatible_resume(strict_errors)
+
+    summary = compatibility_summary_from_report(result)
+    print(
+        "[adventure-generalist] model_compatibility_check=ok "
+        f"context={context} "
+        f"model_path={model_path} "
+        f"metadata_path={result.metadata_path or ''} "
+        f"action_count={summary.get('model_action_count') or summary.get('action_count')} "
+        f"observation_version={summary.get('observation_version')} "
+        f"action_decoder_version={summary.get('action_decoder_version')} "
+        f"max_seed_slots={model_max_seed_slots}"
+    )
+    return summary
+
+
 def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[str, Any]:
     quick_wait = bool(args.quick_wait or raw_config.get("quick_wait", False))
     board_timeout = pick(args, raw_config, "board_timeout", 60.0 if quick_wait else 180.0)
@@ -826,10 +976,15 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         default_seed_list = ",".join(LEVEL3_SPECIALIST_SEED_LIST)
     else:
         default_seed_list = "SunFlower,Peashooter"
-    if adventure_generalist_requested and getattr(args, "seed_list", None) is None:
+    cli_seed_list = getattr(args, "seed_list", None)
+    config_seed_list_present = "seed_list" in raw_config and raw_config.get("seed_list") not in (None, "")
+    seed_order_source = SEED_ORDER_SOURCE_DEFAULT
+    if adventure_generalist_requested and cli_seed_list is None and not config_seed_list_present:
         raw_seed_list = default_seed_list
     else:
         raw_seed_list = pick(args, raw_config, "seed_list", default_seed_list)
+        if adventure_generalist_requested and (cli_seed_list is not None or config_seed_list_present):
+            seed_order_source = SEED_ORDER_SOURCE_EXPLICIT
     if isinstance(raw_seed_list, list):
         seed_list = [str(seed).strip() for seed in raw_seed_list if str(seed).strip()]
     else:
@@ -955,12 +1110,106 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
     if raw_final_wave_extension is None:
         raw_final_wave_extension = raw_config.get("adventure_final_wave_extension", True)
     adventure_final_wave_extension = bool(raw_final_wave_extension)
+    raw_generalist_strict_startup_validation = getattr(args, "adventure_generalist_strict_startup_validation", None)
+    if raw_generalist_strict_startup_validation is None:
+        raw_generalist_strict_startup_validation = raw_config.get("adventure_generalist_strict_startup_validation", True)
+    adventure_generalist_strict_startup_validation = bool(raw_generalist_strict_startup_validation)
     adventure_run_mode = run_mode in {
         RUN_MODE_ADVENTURE_EVAL,
         ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
         ADVENTURE_GENERALIST_RUN_MODE_EVAL,
     }
     env_max_steps = adventure_hard_max_steps if adventure_run_mode else legacy_max_steps
+    requested_eval_model_path = str(args.model or raw_config.get("model_path", "") or "").strip()
+    requested_resume_model_path = str(getattr(args, "resume_model_path", None) or raw_config.get("resume_model_path", "") or "").strip()
+    if requested_resume_model_path and requested_eval_model_path and requested_resume_model_path != requested_eval_model_path:
+        raise SystemExit(
+            "blocked_reason=invalid_cli: --resume-model-path conflicts with --model-path. "
+            "Provide one path or make them match."
+        )
+    requested_model_path = requested_resume_model_path or requested_eval_model_path
+    if requested_resume_model_path and run_mode in {"fixed_eval", RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}:
+        raise SystemExit("blocked_reason=invalid_cli: --resume-model-path is training-only.")
+    requested_training_continuation = bool(requested_model_path) and run_mode not in {
+        "fixed_eval",
+        RUN_MODE_ADVENTURE_EVAL,
+        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
+    }
+    randomize_seed_order = bool(
+        getattr(args, "randomize_seed_order", False)
+        or raw_config.get("randomize_seed_order", False)
+        or raw_config.get("seed_order_randomization", False)
+    )
+    if adventure_generalist_requested and randomize_seed_order:
+        seed_order_source = SEED_ORDER_SOURCE_RANDOMIZED
+    coach_allow_fusion_planning = bool(
+        getattr(args, "coach_allow_fusion_planning", False)
+        or raw_config.get("coach_allow_fusion_planning", False)
+    )
+    fusion_bridge_enabled = bool(
+        getattr(args, "fusion_bridge_enabled", False)
+        or raw_config.get("fusion_bridge_enabled", False)
+    )
+    human_coach_enabled = bool(
+        getattr(args, "human_coach_enabled", False)
+        or raw_config.get("human_coach_enabled", False)
+    )
+    stream_coach_enabled = bool(
+        getattr(args, "stream_coach_enabled", False)
+        or raw_config.get("stream_coach_enabled", False)
+    )
+    stream_coach_mode = str(
+        getattr(args, "stream_coach_mode", None)
+        or raw_config.get("stream_coach_mode", "")
+        or getattr(args, "stream_coach_platform", None)
+        or raw_config.get("stream_coach_platform", "mock")
+        or "mock"
+    ).strip().lower()
+    default_coach_command_path = "runs/coach_commands.jsonl"
+    raw_human_command_path = (
+        getattr(args, "human_coach_command_path", None)
+        or raw_config.get("human_coach_command_path", "")
+        or ""
+    )
+    human_coach_command_path = str(raw_human_command_path or "").strip()
+    if human_coach_enabled and not human_coach_command_path:
+        human_coach_command_path = default_coach_command_path
+    raw_stream_command_path = (
+        getattr(args, "stream_coach_command_path", None)
+        or raw_config.get("stream_coach_command_path", "")
+        or ""
+    )
+    stream_coach_command_path = str(raw_stream_command_path or "").strip()
+    if stream_coach_enabled and not stream_coach_command_path:
+        stream_coach_command_path = human_coach_command_path or default_coach_command_path
+    human_coach_fusion_enabled = bool(
+        getattr(args, "human_coach_fusion_enabled", False)
+        or raw_config.get("human_coach_fusion_enabled", False)
+        or coach_allow_fusion_planning
+        or fusion_bridge_enabled
+    )
+    stream_coach_fusion_enabled = bool(
+        raw_config.get("stream_coach_fusion_enabled", False)
+        or coach_allow_fusion_planning
+        or fusion_bridge_enabled
+    )
+    stream_coach_apply_enabled = bool(
+        getattr(args, "stream_coach_apply", False)
+        or raw_config.get("stream_coach_apply_enabled", False)
+        or raw_config.get("stream_coach_apply", False)
+    )
+    stream_coach_dry_run = bool(raw_config.get("stream_coach_dry_run", True))
+    if getattr(args, "stream_coach_apply", False):
+        stream_coach_dry_run = False
+    elif getattr(args, "stream_coach_dry_run", False):
+        stream_coach_dry_run = True
+        stream_coach_apply_enabled = False
+    elif "stream_coach_apply_enabled" in raw_config or "stream_coach_apply" in raw_config:
+        stream_coach_dry_run = not bool(stream_coach_apply_enabled)
+    if stream_coach_dry_run:
+        stream_coach_apply_enabled = False
+    elif not stream_coach_apply_enabled:
+        stream_coach_apply_enabled = True
 
     config = {
         "policy": raw_config.get("policy", "MlpPolicy"),
@@ -1003,6 +1252,10 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         ),
         "seed_list": seed_list,
         "initial_loadout": list(initial_loadout),
+        "configured_seed_list": list(seed_list),
+        "seed_order_source": seed_order_source,
+        "seed_order_preserved": True,
+        "randomize_seed_order": bool(randomize_seed_order),
         "seed_click_delay": float(pick(args, raw_config, "seed_click_delay", 0.35)),
         "lets_rock_delay": float(pick(args, raw_config, "lets_rock_delay", 0.5)),
         "post_start_delay": float(pick(args, raw_config, "post_start_delay", 1.0)),
@@ -1023,12 +1276,17 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         "wallnut_tactical_mask": bool(getattr(args, "wallnut_tactical_mask", False) or raw_config.get("wallnut_tactical_mask", False)),
         "cherrybomb_tactical_mask": bool(getattr(args, "cherrybomb_tactical_mask", False) or raw_config.get("cherrybomb_tactical_mask", False)),
         "adventure_eval_mode": bool(adventure_run_mode),
-        "checkpoint_warm_start": False if adventure_generalist_requested else bool(str(args.model or raw_config.get("model_path", "")).strip()),
+        "checkpoint_warm_start": bool(requested_training_continuation),
         "warm_start_used": False,
         "checkpoint_warm_start_reason": (
-            "new_incompatible_architecture" if adventure_generalist_requested else ""
+            "compatible_adventure_generalist_continuation_requested"
+            if adventure_generalist_train_requested and requested_training_continuation
+            else ""
         ),
-        "scratch_initialization": bool(adventure_generalist_train_requested),
+        "resume_training": bool(requested_training_continuation),
+        "resume_model_path": requested_model_path if requested_training_continuation else "",
+        "resume_source_model_family": "",
+        "scratch_initialization": bool(adventure_generalist_train_requested and not requested_training_continuation),
         "incompatible_with_4slot_specialist": bool(adventure_generalist_requested),
         "active_seed_slots_at_start": len(initial_loadout) if adventure_generalist_requested else len(seed_list),
         "unlock_aware_seed_curriculum": bool(
@@ -1039,6 +1297,13 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         "seed_curriculum": str(pick(args, raw_config, "seed_curriculum", "conservative")),
         "unlock_introduction_delay": int(pick(args, raw_config, "unlock_introduction_delay", 0)),
         "new_plant_min_inclusion_prob": float(pick(args, raw_config, "new_plant_min_inclusion_prob", 0.15)),
+        "infer_capacity_from_unlocks": bool(
+            pick(args, raw_config, "infer_capacity_from_unlocks", adventure_generalist_requested)
+        ),
+        "allow_weak_unlocked_capacity_fallback": bool(
+            getattr(args, "allow_weak_unlocked_capacity_fallback", False)
+            or raw_config.get("allow_weak_unlocked_capacity_fallback", False)
+        ),
         "adventure_replay_cleared_levels": bool(
             getattr(args, "adventure_replay_cleared_levels", False)
             or raw_config.get("adventure_replay_cleared_levels", False)
@@ -1050,6 +1315,7 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
             1,
             int(pick(args, raw_config, "adventure_frontier_win_streak_required", 1) or 1),
         ),
+        "adventure_generalist_strict_startup_validation": bool(adventure_generalist_strict_startup_validation),
         "adventure_start_level": int(pick(args, raw_config, "adventure_start_level", 1)),
         "max_adventure_levels": int(pick(args, raw_config, "max_adventure_levels", 5)),
         "max_attempts_per_level": int(pick(args, raw_config, "max_attempts_per_level", 10)),
@@ -1058,8 +1324,58 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
             getattr(args, "allow_missing_model_metadata", False)
             or raw_config.get("allow_missing_model_metadata", False)
         ),
+        "human_coach_enabled": bool(human_coach_enabled),
+        "human_coach_command_path": str(human_coach_command_path),
+        "human_coach_log_path": str(
+            getattr(args, "human_coach_log_path", None)
+            or raw_config.get("human_coach_log_path", "runs/human_coach.jsonl")
+            or ""
+        ),
+        "human_coach_reward": bool(
+            getattr(args, "human_coach_reward", False)
+            or raw_config.get("human_coach_reward", False)
+        ),
+        "human_coach_fusion_enabled": bool(human_coach_fusion_enabled),
+        "human_coach_platform": str(raw_config.get("human_coach_platform", "mock") or "mock"),
+        "stream_coach_enabled": bool(stream_coach_enabled),
+        "stream_coach_mode": stream_coach_mode,
+        "stream_coach_platform": str(
+            getattr(args, "stream_coach_platform", None)
+            or stream_coach_mode
+            or raw_config.get("stream_coach_platform", "mock")
+            or "mock"
+        ),
+        "stream_coach_window_sec": float(
+            pick(args, raw_config, "stream_coach_window_sec", 3.0)
+        ),
+        "stream_coach_min_votes": int(
+            pick(args, raw_config, "stream_coach_min_votes", 2)
+        ),
+        "stream_coach_max_actions_per_minute": int(
+            pick(args, raw_config, "stream_coach_max_actions_per_minute", 20)
+        ),
+        "stream_coach_command_path": str(stream_coach_command_path),
+        "stream_coach_mock_script": str(
+            getattr(args, "stream_coach_mock_script", None)
+            or raw_config.get("stream_coach_mock_script", "")
+            or ""
+        ),
+        "stream_coach_dry_run": bool(stream_coach_dry_run),
+        "stream_coach_apply_enabled": bool(stream_coach_apply_enabled),
+        "stream_coach_reward": bool(
+            getattr(args, "stream_coach_reward", False)
+            or raw_config.get("stream_coach_reward", False)
+        ),
+        "stream_coach_log_path": str(
+            getattr(args, "stream_coach_log_path", None)
+            or raw_config.get("stream_coach_log_path", "runs/stream_coach.jsonl")
+            or ""
+        ),
+        "stream_coach_fusion_enabled": bool(stream_coach_fusion_enabled),
+        "coach_allow_fusion_planning": bool(coach_allow_fusion_planning),
+        "fusion_bridge_enabled": bool(fusion_bridge_enabled),
         "reward": build_reward_config(args, raw_config),
-        "model_path": str(args.model or raw_config.get("model_path", "")),
+        "model_path": requested_model_path,
         "run_dir": run_dir,
         "checkpoint_freq": int(pick(args, raw_config, "checkpoint_freq", 5000)),
         "host": str(pick(args, raw_config, "host", "127.0.0.1")),
@@ -1076,11 +1392,6 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         raise SystemExit(
             "blocked_reason=invalid_adventure_generalist_action_count: "
             f"expected {ADVENTURE_IDENTITY_ACTION_COUNT} got {action_count_for_config(config)}"
-        )
-    if adventure_generalist_train_requested and str(config.get("model_path") or "").strip():
-        raise SystemExit(
-            "blocked_reason=adventure_generalist_checkpoint_warm_start_not_supported: "
-            "Adventure Generalist 14-slot identity v1 starts from scratch and cannot load 201-action specialist checkpoints."
         )
     return config
 
@@ -1127,6 +1438,25 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         cherrybomb_tactical_mask=bool(config.get("cherrybomb_tactical_mask", False)),
         adventure_eval_mode=bool(config.get("adventure_eval_mode", False)),
         game_exe=str(config.get("game_exe") or "") or None,
+        human_coach_enabled=bool(config.get("human_coach_enabled", False)),
+        human_coach_log_path=str(config.get("human_coach_log_path", "") or ""),
+        human_coach_command_path=str(config.get("human_coach_command_path", "") or ""),
+        human_coach_reward=bool(config.get("human_coach_reward", False)),
+        human_coach_fusion_enabled=bool(config.get("human_coach_fusion_enabled", False)),
+        human_coach_platform=str(config.get("human_coach_platform", "mock") or "mock"),
+        stream_coach_enabled=bool(config.get("stream_coach_enabled", False)),
+        stream_coach_mode=str(config.get("stream_coach_mode", config.get("stream_coach_platform", "mock")) or "mock"),
+        stream_coach_platform=str(config.get("stream_coach_platform", "mock") or "mock"),
+        stream_coach_window_sec=float(config.get("stream_coach_window_sec", 3.0) or 3.0),
+        stream_coach_min_votes=int(config.get("stream_coach_min_votes", 2) or 2),
+        stream_coach_max_actions_per_minute=int(config.get("stream_coach_max_actions_per_minute", 20) or 20),
+        stream_coach_reward=bool(config.get("stream_coach_reward", False)),
+        stream_coach_log_path=str(config.get("stream_coach_log_path", "") or ""),
+        stream_coach_command_path=str(config.get("stream_coach_command_path", "") or ""),
+        stream_coach_mock_script=str(config.get("stream_coach_mock_script", "") or ""),
+        stream_coach_dry_run=bool(config.get("stream_coach_dry_run", True)),
+        stream_coach_apply_enabled=bool(config.get("stream_coach_apply_enabled", False)),
+        stream_coach_fusion_enabled=bool(config.get("stream_coach_fusion_enabled", False)),
         reward=reward_config_from_mapping(config.get("reward", {})),
     )
 
@@ -1146,11 +1476,16 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
             seed_curriculum=str(config.get("seed_curriculum", "conservative")),
             unlock_introduction_delay=int(config.get("unlock_introduction_delay", 0) or 0),
             new_plant_min_inclusion_prob=float(config.get("new_plant_min_inclusion_prob", 0.15) or 0.0),
+            seed_order_source=str(config.get("seed_order_source", "default_canonical")),
+            randomize_seed_order=bool(config.get("randomize_seed_order", False)),
+            infer_capacity_from_unlocks=bool(config.get("infer_capacity_from_unlocks", True)),
+            allow_weak_unlocked_capacity_fallback=bool(config.get("allow_weak_unlocked_capacity_fallback", False)),
             replay_cleared_levels=bool(config.get("adventure_replay_cleared_levels", False)),
             frontier_sample_prob=float(config.get("adventure_frontier_sample_prob", 0.60) or 0.0),
             recent_cleared_sample_prob=float(config.get("adventure_recent_cleared_sample_prob", 0.30) or 0.0),
             maintenance_sample_prob=float(config.get("adventure_maintenance_sample_prob", 0.10) or 0.0),
             frontier_win_streak_required=int(config.get("adventure_frontier_win_streak_required", 1) or 1),
+            strict_startup_validation=bool(config.get("adventure_generalist_strict_startup_validation", True)),
         )
     else:
         env = PvZMaskedPPOEnv(make_env_config(config))
@@ -1776,7 +2111,7 @@ def write_eval_placeholder(config: Dict[str, Any], run_dir: Path, model_path: Pa
 
 def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
@@ -1874,6 +2209,72 @@ def live_status_rows_from_observation(observation: Dict[str, Any], summary: Dict
     return rows
 
 
+def coach_live_status_fields_from_summary(config: Dict[str, Any], summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    summary = summary or {}
+    stream_summary = summary.get("stream_coach") if isinstance(summary, dict) else None
+    coach_summary = summary.get("coach") if isinstance(summary, dict) else None
+    human_summary = summary.get("human_coach") if isinstance(summary, dict) else None
+    selected_summary = None
+    for candidate in (coach_summary, stream_summary, human_summary):
+        if isinstance(candidate, dict) and candidate:
+            selected_summary = candidate
+            break
+    fields = (
+        dict(selected_summary)
+        if isinstance(selected_summary, dict)
+        else human_coach_live_status_defaults(
+            enabled=bool(config.get("human_coach_enabled", False)),
+            platform=str(config.get("human_coach_platform", "mock") or "mock"),
+        )
+    )
+    stream_enabled = bool(config.get("stream_coach_enabled", False))
+    dry_run = bool(config.get("stream_coach_dry_run", True))
+    apply_enabled = bool(config.get("stream_coach_apply_enabled", False)) and not dry_run
+    fields.setdefault(
+        "stream_coach_mode",
+        str(config.get("stream_coach_mode", config.get("stream_coach_platform", "mock")) or "mock") if stream_enabled else "off",
+    )
+    fields.setdefault("stream_coach_enabled", stream_enabled)
+    fields.setdefault("stream_coach_platform", str(config.get("stream_coach_platform", "mock") or "mock"))
+    fields.setdefault("stream_coach_alive", bool(stream_enabled))
+    fields.setdefault("stream_coach_alive_status", "alive" if stream_enabled else "off")
+    fields.setdefault("stream_coach_dry_run", bool(dry_run))
+    fields.setdefault("stream_coach_apply_enabled", bool(apply_enabled))
+    fields.setdefault("stream_coach_command_path", str(config.get("stream_coach_command_path", "") or ""))
+    fields.setdefault("mock_stream_script", str(config.get("stream_coach_mock_script", "") or ""))
+    fields.setdefault("stream_coach_messages_seen", 0)
+    fields.setdefault("stream_coach_commands_parsed", 0)
+    fields.setdefault("stream_coach_commands_accepted", 0)
+    fields.setdefault("stream_coach_commands_rejected", 0)
+    fields.setdefault("stream_messages_seen", int(fields.get("stream_coach_messages_seen", 0) or 0))
+    fields.setdefault("stream_commands_parsed", int(fields.get("stream_coach_commands_parsed", 0) or 0))
+    fields.setdefault("stream_commands_accepted", int(fields.get("stream_coach_commands_accepted", 0) or 0))
+    fields.setdefault("stream_commands_rejected", int(fields.get("stream_coach_commands_rejected", 0) or 0))
+    fields.setdefault("stream_coach_validated_count", 0)
+    fields.setdefault("stream_coach_applied_count", 0)
+    fields.setdefault("stream_coach_dry_run_count", 0)
+    fields.setdefault("stream_coach_last_user", "")
+    fields.setdefault("last_stream_user", str(fields.get("stream_coach_last_user") or ""))
+    fields.setdefault("stream_coach_last_message", "")
+    fields.setdefault("last_stream_message", str(fields.get("stream_coach_last_message") or ""))
+    fields.setdefault("stream_coach_last_parsed_command", None)
+    fields.setdefault("last_stream_parsed_command", fields.get("stream_coach_last_parsed_command"))
+    fields.setdefault("stream_coach_last_command_status", "idle" if stream_enabled else "off")
+    fields.setdefault("last_stream_command_status", str(fields.get("stream_coach_last_command_status") or ""))
+    fields.setdefault("stream_coach_last_reject_reason", "")
+    fields.setdefault("last_stream_reject_reason", str(fields.get("stream_coach_last_reject_reason") or ""))
+    fields.setdefault("stream_coach_last_validated_command", "")
+    fields.setdefault("last_validated_coach_command", str(fields.get("stream_coach_last_validated_command") or ""))
+    fields.setdefault("stream_coach_last_applied_command", "")
+    fields.setdefault("last_applied_coach_command", str(fields.get("stream_coach_last_applied_command") or ""))
+    fields.setdefault("pending_stream_commands", 0)
+    fields.setdefault("stream_coach_startup_stale_cleared", False)
+    fields.setdefault("stream_coach_stale_messages_cleared", 0)
+    fields.setdefault("stream_coach_clear_count", 0)
+    fields.setdefault("stream_coach_last_clear_reason", "")
+    return fields
+
+
 def write_eval_live_status(
     live_status_path: Optional[Path],
     *,
@@ -1912,6 +2313,7 @@ def write_eval_live_status(
                 if live_key == "fusion_candidate_count":
                     live_key = "fusion_candidate_count"
                 fusion_fields[live_key] = summary[key]
+    coach_fields = coach_live_status_fields_from_summary(config, summary)
     payload = {
         "mode": mode,
         "run_mode": str(config.get("run_mode", mode)),
@@ -1934,7 +2336,11 @@ def write_eval_live_status(
         "compatibility": compatibility,
         "eval": summary or {},
         "fusion": dict(fusion_fields),
+        "coach": dict(coach_fields),
+        "stream_coach": dict(coach_fields),
+        "human_coach": dict(coach_fields),
         **fusion_fields,
+        **coach_fields,
     }
     write_json_atomic(live_status_path, payload)
 
@@ -2006,6 +2412,7 @@ def write_runtime_live_status(
     for key in REWARD_EPISODE_TOTAL_FIELDS:
         if key in summary:
             reward[key] = summary[key]
+    coach_fields = coach_live_status_fields_from_summary(config, summary)
     payload = {
         "mode": mode,
         "run_mode": str(config.get("run_mode", mode)),
@@ -2066,8 +2473,12 @@ def write_runtime_live_status(
             if isinstance(lane, dict) and lane.get("row") is not None
         },
         "row_danger": row_danger,
+        "coach": dict(coach_fields),
+        "stream_coach": dict(coach_fields),
+        "human_coach": dict(coach_fields),
         "summary": summary,
         "eval": summary,
+        **coach_fields,
     }
     write_json_atomic(live_status_path, payload)
 
@@ -2112,14 +2523,53 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     if live_status_path is not None:
         print(f"[train] live_status_path={live_status_path}")
     run_dir = Path(config["run_dir"])
+    initial_model_path = Path(str(config.get("model_path") or ""))
+    requested_continuation = bool(str(config.get("model_path") or "").strip())
+    generalist_training = str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
+    config["resume_training"] = bool(requested_continuation)
+    config["resume_model_path"] = str(initial_model_path) if requested_continuation else ""
+    config["resume_source_model_family"] = str(config.get("resume_source_model_family") or "")
+
+    def _safe_resolve(path: Path) -> Path:
+        try:
+            return path.resolve()
+        except OSError:
+            return path
+
+    if requested_continuation and generalist_training:
+        source_run_dir = initial_model_path.parent.parent if initial_model_path.parent.name.lower() == "checkpoints" else initial_model_path.parent
+        resolved_source_run_dir = _safe_resolve(source_run_dir)
+        resolved_run_dir = _safe_resolve(run_dir)
+        if resolved_source_run_dir == resolved_run_dir:
+            raise SystemExit(
+                "blocked_reason=resume_run_dir_must_be_new: "
+                f"resume_source_run_dir={resolved_source_run_dir} run_dir={resolved_run_dir}"
+            )
+        resolved_resume_model = _safe_resolve(initial_model_path)
+        resolved_model_target = _safe_resolve(run_dir / "model.zip")
+        resolved_final_model_target = _safe_resolve(run_dir / "final_model.zip")
+        resolved_checkpoint_dir = _safe_resolve(run_dir / "checkpoints")
+        if (
+            resolved_resume_model in {resolved_model_target, resolved_final_model_target}
+            or _safe_resolve(initial_model_path.parent) == resolved_checkpoint_dir
+        ):
+            raise SystemExit(
+                "blocked_reason=resume_model_overwrite_risk: "
+                f"resume_model_path={resolved_resume_model} run_dir={resolved_run_dir}"
+            )
+
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     config.update(apply_model_metadata_defaults(config))
     config["action_count"] = action_count_for_config(config)
     config["seed_slot_signature"] = seed_slot_signature(config)
     config_path = run_dir / "resolved_config.json"
-    (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    def _write_run_config_files() -> None:
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    _write_run_config_files()
     write_model_metadata(run_dir, config, config_path=config_path)
     (run_dir / "command_used.txt").write_text(command_used() + "\n", encoding="utf-8")
     write_action_map(config, run_dir / "action_map.txt")
@@ -2142,7 +2592,11 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                     "active_seed_slot_count": selected_count,
                     "inactive_seed_slot_count": max(0, 14 - selected_count),
                     "inactive_model_slots": max(0, 14 - selected_count),
+                    "configured_seed_list": list(config.get("configured_seed_list", initial_loadout)),
                     "selected_loadout": list(initial_loadout),
+                    "seed_order_source": str(config.get("seed_order_source", SEED_ORDER_SOURCE_DEFAULT)),
+                    "seed_order_preserved": True,
+                    "seed_order_blocked_reason": "",
                     "cleared_levels": [],
                     "frontier_level": int(config.get("adventure_start_level", 1) or 1),
                     "frontier_win_streak": 0,
@@ -2166,6 +2620,10 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                     "status": "starting",
                     "unlocked_seeds": list(config.get("initial_loadout", [])),
                     "eligible_seeds": list(config.get("initial_loadout", [])),
+                    "configured_seed_list": list(config.get("configured_seed_list", initial_loadout)),
+                    "selected_loadout": list(initial_loadout),
+                    "seed_order_source": str(config.get("seed_order_source", SEED_ORDER_SOURCE_DEFAULT)),
+                    "seed_order_preserved": True,
                 },
                 indent=2,
             ),
@@ -2183,7 +2641,11 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                     "active_seed_slot_count": selected_count,
                     "inactive_seed_slot_count": max(0, 14 - selected_count),
                     "inactive_model_slots": max(0, 14 - selected_count),
+                    "configured_seed_list": list(config.get("configured_seed_list", initial_loadout)),
                     "selected_loadout": list(initial_loadout),
+                    "seed_order_source": str(config.get("seed_order_source", SEED_ORDER_SOURCE_DEFAULT)),
+                    "seed_order_preserved": True,
+                    "seed_order_blocked_reason": "",
                     "frontier_win_streak": 0,
                     "frontier_win_streak_required": frontier_win_streak_required,
                     "frontier_mastery_ready": False,
@@ -2221,9 +2683,30 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             f"action_count={config['action_count']}"
         )
         print(f"[adventure-generalist] initial_loadout={list(config.get('initial_loadout', []))}")
+        print(
+            "[adventure-generalist] seed_order "
+            f"configured_seed_list={list(config.get('configured_seed_list', config.get('seed_list', [])))} "
+            f"seed_order_source={config.get('seed_order_source', SEED_ORDER_SOURCE_DEFAULT)} "
+            f"randomize_seed_order={bool(config.get('randomize_seed_order', False))}"
+        )
         print(f"[adventure-generalist] unlock_aware_seed_curriculum={bool(config.get('unlock_aware_seed_curriculum'))}")
+        print(f"[adventure-generalist] infer_capacity_from_unlocks={bool(config.get('infer_capacity_from_unlocks', True))}")
+        print(f"[adventure-generalist] allow_weak_unlocked_capacity_fallback={bool(config.get('allow_weak_unlocked_capacity_fallback', False))}")
         print(f"[adventure-generalist] frontier_win_streak_required={int(config.get('adventure_frontier_win_streak_required', 1) or 1)}")
-        print("[adventure-generalist] checkpoint_warm_start=False reason=new_incompatible_architecture")
+        print(
+            "[adventure-generalist] "
+            f"strict_startup_validation={bool(config.get('adventure_generalist_strict_startup_validation', True))}"
+        )
+        resume_training = bool(config.get("resume_training", False))
+        resume_model_path = str(config.get("resume_model_path") or "").strip()
+        print(f"[adventure-generalist] resume_training={'true' if resume_training else 'false'}")
+        if resume_model_path:
+            print(f"[adventure-generalist] resume_model_path={resume_model_path}")
+        print(f"[adventure-generalist] additional_timesteps={int(config.get('total_timesteps', 0) or 0)}")
+        if resume_training:
+            print(f"[adventure-generalist] checkpoint_warm_start=True model_path={resume_model_path}")
+        else:
+            print("[adventure-generalist] checkpoint_warm_start=False reason=scratch_initialization")
 
     class ExperimentCallback(BaseCallback):
         def __init__(self, csv_path: Path, jsonl_path: Path):
@@ -2289,16 +2772,25 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     vec_env = DummyVecEnv([lambda: make_monitored_env(config, run_dir / "monitor.csv", live_status_path=live_status_path)])
     runtime_env = vec_env.envs[0] if getattr(vec_env, "envs", None) else None
     runtime_env_metadata = env_metadata_for_config(config, runtime_env)
-    initial_model_path = Path(str(config.get("model_path") or ""))
-    requested_continuation = bool(str(config.get("model_path") or "").strip())
     continuing = requested_continuation and initial_model_path.exists()
     if continuing:
-        validate_model_seed_slots(
-            initial_model_path,
-            config,
-            "Training continuation",
-            env_metadata=runtime_env_metadata,
-        )
+        if generalist_training:
+            print(f"[adventure-generalist] model_path_load_requested={initial_model_path}")
+            print("[adventure-generalist] loading prior PPO model for continued training")
+            compatibility = validate_adventure_generalist_model_compatibility(
+                initial_model_path,
+                config,
+                "Adventure Generalist training continuation metadata",
+                env_metadata=runtime_env_metadata,
+            )
+            config["resume_source_model_family"] = str(compatibility.get("model_family") or ADVENTURE_GENERALIST_MODEL_FAMILY)
+        else:
+            validate_model_seed_slots(
+                initial_model_path,
+                config,
+                "Training continuation",
+                env_metadata=runtime_env_metadata,
+            )
         print(f"Continuing PPO model from {initial_model_path}")
         model = MaskablePPO.load(
             str(initial_model_path),
@@ -2306,15 +2798,29 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             tensorboard_log=str(run_dir / "tensorboard"),
         )
         model.verbose = config["verbose"]
-        validate_loaded_model_compatibility(
-            model,
-            initial_model_path,
-            config,
-            "Training continuation",
-            env_metadata=runtime_env_metadata,
-        )
+        if generalist_training:
+            validate_adventure_generalist_model_compatibility(
+                initial_model_path,
+                config,
+                "Adventure Generalist training continuation loaded model",
+                model=model,
+                env_metadata=runtime_env_metadata,
+            )
+            config["warm_start_used"] = True
+            _write_run_config_files()
+            write_model_metadata(run_dir, config, config_path=config_path)
+            print(f"[adventure-generalist] model_path_loaded={initial_model_path}")
+        else:
+            validate_loaded_model_compatibility(
+                model,
+                initial_model_path,
+                config,
+                "Training continuation",
+                env_metadata=runtime_env_metadata,
+            )
+            config["warm_start_used"] = True
     elif requested_continuation:
-        raise FileNotFoundError(f"Continuation model not found: {initial_model_path}")
+        raise SystemExit(f"blocked_reason=resume_model_path_missing: {initial_model_path}")
     else:
         model = MaskablePPO(
             config["policy"],
@@ -2355,6 +2861,24 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             "total_timesteps": int(getattr(model, "num_timesteps", 0) or 0),
         },
     )
+    if generalist_training and bool(config.get("adventure_generalist_strict_startup_validation", True)):
+        pvz_env = unwrap_pvz_env(runtime_env)
+        if not isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+            vec_env.close()
+            raise SystemExit(
+                "blocked_reason=adventure_generalist_startup_validation_failed: "
+                "could not locate AdventureGeneralistTrainingEnv before PPO learn()."
+            )
+        validation = pvz_env.validate_startup_state(phase="pre_learn", raise_on_failure=False)
+        if not validation.get("ok", False):
+            error = str(validation.get("actionable_error") or validation.get("reason") or "startup validation failed")
+            vec_env.close()
+            raise SystemExit(f"blocked_reason=adventure_generalist_startup_validation_failed: {error}")
+    if generalist_training:
+        print(
+            "[adventure-generalist] "
+            f"sb3_learn_reset_num_timesteps={'false' if continuing else 'true'}"
+        )
     started = time.perf_counter()
     try:
         model.learn(
@@ -3365,13 +3889,17 @@ def loaded_model_action_count(model_path: Path) -> int:
 def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
     if not model_path.exists():
         if str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
+            if str(config.get("model_path") or "").strip():
+                payload = {"ok": False, "blocked_reason": "model_path_missing", "model_path": str(model_path)}
+                print(json.dumps(payload, indent=2))
+                return 1
             payload = {
                 "ok": True,
                 "run_mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
                 "model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
                 "scratch_initialization": True,
                 "checkpoint_warm_start": False,
-                "checkpoint_warm_start_reason": "new_incompatible_architecture",
+                "checkpoint_warm_start_reason": "scratch_initialization",
                 "action_count": action_count_for_config(config),
                 "max_seed_slots": int(config.get("max_seed_slots", 14) or 14),
                 "active_seed_slots": len(config.get("initial_loadout", [])),
@@ -3389,6 +3917,22 @@ def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
         print(json.dumps(payload, indent=2))
         return 1
     model_action_count = loaded_model_action_count(model_path)
+    if str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
+        summary = validate_adventure_generalist_model_compatibility(
+            model_path,
+            config,
+            "Adventure Generalist metadata dry run",
+            model_action_count=model_action_count,
+            env_metadata=env_metadata_for_config(config),
+        )
+        payload = {
+            "ok": True,
+            "model_path": str(model_path),
+            "model_action_count": model_action_count,
+            "model_compatibility": summary.get("model_compatibility", {}),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
     result = validate_model_metadata(
         model_path,
         config,
@@ -3464,7 +4008,11 @@ def main() -> int:
     parser.add_argument("--target-level", type=int, default=None)
     parser.add_argument("--adventure", action="store_true", help="Alias for --adventure-eval.")
     parser.add_argument("--adventure-eval", action="store_true", help="Run inference-only Adventure progression with a loaded PPO model.")
-    parser.add_argument("--adventure-generalist-train", action="store_true", help="Train the scratch 14-slot identity Adventure Generalist.")
+    parser.add_argument(
+        "--adventure-generalist-train",
+        action="store_true",
+        help="Train the 14-slot identity Adventure Generalist (fresh when no resume model is provided).",
+    )
     parser.add_argument("--adventure-generalist-eval", action="store_true", help="Evaluate a 14-slot identity Adventure Generalist in Adventure progression.")
     parser.add_argument(
         "--run-mode",
@@ -3492,6 +4040,12 @@ def main() -> int:
     parser.add_argument("--experimental-dynamic-seed-slots", action="store_true")
     parser.add_argument("--action-space-mode", default=None)
     parser.add_argument("--model", "--model-path", dest="model", type=Path)
+    parser.add_argument(
+        "--resume-model-path",
+        type=Path,
+        default=None,
+        help="Training-only checkpoint/model .zip to continue PPO learning from (adds timesteps; does not overwrite source).",
+    )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--run-dir")
     parser.add_argument("--total-timesteps", type=int)
@@ -3533,19 +4087,66 @@ def main() -> int:
     parser.add_argument("--adventure-hard-max-steps", type=int, default=None)
     parser.add_argument("--adventure-final-wave-extension", dest="adventure_final_wave_extension", action="store_true", default=None)
     parser.add_argument("--no-adventure-final-wave-extension", dest="adventure_final_wave_extension", action="store_false")
+    parser.add_argument(
+        "--adventure-generalist-strict-startup-validation",
+        dest="adventure_generalist_strict_startup_validation",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-adventure-generalist-strict-startup-validation",
+        dest="adventure_generalist_strict_startup_validation",
+        action="store_false",
+    )
     parser.add_argument("--conservative-seeds", dest="conservative_seeds", action="store_true", default=True)
     parser.add_argument("--no-conservative-seeds", dest="conservative_seeds", action="store_false")
     parser.add_argument("--allow-new-plants", action="store_true", default=False)
     parser.add_argument("--unlock-aware-seed-curriculum", action="store_true")
     parser.add_argument("--seed-curriculum", choices=("conservative", "varied"), default=None)
+    parser.add_argument("--randomize-seed-order", action="store_true")
     parser.add_argument("--unlock-introduction-delay", type=int, default=None)
     parser.add_argument("--new-plant-min-inclusion-prob", type=float, default=None)
+    parser.add_argument("--infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_true", default=None)
+    parser.add_argument("--no-infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_false")
+    parser.add_argument("--allow-weak-unlocked-capacity-fallback", action="store_true")
     parser.add_argument("--adventure-replay-cleared-levels", action="store_true")
     parser.add_argument("--adventure-frontier-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-recent-cleared-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-maintenance-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-frontier-win-streak-required", type=int, default=None)
     parser.add_argument("--live-status-path", type=Path, default=Path("runs/live_status.json"))
+    parser.add_argument("--human-coach-enabled", action="store_true", help="Enable local/mock human coach action overrides.")
+    parser.add_argument("--human-coach-command-path", type=Path, default=None, help="Plain text or JSONL file of local coach commands.")
+    parser.add_argument("--human-coach-log-path", type=Path, default=None, help="JSONL log path for human coach decisions.")
+    parser.add_argument("--human-coach-reward", action="store_true", help="Apply small optional coach reward shaping.")
+    parser.add_argument("--human-coach-fusion-enabled", action="store_true", help="Enable bridge-probed !fuse coach overrides.")
+    parser.add_argument("--human-coach-bonus", type=float, default=None, help="Legacy alias for --coach-legal-execution-reward.")
+    parser.add_argument("--human-coach-match-bonus", type=float, default=None, help="Legacy alias for --coach-match-reward.")
+    parser.add_argument("--human-coach-override-penalty", type=float, default=None, help="Legacy alias for --coach-override-penalty.")
+    parser.add_argument("--stream-coach-enabled", action="store_true", help="Enable mock/local stream crowd coach overrides.")
+    parser.add_argument(
+        "--stream-coach-mode",
+        choices=("twitch", "youtube", "mock"),
+        default=None,
+        help="Stream coach mode/source family. Alias-friendly companion to --stream-coach-platform.",
+    )
+    parser.add_argument(
+        "--stream-coach-platform",
+        choices=("twitch", "youtube", "mock"),
+        default=None,
+        help="Stream coach platform: twitch|youtube|mock.",
+    )
+    parser.add_argument("--stream-coach-window-sec", type=float, default=None, help="Crowd vote window length in seconds.")
+    parser.add_argument("--stream-coach-min-votes", type=int, default=None, help="Minimum votes needed to select a crowd command.")
+    parser.add_argument("--stream-coach-max-actions-per-minute", type=int, default=None, help="Upper bound for accepted crowd actions per minute.")
+    parser.add_argument("--stream-coach-command-path", type=Path, default=None, help="Mock/local stream command JSONL source path.")
+    parser.add_argument("--stream-coach-mock-script", type=Path, default=None, help="Deterministic mock stream chat JSONL script.")
+    parser.add_argument("--stream-coach-dry-run", action="store_true", help="Parse/validate stream commands without applying them.")
+    parser.add_argument("--stream-coach-apply", action="store_true", help="Allow validated safe stream commands to affect the active coach path.")
+    parser.add_argument("--stream-coach-reward", action="store_true", help="Apply optional stream crowd-coach reward shaping.")
+    parser.add_argument("--stream-coach-log-path", type=Path, default=None, help="JSONL log path for stream crowd-coach events.")
+    parser.add_argument("--coach-allow-fusion-planning", action="store_true", help="Allow coach !fuse planning via fusion probe when available.")
+    parser.add_argument("--fusion-bridge-enabled", action="store_true", help="Enable fusion bridge probe routing for coach commands.")
     parser.add_argument("--fusion-policy", choices=("none", "observe", "scripted", "assist"), default=None)
     parser.add_argument("--tactical-masks", action="store_true")
     parser.add_argument("--wallnut-tactical-mask", action="store_true")
@@ -3593,6 +4194,11 @@ def main() -> int:
     parser.add_argument("--cherrybomb-wasted-penalty", type=float, default=None)
     parser.add_argument("--mower-risk-reduction-reward", type=float, default=None)
     parser.add_argument("--tough-zombie-response-reward", type=float, default=None)
+    parser.add_argument("--coach-match-reward", type=float, default=None)
+    parser.add_argument("--coach-legal-execution-reward", type=float, default=None)
+    parser.add_argument("--coach-override-penalty", type=float, default=None)
+    parser.add_argument("--coach-fusion-success-reward", type=float, default=None)
+    parser.add_argument("--coach-tactical-usefulness-reward", type=float, default=None)
     parser.add_argument("--checkpoint-freq", type=int)
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
