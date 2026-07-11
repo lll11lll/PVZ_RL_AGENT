@@ -395,20 +395,6 @@ def update_unlocked_from_state(
     return sorted(set(unlocked.keys()) - before)
 
 
-def clear_post_win_screens(env: PvZMaskedPPOEnv, writer: LiveStatusWriter, context: Dict[str, Any], max_clicks: int = 6) -> Dict[str, Any]:
-    last_state: Dict[str, Any] = {}
-    for _ in range(max(1, max_clicks)):
-        state = env.base.adventure_screen_state()
-        last_state = state
-        writer.write(build_live_status(env, context, adventure_state=state))
-        if not (state.get("isRewardScreen") or state.get("blockingRewardUiActive") or state.get("isNewPlantUnlockedScreen")):
-            return state
-        click = env.base.click_reward_continue_once()
-        context["last_ui_action"] = click
-        time.sleep(max(0.4, env.config.poll_seconds))
-    return last_state
-
-
 def _is_reward_or_unlock_state(state: Dict[str, Any]) -> bool:
     return bool(
         state.get("isRewardScreen")
@@ -624,62 +610,6 @@ def _combine_unlock_snapshots(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     for key in ("visibleRewardTexts", "visibleSeedCardNames", "visibleSeedPlantTypes", "unknownUnlockObjects", "unknownVisibleSeedCards"):
         combined[key] = _unique_list(combined[key])
     return combined
-
-
-def _wait_for_unlock_or_reward_screen(
-    env: PvZMaskedPPOEnv,
-    writer: LiveStatusWriter,
-    context: Dict[str, Any],
-    timeout: float = 8.0,
-) -> Dict[str, Any]:
-    deadline = time.monotonic() + max(0.5, timeout)
-    last_state: Dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        state = env.base.adventure_screen_state()
-        last_state = state
-        writer.write(build_live_status(env, context, adventure_state=state))
-        if _is_reward_or_unlock_state(state):
-            return state
-        if state.get("isSeedSelectionScreen") or state.get("isAdventureButtonVisible") or state.get("isGameplayReady"):
-            return state
-        time.sleep(max(0.05, env.config.poll_seconds))
-    return last_state
-
-
-def _wait_for_next_seed_selection_or_menu(
-    env: PvZMaskedPPOEnv,
-    writer: LiveStatusWriter,
-    context: Dict[str, Any],
-    unlocked: Counter[str],
-    level: int,
-    timeout: float = 10.0,
-) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
-    deadline = time.monotonic() + max(0.5, timeout)
-    last_state: Dict[str, Any] = {}
-    snapshots: List[Dict[str, Any]] = []
-    while time.monotonic() < deadline:
-        state = env.base.adventure_screen_state()
-        last_state = state
-        snapshot = _snapshot_unlock_state(state, source="post_reward_transition")
-        snapshots.append(snapshot)
-        update_unlocked_from_state(unlocked, state, source="post_reward_transition", level=level)
-        writer.write(build_live_status(env, context, adventure_state=state))
-        if _is_reward_or_unlock_state(state):
-            click = env.base.click_reward_continue_once()
-            context["last_ui_action"] = click
-            if not click.get("ok", False):
-                return state, "reward_or_unlock_click_failed_after_win", snapshots
-            time.sleep(max(0.4, env.config.poll_seconds))
-            continue
-        if (
-            state.get("isSeedSelectionScreen")
-            or state.get("isAdventureButtonVisible")
-            or state.get("isGameplayReady")
-            or state.get("screenState") in {"main_menu", "loading_or_menu", "transition"}
-        ):
-            return state, "", snapshots
-        time.sleep(max(0.05, env.config.poll_seconds))
-    return last_state, "post_win_next_screen_timeout", snapshots
 
 
 def collect_post_win_unlocks(

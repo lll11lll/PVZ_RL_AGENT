@@ -1291,14 +1291,6 @@ class PvZGymEnv:
         self.configure()
         reset_reason = str(reset_reason or "").strip()
         initial_manual_reset = False
-        level3_start_state: Dict[str, Any] = {}
-        # if self._is_level3_specialist_mode():
-        #     level3_start_state = self.level3_specialist_start_state()
-        #     if not bool(level3_start_state.get("ok")):
-        #         raise RuntimeError(
-        #             "blocked_reason=not_at_level3_specialist_start_state "
-        #             + json.dumps(level3_start_state, separators=(",", ":"), sort_keys=True)
-        #         )
         if not reset_reason:
             previous_observation = self.previous_observation if isinstance(self.previous_observation, dict) else {}
             inferred_reset_reason = ""
@@ -2887,13 +2879,6 @@ class PvZGymEnv:
             and not bool(observation.get("moreZombiesComing", False))
         )
 
-    def _is_confirmed_terminal_or_transition(self, observation: Dict[str, Any]) -> bool:
-        lifecycle_state = self._classify_lifecycle_state(observation)
-        return bool(lifecycle_state in {LIFECYCLE_POST_WIN_PENDING, LIFECYCLE_LOSS_PENDING})
-
-    def _is_active_gameplay(self, observation: Dict[str, Any]) -> bool:
-        return self._confirmed_active_gameplay(observation)
-
     def _has_active_gameplay_progress(self, observation: Dict[str, Any]) -> bool:
         if bool(observation.get("gameplayReady")) or bool(observation.get("actualGameplayReady")):
             return True
@@ -3033,21 +3018,6 @@ class PvZGymEnv:
             )
         raise RuntimeError(
             "Unsafe loss reset: gameplayReady became true before seed selection was observed in this reset sequence."
-        )
-
-    def _playable_board_has_episode_residue(self, observation: Dict[str, Any]) -> bool:
-        return bool(
-            self._safe_int(observation.get("plantCount"), default=0) > 0
-            or self._safe_int(observation.get("visiblePlantObjectCount"), default=0) > 0
-            or self._safe_int(observation.get("zombieCount"), default=0) > 0
-            or self._safe_int(observation.get("logicalZombieCount"), default=0) > 0
-            or self._safe_int(observation.get("sceneZombieObjectCount"), default=0) > 0
-            or self._safe_int(observation.get("bulletCount"), default=0) > 0
-            or self._safe_int(observation.get("logicalBulletCount"), default=0) > 0
-            or self._safe_int(observation.get("sceneBulletObjectCount"), default=0) > 0
-            or self._safe_int(observation.get("wave"), default=0) > 0
-            or self._safe_int(observation.get("killCount"), default=0) > 0
-            or self._safe_float(observation.get("time"), default=0.0) > 1.0
         )
 
     def _request_reconnect_once(self, command: str, **payload: Any) -> Dict[str, Any]:
@@ -3822,60 +3792,6 @@ class PvZGymEnv:
             time.sleep(poll_seconds)
 
         raise TimeoutError(f"Timed out ensuring seeds/gameplayReady. Last state: {last_state}")
-
-    def _wait_for_reset_playable(
-        self,
-        reset_result: Dict[str, Any],
-        require_seed_selection_this_reset: bool = False,
-        saw_seed_selection_this_reset: bool = False,
-    ) -> Dict[str, Any]:
-        started = time.monotonic()
-        self.wait_for_board(timeout=self.config.reset_wait_timeout, poll_seconds=self.config.reset_poll_seconds, quiet=True)
-        if self.config.auto_select_seeds:
-            observation, selection = self.ensure_seeds_then_gameplay_ready(
-                seed_list=self.config.seed_list,
-                timeout=self.config.reset_wait_timeout,
-                poll_seconds=self.config.reset_poll_seconds,
-                quiet=True,
-            )
-            reset_result["autoSelectSeeds"] = selection
-            if not selection.get("ok", False):
-                raise RuntimeError(f"auto_select_seeds failed during reset: {selection}")
-        else:
-            observation = self.wait_for_gameplay_ready(
-                timeout=self.config.reset_wait_timeout,
-                poll_seconds=self.config.reset_poll_seconds,
-                quiet=True,
-                fail_on_terminal=False,
-            )
-        cleanup = self.reset_cleanup(reset_card_cooldowns=True)
-        reset_result["cleanup"] = cleanup
-        observation, cleanup_ok, cleanup_message = self._wait_for_cleanup_valid(require_mowers=True)
-        reset_result["cleanupValidation"] = cleanup_message
-        reset_result["cleanupSuccess"] = cleanup_ok
-        if not cleanup_ok:
-            raise RuntimeError(f"reset cleanup validation failed: {cleanup_message}")
-        observation, playable_ok, playable_message = self._wait_for_post_reset_playable()
-        reset_result["postResetPlayableValidation"] = playable_message
-        reset_result["postResetPlayableSuccess"] = playable_ok
-        if not playable_ok:
-            raise RuntimeError(f"reset post-playable validation failed: {playable_message}")
-        legal = self.legal_actions(observation)
-        reset_result["timeToPlayableSeconds"] = round(time.monotonic() - started, 3)
-        reset_result["postResetSeedSelectionActive"] = bool(observation.get("seedSelectionActive"))
-        invariant_ok = (not require_seed_selection_this_reset) or saw_seed_selection_this_reset
-        reset_result["resetSuccess"] = (
-            bool(observation.get("gameplayReady"))
-            and not bool(observation.get("seedSelectionActive"))
-            and not bool(observation.get("done"))
-            and invariant_ok
-        )
-        reset_result["postResetLegalActionCount"] = len(legal)
-        reset_result["postResetWaitOnly"] = legal == [0]
-        reset_result["postResetWaitOnlyExpected"] = self._wait_only_expected(observation)
-        if legal == [0] and not reset_result["postResetWaitOnlyExpected"]:
-            raise RuntimeError(f"reset produced unexpected wait-only legal_actions: {reset_result}")
-        return observation
 
     def _wait_for_cleanup_valid(
         self,
@@ -5241,10 +5157,12 @@ class PvZGymEnv:
             done_reason: Optional[str] = None,
             adventure_state: Optional[Dict[str, Any]] = None,
         ) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+            reward_events: Dict[str, Any] = {}
             reward_breakdown = self.compute_reward_breakdown(
                 self.previous_observation,
                 observation,
                 reward_action_result or action_result,
+                event_diagnostics=reward_events,
             )
             reward = reward_breakdown["reward_total"]
             legal_started = time.perf_counter()
@@ -5270,6 +5188,7 @@ class PvZGymEnv:
                 observation,
                 action_result,
                 legal,
+                cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
             )
             if self.config.debug_performance:
                 info["performance"] = {
@@ -5436,7 +5355,13 @@ class PvZGymEnv:
                 "bridgeTimeout": True,
                 "observation": observation,
             }
-            reward_breakdown = self.compute_reward_breakdown(self.previous_observation, observation, action_result)
+            reward_events: Dict[str, Any] = {}
+            reward_breakdown = self.compute_reward_breakdown(
+                self.previous_observation,
+                observation,
+                action_result,
+                event_diagnostics=reward_events,
+            )
             penalty = 10.0
             reward = float(reward_breakdown.get("reward_total", 0.0)) - penalty
             reward_breakdown["reward_total"] = reward
@@ -5464,6 +5389,7 @@ class PvZGymEnv:
                 observation,
                 action_result,
                 legal,
+                cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
             ) if observation else {}
             self.previous_observation = observation
             self._steps_since_seed_screen_check = self.config.seed_screen_check_interval
@@ -5529,7 +5455,13 @@ class PvZGymEnv:
                 "board_refresh_detected",
             ):
                 print(f"[corruption] {event_name}: {event}")
-        reward_breakdown = self.compute_reward_breakdown(self.previous_observation, observation, action_result)
+        reward_events: Dict[str, Any] = {}
+        reward_breakdown = self.compute_reward_breakdown(
+            self.previous_observation,
+            observation,
+            action_result,
+            event_diagnostics=reward_events,
+        )
         # Shaped fusion reward is computed once here (not inside compute_reward_breakdown,
         # which is side-effect free and may run on non-step paths). Covers every fusion
         # source because model/coach/scripted fusions all surface as this step's action_result.
@@ -5694,6 +5626,7 @@ class PvZGymEnv:
             observation,
             action_result,
             legal,
+            cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
         )
         if self.config.debug_performance:
             info["performance"] = {
@@ -5725,6 +5658,8 @@ class PvZGymEnv:
         previous: Optional[Dict[str, Any]],
         current: Dict[str, Any],
         action_result: Optional[Dict[str, Any]] = None,
+        *,
+        event_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, float]:
         components = {field: 0.0 for field in REWARD_COMPONENT_FIELDS}
         components["reward_total"] = 0.0
@@ -5735,6 +5670,8 @@ class PvZGymEnv:
         kill_delta = max(0, int(current.get("killCount", 0)) - int(previous.get("killCount", 0)))
         components["kill_reward"] = kill_delta * cfg.kill_reward
         cherry_delayed_reward, cherry_delayed_wasted_penalty, cherry_delayed_diag = self._update_pending_cherry_events(kill_delta)
+        if event_diagnostics is not None:
+            event_diagnostics["cherry_delayed"] = dict(cherry_delayed_diag)
         components["cherrybomb_tactical_kill_reward"] += cherry_delayed_reward
         components["cherrybomb_wasted_penalty"] += cherry_delayed_wasted_penalty
         components["cherrybomb_kill_reward"] += int(cherry_delayed_diag.get("kills", 0) or 0) * cfg.cherrybomb_kill_reward
@@ -6065,6 +6002,8 @@ class PvZGymEnv:
         current: Dict[str, Any],
         action_result: Optional[Dict[str, Any]],
         legal_actions: Optional[List[int]] = None,
+        *,
+        cherry_delayed_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         action_info = self._action_info(action_result)
         previous_obs = previous or current
@@ -6277,6 +6216,7 @@ class PvZGymEnv:
                 or action_audit.get("bridgeLegalActionsValueBefore")
             )
         )
+        cherry_delayed_diag = cherry_delayed_diagnostics or {}
         return {
             "action_kind": action_info.get("kind", "wait"),
             "action_plant_type": int(action_info.get("plant_type", -1)),
@@ -6355,10 +6295,10 @@ class PvZGymEnv:
             "cherrybomb_used_low_value": cherrybomb_used_low_value,
             "cherrybomb_cluster_use": cherrybomb_cluster_use,
             "cherrybomb_emergency_use": cherrybomb_emergency_use,
-            "cherrybomb_delayed_kills": int(cherry_delayed_diag.get("kills", 0) if "cherry_delayed_diag" in locals() else 0),
-            "cherrybomb_delayed_zero_kill": int(cherry_delayed_diag.get("zero_kill", 0) if "cherry_delayed_diag" in locals() else 0),
-            "cherrybomb_buckethead_kill_credit": int(cherry_delayed_diag.get("buckethead", 0) if "cherry_delayed_diag" in locals() else 0),
-            "cherrybomb_conehead_kill_credit": int(cherry_delayed_diag.get("conehead", 0) if "cherry_delayed_diag" in locals() else 0),
+            "cherrybomb_delayed_kills": int(cherry_delayed_diag.get("kills", 0) or 0),
+            "cherrybomb_delayed_zero_kill": int(cherry_delayed_diag.get("zero_kill", 0) or 0),
+            "cherrybomb_buckethead_kill_credit": int(cherry_delayed_diag.get("buckethead", 0) or 0),
+            "cherrybomb_conehead_kill_credit": int(cherry_delayed_diag.get("conehead", 0) or 0),
             "mower_risk_steps_by_row": self._row_int_dict({row: 1 for row in self._mower_risk_rows(current)}, rows),
             "high_danger_unanswered_steps": len(high_danger_unanswered_rows),
             "mower_exposure_steps": len(mower_exposure_rows),
@@ -7628,16 +7568,6 @@ class PvZGymEnv:
             except (TypeError, ValueError):
                 continue
         return float(default)
-
-    def _zombie_proximity_penalty(self, observation: Dict[str, Any]) -> float:
-        penalty = 0.0
-        for lane in observation.get("lanes", []):
-            nearest_x = lane.get("nearestZombieX")
-            if nearest_x is None:
-                continue
-            penalty += max(0.0, 1.0 - float(nearest_x) / 10.0)
-        return penalty
-
 
 def validate_observation(observation: Dict[str, Any]) -> None:
     required = [

@@ -684,21 +684,6 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.writer.write(build_live_status(self, self.context, adventure_state=self._safe_adventure_state()))
         raise RuntimeError(f"blocked_reason={blocked_reason}")
 
-    def _set_hard_blocked(self, reason: str) -> None:
-        blocked_reason = str(reason or BLOCKED_FRONTIER_REPLAY_REQUIRED)
-        self._hard_blocked_reason = blocked_reason
-        self.frontier_replay_supported = False
-        self.frontier_replay_blocked_reason = blocked_reason
-        self.context.update(
-            {
-                "status": "blocked",
-                "state": "BLOCKED_FRONTIER_REPLAY",
-                "blocked_reason": blocked_reason,
-                "frontier_replay_supported": False,
-                "frontier_replay_blocked_reason": blocked_reason,
-            }
-        )
-
     def _capacity_context_fields(self) -> Dict[str, Any]:
         observed = _clamp_capacity(
             int(getattr(self, "observed_seed_bank_capacity", len(getattr(self, "current_loadout", []))) or 1),

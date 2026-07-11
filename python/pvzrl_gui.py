@@ -33,7 +33,17 @@ from pvzrl_assisted_coach import (
 
 POLL_MS = 1000
 LOG_POLL_MS = 100
+LOG_BACKLOG_POLL_MS = 1
+LOG_DRAIN_MAX_ITEMS = 250
+LOG_DRAIN_BUDGET_SECONDS = 0.012
+LOG_QUEUE_MAX_ITEMS = 10_000
+LOG_HISTORY_MAX_LINES = 5000
+LOG_HISTORY_MAX_CHARS = 1_000_000
 STOP_GRACE_SECONDS = 5.0
+STOP_KILL_WAIT_SECONDS = 2.0
+CLOSE_POLL_MS = 50
+PROCESS_THREAD_JOIN_SECONDS = 0.2
+CLOSE_LOG_DRAIN_SECONDS = 0.3
 ROLLING_WIN_WINDOW = 20
 MODEL_ZIP_NAMES = {"model.zip", "final_model.zip"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -90,20 +100,6 @@ def lines_from_pairs(pairs: Iterable[Tuple[str, Any]]) -> str:
     rows = [(label, fmt_value(value)) for label, value in pairs]
     width = max([len(label) for label, _ in rows] or [1])
     return "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)
-
-
-def row_panel_lines(rows: Dict[str, Any]) -> str:
-    output: List[str] = []
-    for row, payload in sorted(rows.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 99):
-        if not isinstance(payload, dict):
-            continue
-        output.append(
-            f"row {row}: pea={payload.get('peashooters', 0)} "
-            f"threat={payload.get('threatened', False)} "
-            f"undef={payload.get('undefended_threat', False)} "
-            f"steps={payload.get('threat_steps', 0)}"
-        )
-    return "\n".join(output) if output else "-"
 
 
 class _Tooltip:
@@ -362,6 +358,8 @@ class PvZDashboard:
         self.generalist_status_text: Optional[tk.Text] = None
         self.train_advanced_frame: Optional[ttk.LabelFrame] = None
         self.log_history: List[str] = []
+        self.log_history_chars = 0
+        self.log_dropped_lines = 0
         self.fusion_grid: Dict[Tuple[int, int], str] = {}
         self.fusion_tile_buttons: Dict[Tuple[int, int], ttk.Button] = {}
         self.fusion_selected_tile: Optional[Tuple[int, int]] = None
@@ -373,10 +371,22 @@ class PvZDashboard:
         self._structured_raw_copy_value = ""
         self.assisted_command_queue = AssistedCommandQueue()
         self.intervention_logger = InterventionJSONLLogger(self._resolve_path(DEFAULT_INTERVENTION_LOG_PATH))
-        self.log_queue: queue.Queue[Any] = queue.Queue()
+        self.log_queue: queue.Queue[Any] = queue.Queue(maxsize=LOG_QUEUE_MAX_ITEMS)
+        self._log_queue_put_lock = threading.Lock()
+        self._log_queue_drop_lock = threading.Lock()
+        self._log_queue_dropped_items = 0
         self.active_process: Optional[subprocess.Popen[str]] = None
         self.active_process_name = ""
         self.active_process_started_at: Optional[float] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stopper_thread: Optional[threading.Thread] = None
+        self._stopping_process: Optional[subprocess.Popen[str]] = None
+        self._poll_after_id: Optional[str] = None
+        self._log_after_id: Optional[str] = None
+        self._close_after_id: Optional[str] = None
+        self._closing = False
+        self._destroyed = False
+        self._close_deadline = 0.0
         self.active_run_path = ""
         self.live_writer_warning_emitted = False
         self.last_good_status: Optional[Dict[str, Any]] = None
@@ -384,6 +394,10 @@ class PvZDashboard:
         self.last_live_parse_error = ""
         self.last_live_health = ""
         self.last_live_warning_key = ""
+        self._live_status_signature: Optional[Tuple[int, int, int, int, int]] = None
+        self._live_status_cached_payload: Optional[Dict[str, Any]] = None
+        self._live_status_cached_state = "MISSING"
+        self._live_status_cached_parse_error = ""
 
         self._build()
         self._append_log(f"Project root: {self.project_root}\n")
@@ -2697,8 +2711,13 @@ class PvZDashboard:
         self.live_writer_warning_emitted = False
         self.process_status_var.set(f"Running: {name}")
         self._set_running(True)
-        thread = threading.Thread(target=self._read_process_output, args=(name, process), name=f"{name} log reader", daemon=True)
-        thread.start()
+        self._reader_thread = threading.Thread(
+            target=self._read_process_output,
+            args=(name, process),
+            name=f"{name} log reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
 
     def _command_arg(self, command: List[str], flag: str) -> str:
         try:
@@ -2714,17 +2733,32 @@ class PvZDashboard:
         try:
             if process.stdout is not None:
                 for line in process.stdout:
-                    self.log_queue.put(line)
+                    self._queue_log_item(line)
         finally:
-            exit_code = process.wait()
-            self.log_queue.put(("process_exit", name, process, exit_code))
+            try:
+                exit_code = process.wait()
+            except OSError:
+                exit_code = process.poll()
+                if exit_code is None:
+                    exit_code = -1
+            self._queue_log_item(("process_exit", name, process, exit_code), critical=True)
 
     def stop_active_process(self) -> None:
         process = self.active_process
         if process is None:
             self._append_log("No active process to stop.\n")
             return
+        exit_code = process.poll()
+        if exit_code is not None:
+            self._handle_process_exit(self.active_process_name or "process", process, int(exit_code))
+            return
         name = self.active_process_name or "process"
+        self._begin_process_stop(name, process)
+
+    def _begin_process_stop(self, name: str, process: subprocess.Popen[str]) -> None:
+        if self._stopping_process is process:
+            return
+        self._stopping_process = process
         for button in self.stop_buttons:
             button.configure(state="disabled")
         try:
@@ -2732,47 +2766,139 @@ class PvZDashboard:
             self._append_log(f"[{name}] terminate() sent.\n")
         except OSError as exc:
             self._append_log(f"ERROR: Failed to terminate {name}: {exc}\n")
-            if process.poll() is None:
-                for button in self.stop_buttons:
-                    button.configure(state="normal")
-            return
-        thread = threading.Thread(target=self._wait_then_kill, args=(name, process), name=f"{name} stopper", daemon=True)
-        thread.start()
+        self._stopper_thread = threading.Thread(
+            target=self._wait_then_kill,
+            args=(name, process),
+            name=f"{name} stopper",
+            daemon=True,
+        )
+        self._stopper_thread.start()
 
     def _wait_then_kill(self, name: str, process: subprocess.Popen[str]) -> None:
         try:
             process.wait(timeout=STOP_GRACE_SECONDS)
-            self.log_queue.put(f"[{name}] process exited after terminate().\n")
+            self._queue_log_item(f"[{name}] process exited after terminate().\n")
         except subprocess.TimeoutExpired:
-            self.log_queue.put(f"[{name}] terminate() timed out; kill() used.\n")
+            self._queue_log_item(f"[{name}] terminate() timed out; kill() used.\n")
             try:
                 process.kill()
-                process.wait()
+                process.wait(timeout=STOP_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._queue_log_item(
+                    f"ERROR: {name} did not exit within {STOP_KILL_WAIT_SECONDS:.1f}s after kill().\n"
+                )
             except OSError as exc:
-                self.log_queue.put(f"ERROR: Failed to kill {name}: {exc}\n")
+                self._queue_log_item(f"ERROR: Failed to kill {name}: {exc}\n")
+        except OSError as exc:
+            self._queue_log_item(f"ERROR: Failed while waiting for {name} to stop: {exc}\n")
+
+    def _queue_log_item(self, item: Any, *, critical: bool = False) -> bool:
+        with self._log_queue_put_lock:
+            try:
+                self.log_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                if not critical:
+                    with self._log_queue_drop_lock:
+                        self._log_queue_dropped_items += 1
+                    return False
+                try:
+                    self.log_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    with self._log_queue_drop_lock:
+                        self._log_queue_dropped_items += 1
+                try:
+                    self.log_queue.put_nowait(item)
+                    return True
+                except queue.Full:
+                    with self._log_queue_drop_lock:
+                        self._log_queue_dropped_items += 1
+                    return False
+
+    def _take_log_queue_drop_count(self) -> int:
+        with self._log_queue_drop_lock:
+            dropped = int(self._log_queue_dropped_items)
+            self._log_queue_dropped_items = 0
+        return dropped
+
+    def _schedule_after(self, attribute: str, delay_ms: int, callback: Any) -> None:
+        self._cancel_after(attribute)
+        if self._destroyed:
+            return
+        try:
+            callback_id = self.root.after(delay_ms, callback)
+        except tk.TclError:
+            return
+        setattr(self, attribute, callback_id)
+
+    def _cancel_after(self, attribute: str) -> None:
+        callback_id = getattr(self, attribute, None)
+        if callback_id is None:
+            return
+        setattr(self, attribute, None)
+        try:
+            self.root.after_cancel(callback_id)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _cancel_scheduled_callbacks(self, *, include_close: bool = True) -> None:
+        self._cancel_after("_poll_after_id")
+        self._cancel_after("_log_after_id")
+        if include_close:
+            self._cancel_after("_close_after_id")
 
     def _drain_log_queue(self) -> None:
-        try:
-            while True:
+        self._log_after_id = None
+        if self._closing or self._destroyed:
+            return
+        self._consume_log_queue(LOG_DRAIN_MAX_ITEMS, LOG_DRAIN_BUDGET_SECONDS)
+        delay_ms = LOG_BACKLOG_POLL_MS if not self.log_queue.empty() else LOG_POLL_MS
+        self._schedule_after("_log_after_id", delay_ms, self._drain_log_queue)
+
+    def _consume_log_queue(self, max_items: int, budget_seconds: float) -> int:
+        started_at = time.monotonic()
+        processed = 0
+        pending_text: List[str] = []
+        dropped = self._take_log_queue_drop_count()
+        if dropped:
+            pending_text.append(f"[gui] log queue dropped {dropped} item(s) while producers outpaced the UI.\n")
+        while processed < max_items and time.monotonic() - started_at < budget_seconds:
+            try:
                 item = self.log_queue.get_nowait()
-                if isinstance(item, tuple) and item and item[0] == "process_exit":
-                    _, name, process, exit_code = item
-                    self._handle_process_exit(str(name), process, int(exit_code))
-                else:
-                    self._append_log(str(item))
-        except queue.Empty:
-            pass
-        self.root.after(LOG_POLL_MS, self._drain_log_queue)
+            except queue.Empty:
+                break
+            processed += 1
+            if isinstance(item, tuple) and item and item[0] == "process_exit":
+                if pending_text:
+                    self._append_log("".join(pending_text))
+                    pending_text.clear()
+                _, name, process, exit_code = item
+                self._handle_process_exit(str(name), process, int(exit_code))
+            else:
+                pending_text.append(str(item))
+        if pending_text:
+            self._append_log("".join(pending_text))
+        return processed
 
     def _handle_process_exit(self, name: str, process: subprocess.Popen[str], exit_code: int) -> None:
+        if self.active_process is not process and self._stopping_process is not process:
+            return
         self._append_log(f"[{name}] exited with code {exit_code}\n")
         if self.active_process is process:
             self.active_process = None
             self.active_process_name = ""
             self.active_process_started_at = None
+            self._stopping_process = None
             self.live_writer_warning_emitted = False
             self.process_status_var.set("Idle")
-            self._set_running(False)
+            if not self._closing:
+                self._set_running(False)
+        if self._reader_thread is not None and not self._reader_thread.is_alive():
+            self._reader_thread = None
+        if self._stopper_thread is not None and not self._stopper_thread.is_alive():
+            self._stopper_thread = None
 
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
@@ -3163,6 +3289,8 @@ class PvZDashboard:
         history = getattr(self, "log_history", None)
         if history is not None:
             history.clear()
+        self.log_history_chars = 0
+        self.log_dropped_lines = 0
         if self.log_text is None:
             return
         self.log_text.configure(state="normal")
@@ -3172,17 +3300,36 @@ class PvZDashboard:
     def _append_log(self, text: str) -> None:
         if not hasattr(self, "log_history"):
             self.log_history = []
-        self.log_history.append(text)
-        if len(self.log_history) > 5000:
-            del self.log_history[: len(self.log_history) - 5000]
+        text = str(text)
+        lines = text.splitlines(keepends=True) if text else []
+        if text and not lines:
+            lines = [text]
+        if not hasattr(self, "log_history_chars"):
+            self.log_history_chars = sum(len(line) for line in self.log_history)
+        if not hasattr(self, "log_dropped_lines"):
+            self.log_dropped_lines = 0
+        self.log_history.extend(lines)
+        self.log_history_chars += sum(len(line) for line in lines)
+
+        drop_count = max(0, len(self.log_history) - LOG_HISTORY_MAX_LINES)
+        dropped_chars = sum(len(line) for line in self.log_history[:drop_count])
+        retained_chars = self.log_history_chars - dropped_chars
+        while drop_count < len(self.log_history) and retained_chars > LOG_HISTORY_MAX_CHARS:
+            retained_chars -= len(self.log_history[drop_count])
+            drop_count += 1
+        if drop_count:
+            del self.log_history[:drop_count]
+            self.log_history_chars = max(0, retained_chars)
+            self.log_dropped_lines += drop_count
         if self.log_text is None:
             return
         filter_var = getattr(self, "log_filter_var", None)
         severity_var = getattr(self, "log_severity_var", None)
         pause_var = getattr(self, "log_pause_autoscroll_var", None)
-        if (filter_var is not None and filter_var.get().strip()) or (
+        filtering = (filter_var is not None and filter_var.get().strip()) or (
             severity_var is not None and severity_var.get() != "All"
-        ):
+        )
+        if filtering or drop_count:
             self._refresh_log_view()
             return
         self.log_text.configure(state="normal")
@@ -3212,13 +3359,22 @@ class PvZDashboard:
                 return any(token in lowered for token in ("process", "starting subprocess", "exited", "terminate"))
             return True
 
-        filtered = "".join(line for line in lines if matches(line))
+        filtered = self._log_drop_notice() + "".join(line for line in lines if matches(line))
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.insert("1.0", filtered)
         if not self.log_pause_autoscroll_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _log_drop_notice(self) -> str:
+        dropped = int(getattr(self, "log_dropped_lines", 0) or 0)
+        if dropped <= 0:
+            return ""
+        return (
+            f"[gui] log retention dropped {dropped} older line(s); "
+            f"showing the newest {len(self.log_history)} line(s).\n"
+        )
 
     def copy_selected_logs(self) -> None:
         if self.log_text is None:
@@ -3265,8 +3421,11 @@ class PvZDashboard:
         self.generalist_status_text.configure(state="disabled")
 
     def _poll(self) -> None:
+        self._poll_after_id = None
+        if self._closing or self._destroyed:
+            return
         self._refresh_diagnostics(auto=True)
-        self.root.after(POLL_MS, self._poll)
+        self._schedule_after("_poll_after_id", POLL_MS, self._poll)
 
     def refresh_diagnostics_now(self) -> None:
         self._refresh_diagnostics(auto=False)
@@ -3277,7 +3436,8 @@ class PvZDashboard:
             payload, info = self._read_live_status_file()
             if payload is not None:
                 self.last_good_status = payload
-                self.last_good_read_time = time.time()
+                if not bool(info.get("unchanged")):
+                    self.last_good_read_time = time.time()
                 self.last_live_parse_error = ""
             elif info.get("parse_error"):
                 self.last_live_parse_error = str(info["parse_error"])
@@ -3326,6 +3486,7 @@ class PvZDashboard:
         try:
             stat = path.stat()
         except FileNotFoundError:
+            self._reset_live_status_cache()
             return None, info
         except OSError as exc:
             info["health"] = "MALFORMED"
@@ -3334,14 +3495,37 @@ class PvZDashboard:
 
         age = max(0.0, time.time() - stat.st_mtime)
         info.update({"exists": True, "size": int(stat.st_size), "mtime": stat.st_mtime, "age": age})
+        signature = (
+            int(getattr(stat, "st_dev", 0) or 0),
+            int(getattr(stat, "st_ino", 0) or 0),
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000))),
+        )
         if stat.st_size == 0:
+            self._live_status_signature = signature
+            self._live_status_cached_payload = None
+            self._live_status_cached_state = "EMPTY"
+            self._live_status_cached_parse_error = ""
             info["health"] = "EMPTY"
+            return None, info
+
+        if signature == getattr(self, "_live_status_signature", None):
+            info["unchanged"] = True
+            cached_error = str(getattr(self, "_live_status_cached_parse_error", "") or "")
+            cached_payload = getattr(self, "_live_status_cached_payload", None)
+            info["parse_error"] = cached_error
+            if cached_payload is not None:
+                info["health"] = self._live_health(age, cached_payload)
+                return cached_payload, info
+            info["health"] = str(getattr(self, "_live_status_cached_state", "MALFORMED"))
             return None, info
 
         try:
             with path.open("r", encoding="utf-8") as handle:
                 content = handle.read()
         except FileNotFoundError:
+            self._reset_live_status_cache()
             info.update({"exists": False, "size": None, "mtime": None, "age": None, "health": "MISSING"})
             return None, info
         except OSError as exc:
@@ -3350,6 +3534,10 @@ class PvZDashboard:
             return None, info
 
         if not content.strip():
+            self._live_status_signature = signature
+            self._live_status_cached_payload = None
+            self._live_status_cached_state = "EMPTY"
+            self._live_status_cached_parse_error = ""
             info["health"] = "EMPTY"
             return None, info
 
@@ -3358,18 +3546,40 @@ class PvZDashboard:
         except json.JSONDecodeError as exc:
             info["health"] = "MALFORMED"
             info["parse_error"] = f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
+            self._cache_live_status_failure(signature, info["parse_error"])
             return None, info
 
         if not isinstance(payload, dict):
             info["health"] = "MALFORMED"
             info["parse_error"] = f"Expected JSON object, got {type(payload).__name__}"
+            self._cache_live_status_failure(signature, info["parse_error"])
             return None, info
 
         info["health"] = self._live_health(age, payload)
+        self._live_status_signature = signature
+        self._live_status_cached_payload = payload
+        self._live_status_cached_state = str(info["health"])
+        self._live_status_cached_parse_error = ""
         return payload, info
+
+    def _cache_live_status_failure(self, signature: Tuple[int, int, int, int, int], error: str) -> None:
+        self._live_status_signature = signature
+        self._live_status_cached_payload = None
+        self._live_status_cached_state = "MALFORMED"
+        self._live_status_cached_parse_error = str(error or "")
+
+    def _reset_live_status_cache(self) -> None:
+        self._live_status_signature = None
+        self._live_status_cached_payload = None
+        self._live_status_cached_state = "MISSING"
+        self._live_status_cached_parse_error = ""
 
     def _live_health(self, age: float, payload: Optional[Dict[str, Any]] = None) -> str:
         payload = payload if isinstance(payload, dict) else {}
+        if age > STALE_MAX_AGE_SECONDS:
+            return "DEAD"
+        if age >= LIVE_MAX_AGE_SECONDS:
+            return "STALE"
         blocked_reason = str(
             self._first_value(
                 payload,
@@ -3387,11 +3597,7 @@ class PvZDashboard:
             return "BLOCKED_SEED_SELECTION"
         if "gameplay_ready" in blocked_reason or "gameplay" in blocked_reason:
             return "BLOCKED_GAMEPLAY_READY"
-        if age < LIVE_MAX_AGE_SECONDS:
-            return "LIVE"
-        if age <= STALE_MAX_AGE_SECONDS:
-            return "STALE"
-        return "DEAD"
+        return "LIVE"
 
     def _set_live_status(self, info: Dict[str, Any]) -> None:
         path = info.get("path", self.live_status_path)
@@ -4426,12 +4632,64 @@ class PvZDashboard:
             return 999, text
 
     def _on_close(self) -> None:
-        if self.active_process is not None and self.active_process.poll() is None:
+        if self._closing or self._destroyed:
+            return
+        self._closing = True
+        self._close_deadline = time.monotonic() + STOP_GRACE_SECONDS + STOP_KILL_WAIT_SECONDS + 1.0
+        self._cancel_scheduled_callbacks()
+        process = self.active_process
+        if process is not None and process.poll() is None:
+            self._begin_process_stop(self.active_process_name or "process", process)
+        self._poll_close_cleanup()
+
+    def _poll_close_cleanup(self) -> None:
+        self._close_after_id = None
+        if self._destroyed:
+            return
+        self._consume_log_queue(max(LOG_DRAIN_MAX_ITEMS, 1000), max(LOG_DRAIN_BUDGET_SECONDS, 0.02))
+
+        process = self.active_process
+        exit_code = process.poll() if process is not None else 0
+        if process is not None and exit_code is not None:
+            self._handle_process_exit(self.active_process_name or "process", process, int(exit_code))
+            process = None
+
+        if process is not None and time.monotonic() >= self._close_deadline:
             try:
-                self.active_process.terminate()
-            except OSError:
-                pass
-        self.root.destroy()
+                process.kill()
+            except OSError as exc:
+                self._append_log(f"ERROR: Final close-time kill failed: {exc}\n")
+            self._close_deadline = time.monotonic() + STOP_KILL_WAIT_SECONDS
+
+        if process is not None and process.poll() is None:
+            self._schedule_after("_close_after_id", CLOSE_POLL_MS, self._poll_close_cleanup)
+            return
+
+        for thread in (self._stopper_thread, self._reader_thread):
+            if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=PROCESS_THREAD_JOIN_SECONDS)
+        self._drain_remaining_logs_for_close()
+        self._finish_close()
+
+    def _drain_remaining_logs_for_close(self) -> None:
+        deadline = time.monotonic() + CLOSE_LOG_DRAIN_SECONDS
+        while not self.log_queue.empty() and time.monotonic() < deadline:
+            self._consume_log_queue(max(LOG_DRAIN_MAX_ITEMS, 1000), max(LOG_DRAIN_BUDGET_SECONDS, 0.025))
+        self._consume_log_queue(max(LOG_DRAIN_MAX_ITEMS, 1000), max(LOG_DRAIN_BUDGET_SECONDS, 0.025))
+
+    def _finish_close(self) -> None:
+        if self._destroyed:
+            return
+        self._cancel_scheduled_callbacks()
+        self._destroyed = True
+        self.active_process = None
+        self._stopping_process = None
+        self._reader_thread = None
+        self._stopper_thread = None
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def main() -> int:

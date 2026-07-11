@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, Union
 
 from pvzrl_action_space import build_action_space_spec, normalize_action_space_mode
+from pvzrl_file_tail import IncrementalLineTailReader
 from pvzrl_human_coach import (
     COACH_PENDING_RETRY_REASONS,
     COACH_REJECTION_PENDING_COMMAND,
@@ -233,7 +234,8 @@ class JsonlCoachCommandSource:
 
     def __init__(self, path: Optional[Path], *, start_at_end: bool = True) -> None:
         self.path = path
-        self._offset = path.stat().st_size if start_at_end and path is not None and path.exists() else 0
+        self._tail = IncrementalLineTailReader(path, start_at_end=start_at_end) if path is not None else None
+        self._offset = self._tail.offset if self._tail is not None else 0
         self._started = False
         self._sequence = 0
         self._messages_emitted = 0
@@ -283,50 +285,39 @@ class JsonlCoachCommandSource:
         }
 
     def _read_new_payloads(self) -> List[Dict[str, Any]]:
-        if self.path is None:
+        if self.path is None or self._tail is None:
             return []
         try:
-            if not self.path.exists():
-                self._offset = 0
-                return []
-            size = self.path.stat().st_size
-            if size < self._offset:
-                self._offset = 0
             payloads: List[Dict[str, Any]] = []
-            with self.path.open("r", encoding="utf-8") as handle:
-                handle.seek(self._offset)
-                for raw_line in handle:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        self._last_error = "json_decode_error"
-                        continue
-                    if isinstance(payload, dict):
-                        payloads.append(payload)
-                self._offset = handle.tell()
-            self._last_error = ""
+            parse_error = ""
+            for raw_line in self._tail.read_lines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    parse_error = "json_decode_error"
+                    self._tail.note_malformed_record(parse_error)
+                    continue
+                if isinstance(payload, dict):
+                    payloads.append(payload)
+                else:
+                    parse_error = "json_not_object"
+                    self._tail.note_malformed_record(parse_error)
+            self._offset = self._tail.offset
+            self._last_error = parse_error or str(self._tail.last_error or "")
             return payloads
         except OSError as exc:
             self._last_error = str(exc)
             return []
 
     def clear_to_end(self) -> int:
-        if self.path is None:
+        if self.path is None or self._tail is None:
             return 0
         try:
-            if not self.path.exists():
-                self._offset = 0
-                return 0
-            skipped = 0
-            with self.path.open("r", encoding="utf-8") as handle:
-                handle.seek(self._offset)
-                for raw_line in handle:
-                    if raw_line.strip():
-                        skipped += 1
-                self._offset = handle.tell()
+            skipped = self._tail.clear_to_end()
+            self._offset = self._tail.offset
             self._last_clear_count = int(skipped)
             return int(skipped)
         except OSError as exc:

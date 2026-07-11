@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import json
+import os
+import queue
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from pvzrl_gui import (
+    LOG_DRAIN_MAX_ITEMS,
+    LOG_HISTORY_MAX_CHARS,
+    LOG_HISTORY_MAX_LINES,
+    LIVE_MAX_AGE_SECONDS,
+    STALE_MAX_AGE_SECONDS,
+    PvZDashboard,
+)
+
+
+class FakeRoot:
+    def __init__(self) -> None:
+        self.callbacks: dict[str, Callable[[], None]] = {}
+        self.canceled: list[str] = []
+        self.destroyed = False
+        self._next_id = 0
+
+    def after(self, _delay_ms: int, callback: Callable[[], None]) -> str:
+        self._next_id += 1
+        callback_id = f"after-{self._next_id}"
+        self.callbacks[callback_id] = callback
+        return callback_id
+
+    def after_cancel(self, callback_id: str) -> None:
+        self.canceled.append(callback_id)
+        self.callbacks.pop(callback_id, None)
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+
+class FakeVar:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def set(self, value: str) -> None:
+        self.value = str(value)
+
+
+class ImmediateExitProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        return int(self.returncode or 0)
+
+
+class TimeoutThenKillProcess(ImmediateExitProcess):
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("test", timeout)
+        return int(self.returncode)
+
+
+def _bare_dashboard() -> PvZDashboard:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    dashboard.root = FakeRoot()
+    dashboard.log_queue = queue.Queue(maxsize=10)
+    dashboard._log_queue_put_lock = threading.Lock()
+    dashboard._log_queue_drop_lock = threading.Lock()
+    dashboard._log_queue_dropped_items = 0
+    dashboard.log_history = []
+    dashboard.log_history_chars = 0
+    dashboard.log_dropped_lines = 0
+    dashboard.log_text = None
+    dashboard._poll_after_id = "poll-existing"
+    dashboard._log_after_id = "log-existing"
+    dashboard._close_after_id = None
+    dashboard._closing = False
+    dashboard._destroyed = False
+    dashboard._close_deadline = 0.0
+    dashboard._reader_thread = None
+    dashboard._stopper_thread = None
+    dashboard._stopping_process = None
+    dashboard.active_process = None
+    dashboard.active_process_name = ""
+    dashboard.active_process_started_at = None
+    dashboard.live_writer_warning_emitted = False
+    dashboard.process_status_var = FakeVar()
+    dashboard.launch_buttons = []
+    dashboard.stop_buttons = []
+    return dashboard
+
+
+def _status_dashboard(path: Path) -> PvZDashboard:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    dashboard.live_status_path = path
+    dashboard._live_status_signature = None
+    dashboard._live_status_cached_payload = None
+    dashboard._live_status_cached_state = "MISSING"
+    dashboard._live_status_cached_parse_error = ""
+    return dashboard
+
+
+def test_close_reuses_process_stop_and_cancels_callbacks() -> None:
+    dashboard = _bare_dashboard()
+    process = ImmediateExitProcess()
+    dashboard.active_process = process
+    dashboard.active_process_name = "training"
+
+    dashboard._on_close()
+    dashboard._on_close()
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert dashboard._destroyed is True
+    assert dashboard.root.destroyed is True
+    assert "poll-existing" in dashboard.root.canceled
+    assert "log-existing" in dashboard.root.canceled
+    assert dashboard.active_process is None
+
+
+def test_close_drains_bounded_queue_before_destroy() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_queue = queue.Queue(maxsize=2000)
+    for index in range(2000):
+        dashboard.log_queue.put_nowait(f"line {index}\n")
+    dashboard._on_close()
+    assert dashboard.root.destroyed is True
+    assert dashboard.log_queue.empty()
+
+
+def test_stop_escalates_only_after_grace_timeout() -> None:
+    dashboard = _bare_dashboard()
+    process = TimeoutThenKillProcess()
+    process.terminate()
+    dashboard._wait_then_kill("training", process)
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.poll() == -9
+
+
+def test_poll_and_log_callbacks_are_tracked_and_bounded() -> None:
+    dashboard = _bare_dashboard()
+    dashboard._poll_after_id = None
+    dashboard._log_after_id = None
+    dashboard._refresh_diagnostics = lambda auto: None
+
+    dashboard._poll()
+    assert dashboard._poll_after_id in dashboard.root.callbacks
+
+    dashboard.log_queue = queue.Queue(maxsize=LOG_DRAIN_MAX_ITEMS + 25)
+    for index in range(LOG_DRAIN_MAX_ITEMS + 25):
+        dashboard.log_queue.put_nowait(f"line {index}\n")
+    dashboard._drain_log_queue()
+    assert dashboard.log_queue.qsize() == 25
+    assert dashboard._log_after_id in dashboard.root.callbacks
+
+
+def test_log_queue_and_retained_history_are_bounded_with_drop_accounting() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_queue = queue.Queue(maxsize=2)
+    assert dashboard._queue_log_item("first\n")
+    assert dashboard._queue_log_item("second\n")
+    assert not dashboard._queue_log_item("third\n")
+    assert dashboard._queue_log_item("critical\n", critical=True)
+    dashboard._consume_log_queue(10, 1.0)
+    assert any("log queue dropped 2 item(s)" in line for line in dashboard.log_history)
+
+    dashboard._append_log("x\n" * (LOG_HISTORY_MAX_LINES + 20))
+    assert len(dashboard.log_history) <= LOG_HISTORY_MAX_LINES
+    assert dashboard.log_history_chars <= LOG_HISTORY_MAX_CHARS
+    assert dashboard.log_dropped_lines >= 20
+
+
+def test_unchanged_live_status_uses_cached_parse_and_recomputes_age(tmp_path: Path) -> None:
+    path = tmp_path / "live_status.json"
+    path.write_text(json.dumps({"status": "running", "value": 1}), encoding="utf-8")
+    dashboard = _status_dashboard(path)
+
+    first, first_info = dashboard._read_live_status_file()
+    second, second_info = dashboard._read_live_status_file()
+
+    assert first == second == {"status": "running", "value": 1}
+    assert not first_info.get("unchanged", False)
+    assert second_info["unchanged"] is True
+    assert second_info["health"] == "LIVE"
+
+
+def test_status_age_overrides_old_blocked_payload(tmp_path: Path) -> None:
+    path = tmp_path / "live_status.json"
+    path.write_text(json.dumps({"blocked_reason": "post_win_next_screen_timeout"}), encoding="utf-8")
+    old = time.time() - STALE_MAX_AGE_SECONDS - 5.0
+    os.utime(path, (old, old))
+    dashboard = _status_dashboard(path)
+
+    _, info = dashboard._read_live_status_file()
+    assert info["health"] == "DEAD"
+    assert dashboard._live_health(LIVE_MAX_AGE_SECONDS + 0.01, {"blocked_reason": "post_win_timeout"}) == "STALE"
+
+
+def test_malformed_cache_recovers_after_rotation(tmp_path: Path) -> None:
+    path = tmp_path / "live_status.json"
+    path.write_text("{bad", encoding="utf-8")
+    dashboard = _status_dashboard(path)
+
+    payload, malformed = dashboard._read_live_status_file()
+    _, unchanged = dashboard._read_live_status_file()
+    assert payload is None
+    assert malformed["health"] == "MALFORMED"
+    assert unchanged["unchanged"] is True
+
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({"status": "recovered"}), encoding="utf-8")
+    os.replace(replacement, path)
+    recovered, info = dashboard._read_live_status_file()
+    assert recovered == {"status": "recovered"}
+    assert info["health"] == "LIVE"
+    assert not info.get("unchanged", False)

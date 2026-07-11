@@ -33,6 +33,7 @@ from pvzrl_fusion import (
     plant_type_at_cell,
     seed_plant_type_for_slot,
 )
+from pvzrl_file_tail import IncrementalLineTailReader
 
 
 COACH_COMMANDS = {"plant", "fuse", "wait", "defend", "economy"}
@@ -403,32 +404,30 @@ class FileCoachCommandSource:
 
     def __init__(self, path: Union[str, Path], *, start_at_end: bool = True) -> None:
         self.path = Path(path)
-        self._offset = self.path.stat().st_size if start_at_end and self.path.exists() else 0
+        self._tail = IncrementalLineTailReader(self.path, start_at_end=start_at_end)
+        self._offset = self._tail.offset
+        self._last_error = ""
         self._queue: Deque[str] = deque()
 
     def poll(self) -> Optional[str]:
         if self._queue:
             return self._queue.popleft()
-        if not self.path.exists():
-            return None
-        size = self.path.stat().st_size
-        if size < self._offset:
-            self._offset = 0
-        with self.path.open("r", encoding="utf-8") as handle:
-            handle.seek(self._offset)
-            while True:
-                line_start = handle.tell()
-                line = handle.readline()
-                if not line:
-                    break
-                # Keep trailing partial writes for the next poll.
-                if not line.endswith("\n"):
-                    self._offset = line_start
-                    break
-                text = _command_text_from_line(line)
-                if text:
-                    self._queue.append(text)
-                self._offset = handle.tell()
+        self._last_error = ""
+        for line in self._tail.read_lines():
+            stripped = line.strip()
+            if stripped.startswith("{"):
+                try:
+                    json.loads(stripped)
+                except json.JSONDecodeError:
+                    self._tail.note_malformed_record("json_decode_error")
+                    self._last_error = "json_decode_error"
+                    continue
+            text = _command_text_from_line(line)
+            if text:
+                self._queue.append(text)
+        self._offset = self._tail.offset
+        if not self._last_error and self._tail.last_error:
+            self._last_error = self._tail.last_error
         if not self._queue:
             return None
         return self._queue.popleft()
@@ -440,13 +439,10 @@ class FileCoachCommandSource:
 
     def clear_to_end(self) -> int:
         cleared = self.clear_pending()
-        if not self.path.exists():
-            self._offset = 0
-            return cleared
-        size = self.path.stat().st_size
-        if size > self._offset:
+        self._tail.clear_to_end()
+        if self._tail.last_clear_had_bytes:
             cleared += 1
-        self._offset = size
+        self._offset = self._tail.offset
         return int(cleared)
 
 
@@ -2246,18 +2242,6 @@ def build_env_fusion_probe(
     return _probe
 
 
-def _build_env_fusion_probe(
-    env: Any,
-) -> Optional[
-    Callable[
-        [CoachCommand, Dict[str, Any], Sequence[int], ActionSpaceSpec],
-        Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]],
-    ]
-]:
-    # Backward-compatible private alias.
-    return build_env_fusion_probe(env)
-
-
 def _find_source_plant_at_cell(observation: Dict[str, Any], *, row: int, col: int) -> Optional[Dict[str, Any]]:
     plants = observation.get("plants")
     if not isinstance(plants, list):
@@ -2292,10 +2276,6 @@ def _ingredient_type_for_seed_slot(
         except (TypeError, ValueError):
             ingredient_type = -1
     return ingredient_type, slot_obj
-
-
-def _seed_slot_ready_for_use(observation: Dict[str, Any], slot: Optional[Dict[str, Any]]) -> bool:
-    return _seed_slot_block_reason(observation, slot) == ""
 
 
 def _build_fusion_slot_probe_rows(

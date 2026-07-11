@@ -627,26 +627,6 @@ def format_compatibility_failure(result: CompatibilityCheck) -> str:
     return "\n".join(lines)
 
 
-def compatibility_or_raise(
-    model_path: Path,
-    expected_config: Dict[str, Any],
-    *,
-    model_action_count: Optional[int] = None,
-    env_metadata: Optional[Dict[str, Any]] = None,
-    allow_missing_model_metadata: bool = False,
-) -> CompatibilityCheck:
-    result = validate_model_metadata(
-        model_path,
-        expected_config,
-        model_action_count=model_action_count,
-        env_metadata=env_metadata,
-        allow_missing_model_metadata=allow_missing_model_metadata,
-    )
-    if result.ok:
-        return result
-    raise SystemExit(format_compatibility_failure(result))
-
-
 def model_compatibility_live_status(result: CompatibilityCheck) -> Dict[str, Any]:
     model_metadata = result.model_metadata or result.actual or {}
     env_metadata = result.env_metadata or result.expected or {}

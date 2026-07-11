@@ -724,40 +724,6 @@ def seed_slot_signature(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def model_config_candidates(model_path: Path) -> List[Path]:
-    dirs: List[Path] = [model_path.parent]
-    if model_path.parent.name.lower() == "checkpoints":
-        dirs.append(model_path.parent.parent)
-    candidates: List[Path] = []
-    for directory in dirs:
-        for filename in ("resolved_config.json", "config.json"):
-            candidate = directory / filename
-            if candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
-
-
-def load_model_run_config(model_path: Path) -> tuple[Optional[Path], Optional[Dict[str, Any]]]:
-    for candidate in model_config_candidates(model_path):
-        if not candidate.exists():
-            continue
-        try:
-            return candidate, json.loads(candidate.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"Model compatibility metadata is not valid JSON: {candidate}") from exc
-    return None, None
-
-
-def plant_types_from_model_metadata(metadata: Dict[str, Any]) -> List[int]:
-    raw_plant_types = metadata.get("plant_types")
-    if isinstance(raw_plant_types, list) and raw_plant_types:
-        return [int(plant_type) for plant_type in raw_plant_types]
-    seed_list = normalized_seed_list(metadata.get("seed_list", []))
-    if seed_list:
-        return resolve_seed_list(seed_list)
-    return []
-
-
 def _model_action_count(model: Any) -> int:
     value = getattr(getattr(model, "action_space", None), "n", None)
     try:

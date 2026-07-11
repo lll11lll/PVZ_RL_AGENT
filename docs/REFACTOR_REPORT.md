@@ -191,4 +191,44 @@ Completed:
 
 Rollback boundary: local commit subject `test: lock PvZRL refactor baseline`; its hash will be recorded in the final phase table.
 
+### Phase 1 - confirmed defects and lifecycle safety
+
+Status: complete.
+
+Implemented:
+
+- Replaced the bridge's unowned concurrent queue entries with request IDs, monotonic deadlines, and atomic `Queued -> Dispatching -> Completed` or `Queued -> Canceled` ownership. Timeout cancellation can win only before Unity dispatch; once dispatch owns a request, the client receives the real completion rather than an early timeout.
+- Made bridge shutdown atomically stop enqueue and client registration, cancel every queued request with `server_stopping`, stop the listener, close active client sockets to unblock reads, prevent later `OnUpdate` dispatch, bounded-join the listener thread, and bounded-wait for client-worker drain with actionable warnings.
+- Added a deterministic standalone C# lifecycle harness covering deadlines, expired step/fusion/configure/reset commands, timeout/dispatch and stop/dispatch races, queued cancellation, rejection after stop, and bounded client drain.
+- Rebuilt seed-slot placement lookup by explicit `SlotIndex`, rejected missing/stale/null cached cards after one authoritative probe rebuild, and removed both nullable `CardUI` compiler paths.
+- Retained `sunSpawnCompensationApplyCount` as an explicit deprecated constant-zero compatibility field, eliminating the dead-field warning without changing its serialized value.
+- Added one bounded binary incremental line tailer shared by human and mock-stream coach sources. It separates committed and read offsets, retains incomplete UTF-8/CRLF records, resumes them exactly once, skips complete malformed records with diagnostics, detects replacement/truncation/same-inode rewrite, preserves clear/start-at-end behavior, and bounds reads and oversized pending records.
+- Unified GUI explicit-stop and window-close process handling. Close cancels tracked Tk callbacks, requests terminate, waits without blocking Tk, escalates to kill only after the grace period, drains remaining output, joins reader/stopper threads briefly, and destroys the root only after the child is gone.
+- Bounded the GUI producer queue, per-tick drain count/time, retained log lines/chars, and visible drop accounting. Unchanged live-status files now reuse parsed payloads by file signature, while missing/malformed/replaced files recover normally.
+- Made live-status age authoritative over old `blocked_reason` values, so stale/dead writers can no longer remain indefinitely `BLOCKED_*`.
+- Passed CherryBomb delayed event diagnostics explicitly from reward calculation into lane diagnostics; delayed kills, zero-kill expiry, buckethead credit, and conehead credit no longer serialize as unconditional zero.
+
+Proven deletions:
+
+- Removed the disabled commented Level-3 start gate and unused environment helpers `_is_active_gameplay`, `_is_confirmed_terminal_or_transition`, `_playable_board_has_episode_residue`, `_wait_for_reset_playable`, and `_zombie_proximity_penalty`.
+- Removed unused Adventure post-win helpers `clear_post_win_screens`, `_wait_for_unlock_or_reward_screen`, and `_wait_for_next_seed_selection_or_menu`, plus generalist `_set_hard_blocked`.
+- Removed unused GUI `row_panel_lines`, human-coach private compatibility aliases `_build_env_fusion_probe` and `_seed_slot_ready_for_use`, model-metadata `compatibility_or_raise`, and trainer helpers `model_config_candidates`, `load_model_run_config`, and `plant_types_from_model_metadata`.
+- Each deletion had definition-only repository, import, call-site, configuration, serialized-key, documentation, and checkpoint/metadata searches before removal. Compatibility wrappers still used by reset, diagnostics, router, local mock-stream, CLI, or serialized consumers remain.
+
+Current gate results:
+
+- `python -m compileall -q python`: PASS.
+- `python -m pytest -q`: PASS, 47 tests plus 7 subtests after the final focused additions.
+- All nine retained script regression entry points: PASS.
+- `scripts/test_bridge_lifecycle.ps1`: PASS, 7,051 deterministic checks and a zero-warning bridge build.
+- Headless Tk construction/close smoke: PASS.
+- Real child-process GUI close smoke: PASS; the 60-second child was terminated, reaped, and the dashboard destroyed without an orphan.
+- Fixed and protected metadata dry-runs: PASS with 201/701 actions and no warnings.
+- Actual protected generalist and fixed control loads: PASS with `(701, (4297,), 370000)` and `(201, (357,), 350368)`.
+- Independent review: PASS with no blocking findings. It directly checked request ownership, shutdown, seed caching, DTO/wire compatibility, tail offsets/anchors, GUI lifecycle, Cherry propagation, and deletion evidence.
+
+Residual Phase 1 limitation: the deterministic C# harness exercises the request queue/state and active-client registry primitives but not a complete listener with a worker blocked in `ReadLine()`. The reviewed production path closes every socket that wins atomic registration, which is the operation that unblocks that read; a live bridge connection remains part of the final environment gate.
+
+Rollback boundary: local commit subject `fix: harden PvZRL lifecycle boundaries`; its hash will be recorded in the final phase table.
+
 Later phase results, benchmark comparisons, live verification, independent review findings, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.

@@ -90,7 +90,7 @@ Unless a separately documented defect correction has focused regression coverage
 | Phase | Scope | Current status | Required gate before next phase |
 | --- | --- | --- | --- |
 | 0 | Baseline, behavior locks, fixtures, benchmarks, plan/report | Complete | Full existing Python baseline, bridge build, checkpoint loads, new contract tests, benchmark record |
-| 1 | Request deadlines/shutdown, seed cache warnings, shared JSONL tailing, GUI close, confirmed defects/dead code | Pending | Deterministic stale-request, shutdown, partial-record, GUI lifecycle tests; zero-warning bridge build; full baseline |
+| 1 | Request deadlines/shutdown, seed cache warnings, shared JSONL tailing, GUI close, confirmed defects/dead code | Complete | Deterministic stale-request, shutdown, partial-record, GUI lifecycle tests; zero-warning bridge build; full baseline |
 | 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Pending | Registry parity, precedence matrix, model/action/observation metadata snapshots |
 | 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Pending | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Pending | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |

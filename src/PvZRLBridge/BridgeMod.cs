@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -20,15 +19,21 @@ using Object = UnityEngine.Object;
 
 [assembly: MelonInfo(typeof(PvZRLBridge.BridgeMod), "PvZRLBridge", "0.1.0", "Codex")]
 [assembly: MelonGame("LanPiaoPiao", "PlantsVsZombiesRH")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("PvZRLBridgeLifecycleHarness")]
 
 namespace PvZRLBridge;
 
 public sealed class BridgeMod : MelonMod
 {
     private const int DefaultPort = 32323;
+    private const long DeprecatedSunSpawnCompensationApplyCount = 0;
     private const uint MouseEventLeftDown = 0x0002;
     private const uint MouseEventLeftUp = 0x0004;
-    private readonly ConcurrentQueue<PendingRequest> _pending = new();
+    private static readonly TimeSpan ServerThreadShutdownTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ClientWorkerShutdownTimeout = TimeSpan.FromSeconds(2);
+    private readonly PendingRequestQueue _pending = new();
+    private readonly ActiveClientRegistry _activeClients = new();
+    private readonly object _serverStateGate = new();
     private readonly BridgeConfig _config = new();
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -40,6 +45,7 @@ public sealed class BridgeMod : MelonMod
     private TcpListener? _listener;
     private Thread? _serverThread;
     private volatile bool _stopping;
+    private long _nextRequestId;
     private int _loggedBoardReady;
     private readonly SeedRuntimeCache _seedRuntimeCache = new();
     private readonly RestartUiCache _restartUiCache = new();
@@ -52,7 +58,6 @@ public sealed class BridgeMod : MelonMod
     private long _bridgeUpdateLoopCount;
     private long _speedApplyCount;
     private long _validSpeedModeApplyCount;
-    private long _sunSpawnCompensationApplyCount;
     private long _resetCount;
     private long _letsRockClickCount;
     private int _lastSunDebugFrame = -100000;
@@ -96,14 +101,28 @@ public sealed class BridgeMod : MelonMod
 
     public override void OnUpdate()
     {
+        if (_stopping)
+        {
+            return;
+        }
+
         _bridgeUpdateLoopCount++;
         ApplyConfiguredGameSpeed();
         LogBoardReadyOnce();
 
         var processed = 0;
-        while (processed < 16 && _pending.TryDequeue(out var request))
+        while (processed < 16 &&
+               _pending.TryTakeForDispatch(
+                   Stopwatch.GetTimestamp(),
+                   CreateRequestTimeoutResponse(),
+                   out var request))
         {
             processed++;
+            if (request == null)
+            {
+                continue;
+            }
+
             BridgeResponse response;
             try
             {
@@ -114,7 +133,7 @@ public sealed class BridgeMod : MelonMod
                 response = BridgeResponse.Fail("request_failed", ex.ToString());
             }
 
-            request.Completion.TrySetResult(response);
+            request.TryComplete(response);
         }
     }
 
@@ -132,98 +151,230 @@ public sealed class BridgeMod : MelonMod
 
     private void StartServer()
     {
-        _listener = new TcpListener(IPAddress.Loopback, _config.Port);
-        _listener.Start();
-        _serverThread = new Thread(ServerLoop)
+        var listener = new TcpListener(IPAddress.Loopback, _config.Port);
+        listener.Start();
+        _pending.StartAccepting();
+        _activeClients.StartAccepting();
+        _stopping = false;
+
+        var serverThread = new Thread(() => ServerLoop(listener))
         {
             IsBackground = true,
             Name = "PvZRLBridgeServer"
         };
-        _serverThread.Start();
+        lock (_serverStateGate)
+        {
+            _listener = listener;
+            _serverThread = serverThread;
+        }
+        serverThread.Start();
     }
 
     private void StopServer()
     {
         _stopping = true;
-        try { _listener?.Stop(); } catch { }
+        _pending.StopAcceptingAndCancel(CreateServerStoppingResponse());
+        var clients = _activeClients.StopAcceptingAndSnapshot();
+
+        TcpListener? listener;
+        Thread? serverThread;
+        lock (_serverStateGate)
+        {
+            listener = _listener;
+            _listener = null;
+            serverThread = _serverThread;
+        }
+
+        try { listener?.Stop(); } catch { }
+        foreach (var client in clients)
+        {
+            SafeCloseClient(client);
+        }
+
+        if (serverThread != null && serverThread != Thread.CurrentThread)
+        {
+            try
+            {
+                if (!serverThread.Join(ServerThreadShutdownTimeout))
+                {
+                    LoggerInstance.Warning(
+                        $"PvZRLBridge server thread did not stop within {ServerThreadShutdownTimeout.TotalSeconds:0.###} seconds.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerInstance.Warning("PvZRLBridge server thread join failed: " + ex.Message);
+            }
+        }
+
+        if (!_activeClients.WaitForDrain(ClientWorkerShutdownTimeout))
+        {
+            LoggerInstance.Warning(
+                $"PvZRLBridge still has {_activeClients.ActiveCount} client worker(s) after " +
+                $"{ClientWorkerShutdownTimeout.TotalSeconds:0.###} seconds; sockets were closed and shutdown will continue.");
+        }
+
+        lock (_serverStateGate)
+        {
+            if (ReferenceEquals(_serverThread, serverThread) && (serverThread == null || !serverThread.IsAlive))
+            {
+                _serverThread = null;
+            }
+        }
     }
 
-    private void ServerLoop()
+    private void ServerLoop(TcpListener listener)
     {
         while (!_stopping)
         {
             try
             {
-                var client = _listener!.AcceptTcpClient();
-                ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
+                var client = listener.AcceptTcpClient();
+                if (!_activeClients.TryRegister(client, out var clientId))
+                {
+                    SafeCloseClient(client);
+                    continue;
+                }
+
+                var queued = false;
+                try
+                {
+                    queued = ThreadPool.QueueUserWorkItem(_ => HandleClient(clientId, client));
+                }
+                catch (Exception ex)
+                {
+                    if (!_stopping)
+                    {
+                        LoggerInstance.Warning("PvZRLBridge could not queue a client worker: " + ex.Message);
+                    }
+                }
+
+                if (!queued)
+                {
+                    _activeClients.Unregister(clientId);
+                    SafeCloseClient(client);
+                }
             }
-            catch
+            catch (Exception ex)
             {
                 if (!_stopping)
                 {
+                    LoggerInstance.Warning("PvZRLBridge listener failed: " + ex.Message);
                     Thread.Sleep(250);
                 }
             }
         }
     }
 
-    private void HandleClient(TcpClient client)
+    private void HandleClient(long clientId, TcpClient client)
     {
-        using (client)
+        try
         {
-            client.NoDelay = true;
-            using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8, false, 8192, false);
-            using var writer = new StreamWriter(stream, new UTF8Encoding(false), 8192, false)
+            using (client)
             {
-                AutoFlush = true
-            };
+                client.NoDelay = true;
+                using var stream = client.GetStream();
+                using var reader = new StreamReader(stream, Encoding.UTF8, false, 8192, false);
+                using var writer = new StreamWriter(stream, new UTF8Encoding(false), 8192, false)
+                {
+                    AutoFlush = true
+                };
 
-            while (!_stopping && client.Connected)
-            {
-                string? line;
-                try
+                while (!_stopping && client.Connected)
                 {
-                    line = reader.ReadLine();
-                }
-                catch
-                {
-                    break;
-                }
+                    string? line;
+                    try
+                    {
+                        line = reader.ReadLine();
+                    }
+                    catch
+                    {
+                        break;
+                    }
 
-                if (line == null)
-                {
-                    break;
-                }
+                    if (line == null)
+                    {
+                        break;
+                    }
 
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    continue;
-                }
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
 
-                var pending = new PendingRequest(line);
-                _pending.Enqueue(pending);
+                    var requestId = Interlocked.Increment(ref _nextRequestId);
+                    var pending = new PendingRequest(
+                        requestId,
+                        line,
+                        TimeSpan.FromSeconds(Math.Max(0.001, _config.RequestTimeoutSeconds)));
+                    _pending.TryEnqueue(pending, CreateServerStoppingResponse());
 
-                BridgeResponse response;
-                if (pending.Completion.Task.Wait(TimeSpan.FromSeconds(_config.RequestTimeoutSeconds)))
-                {
-                    response = pending.Completion.Task.Result;
-                }
-                else
-                {
-                    response = BridgeResponse.Fail("timeout", "Unity main thread did not process the request in time.");
-                }
+                    var response = WaitForRequestCompletion(pending);
 
-                try
-                {
-                    writer.WriteLine(JsonSerializer.Serialize(response, _jsonOptions));
-                }
-                catch
-                {
-                    break;
+                    try
+                    {
+                        writer.WriteLine(JsonSerializer.Serialize(response, _jsonOptions));
+                    }
+                    catch
+                    {
+                        break;
+                    }
                 }
             }
         }
+        catch (Exception ex)
+        {
+            if (!_stopping)
+            {
+                LoggerInstance.Warning($"PvZRLBridge client {clientId} failed: {ex.Message}");
+            }
+        }
+        finally
+        {
+            _activeClients.Unregister(clientId);
+        }
+    }
+
+    private static BridgeResponse WaitForRequestCompletion(PendingRequest pending)
+    {
+        while (true)
+        {
+            if (pending.Completion.Task.IsCompleted)
+            {
+                return pending.Completion.Task.GetAwaiter().GetResult();
+            }
+
+            var remaining = pending.RemainingUntilDeadline(Stopwatch.GetTimestamp());
+            if (remaining <= TimeSpan.Zero)
+            {
+                var timeout = CreateRequestTimeoutResponse();
+                if (pending.TryCancel(timeout))
+                {
+                    return timeout;
+                }
+
+                // Dispatch owns the request. Waiting for its real completion prevents a
+                // timeout response from racing ahead of an in-progress Unity mutation.
+                return pending.Completion.Task.GetAwaiter().GetResult();
+            }
+
+            if (pending.Completion.Task.Wait(remaining))
+            {
+                return pending.Completion.Task.GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    private static BridgeResponse CreateRequestTimeoutResponse() =>
+        BridgeResponse.Fail("timeout", "Unity main thread did not process the request in time.");
+
+    private static BridgeResponse CreateServerStoppingResponse() =>
+        BridgeResponse.Fail("server_stopping", "PvZRLBridge is stopping and cannot accept this request.");
+
+    private static void SafeCloseClient(TcpClient client)
+    {
+        try { client.Client?.Shutdown(SocketShutdown.Both); } catch { }
+        try { client.Close(); } catch { }
     }
 
     private BridgeResponse HandleRequest(string json)
@@ -5703,50 +5854,57 @@ public sealed class BridgeMod : MelonMod
     {
         slot = new SeedSlotDto { SlotIndex = seedSlotIndex, PlantType = -1, PlantTypeName = "unknown" };
         card = null;
-        if (!_seedRuntimeCache.Valid || _seedRuntimeCache.SeedSelectionActive || seedSlotIndex < 0 ||
-            seedSlotIndex >= _seedRuntimeCache.CachedSeedSlots.Count)
-        {
-            BuildSeedProbe();
-        }
-
-        if (seedSlotIndex < 0 || seedSlotIndex >= _seedRuntimeCache.CachedSeedSlots.Count)
+        if (seedSlotIndex < 0)
         {
             return false;
         }
 
-        var entry = _seedRuntimeCache.CachedSeedSlots[seedSlotIndex];
-        try
+        if (!_seedRuntimeCache.Valid || _seedRuntimeCache.SeedSelectionActive)
         {
-            if (entry.Card == null ||
-                entry.Card.gameObject == null ||
-                !entry.Card.gameObject.activeInHierarchy ||
-                entry.Card.GetInstanceID() != entry.CardInstanceId)
-            {
-                BuildSeedProbe();
-                if (seedSlotIndex < 0 || seedSlotIndex >= _seedRuntimeCache.CachedSeedSlots.Count)
-                {
-                    return false;
-                }
+            try { BuildSeedProbe(); }
+            catch { return false; }
+        }
 
-                entry = _seedRuntimeCache.CachedSeedSlots[seedSlotIndex];
-            }
-
-            card = entry.Card;
-            slot = BuildSeedSlotDto(card, seedSlotIndex, "cached_active_gameplay_card", includeHierarchyPath: false);
+        if (TryBuildCachedSeedSlotForPlacement(seedSlotIndex, out slot, out card))
+        {
             return true;
         }
-        catch
+
+        try { BuildSeedProbe(); }
+        catch { return false; }
+        return TryBuildCachedSeedSlotForPlacement(seedSlotIndex, out slot, out card);
+    }
+
+    private bool TryBuildCachedSeedSlotForPlacement(int seedSlotIndex, out SeedSlotDto slot, out CardUI? card)
+    {
+        slot = new SeedSlotDto { SlotIndex = seedSlotIndex, PlantType = -1, PlantTypeName = "unknown" };
+        card = null;
+        var entry = _seedRuntimeCache.CachedSeedSlots.FirstOrDefault(candidate => candidate.SlotIndex == seedSlotIndex);
+        if (entry == null || entry.SlotIndex != seedSlotIndex)
         {
-            BuildSeedProbe();
-            if (seedSlotIndex < 0 || seedSlotIndex >= _seedRuntimeCache.CachedSeedSlots.Count)
+            return false;
+        }
+
+        var resolvedCard = entry.Card;
+        try
+        {
+            if (resolvedCard == null ||
+                resolvedCard.gameObject == null ||
+                !resolvedCard.gameObject.activeInHierarchy ||
+                resolvedCard.GetInstanceID() != entry.CardInstanceId)
             {
                 return false;
             }
 
-            entry = _seedRuntimeCache.CachedSeedSlots[seedSlotIndex];
-            card = entry.Card;
-            slot = BuildSeedSlotDto(card, seedSlotIndex, "cached_active_gameplay_card", includeHierarchyPath: false);
+            slot = BuildSeedSlotDto(resolvedCard, seedSlotIndex, "cached_active_gameplay_card", includeHierarchyPath: false);
+            card = resolvedCard;
             return true;
+        }
+        catch
+        {
+            slot = new SeedSlotDto { SlotIndex = seedSlotIndex, PlantType = -1, PlantTypeName = "unknown" };
+            card = null;
+            return false;
         }
     }
 
@@ -7513,7 +7671,9 @@ public sealed class BridgeMod : MelonMod
         obs.EffectiveGameSpeed = ResolveEffectiveGameSpeed();
         obs.SpeedApplyCount = _speedApplyCount;
         obs.ValidSpeedModeApplyCount = _validSpeedModeApplyCount;
-        obs.SunSpawnCompensationApplyCount = _sunSpawnCompensationApplyCount;
+        // Compatibility key retained for Python diagnostics. Compensation is deprecated,
+        // so the counter intentionally remains a serialized constant zero.
+        obs.SunSpawnCompensationApplyCount = DeprecatedSunSpawnCompensationApplyCount;
         obs.BridgeUpdateLoopCount = _bridgeUpdateLoopCount;
         obs.ResetCount = _resetCount;
         obs.LetsRockClickCount = _letsRockClickCount;
@@ -10697,16 +10857,259 @@ internal sealed class BridgeConfig
     public List<int> PlantTypes { get; } = new() { (int)PlantType.SunFlower, (int)PlantType.Peashooter };
 }
 
+internal enum PendingRequestState
+{
+    Queued = 0,
+    Dispatching = 1,
+    Completed = 2,
+    Canceled = 3
+}
+
 internal sealed class PendingRequest
 {
-    public PendingRequest(string json)
+    private readonly long _timestampFrequency;
+    private int _state = (int)PendingRequestState.Queued;
+
+    public PendingRequest(long requestId, string json, TimeSpan timeout)
+        : this(requestId, json, Stopwatch.GetTimestamp(), Stopwatch.Frequency, timeout)
     {
-        Json = json;
     }
 
+    internal PendingRequest(long requestId, string json, long createdTimestamp, long timestampFrequency, TimeSpan timeout)
+    {
+        if (timestampFrequency <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timestampFrequency));
+        }
+
+        RequestId = requestId;
+        Json = json;
+        CreatedTimestamp = createdTimestamp;
+        _timestampFrequency = timestampFrequency;
+        DeadlineTimestamp = CalculateDeadline(createdTimestamp, timestampFrequency, timeout);
+    }
+
+    public long RequestId { get; }
     public string Json { get; }
+    public long CreatedTimestamp { get; }
+    public long DeadlineTimestamp { get; }
+    public PendingRequestState State => (PendingRequestState)Volatile.Read(ref _state);
     public TaskCompletionSource<BridgeResponse> Completion { get; } =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TimeSpan RemainingUntilDeadline(long nowTimestamp)
+    {
+        var remainingTicks = DeadlineTimestamp - nowTimestamp;
+        if (remainingTicks <= 0)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return TimeSpan.FromSeconds(remainingTicks / (double)_timestampFrequency);
+    }
+
+    public bool TryBeginDispatch(long nowTimestamp, BridgeResponse expiredResponse)
+    {
+        if (nowTimestamp >= DeadlineTimestamp)
+        {
+            TryCancel(expiredResponse);
+            return false;
+        }
+
+        return Interlocked.CompareExchange(
+                   ref _state,
+                   (int)PendingRequestState.Dispatching,
+                   (int)PendingRequestState.Queued) == (int)PendingRequestState.Queued;
+    }
+
+    public bool TryCancel(BridgeResponse response)
+    {
+        if (Interlocked.CompareExchange(
+                ref _state,
+                (int)PendingRequestState.Canceled,
+                (int)PendingRequestState.Queued) != (int)PendingRequestState.Queued)
+        {
+            return false;
+        }
+
+        Completion.TrySetResult(response);
+        return true;
+    }
+
+    public bool TryComplete(BridgeResponse response)
+    {
+        if (Interlocked.CompareExchange(
+                ref _state,
+                (int)PendingRequestState.Completed,
+                (int)PendingRequestState.Dispatching) != (int)PendingRequestState.Dispatching)
+        {
+            return false;
+        }
+
+        Completion.TrySetResult(response);
+        return true;
+    }
+
+    private static long CalculateDeadline(long createdTimestamp, long timestampFrequency, TimeSpan timeout)
+    {
+        var timeoutSeconds = Math.Max(0.0, timeout.TotalSeconds);
+        var duration = (long)Math.Ceiling(timeoutSeconds * timestampFrequency);
+        if (duration <= 0)
+        {
+            return createdTimestamp;
+        }
+        if (createdTimestamp > long.MaxValue - duration)
+        {
+            return long.MaxValue;
+        }
+        return createdTimestamp + duration;
+    }
+}
+
+internal sealed class PendingRequestQueue
+{
+    private readonly object _gate = new();
+    private readonly Queue<PendingRequest> _queue = new();
+    private bool _accepting;
+
+    public void StartAccepting()
+    {
+        lock (_gate)
+        {
+            if (_queue.Count != 0)
+            {
+                throw new InvalidOperationException("Cannot start a bridge request queue with stale entries.");
+            }
+            _accepting = true;
+        }
+    }
+
+    public bool TryEnqueue(PendingRequest request, BridgeResponse rejectionResponse)
+    {
+        lock (_gate)
+        {
+            if (!_accepting)
+            {
+                request.TryCancel(rejectionResponse);
+                return false;
+            }
+
+            _queue.Enqueue(request);
+            return true;
+        }
+    }
+
+    public bool TryTakeForDispatch(
+        long nowTimestamp,
+        BridgeResponse expiredResponse,
+        out PendingRequest? request)
+    {
+        lock (_gate)
+        {
+            request = null;
+            if (!_accepting || _queue.Count == 0)
+            {
+                return false;
+            }
+
+            var candidate = _queue.Dequeue();
+            if (candidate.TryBeginDispatch(nowTimestamp, expiredResponse))
+            {
+                request = candidate;
+            }
+            return true;
+        }
+    }
+
+    public int StopAcceptingAndCancel(BridgeResponse cancellationResponse)
+    {
+        lock (_gate)
+        {
+            _accepting = false;
+            var canceled = 0;
+            while (_queue.Count > 0)
+            {
+                if (_queue.Dequeue().TryCancel(cancellationResponse))
+                {
+                    canceled++;
+                }
+            }
+            return canceled;
+        }
+    }
+}
+
+internal sealed class ActiveClientRegistry
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<long, TcpClient> _clients = new();
+    private readonly ManualResetEventSlim _drained = new(initialState: true);
+    private bool _accepting;
+    private long _nextClientId;
+
+    public int ActiveCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _clients.Count;
+            }
+        }
+    }
+
+    public void StartAccepting()
+    {
+        lock (_gate)
+        {
+            if (_clients.Count != 0)
+            {
+                throw new InvalidOperationException("Cannot start bridge clients while previous workers remain active.");
+            }
+            _accepting = true;
+            _drained.Set();
+        }
+    }
+
+    public bool TryRegister(TcpClient client, out long clientId)
+    {
+        lock (_gate)
+        {
+            clientId = 0;
+            if (!_accepting)
+            {
+                return false;
+            }
+
+            clientId = ++_nextClientId;
+            _drained.Reset();
+            _clients.Add(clientId, client);
+            return true;
+        }
+    }
+
+    public void Unregister(long clientId)
+    {
+        lock (_gate)
+        {
+            _clients.Remove(clientId);
+            if (_clients.Count == 0)
+            {
+                _drained.Set();
+            }
+        }
+    }
+
+    public IReadOnlyList<TcpClient> StopAcceptingAndSnapshot()
+    {
+        lock (_gate)
+        {
+            _accepting = false;
+            return _clients.Values.ToArray();
+        }
+    }
+
+    public bool WaitForDrain(TimeSpan timeout) => _drained.Wait(timeout);
 }
 
 internal sealed class BridgeResponse
