@@ -45,6 +45,94 @@
       "description": "Area burst damage plant. Metadata only; not enabled for the first PPO scope.",
       "source_of_metadata": "almanac dump plus registry fallback",
       "enabled_for_training": false
+    },
+    {
+      "canonical_name": "PotatoMine",
+      "aliases": ["Potato Mine", "Potato", "Mine"],
+      "plant_type_id": 4,
+      "cost": 25,
+      "cooldown": 30.0,
+      "role": "explosive",
+      "description": "Cheap delayed emergency defense for an early threatened lane.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "SnowPea",
+      "aliases": ["Snow Pea"],
+      "plant_type_id": 5,
+      "cost": 175,
+      "cooldown": 7.5,
+      "role": "support",
+      "description": "Lane attacker with slowing utility.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "Chomper",
+      "aliases": ["Chomp"],
+      "plant_type_id": 6,
+      "cost": 150,
+      "cooldown": 7.5,
+      "role": "attacker",
+      "description": "High-value single-target emergency removal with a long digest cycle.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "Repeater",
+      "aliases": ["Repeater Seed"],
+      "plant_type_id": 7,
+      "cost": 200,
+      "cooldown": 7.5,
+      "role": "attacker",
+      "description": "Two-shot lane attacker seed; distinct from the mod fusion-result type 1030.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "PuffShroom",
+      "aliases": ["Puff-shroom", "Puff Shroom"],
+      "plant_type_id": 8,
+      "cost": 0,
+      "cooldown": 7.5,
+      "role": "attacker",
+      "description": "Short-range night attacker.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "SunShroom",
+      "aliases": ["Sun-shroom", "Sun Shroom"],
+      "plant_type_id": 9,
+      "cost": 25,
+      "cooldown": 7.5,
+      "role": "economy",
+      "description": "Night economy plant.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "FumeShroom",
+      "aliases": ["Fume-shroom", "Fume Shroom"],
+      "plant_type_id": 10,
+      "cost": 75,
+      "cooldown": 7.5,
+      "role": "attacker",
+      "description": "Short-range piercing night attacker.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
+    },
+    {
+      "canonical_name": "GraveBuster",
+      "aliases": ["Grave Buster"],
+      "plant_type_id": 11,
+      "cost": 75,
+      "cooldown": 7.5,
+      "role": "utility",
+      "description": "Removes graves during night levels.",
+      "source_of_metadata": "base PvZ plant enum; runtime card metadata remains authoritative",
+      "enabled_for_training": true
     }
   ]
 }

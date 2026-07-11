@@ -26,6 +26,7 @@ from pvzrl_env import (
     plant_type_name,
     registry_entries,
 )
+from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields
 from pvzrl_human_coach import human_coach_live_status_from_hook
 from pvzrl_model_router import ModelRouter
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
@@ -1883,6 +1884,20 @@ def _finalize_policy_attempt(
         or log.terminal_new_plant_unlocked_visible
         or log.terminal_reward_object_visible
     )
+    terminal_screen = str(adventure_state.get("screenState") or raw.get("screenState") or "").strip().lower()
+    terminal_loss_visible = bool(
+        terminal_screen in {"game_over", "game_over_restart", "loss", "lose_menu"}
+        or adventure_state.get("gameOverVisible")
+        or adventure_state.get("restartButtonVisible")
+        or raw.get("gameOverVisible")
+        or raw.get("restartButtonVisible")
+    )
+    # The bridge can leave a stale win/done hint in the episode summary while
+    # the authoritative UI has already settled on the loss/restart screen. Do
+    # not enter the 35-second post-win unlock loop in that state.
+    if terminal_loss_visible and not terminal_post_win_visible:
+        done_reason = "loss"
+        terminal_reason = "game_over_restart_screen"
     if terminal_post_win_visible and done_reason not in ("post_win_pending", "win"):
         done_reason = "post_win_pending"
         if not terminal_reason or terminal_reason in {"game_over_restart_screen", "timeout", "timeout_hard_cap"}:
@@ -2160,6 +2175,24 @@ def build_live_status(
     )
     reward_totals = getattr(env, "_episode_reward_totals", {})
     lane_diagnostics = last_info.get("lane_diagnostics", {}) if isinstance(last_info, dict) else {}
+    fusion_diagnostics = dict(
+        last_info.get("fusion_diagnostics", {})
+        if isinstance(last_info, dict) and isinstance(last_info.get("fusion_diagnostics"), dict)
+        else getattr(getattr(env, "base", None), "_last_fusion_diagnostics", {}) or {}
+    )
+    mask_diagnostics = last_info.get("mask_diagnostics", {}) if isinstance(last_info, dict) else {}
+    if not isinstance(mask_diagnostics, dict):
+        mask_diagnostics = {}
+    for key, value in mask_diagnostics.items():
+        if str(key).startswith("fusion_"):
+            fusion_diagnostics[str(key)] = value
+    fusion_fields = fusion_live_fields(
+        fusion_diagnostics,
+        str(getattr(getattr(env, "config", None), "fusion_policy", FUSION_POLICY_NONE)),
+    )
+    fusion_fields["fusion_action_mask_enabled"] = bool(
+        getattr(getattr(env, "config", None), "fusion_action_mask_enabled", False)
+    )
     summary = context.get("eval_summary", {})
     if hasattr(env, "_coach_live_status"):
         try:
@@ -2654,6 +2687,7 @@ def build_live_status(
         "coach": dict(coach_fields),
         "human_coach": dict(coach_fields),
         "stream_coach": dict(coach_fields),
+        "fusion": dict(fusion_fields),
         "agent": build_agent_payload(env, context, last_info),
         "rows": build_rows_payload(observation, lane_diagnostics),
         "reward": {
@@ -2661,6 +2695,7 @@ def build_live_status(
             **{field: float(reward_totals.get(field, 0.0) or 0.0) for field in REWARD_EPISODE_TOTAL_FIELDS},
         },
         "eval": summary,
+        **fusion_fields,
         **coach_fields,
     }
 

@@ -46,6 +46,7 @@ PLANT_NAMES = {
     2: "CherryBomb",
     3: "WallNut",
     1030: "Repeater",
+    1031: "Threepeater",
     1032: "GatlingPea",
     1033: "TwinSunFlower",
 }
@@ -56,6 +57,20 @@ FUSION_RULES: Dict[Tuple[int, int], Dict[str, Any]] = {
         "predicted_result_name": "Repeater",
         "predicted_result_type": 1030,
         "reason": "Peashooter-on-Peashooter should improve lane DPS.",
+        "role": "dps",
+        "scripted_enabled": True,
+    },
+    (1030, 0): {
+        "predicted_result_name": "Threepeater",
+        "predicted_result_type": 1031,
+        "reason": "Peashooter on Repeater advances the recursive pea fusion chain.",
+        "role": "dps",
+        "scripted_enabled": True,
+    },
+    (1031, 0): {
+        "predicted_result_name": "GatlingPea",
+        "predicted_result_type": 1032,
+        "reason": "Peashooter on Threepeater completes the high-tier pea fusion chain.",
         "role": "dps",
         "scripted_enabled": True,
     },
@@ -102,6 +117,8 @@ PLANT_NAME_TO_ID: Dict[str, int] = {
     "wallnut": WALLNUT_ID,
     "nut": WALLNUT_ID,
     "repeater": 1030,
+    "threepeater": 1031,
+    "3pea": 1031,
     "gatlingpea": 1032,
     "twinsunflower": 1033,
 }
@@ -111,10 +128,63 @@ PLANT_NAME_TO_ID: Dict[str, int] = {
 # either direction and both directions become legal.  Compatibility is
 # explicit: a pair that does not appear here is NOT fusable.
 FUSION_COMPATIBILITY: Dict[int, Set[int]] = {
-    SUNFLOWER_ID: {PEASHOOTER_ID},
-    PEASHOOTER_ID: {SUNFLOWER_ID, CHERRYBOMB_ID},
+    # Keep the two known self-upgrades in sync with FUSION_RULES above.
+    SUNFLOWER_ID: {SUNFLOWER_ID, PEASHOOTER_ID},
+    PEASHOOTER_ID: {PEASHOOTER_ID, SUNFLOWER_ID, CHERRYBOMB_ID, 1030, 1031},
     CHERRYBOMB_ID: {PEASHOOTER_ID},
+    1030: {PEASHOOTER_ID},
+    1031: {PEASHOOTER_ID},
 }
+
+
+FUSION_TIER_BY_TYPE: Dict[int, int] = {
+    PEASHOOTER_ID: 0,
+    1030: 1,
+    1031: 2,
+    1032: 3,
+    SUNFLOWER_ID: 0,
+    1033: 1,
+}
+
+
+def fusion_tier(plant: Any) -> int:
+    plant_id = normalize_plant_name_or_id(plant)
+    return int(FUSION_TIER_BY_TYPE.get(int(plant_id), 0)) if plant_id is not None else 0
+
+
+def can_accept_fusion(plant: Any) -> bool:
+    plant_id = normalize_plant_name_or_id(plant)
+    return bool(plant_id is not None and _FUSION_COMPATIBILITY_SYMMETRIC.get(int(plant_id)))
+
+
+def board_plant_identity_features(plant: Dict[str, Any]) -> Tuple[float, float]:
+    """Two checkpoint-shape-safe identity channels for board cells.
+
+    Base SunFlower and Peashooter retain their historical [1,0] and [0,1]
+    encodings. Fused tiers and later plants receive distinct values without
+    changing the observation vector length, so the 370k policy can be resumed.
+    """
+    plant_id = normalize_plant_name_or_id(plant)
+    if plant_id == SUNFLOWER_ID:
+        return 1.0, 0.0
+    if plant_id == PEASHOOTER_ID:
+        return 0.0, 1.0
+    known = {
+        1033: (0.75, 0.0),
+        1030: (0.0, 0.75),
+        1031: (0.0, 0.50),
+        1032: (0.0, 0.25),
+        WALLNUT_ID: (-0.25, 0.0),
+        CHERRYBOMB_ID: (-0.50, 0.0),
+        4: (-0.75, 0.0),  # Potato Mine in the base PvZ plant enum.
+        6: (-1.00, 0.0),  # Chomper in the base PvZ plant enum.
+    }
+    if plant_id in known:
+        return known[int(plant_id)]
+    if plant_id is None:
+        return 0.0, 0.0
+    # Deterministic unknown identity; never aliases the historical generic [0,0].
+    return -0.10, max(-1.0, min(1.0, (int(plant_id) % 97 + 1) / 100.0))
 
 # Human-readable rejection reasons used by ``get_fusion_illegal_reason`` and
 # surfaced verbatim by the coaches and diagnostics.
@@ -387,6 +457,10 @@ def default_fusion_diagnostics(policy: str = FUSION_POLICY_NONE) -> Dict[str, An
         "fusion_reward_total": 0.0,
         "fusion_attempt_reward_total": 0.0,
         "fusion_success_reward_total": 0.0,
+        "fusion_new_recipe_reward_total": 0.0,
+        "fusion_recursive_reward_total": 0.0,
+        "fusion_tier_reward_total": 0.0,
+        "fusion_repeat_decay_total": 0.0,
         "fusion_threatened_row_bonus_total": 0.0,
         "fusion_active_wave_bonus_total": 0.0,
         "fusion_defensive_value_bonus_total": 0.0,
@@ -420,6 +494,14 @@ def default_fusion_diagnostics(policy: str = FUSION_POLICY_NONE) -> Dict[str, An
         "fusion_by_result_type": {},
         "fusion_by_source_type": {},
         "fusion_by_row": {},
+        "fusion_attempts_by_pair": {},
+        "fusion_successes_by_pair": {},
+        "fusion_failures_by_pair": {},
+        "fusion_result_counts": {},
+        "fusion_depth_counts": {},
+        "recursive_fusion_count": 0,
+        "high_tier_fusion_count": 0,
+        "highest_fusion_tier": 0,
         "fusion_under_threat_count": 0,
         "fusion_near_buckethead_count": 0,
         "fusion_near_conehead_count": 0,
@@ -685,6 +767,8 @@ def apply_fusion_attempt_result(
 ) -> Dict[str, Any]:
     diag = dict(diagnostics)
     reasons = Counter(diag.get("fusion_rejected_reasons") or {})
+    if isinstance(candidate, dict):
+        diag["fusion_last_attempt"] = compact_candidate(candidate)
     if bridge_error:
         diag["fusion_bridge_error_count"] = int(diag.get("fusion_bridge_error_count") or 0) + 1
         rejected_reason = rejected_reason or "exception"
@@ -710,6 +794,10 @@ def apply_fusion_attempt_result(
             diag["fusion_unsafe_state_block_count"] = int(diag.get("fusion_unsafe_state_block_count") or 0) + 1
     if result is not None:
         diag["fusion_attempted_count"] = int(diag.get("fusion_attempted_count") or 0) + 1
+        source_type = _safe_int((candidate or {}).get("source_plant_type"), default=-1)
+        ingredient_type = _safe_int((candidate or {}).get("target_or_ingredient_type"), default=-1)
+        pair_key = f"{plant_name(ingredient_type)} + {plant_name(source_type)}"
+        _bump_dict(diag, "fusion_attempts_by_pair", pair_key)
         success = bool(
             result.get("fusionSucceeded")
             if "fusionSucceeded" in result
@@ -717,9 +805,31 @@ def apply_fusion_attempt_result(
         )
         if success:
             diag["fusion_success_count"] = int(diag.get("fusion_success_count") or 0) + 1
+            _bump_dict(diag, "fusion_successes_by_pair", pair_key)
             _bump_dict(diag, "fusion_by_result_type", str((candidate or {}).get("predicted_result_type", -1)))
             _bump_dict(diag, "fusion_by_source_type", str((candidate or {}).get("source_plant_type", -1)))
             _bump_dict(diag, "fusion_by_row", str((candidate or {}).get("source_row", -1)))
+            resulting = result.get("resultingPlantAfter") if isinstance(result.get("resultingPlantAfter"), dict) else {}
+            result_type = _safe_int(
+                resulting.get("plantType"),
+                resulting.get("type"),
+                (candidate or {}).get("predicted_result_type"),
+                default=-1,
+            )
+            result_name = str(
+                resulting.get("plantTypeName")
+                or resulting.get("typeName")
+                or (candidate or {}).get("predicted_result_name")
+                or plant_name(result_type)
+            )
+            depth = fusion_tier(result_type)
+            _bump_dict(diag, "fusion_result_counts", result_name)
+            _bump_dict(diag, "fusion_depth_counts", f"depth_{depth}")
+            diag["highest_fusion_tier"] = max(int(diag.get("highest_fusion_tier") or 0), depth)
+            if fusion_tier(source_type) > 0:
+                diag["recursive_fusion_count"] = int(diag.get("recursive_fusion_count") or 0) + 1
+            if depth >= 2:
+                diag["high_tier_fusion_count"] = int(diag.get("high_tier_fusion_count") or 0) + 1
             if float((candidate or {}).get("lane_danger_score") or 0.0) > 0.0:
                 diag["fusion_under_threat_count"] = int(diag.get("fusion_under_threat_count") or 0) + 1
             if int((candidate or {}).get("nearby_buckethead_count") or 0) > 0:
@@ -731,9 +841,10 @@ def apply_fusion_attempt_result(
         else:
             diag["fusion_failed_count"] = int(diag.get("fusion_failed_count") or 0) + 1
             reason = str(result.get("fusionRejectedReason") or result.get("illegalReason") or "bridge_rejected")
-            reasons[reason] += 1
+            _bump_dict(diag, "fusion_failures_by_pair", f"{pair_key}|{reason}")
+            if not rejected_reason or reason != rejected_reason:
+                reasons[reason] += 1
             diag["fusion_last_rejected_reason"] = reason
-        diag["fusion_last_attempt"] = compact_candidate(candidate)
         diag["fusion_last_result"] = {
             "success": success,
             "illegalReason": result.get("illegalReason"),
@@ -797,6 +908,8 @@ def merge_episode_fusion_stats(target: Any, diagnostics: Dict[str, Any]) -> None
         "fusion_kills_after_use_total",
         "fusion_bridge_error_count",
         "fusion_unsafe_state_block_count",
+        "recursive_fusion_count",
+        "high_tier_fusion_count",
     ):
         value = int(diagnostics.get(name) or 0)
         if name == "fusion_candidate_count":
@@ -804,19 +917,38 @@ def merge_episode_fusion_stats(target: Any, diagnostics: Dict[str, Any]) -> None
             setattr(target, total_name, int(getattr(target, total_name, 0)) + value)
         else:
             setattr(target, name, int(getattr(target, name, 0)) + value)
-    for name in ("fusion_rejected_reasons", "fusion_by_result_type", "fusion_by_source_type", "fusion_by_row"):
+    for name in (
+        "fusion_rejected_reasons",
+        "fusion_by_result_type",
+        "fusion_by_source_type",
+        "fusion_by_row",
+        "fusion_attempts_by_pair",
+        "fusion_successes_by_pair",
+        "fusion_failures_by_pair",
+        "fusion_result_counts",
+        "fusion_depth_counts",
+    ):
         current = getattr(target, name, {})
         if not isinstance(current, dict):
             current = {}
         for key, value in (diagnostics.get(name) or {}).items():
             current[str(key)] = int(current.get(str(key), 0)) + int(value)
         setattr(target, name, dict(sorted(current.items())))
+    setattr(
+        target,
+        "highest_fusion_tier",
+        max(int(getattr(target, "highest_fusion_tier", 0)), int(diagnostics.get("highest_fusion_tier") or 0)),
+    )
     # Fusion reward component totals are cumulative per-episode values supplied by
     # the env each step, so take the latest (set, do not sum). fusion_reward_total
     # itself is owned by accumulate_reward_episode_totals via the reward breakdown.
     for name in (
         "fusion_attempt_reward_total",
         "fusion_success_reward_total",
+        "fusion_new_recipe_reward_total",
+        "fusion_recursive_reward_total",
+        "fusion_tier_reward_total",
+        "fusion_repeat_decay_total",
         "fusion_threatened_row_bonus_total",
         "fusion_active_wave_bonus_total",
         "fusion_defensive_value_bonus_total",
@@ -833,6 +965,18 @@ def merge_episode_fusion_stats(target: Any, diagnostics: Dict[str, Any]) -> None
                 pass
     if diagnostics.get("fusion_reward_capped"):
         setattr(target, "fusion_reward_capped", True)
+    for name, default in (
+        ("fusion_last_reward_delta", 0.0),
+        ("fusion_last_usefulness_bonus", 0.0),
+    ):
+        if name in diagnostics:
+            try:
+                setattr(target, name, float(diagnostics.get(name) or default))
+            except (TypeError, ValueError):
+                pass
+    for name in ("fusion_last_reward_reason", "fusion_last_source"):
+        if name in diagnostics:
+            setattr(target, name, str(diagnostics.get(name) or ""))
     setattr(target, "fusion_policy", str(diagnostics.get("fusion_policy") or getattr(target, "fusion_policy", "none")))
 
 
@@ -858,6 +1002,10 @@ def fusion_live_fields(diagnostics: Optional[Dict[str, Any]], policy: str = FUSI
         "fusion_reward_total": float(diag.get("fusion_reward_total") or 0.0),
         "fusion_attempt_reward_total": float(diag.get("fusion_attempt_reward_total") or 0.0),
         "fusion_success_reward_total": float(diag.get("fusion_success_reward_total") or 0.0),
+        "fusion_new_recipe_reward_total": float(diag.get("fusion_new_recipe_reward_total") or 0.0),
+        "fusion_recursive_reward_total": float(diag.get("fusion_recursive_reward_total") or 0.0),
+        "fusion_tier_reward_total": float(diag.get("fusion_tier_reward_total") or 0.0),
+        "fusion_repeat_decay_total": float(diag.get("fusion_repeat_decay_total") or 0.0),
         "fusion_threatened_row_bonus_total": float(diag.get("fusion_threatened_row_bonus_total") or 0.0),
         "fusion_active_wave_bonus_total": float(diag.get("fusion_active_wave_bonus_total") or 0.0),
         "fusion_defensive_value_bonus_total": float(diag.get("fusion_defensive_value_bonus_total") or 0.0),
@@ -888,6 +1036,14 @@ def fusion_live_fields(diagnostics: Optional[Dict[str, Any]], policy: str = FUSI
         "fusion_failed_count": int(diag.get("fusion_failed_count") or 0),
         "fusion_rejected_count": int(diag.get("fusion_rejected_count") or 0),
         "fusion_rejected_reasons": dict(diag.get("fusion_rejected_reasons") or {}),
+        "fusion_attempts_by_pair": dict(diag.get("fusion_attempts_by_pair") or {}),
+        "fusion_successes_by_pair": dict(diag.get("fusion_successes_by_pair") or {}),
+        "fusion_failures_by_pair": dict(diag.get("fusion_failures_by_pair") or {}),
+        "fusion_result_counts": dict(diag.get("fusion_result_counts") or {}),
+        "fusion_depth_counts": dict(diag.get("fusion_depth_counts") or {}),
+        "recursive_fusion_count": int(diag.get("recursive_fusion_count") or 0),
+        "high_tier_fusion_count": int(diag.get("high_tier_fusion_count") or 0),
+        "highest_fusion_tier": int(diag.get("highest_fusion_tier") or 0),
     }
 
 

@@ -1887,8 +1887,8 @@ def main() -> int:
     )
     assert_case(
         results,
-        "runtime loadout candidates ignore plants outside the supported registry",
-        filtered_runtime_candidates == ["SunFlower", "Peashooter", "CherryBomb"],
+        "runtime loadout candidates retain newly registered plants and ignore unknown names",
+        filtered_runtime_candidates == ["SunFlower", "Peashooter", "CherryBomb", "GraveBuster"],
         filtered_runtime_candidates,
     )
     monotonic_later_capacity = generalist_module.resolve_adventure_generalist_seed_capacity(

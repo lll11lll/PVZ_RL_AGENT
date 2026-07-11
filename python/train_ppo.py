@@ -228,8 +228,39 @@ LANE_DIAGNOSTIC_NUMERIC_FIELDS = [
     "fusion_bridge_error_count",
     "fusion_unsafe_state_block_count",
 ]
+PROGRESS_CSV_DIAGNOSTIC_INT_FIELDS = [
+    "recursive_fusion_count",
+    "highest_fusion_tier",
+    "action_freeze_count",
+]
+PROGRESS_CSV_ACTION_DURATION_FIELDS = [
+    "mean_action_duration_seconds",
+    "p95_action_duration_seconds",
+    "max_action_duration_seconds",
+]
+PROGRESS_CSV_DIAGNOSTIC_FIELDS = PROGRESS_CSV_DIAGNOSTIC_INT_FIELDS + PROGRESS_CSV_ACTION_DURATION_FIELDS
+FUSION_REWARD_FLOAT_FIELDS = [
+    "fusion_attempt_reward_total",
+    "fusion_success_reward_total",
+    "fusion_new_recipe_reward_total",
+    "fusion_recursive_reward_total",
+    "fusion_tier_reward_total",
+    "fusion_repeat_decay_total",
+    "fusion_threatened_row_bonus_total",
+    "fusion_active_wave_bonus_total",
+    "fusion_defensive_value_bonus_total",
+    "fusion_incompatible_penalty_total",
+    "fusion_empty_tile_penalty_total",
+    "fusion_failed_penalty_total",
+    "fusion_bridge_error_penalty_total",
+    "fusion_spam_penalty_total",
+    "fusion_last_reward_delta",
+    "fusion_last_usefulness_bonus",
+]
 EPISODE_STRING_FIELDS = [
     "fusion_policy",
+    "fusion_last_reward_reason",
+    "fusion_last_source",
 ]
 EPISODE_METRIC_FIELDS = [
     "run_mode",
@@ -265,7 +296,7 @@ EPISODE_METRIC_FIELDS = [
     "cherrybomb_avg_kills_per_use",
     "fusion_candidate_count_avg",
     "fusion_avg_kills_after_use",
-] + list(REWARD_EPISODE_TOTAL_FIELDS)
+] + PROGRESS_CSV_DIAGNOSTIC_FIELDS + FUSION_REWARD_FLOAT_FIELDS + ["fusion_reward_capped"] + list(REWARD_EPISODE_TOTAL_FIELDS)
 
 
 @dataclass
@@ -473,6 +504,38 @@ class EvalLog:
     fusion_avg_kills_after_use: float = 0.0
     fusion_bridge_error_count: int = 0
     fusion_unsafe_state_block_count: int = 0
+    fusion_reward_total: float = 0.0
+    fusion_attempt_reward_total: float = 0.0
+    fusion_success_reward_total: float = 0.0
+    fusion_new_recipe_reward_total: float = 0.0
+    fusion_recursive_reward_total: float = 0.0
+    fusion_tier_reward_total: float = 0.0
+    fusion_repeat_decay_total: float = 0.0
+    fusion_threatened_row_bonus_total: float = 0.0
+    fusion_active_wave_bonus_total: float = 0.0
+    fusion_defensive_value_bonus_total: float = 0.0
+    fusion_incompatible_penalty_total: float = 0.0
+    fusion_empty_tile_penalty_total: float = 0.0
+    fusion_failed_penalty_total: float = 0.0
+    fusion_bridge_error_penalty_total: float = 0.0
+    fusion_spam_penalty_total: float = 0.0
+    fusion_reward_capped: bool = False
+    fusion_last_reward_delta: float = 0.0
+    fusion_last_reward_reason: str = ""
+    fusion_last_usefulness_bonus: float = 0.0
+    fusion_last_source: str = ""
+    plant_action_counts: Dict[str, int] = field(default_factory=dict)
+    successful_placements_by_plant: Dict[str, int] = field(default_factory=dict)
+    invalid_actions_by_plant: Dict[str, int] = field(default_factory=dict)
+    fusion_attempts_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_successes_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_depth_counts: Dict[str, int] = field(default_factory=dict)
+    highest_fusion_tier: int = 0
+    recursive_fusion_count: int = 0
+    action_freeze_count: int = 0
+    mean_action_duration_seconds: float = 0.0
+    max_action_duration_seconds: float = 0.0
+    p95_action_duration_seconds: float = 0.0
 
     @property
     def won(self) -> bool:
@@ -1279,6 +1342,18 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
             getattr(args, "fusion_action_mask_enabled", False)
             or raw_config.get("fusion_action_mask_enabled", False)
         ),
+        "enable_board_plant_identity": bool(
+            pick(args, raw_config, "enable_board_plant_identity", False)
+        ),
+        "enable_fusion_chain_rewards": bool(pick(args, raw_config, "enable_fusion_chain_rewards", False)),
+        "enable_recipe_discovery_reward": bool(pick(args, raw_config, "enable_recipe_discovery_reward", False)),
+        "enable_repeat_recipe_decay": bool(pick(args, raw_config, "enable_repeat_recipe_decay", False)),
+        "enable_fusion_curriculum": bool(pick(args, raw_config, "enable_fusion_curriculum", False)),
+        "enable_later_plant_curriculum": bool(pick(args, raw_config, "enable_later_plant_curriculum", False)),
+        "enable_coach_fusion_sampling": bool(pick(args, raw_config, "enable_coach_fusion_sampling", False)),
+        "fusion_curriculum_prob": float(pick(args, raw_config, "fusion_curriculum_prob", 0.20)),
+        "later_plant_curriculum_prob": float(pick(args, raw_config, "later_plant_curriculum_prob", 0.10)),
+        "coach_fusion_prob": float(pick(args, raw_config, "coach_fusion_prob", 0.10)),
         "run_mode": run_mode,
         "target_level": int(target_level),
         "tactical_masks": bool(getattr(args, "tactical_masks", False) or raw_config.get("tactical_masks", False)),
@@ -1395,6 +1470,15 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         "host": str(pick(args, raw_config, "host", "127.0.0.1")),
         "port": int(pick(args, raw_config, "port", 32323)),
         "timeout": float(pick(args, raw_config, "timeout", 10.0)),
+        "enable_action_watchdog": bool(pick(args, raw_config, "enable_action_watchdog", True)),
+        "action_timeout_seconds": float(pick(args, raw_config, "action_timeout_seconds", 10.0)),
+        "save_freeze_debug_bundle": bool(pick(args, raw_config, "save_freeze_debug_bundle", True)),
+        "action_diagnostics_path": str(
+            pick(args, raw_config, "action_diagnostics_path", str(Path(run_dir) / "action_diagnostics.jsonl"))
+        ),
+        "freeze_debug_dir": str(
+            pick(args, raw_config, "freeze_debug_dir", str(Path(run_dir) / "freeze_debug"))
+        ),
         "game_exe": str(pick(args, raw_config, "game_exe", "") or ""),
     }
     config = apply_model_metadata_defaults(config)
@@ -1415,6 +1499,11 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         host=config["host"],
         port=config["port"],
         timeout=config["timeout"],
+        enable_action_watchdog=bool(config.get("enable_action_watchdog", True)),
+        action_timeout_seconds=float(config.get("action_timeout_seconds", config["timeout"])),
+        save_freeze_debug_bundle=bool(config.get("save_freeze_debug_bundle", True)),
+        action_diagnostics_path=str(config.get("action_diagnostics_path", "") or ""),
+        freeze_debug_dir=str(config.get("freeze_debug_dir", "") or ""),
         step_seconds=config["step_seconds"],
         plant_types=list(config["plant_types"]),
         action_space_mode=str(config.get("action_space_mode", ACTION_SPACE_FIXED)),
@@ -1446,6 +1535,16 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         debug_sun_sample_interval=config.get("debug_sun_sample_interval", 25),
         fusion_policy=str(config.get("fusion_policy", FUSION_POLICY_NONE)),
         fusion_action_mask_enabled=bool(config.get("fusion_action_mask_enabled", False)),
+        enable_board_plant_identity=bool(config.get("enable_board_plant_identity", False)),
+        enable_fusion_chain_rewards=bool(config.get("enable_fusion_chain_rewards", False)),
+        enable_recipe_discovery_reward=bool(config.get("enable_recipe_discovery_reward", False)),
+        enable_repeat_recipe_decay=bool(config.get("enable_repeat_recipe_decay", False)),
+        enable_fusion_curriculum=bool(config.get("enable_fusion_curriculum", False)),
+        enable_later_plant_curriculum=bool(config.get("enable_later_plant_curriculum", False)),
+        enable_coach_fusion_sampling=bool(config.get("enable_coach_fusion_sampling", False)),
+        fusion_curriculum_prob=float(config.get("fusion_curriculum_prob", 0.20)),
+        later_plant_curriculum_prob=float(config.get("later_plant_curriculum_prob", 0.10)),
+        coach_fusion_prob=float(config.get("coach_fusion_prob", 0.10)),
         run_mode=str(config.get("run_mode", "fixed_train")),
         target_level=int(config.get("target_level", 0) or 0),
         tactical_masks=bool(config.get("tactical_masks", False)),
@@ -1531,6 +1630,8 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
             "cherrybomb_avg_kills_per_use",
             "fusion_candidate_count_avg",
             "fusion_avg_kills_after_use",
+            *FUSION_REWARD_FLOAT_FIELDS,
+            "fusion_reward_capped",
             *REWARD_EPISODE_TOTAL_FIELDS,
         ),
     )
@@ -1693,6 +1794,7 @@ def clean_episode_row(summary: Dict[str, Any], fallback_episode: int) -> Dict[st
         "fusion_kills_after_use_total",
         "fusion_bridge_error_count",
         "fusion_unsafe_state_block_count",
+        *PROGRESS_CSV_DIAGNOSTIC_INT_FIELDS,
     ):
         row[field] = int(row.get(field) or 0)
     for field in (
@@ -1709,10 +1811,13 @@ def clean_episode_row(summary: Dict[str, Any], fallback_episode: int) -> Dict[st
         "fusion_avg_kills_after_use",
         "max_row_danger",
         "avg_row_danger",
+        *PROGRESS_CSV_ACTION_DURATION_FIELDS,
+        *FUSION_REWARD_FLOAT_FIELDS,
         *REWARD_EPISODE_TOTAL_FIELDS,
     ):
         row[field] = float(row.get(field) or 0.0)
     row["tactical_mask_enabled"] = bool(row.get("tactical_mask_enabled"))
+    row["fusion_reward_capped"] = bool(row.get("fusion_reward_capped"))
     return row
 
 
@@ -1755,6 +1860,68 @@ def csv_safe_row(row: Dict[str, Any]) -> Dict[str, Any]:
     for field in LANE_DIAGNOSTIC_DICT_FIELDS + LANE_DIAGNOSTIC_FLOAT_DICT_FIELDS:
         safe[field] = json.dumps(safe.get(field) or {}, separators=(",", ":"), sort_keys=True)
     return safe
+
+
+def extend_csv_fieldnames(fieldnames: List[str], extra_fields: List[str]) -> List[str]:
+    extended = list(fieldnames)
+    seen = set(extended)
+    for field in extra_fields:
+        if field not in seen:
+            extended.append(field)
+            seen.add(field)
+    return extended
+
+
+def filter_row_to_fieldnames(row: Dict[str, Any], fieldnames: List[str]) -> Dict[str, Any]:
+    safe = csv_safe_row(row)
+    return {key: safe.get(key, "") for key in fieldnames}
+
+
+def ensure_progress_csv_fieldnames(csv_path: Path, fieldnames: List[str]) -> List[str]:
+    schema_fieldnames = extend_csv_fieldnames(fieldnames, PROGRESS_CSV_DIAGNOSTIC_FIELDS)
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return schema_fieldnames
+
+    with csv_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        loaded_fieldnames = list(reader.fieldnames or [])
+        if not loaded_fieldnames:
+            return schema_fieldnames
+        migrated_fieldnames = extend_csv_fieldnames(
+            loaded_fieldnames,
+            [field for field in schema_fieldnames if field not in loaded_fieldnames],
+        )
+        if migrated_fieldnames == loaded_fieldnames:
+            return migrated_fieldnames
+        rows = list(reader)
+
+    temp_path = csv_path.with_name(f"{csv_path.name}.tmp")
+    with temp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=migrated_fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in migrated_fieldnames})
+    temp_path.replace(csv_path)
+    return migrated_fieldnames
+
+
+def write_progress_csv_rows(
+    csv_path: Path,
+    rows: List[Dict[str, Any]],
+    fieldnames: List[str],
+    header_written: bool,
+) -> tuple[bool, List[str]]:
+    writer_fieldnames = ensure_progress_csv_fieldnames(csv_path, fieldnames)
+    header_written = header_written or (csv_path.exists() and csv_path.stat().st_size > 0)
+    with csv_path.open("a", newline="", encoding="utf-8") as csv_handle:
+        writer = csv.DictWriter(csv_handle, fieldnames=writer_fieldnames, extrasaction="ignore")
+        if not header_written:
+            writer.writeheader()
+            header_written = True
+        for row in rows:
+            safe_row = filter_row_to_fieldnames(row, list(writer.fieldnames or []))
+            writer.writerow(safe_row)
+    return header_written, writer_fieldnames
 
 
 def sum_count_dicts_from_rows(rows: List[Dict[str, Any]], field_name: str) -> Dict[str, int]:
@@ -2048,6 +2215,19 @@ def summarize_episode_rows(
         "model_path": str(model_path),
         "run_dir": str(run_dir),
     }
+    summary.update({
+        field: sum(float(row.get(field, 0.0) or 0.0) for row in rows)
+        for field in FUSION_REWARD_FLOAT_FIELDS[:-2]
+    })
+    summary["fusion_reward_total"] = float(reward_component_totals.get("fusion_reward_total", 0.0))
+    summary["fusion_reward_capped"] = any(bool(row.get("fusion_reward_capped")) for row in rows)
+    if rows:
+        summary["fusion_last_reward_delta"] = float(rows[-1].get("fusion_last_reward_delta", 0.0) or 0.0)
+        summary["fusion_last_usefulness_bonus"] = float(
+            rows[-1].get("fusion_last_usefulness_bonus", 0.0) or 0.0
+        )
+        summary["fusion_last_reward_reason"] = str(rows[-1].get("fusion_last_reward_reason") or "")
+        summary["fusion_last_source"] = str(rows[-1].get("fusion_last_source") or "")
     return summary
 
 
@@ -2325,11 +2505,14 @@ def write_eval_live_status(
             "fusion_failed_count",
             "fusion_rejected_count",
             "fusion_rejected_reasons",
+            "fusion_reward_total",
+            *FUSION_REWARD_FLOAT_FIELDS,
+            "fusion_reward_capped",
+            "fusion_last_reward_reason",
+            "fusion_last_source",
         ):
             if key in summary:
-                live_key = key.replace("_total", "")
-                if live_key == "fusion_candidate_count":
-                    live_key = "fusion_candidate_count"
+                live_key = "fusion_candidate_count" if key == "fusion_candidate_count_total" else key
                 fusion_fields[live_key] = summary[key]
     coach_fields = coach_live_status_fields_from_summary(config, summary)
     payload = {
@@ -2735,6 +2918,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             self.jsonl_path = jsonl_path
             self.rows: List[Dict[str, Any]] = []
             self.performance = PerformanceAccumulator()
+            self.csv_fieldnames = ensure_progress_csv_fieldnames(csv_path, EPISODE_METRIC_FIELDS)
             self._header_written = csv_path.exists() and csv_path.stat().st_size > 0
 
         def _on_step(self) -> bool:
@@ -2767,13 +2951,12 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                 if summary:
                     rows.append(clean_episode_row(summary, len(self.rows)))
             if rows:
-                with self.csv_path.open("a", newline="", encoding="utf-8") as csv_handle:
-                    writer = csv.DictWriter(csv_handle, fieldnames=EPISODE_METRIC_FIELDS)
-                    if not self._header_written:
-                        writer.writeheader()
-                        self._header_written = True
-                    for row in rows:
-                        writer.writerow(csv_safe_row(row))
+                self._header_written, self.csv_fieldnames = write_progress_csv_rows(
+                    self.csv_path,
+                    rows,
+                    self.csv_fieldnames,
+                    self._header_written,
+                )
                 with self.jsonl_path.open("a", encoding="utf-8") as jsonl_handle:
                     for row in rows:
                         jsonl_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -3248,9 +3431,22 @@ def apply_eval_diagnostics(log: EvalLog, summary: Dict[str, Any]) -> None:
         "legal_action_count_mean",
         "max_row_danger",
         "avg_row_danger",
+        *FUSION_REWARD_FLOAT_FIELDS,
     ):
         setattr(log, field, float(summary.get(field) or 0.0))
     log.tactical_mask_enabled = bool(summary.get("tactical_mask_enabled"))
+    log.fusion_reward_capped = bool(summary.get("fusion_reward_capped"))
+    log.fusion_last_reward_reason = str(summary.get("fusion_last_reward_reason") or "")
+    log.fusion_last_source = str(summary.get("fusion_last_source") or "")
+    for field in (
+        "plant_action_counts",
+        "successful_placements_by_plant",
+        "invalid_actions_by_plant",
+        "fusion_attempts_by_pair",
+        "fusion_successes_by_pair",
+        "fusion_depth_counts",
+    ):
+        setattr(log, field, normalize_count_dict(summary.get(field)))
     for field in REWARD_EPISODE_TOTAL_FIELDS:
         setattr(log, field, float(summary.get(field) or 0.0))
 
@@ -3548,6 +3744,20 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "fusion_by_result_type": sum_eval_count_dicts(logs, "fusion_by_result_type"),
         "fusion_by_source_type": sum_eval_count_dicts(logs, "fusion_by_source_type"),
         "fusion_by_row": sum_eval_count_dicts(logs, "fusion_by_row"),
+        "plant_action_counts": sum_eval_count_dicts(logs, "plant_action_counts"),
+        "successful_placements_by_plant": sum_eval_count_dicts(logs, "successful_placements_by_plant"),
+        "invalid_actions_by_plant": sum_eval_count_dicts(logs, "invalid_actions_by_plant"),
+        "fusion_attempts_by_pair": sum_eval_count_dicts(logs, "fusion_attempts_by_pair"),
+        "fusion_successes_by_pair": sum_eval_count_dicts(logs, "fusion_successes_by_pair"),
+        "fusion_depth_counts": sum_eval_count_dicts(logs, "fusion_depth_counts"),
+        "recursive_fusion_count": sum(log.recursive_fusion_count for log in logs),
+        "highest_fusion_tier": max((log.highest_fusion_tier for log in logs), default=0),
+        "action_freeze_count": sum(log.action_freeze_count for log in logs),
+        "mean_action_duration_seconds": (
+            sum(log.mean_action_duration_seconds for log in logs) / max(1, len(logs))
+        ),
+        "max_action_duration_seconds": max((log.max_action_duration_seconds for log in logs), default=0.0),
+        "p95_action_duration_seconds": max((log.p95_action_duration_seconds for log in logs), default=0.0),
         "fusion_under_threat_count": sum(log.fusion_under_threat_count for log in logs),
         "fusion_near_buckethead_count": sum(log.fusion_near_buckethead_count for log in logs),
         "fusion_near_conehead_count": sum(log.fusion_near_conehead_count for log in logs),
@@ -3572,6 +3782,16 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
             if total_count(row_defense_opportunities) > 0
             else 0.0
         ),
+        **{
+            field: sum(float(getattr(log, field, 0.0)) for log in logs)
+            for field in FUSION_REWARD_FLOAT_FIELDS[:-2]
+        },
+        "fusion_reward_total": float(reward_component_totals.get("fusion_reward_total", 0.0)),
+        "fusion_reward_capped": any(bool(log.fusion_reward_capped) for log in logs),
+        "fusion_last_reward_delta": float(logs[-1].fusion_last_reward_delta) if logs else 0.0,
+        "fusion_last_usefulness_bonus": float(logs[-1].fusion_last_usefulness_bonus) if logs else 0.0,
+        "fusion_last_reward_reason": str(logs[-1].fusion_last_reward_reason) if logs else "",
+        "fusion_last_source": str(logs[-1].fusion_last_source) if logs else "",
         "reward_component_totals": reward_component_totals,
         "reward_component_avgs": {field: value / count for field, value in reward_component_totals.items()},
     }
@@ -3744,6 +3964,20 @@ def print_eval_diagnostics(results: Dict[str, List[EvalLog]]) -> None:
             "fusion_estimated_mower_save_count": summary["fusion_estimated_mower_save_count"],
             "fusion_bridge_error_count": summary["fusion_bridge_error_count"],
             "fusion_unsafe_state_block_count": summary["fusion_unsafe_state_block_count"],
+            "plant_action_counts": summary.get("plant_action_counts", {}),
+            "successful_placements_by_plant": summary.get("successful_placements_by_plant", {}),
+            "invalid_actions_by_plant": summary.get("invalid_actions_by_plant", {}),
+            "fusion_attempts_by_pair": summary.get("fusion_attempts_by_pair", {}),
+            "fusion_successes_by_pair": summary.get("fusion_successes_by_pair", {}),
+            "fusion_depth_counts": summary.get("fusion_depth_counts", {}),
+            "recursive_fusion_count": summary.get("recursive_fusion_count", 0),
+            "highest_fusion_tier": summary.get("highest_fusion_tier", 0),
+            "action_freeze_count": summary.get("action_freeze_count", 0),
+            "action_duration_seconds": {
+                "mean": summary.get("mean_action_duration_seconds", 0.0),
+                "p95": summary.get("p95_action_duration_seconds", 0.0),
+                "max": summary.get("max_action_duration_seconds", 0.0),
+            },
             "reward_component_avgs": summary["reward_component_avgs"],
         }
         print(f"[eval-diagnostics] policy={policy} " + json.dumps(payload, separators=(",", ":"), sort_keys=True))
@@ -3845,6 +4079,11 @@ def validation_summary_from_logs(
         "fusion_avg_kills_after_use": summary["fusion_avg_kills_after_use"],
         "fusion_bridge_error_count": summary["fusion_bridge_error_count"],
         "fusion_unsafe_state_block_count": summary["fusion_unsafe_state_block_count"],
+        "fusion_reward_total": summary["fusion_reward_total"],
+        **{field: summary[field] for field in FUSION_REWARD_FLOAT_FIELDS},
+        "fusion_reward_capped": summary["fusion_reward_capped"],
+        "fusion_last_reward_reason": summary["fusion_last_reward_reason"],
+        "fusion_last_source": summary["fusion_last_source"],
         "row_defense_opportunities_by_row": summary["row_defense_opportunities_by_row"],
         "row_defense_responses_by_row": summary["row_defense_responses_by_row"],
         "row_defense_response_rate_by_row": summary["row_defense_response_rate_by_row"],
@@ -3870,7 +4109,7 @@ def write_eval_outputs(run_dir: Path, results: Dict[str, List[EvalLog]], config:
     (run_dir / "eval_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     with (run_dir / "eval_results.csv").open("w", newline="", encoding="utf-8") as handle:
         fieldnames = list(asdict(EvalLog(policy="ppo", episode=0)).keys())
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for logs in results.values():
             for log in logs:
@@ -4186,6 +4425,23 @@ def main() -> int:
         help="Expose occupied compatible tiles as legal fuse actions in the model action mask "
         "(and route those placements to the fusion bridge). Off by default.",
     )
+    parser.add_argument("--enable-board-plant-identity", dest="enable_board_plant_identity", action="store_true", default=None)
+    parser.add_argument("--no-board-plant-identity", dest="enable_board_plant_identity", action="store_false")
+    parser.add_argument("--enable-fusion-chain-rewards", dest="enable_fusion_chain_rewards", action="store_true", default=None)
+    parser.add_argument("--no-fusion-chain-rewards", dest="enable_fusion_chain_rewards", action="store_false")
+    parser.add_argument("--enable-recipe-discovery-reward", dest="enable_recipe_discovery_reward", action="store_true", default=None)
+    parser.add_argument("--no-recipe-discovery-reward", dest="enable_recipe_discovery_reward", action="store_false")
+    parser.add_argument("--enable-repeat-recipe-decay", dest="enable_repeat_recipe_decay", action="store_true", default=None)
+    parser.add_argument("--no-repeat-recipe-decay", dest="enable_repeat_recipe_decay", action="store_false")
+    parser.add_argument("--enable-fusion-curriculum", dest="enable_fusion_curriculum", action="store_true", default=None)
+    parser.add_argument("--no-fusion-curriculum", dest="enable_fusion_curriculum", action="store_false")
+    parser.add_argument("--enable-later-plant-curriculum", dest="enable_later_plant_curriculum", action="store_true", default=None)
+    parser.add_argument("--no-later-plant-curriculum", dest="enable_later_plant_curriculum", action="store_false")
+    parser.add_argument("--enable-coach-fusion-sampling", dest="enable_coach_fusion_sampling", action="store_true", default=None)
+    parser.add_argument("--no-coach-fusion-sampling", dest="enable_coach_fusion_sampling", action="store_false")
+    parser.add_argument("--fusion-curriculum-prob", type=float)
+    parser.add_argument("--later-plant-curriculum-prob", type=float)
+    parser.add_argument("--coach-fusion-prob", type=float)
     parser.add_argument("--tactical-masks", action="store_true")
     parser.add_argument("--wallnut-tactical-mask", action="store_true")
     parser.add_argument("--cherrybomb-tactical-mask", action="store_true")
@@ -4237,10 +4493,33 @@ def main() -> int:
     parser.add_argument("--coach-override-penalty", type=float, default=None)
     parser.add_argument("--coach-fusion-success-reward", type=float, default=None)
     parser.add_argument("--coach-tactical-usefulness-reward", type=float, default=None)
+    parser.add_argument("--fusion-attempt-reward", type=float, default=None)
+    parser.add_argument("--fusion-success-reward", type=float, default=None)
+    parser.add_argument("--fusion-new-recipe-reward", type=float, default=None)
+    parser.add_argument("--fusion-recursive-reward", type=float, default=None)
+    parser.add_argument("--fusion-tier2-reward", type=float, default=None)
+    parser.add_argument("--fusion-tier3-reward", type=float, default=None)
+    parser.add_argument("--fusion-repeat-reward-multiplier", type=float, default=None)
+    parser.add_argument("--fusion-threatened-row-bonus", type=float, default=None)
+    parser.add_argument("--fusion-active-wave-bonus", type=float, default=None)
+    parser.add_argument("--fusion-defensive-value-bonus", type=float, default=None)
+    parser.add_argument("--fusion-incompatible-penalty", type=float, default=None)
+    parser.add_argument("--fusion-empty-tile-penalty", type=float, default=None)
+    parser.add_argument("--fusion-failed-penalty", type=float, default=None)
+    parser.add_argument("--fusion-bridge-error-penalty", type=float, default=None)
+    parser.add_argument("--fusion-spam-penalty", type=float, default=None)
+    parser.add_argument("--max-fusion-reward-per-episode", type=float, default=None)
     parser.add_argument("--checkpoint-freq", type=int)
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--enable-action-watchdog", dest="enable_action_watchdog", action="store_true", default=None)
+    parser.add_argument("--no-action-watchdog", dest="enable_action_watchdog", action="store_false")
+    parser.add_argument("--action-timeout-seconds", type=float)
+    parser.add_argument("--save-freeze-debug-bundle", dest="save_freeze_debug_bundle", action="store_true", default=None)
+    parser.add_argument("--no-save-freeze-debug-bundle", dest="save_freeze_debug_bundle", action="store_false")
+    parser.add_argument("--action-diagnostics-path")
+    parser.add_argument("--freeze-debug-dir")
     parser.add_argument("--game-exe", dest="game_exe")
     args = parser.parse_args()
 

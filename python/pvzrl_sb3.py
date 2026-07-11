@@ -7,6 +7,7 @@ or reset semantics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections import Counter
@@ -40,11 +41,18 @@ from pvzrl_env import (
     RUN_MODES,
     PvZEnvConfig,
     PvZGymEnv,
+    BridgeTimeoutError,
     RewardConfig,
     classify_done_reason,
+    plant_type_name,
     resolve_seed_list,
 )
-from pvzrl_fusion import FUSION_POLICY_NONE, merge_episode_fusion_stats, normalize_fusion_policy
+from pvzrl_fusion import (
+    FUSION_POLICY_NONE,
+    board_plant_identity_features,
+    merge_episode_fusion_stats,
+    normalize_fusion_policy,
+)
 from pvzrl_human_coach import (
     COACH_REWARD_LEGAL_EXECUTION_COMPONENT,
     COACH_REWARD_MATCH_COMPONENT,
@@ -70,6 +78,11 @@ class PvZSB3Config:
     host: str = "127.0.0.1"
     port: int = 32323
     timeout: float = 10.0
+    enable_action_watchdog: bool = True
+    action_timeout_seconds: float = 10.0
+    save_freeze_debug_bundle: bool = True
+    action_diagnostics_path: str = ""
+    freeze_debug_dir: str = ""
     step_seconds: float = 0.05
     plant_types: List[int] = None  # type: ignore[assignment]
     action_space_mode: str = ACTION_SPACE_FIXED
@@ -101,6 +114,16 @@ class PvZSB3Config:
     debug_sun_sample_interval: int = 25
     fusion_policy: str = FUSION_POLICY_NONE
     fusion_action_mask_enabled: bool = False
+    enable_board_plant_identity: bool = False
+    enable_fusion_chain_rewards: bool = False
+    enable_recipe_discovery_reward: bool = False
+    enable_repeat_recipe_decay: bool = False
+    enable_fusion_curriculum: bool = False
+    enable_later_plant_curriculum: bool = False
+    enable_coach_fusion_sampling: bool = False
+    fusion_curriculum_prob: float = 0.20
+    later_plant_curriculum_prob: float = 0.10
+    coach_fusion_prob: float = 0.10
     run_mode: str = RUN_MODE_FIXED_TRAIN
     target_level: int = 0
     tactical_masks: bool = False
@@ -213,6 +236,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             host=self.config.host,
             port=self.config.port,
             timeout=self.config.timeout,
+            enable_action_watchdog=self.config.enable_action_watchdog,
+            action_timeout_seconds=self.config.action_timeout_seconds,
+            save_freeze_debug_bundle=self.config.save_freeze_debug_bundle,
             step_seconds=self.config.step_seconds,
             plant_types=list(self.config.plant_types),
             row_count=self.config.row_count,
@@ -235,6 +261,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             debug_sun_sample_interval=self.config.debug_sun_sample_interval,
             fusion_policy=self.config.fusion_policy,
             fusion_action_mask_enabled=self.config.fusion_action_mask_enabled,
+            enable_fusion_chain_rewards=self.config.enable_fusion_chain_rewards,
+            enable_recipe_discovery_reward=self.config.enable_recipe_discovery_reward,
+            enable_repeat_recipe_decay=self.config.enable_repeat_recipe_decay,
             run_mode=self.config.run_mode,
             target_level=self.config.target_level,
             tactical_masks=self.config.tactical_masks,
@@ -293,6 +322,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._perf_totals: Dict[str, float] = {}
         self._perf_report_interval = 100
         self._global_step_count = 0
+        self._reset_action_diagnostics()
         self._sun_diag_report_interval = 500
         self._sun_diag_spawn_window = 0
         self._sun_diag_gained_window = 0
@@ -588,6 +618,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             coach_context = {
                 "enabled": bool(coach_decision.enabled),
                 "source": "human",
+                "commandMode": str(self.config.human_coach_command_mode or "override"),
                 "rewardEnabled": bool(self.config.human_coach_reward),
                 "event": str(coach_decision.event),
                 "overrideApplied": bool(coach_decision.override_applied),
@@ -691,11 +722,67 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                         f"reason={rejected_reason!r}"
                     )
         bridge_action = self._policy_action_to_bridge_action(policy_action)
-        observation, reward, done, _, info = self.base.step(
-            bridge_action,
-            coach_bridge_command=selected_bridge_command,
-            coach_context=coach_context if coach_context else None,
+        action_started_at = time.time()
+        action_started_perf = time.perf_counter()
+        pre_action_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
+        action_exception = ""
+        try:
+            observation, reward, done, _, info = self.base.step(
+                bridge_action,
+                coach_bridge_command=selected_bridge_command,
+                coach_context=coach_context if coach_context else None,
+            )
+        except BridgeTimeoutError as exc:
+            action_exception = str(exc)
+            observation = dict(pre_action_observation)
+            reward = -10.0
+            done = True
+            info = {
+                "action_result": {
+                    "action": int(bridge_action),
+                    "requestedAction": int(bridge_action),
+                    "executedAction": int(bridge_action),
+                    "bridgeTimeout": True,
+                    "illegalAction": False,
+                    "plantPlaced": False,
+                },
+                "reward_breakdown": {"reward_total": reward, "env_corruption_penalty": reward},
+                "terminal_reason": "action_timeout",
+                "done_reason": "action_freeze",
+                "needs_reset": True,
+                "bridge_error": action_exception,
+                "bridge_errors": 1,
+                "environment_corruption_detected": True,
+                "env_corruption_count": 1,
+                "legal_actions": [0],
+                "bridge_legal_actions": [0],
+            }
+        action_duration = max(0.0, time.perf_counter() - action_started_perf)
+        action_timeout = bool(
+            info.get("terminal_reason") in {"bridge_timeout", "action_timeout"}
+            or (isinstance(info.get("action_result"), dict) and info["action_result"].get("bridgeTimeout"))
+            or (
+                self.config.enable_action_watchdog
+                and action_duration > max(0.1, float(self.config.action_timeout_seconds))
+            )
         )
+        action_diag = self._record_action_diagnostic(
+            policy_action=int(policy_action),
+            bridge_action=int(bridge_action),
+            pre_observation=pre_action_observation,
+            post_observation=observation,
+            info=info,
+            started_at=action_started_at,
+            duration=action_duration,
+            timed_out=action_timeout,
+            exception_text=action_exception or str(info.get("bridge_error") or ""),
+        )
+        info["action_diagnostics"] = action_diag
+        if action_timeout:
+            done = True
+            info["done_reason"] = "action_freeze"
+            info["terminal_reason"] = "action_timeout"
+            info["needs_reset"] = True
         if coach_decision is not None and self.human_coach_hook is not None:
             coach_delta = float(self.human_coach_hook.apply_step_outcome(coach_decision, info if isinstance(info, dict) else {}))
             if coach_delta != 0.0:
@@ -829,6 +916,18 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
 
         action_result = info.get("action_result", {})
         placement = action_result.get("placement") or {}
+        decoded_result = action_result.get("decoded") if isinstance(action_result.get("decoded"), dict) else {}
+        plant_type = self._safe_int_value(
+            decoded_result.get("plantType", decoded_result.get("ingredientPlantType", -1)),
+            default=-1,
+        )
+        if plant_type >= 0:
+            plant_label = plant_type_name(plant_type)
+            self._episode_plant_action_counts[plant_label] += 1
+            if action_result.get("illegalAction"):
+                self._episode_invalid_actions_by_plant[plant_label] += 1
+            if placement.get("success") or action_result.get("plantPlaced") or action_result.get("fusionSucceeded"):
+                self._episode_successful_placements_by_plant[plant_label] += 1
         if action_result.get("illegalAction"):
             self._episode_illegal += 1
         if placement.get("success"):
@@ -928,6 +1027,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "max_wave": int(observation.get("maxWave", 0)),
             "zombies_killed": max(0, final_kills - self._start_kills),
             "plants_placed": self._episode_plants,
+            "plant_action_counts": self._plain_counter_dict(self._episode_plant_action_counts),
+            "successful_placements_by_plant": self._plain_counter_dict(self._episode_successful_placements_by_plant),
+            "invalid_actions_by_plant": self._plain_counter_dict(self._episode_invalid_actions_by_plant),
             "sunflowers_planted": sum(self._episode_sunflower_placements_by_row.values()),
             "peashooters_planted": sum(self._episode_peashooter_placements_by_row.values()),
             "wallnuts_planted": sum(self._episode_wallnut_placements_by_row.values()),
@@ -1093,6 +1195,14 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "fusion_by_result_type": self._plain_counter_dict(Counter(self.fusion_by_result_type)),
             "fusion_by_source_type": self._plain_counter_dict(Counter(self.fusion_by_source_type)),
             "fusion_by_row": self._plain_counter_dict(Counter(self.fusion_by_row)),
+            "fusion_attempts_by_pair": self._plain_counter_dict(Counter(self.fusion_attempts_by_pair)),
+            "fusion_successes_by_pair": self._plain_counter_dict(Counter(self.fusion_successes_by_pair)),
+            "fusion_failures_by_pair": self._plain_counter_dict(Counter(self.fusion_failures_by_pair)),
+            "fusion_result_counts": self._plain_counter_dict(Counter(self.fusion_result_counts)),
+            "fusion_depth_counts": self._plain_counter_dict(Counter(self.fusion_depth_counts)),
+            "recursive_fusion_count": self.recursive_fusion_count,
+            "high_tier_fusion_count": self.high_tier_fusion_count,
+            "highest_fusion_tier": self.highest_fusion_tier,
             "fusion_under_threat_count": self.fusion_under_threat_count,
             "fusion_near_buckethead_count": self.fusion_near_buckethead_count,
             "fusion_near_conehead_count": self.fusion_near_conehead_count,
@@ -1103,6 +1213,25 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             ),
             "fusion_bridge_error_count": self.fusion_bridge_error_count,
             "fusion_unsafe_state_block_count": self.fusion_unsafe_state_block_count,
+            "fusion_attempt_reward_total": self.fusion_attempt_reward_total,
+            "fusion_success_reward_total": self.fusion_success_reward_total,
+            "fusion_new_recipe_reward_total": self.fusion_new_recipe_reward_total,
+            "fusion_recursive_reward_total": self.fusion_recursive_reward_total,
+            "fusion_tier_reward_total": self.fusion_tier_reward_total,
+            "fusion_repeat_decay_total": self.fusion_repeat_decay_total,
+            "fusion_threatened_row_bonus_total": self.fusion_threatened_row_bonus_total,
+            "fusion_active_wave_bonus_total": self.fusion_active_wave_bonus_total,
+            "fusion_defensive_value_bonus_total": self.fusion_defensive_value_bonus_total,
+            "fusion_incompatible_penalty_total": self.fusion_incompatible_penalty_total,
+            "fusion_empty_tile_penalty_total": self.fusion_empty_tile_penalty_total,
+            "fusion_failed_penalty_total": self.fusion_failed_penalty_total,
+            "fusion_bridge_error_penalty_total": self.fusion_bridge_error_penalty_total,
+            "fusion_spam_penalty_total": self.fusion_spam_penalty_total,
+            "fusion_reward_capped": self.fusion_reward_capped,
+            "fusion_last_reward_delta": self.fusion_last_reward_delta,
+            "fusion_last_reward_reason": self.fusion_last_reward_reason,
+            "fusion_last_usefulness_bonus": self.fusion_last_usefulness_bonus,
+            "fusion_last_source": self.fusion_last_source,
             "human_coach": self._coach_live_status(),
             "env_corruption_count": self._episode_env_corruption_count,
             "mower_respawn_detected_count": self._episode_mower_respawn_detected_count,
@@ -1125,6 +1254,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "loss": done_reason == "loss",
             "timeout": done_reason == "timeout",
         }
+        episode_summary.update(self._action_diagnostic_summary())
         info.update(
             {
                 "raw_observation": observation,
@@ -1481,6 +1611,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             return None
 
     def _reset_lane_episode_diagnostics(self, observation: Dict[str, Any]) -> None:
+        self._reset_action_diagnostics()
         self._episode_final_plants_by_row: Counter[int] = self._plant_counts_by_row(observation)
         self._episode_final_peashooters_by_row: Counter[int] = self._plant_counts_by_row(observation, plant_type=0)
         self._episode_final_sunflowers_by_row: Counter[int] = self._plant_counts_by_row(observation, plant_type=1)
@@ -1579,6 +1710,14 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self.fusion_by_result_type: Dict[str, int] = {}
         self.fusion_by_source_type: Dict[str, int] = {}
         self.fusion_by_row: Dict[str, int] = {}
+        self.fusion_attempts_by_pair: Dict[str, int] = {}
+        self.fusion_successes_by_pair: Dict[str, int] = {}
+        self.fusion_failures_by_pair: Dict[str, int] = {}
+        self.fusion_result_counts: Dict[str, int] = {}
+        self.fusion_depth_counts: Dict[str, int] = {}
+        self.recursive_fusion_count = 0
+        self.high_tier_fusion_count = 0
+        self.highest_fusion_tier = 0
         self.fusion_under_threat_count = 0
         self.fusion_near_buckethead_count = 0
         self.fusion_near_conehead_count = 0
@@ -1586,6 +1725,25 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self.fusion_kills_after_use_total = 0
         self.fusion_bridge_error_count = 0
         self.fusion_unsafe_state_block_count = 0
+        self.fusion_attempt_reward_total = 0.0
+        self.fusion_success_reward_total = 0.0
+        self.fusion_new_recipe_reward_total = 0.0
+        self.fusion_recursive_reward_total = 0.0
+        self.fusion_tier_reward_total = 0.0
+        self.fusion_repeat_decay_total = 0.0
+        self.fusion_threatened_row_bonus_total = 0.0
+        self.fusion_active_wave_bonus_total = 0.0
+        self.fusion_defensive_value_bonus_total = 0.0
+        self.fusion_incompatible_penalty_total = 0.0
+        self.fusion_empty_tile_penalty_total = 0.0
+        self.fusion_failed_penalty_total = 0.0
+        self.fusion_bridge_error_penalty_total = 0.0
+        self.fusion_spam_penalty_total = 0.0
+        self.fusion_reward_capped = False
+        self.fusion_last_reward_delta = 0.0
+        self.fusion_last_reward_reason = ""
+        self.fusion_last_usefulness_bonus = 0.0
+        self.fusion_last_source = ""
         self._episode_env_corruption_count = 0
         self._episode_mower_respawn_detected_count = 0
         self._episode_cooldown_reset_detected_count = 0
@@ -1600,6 +1758,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._episode_reset_after_false_reward_signal_count = 0
         self._episode_timeout_reset_requested_count = 0
         self._episode_reward_totals: Dict[str, float] = {field: 0.0 for field in REWARD_EPISODE_TOTAL_FIELDS}
+        self._episode_plant_action_counts: Counter[str] = Counter()
+        self._episode_successful_placements_by_plant: Counter[str] = Counter()
+        self._episode_invalid_actions_by_plant: Counter[str] = Counter()
 
     def _record_lane_diagnostics(self, action: int, observation: Dict[str, Any], info: Dict[str, Any]) -> None:
         diag = info.get("lane_diagnostics") if isinstance(info, dict) else {}
@@ -1937,6 +2098,173 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self.base.close()
         super().close()
 
+    def _reset_action_diagnostics(self) -> None:
+        self._action_durations: List[float] = []
+        self._action_freeze_count = 0
+        self._action_freezes_by_type: Counter[str] = Counter()
+        self._action_freezes_by_plant: Counter[str] = Counter()
+        self._action_freezes_by_fusion_pair: Counter[str] = Counter()
+        self._action_freezes_by_grid: Counter[str] = Counter()
+        self._action_freezes_by_screen_state: Counter[str] = Counter()
+        self._action_freezes_by_level: Counter[str] = Counter()
+
+    @staticmethod
+    def _action_state_summary(observation: Dict[str, Any]) -> Dict[str, Any]:
+        slots = observation.get("seedSlots", []) if isinstance(observation.get("seedSlots"), list) else []
+        plants = observation.get("plants", []) if isinstance(observation.get("plants"), list) else []
+        return {
+            "frame": observation.get("frameCount"),
+            "level": observation.get("currentAdventureLevel") or observation.get("currentLevel"),
+            "screen_state": observation.get("screenState"),
+            "next_step": observation.get("nextStep"),
+            "gameplay_ready": bool(observation.get("gameplayReady")),
+            "seed_selection_active": bool(observation.get("seedSelectionActive")),
+            "sun": observation.get("sun"),
+            "wave": observation.get("wave"),
+            "max_wave": observation.get("maxWave"),
+            "plant_count": observation.get("plantCount", len(plants)),
+            "zombie_count": observation.get("zombieCount"),
+            "plants": sorted(
+                (
+                    int(plant.get("row", -1)),
+                    int(plant.get("column", plant.get("col", -1))),
+                    int(plant.get("type", plant.get("plantType", -1))),
+                    int(plant.get("instanceId", 0) or 0),
+                )
+                for plant in plants
+                if isinstance(plant, dict)
+            ),
+            "seed_slots": [
+                {
+                    "slot": slot.get("slotIndex", index),
+                    "plant_type": slot.get("plantType"),
+                    "plant_name": slot.get("plantTypeName") or slot.get("displayName"),
+                    "ready": bool(slot.get("ready")),
+                    "usable": bool(slot.get("usable")),
+                    "cooldown": slot.get("currentCooldown"),
+                    "cost": slot.get("seedCost"),
+                }
+                for index, slot in enumerate(slots)
+                if isinstance(slot, dict)
+            ],
+        }
+
+    @staticmethod
+    def _action_state_hash(summary: Dict[str, Any]) -> str:
+        encoded = json.dumps(summary, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def _record_action_diagnostic(
+        self,
+        *,
+        policy_action: int,
+        bridge_action: int,
+        pre_observation: Dict[str, Any],
+        post_observation: Dict[str, Any],
+        info: Dict[str, Any],
+        started_at: float,
+        duration: float,
+        timed_out: bool,
+        exception_text: str,
+    ) -> Dict[str, Any]:
+        action_result = info.get("action_result") if isinstance(info.get("action_result"), dict) else {}
+        decoded = action_result.get("decoded") if isinstance(action_result.get("decoded"), dict) else {}
+        policy_decoded = self.decode_policy_action(policy_action, pre_observation)
+        fusion_candidate = action_result.get("fusionCandidate") if isinstance(action_result.get("fusionCandidate"), dict) else {}
+        fusion_attempted = bool(action_result.get("fusionAttempted") or action_result.get("fusionSucceeded"))
+        action_type = "fusion" if fusion_attempted else str(decoded.get("kind") or policy_decoded.get("kind") or "wait")
+        seed_slot = decoded.get("seedSlotIndex", decoded.get("seed_slot", policy_decoded.get("seed_slot", -1)))
+        row = decoded.get("row", policy_decoded.get("row", -1))
+        col = decoded.get("column", decoded.get("col", policy_decoded.get("col", -1)))
+        source_row = fusion_candidate.get("source_row", fusion_candidate.get("sourceRow", row))
+        source_col = fusion_candidate.get("source_col", fusion_candidate.get("sourceCol", col))
+        plant_name = str(
+            decoded.get("plantTypeName")
+            or fusion_candidate.get("ingredient_plant_name")
+            or fusion_candidate.get("target_or_ingredient_name")
+            or decoded.get("plantType")
+            or ""
+        )
+        source_name = str(fusion_candidate.get("source_plant_name") or fusion_candidate.get("sourcePlantName") or "")
+        fusion_pair = f"{plant_name}+{source_name}" if fusion_attempted else ""
+        pre_summary = self._action_state_summary(pre_observation)
+        post_summary = self._action_state_summary(post_observation)
+        pre_cooldowns = [(slot.get("slot"), slot.get("cooldown"), slot.get("ready")) for slot in pre_summary["seed_slots"]]
+        post_cooldowns = [(slot.get("slot"), slot.get("cooldown"), slot.get("ready")) for slot in post_summary["seed_slots"]]
+        record = {
+            "episode": int(self._episode_index),
+            "step_index": int(self._step_count + 1),
+            "level": pre_summary.get("level"),
+            "selected_action_id": int(policy_action),
+            "bridge_action_id": int(bridge_action),
+            "decoded_action": decoded or policy_decoded,
+            "action_type": action_type,
+            "plant": plant_name,
+            "seed_slot": seed_slot,
+            "target_grid": {"row": row, "col": col},
+            "source_grid": {"row": source_row, "col": source_col} if fusion_attempted else None,
+            "fusion_pair": fusion_pair,
+            "pre_action_state": pre_summary,
+            "post_action_state": post_summary,
+            "pre_action_state_hash": self._action_state_hash(pre_summary),
+            "post_action_state_hash": self._action_state_hash(post_summary),
+            "action_start_timestamp": started_at,
+            "action_end_timestamp": started_at + duration,
+            "action_duration_seconds": duration,
+            "board_changed": pre_summary["plants"] != post_summary["plants"],
+            "resources_changed": pre_summary.get("sun") != post_summary.get("sun"),
+            "cooldowns_changed": pre_cooldowns != post_cooldowns,
+            "invalid": bool(action_result.get("illegalAction")),
+            "invalid_reason": str(action_result.get("illegalReason") or ""),
+            "timed_out": bool(timed_out),
+            "classification": "action_freeze" if timed_out else "normal_action",
+            "exception": str(exception_text or ""),
+            "screen_state": pre_summary.get("screen_state"),
+        }
+        self._action_durations.append(float(duration))
+        if timed_out:
+            self._action_freeze_count += 1
+            self._action_freezes_by_type[action_type] += 1
+            self._action_freezes_by_plant[plant_name or "unknown"] += 1
+            self._action_freezes_by_fusion_pair[fusion_pair or "not_fusion"] += 1
+            self._action_freezes_by_grid[f"{row},{col}"] += 1
+            self._action_freezes_by_screen_state[str(pre_summary.get("screen_state") or "unknown")] += 1
+            self._action_freezes_by_level[str(pre_summary.get("level") or "unknown")] += 1
+        if self.config.enable_action_watchdog and self.config.action_diagnostics_path:
+            path = Path(self.config.action_diagnostics_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
+        if timed_out and self.config.save_freeze_debug_bundle and self.config.freeze_debug_dir:
+            bundle_dir = Path(self.config.freeze_debug_dir)
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            bundle_path = bundle_dir / f"action_freeze_ep{self._episode_index}_step{self._step_count + 1}_{int(started_at * 1000)}.json"
+            bundle_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+            record["debug_bundle_path"] = str(bundle_path)
+        return record
+
+    def _action_diagnostic_summary(self) -> Dict[str, Any]:
+        durations = sorted(self._action_durations)
+        if durations:
+            p95_index = min(len(durations) - 1, max(0, int(np.ceil(0.95 * len(durations))) - 1))
+            mean_duration = float(sum(durations) / len(durations))
+            max_duration = float(durations[-1])
+            p95_duration = float(durations[p95_index])
+        else:
+            mean_duration = max_duration = p95_duration = 0.0
+        return {
+            "mean_action_duration_seconds": mean_duration,
+            "max_action_duration_seconds": max_duration,
+            "p95_action_duration_seconds": p95_duration,
+            "action_freeze_count": int(self._action_freeze_count),
+            "freezes_by_action_type": dict(self._action_freezes_by_type),
+            "freezes_by_plant": dict(self._action_freezes_by_plant),
+            "freezes_by_fusion_pair": dict(self._action_freezes_by_fusion_pair),
+            "freezes_by_grid_coordinate": dict(self._action_freezes_by_grid),
+            "freezes_by_screen_state": dict(self._action_freezes_by_screen_state),
+            "freezes_by_level": dict(self._action_freezes_by_level),
+        }
+
     def _encode_observation(self, observation: Dict[str, Any]) -> np.ndarray:
         values: List[float] = []
         max_wave = max(1, int(observation.get("maxWave", 0) or 1))
@@ -1989,11 +2317,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                     continue
                 max_health = max(1.0, float(plant.get("maxHealth", 1) or 1))
                 plant_type = int(plant.get("type", -1))
+                if self.config.enable_board_plant_identity:
+                    family_identity, tier_identity = board_plant_identity_features(plant)
+                else:
+                    family_identity = 1.0 if plant_type == 1 else 0.0
+                    tier_identity = 1.0 if plant_type == 0 else 0.0
                 values.extend(
                     [
                         1.0,
-                        1.0 if plant_type == 1 else 0.0,
-                        1.0 if plant_type == 0 else 0.0,
+                        family_identity,
+                        tier_identity,
                         self._clip(float(plant.get("health", 0)) / max_health),
                         self._clip(float(plant.get("attackCooldown", 0.0) or 0.0) / 10.0),
                         self._clip(float(plant.get("produceCooldown", 0.0) or 0.0) / 30.0),

@@ -29,6 +29,7 @@ from pvzrl_adventure import (
     replay_current_level_after_validation_win,
 )
 from pvzrl_env import normalize_plant_name, parse_seed_list, plant_type_name, registry_entries, resolve_seed_list
+from pvzrl_fusion import FUSION_POLICY_SCRIPTED
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 
 
@@ -119,6 +120,18 @@ class AdventureGeneralistProgress:
     timeout_classification: str = "none"
     reward: float = 0.0
     length: int = 0
+    plant_availability: List[Dict[str, Any]] = field(default_factory=list)
+    plant_action_counts: Dict[str, int] = field(default_factory=dict)
+    successful_placements_by_plant: Dict[str, int] = field(default_factory=dict)
+    invalid_actions_by_plant: Dict[str, int] = field(default_factory=dict)
+    action_mask_validity_by_seed_slot: Dict[str, int] = field(default_factory=dict)
+    fusion_attempts_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_successes_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_depth_counts: Dict[str, int] = field(default_factory=dict)
+    highest_fusion_tier: int = 0
+    recursive_fusion_count: int = 0
+    action_freeze_count: int = 0
+    reward_component_totals: Dict[str, float] = field(default_factory=dict)
     frontier_win_streak: int = 0
     frontier_win_streak_required: int = 1
     frontier_mastery_ready: bool = False
@@ -576,6 +589,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         )
         self.current_selectable_seeds = _ordered_by_priority(set(self.current_loadout))
         self.current_excluded_new_plants: List[Dict[str, str]] = []
+        self._base_fusion_policy = str(self.config.fusion_policy)
+        self.current_curriculum_mode = "frontier"
         self._apply_loadout(self.current_loadout)
         self.context: Dict[str, Any] = {
             "mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
@@ -1069,6 +1084,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             self.context["frontier_replay_recovery_required"] = False
         self.curriculum.episode_index = self.episode_index
         adventure_state = self._safe_adventure_state()
+        self.current_curriculum_mode = self._sample_curriculum_mode()
+        fusion_assisted = self.current_curriculum_mode in {"fusion_chain", "coach_fusion"}
+        self.config.fusion_policy = FUSION_POLICY_SCRIPTED if fusion_assisted else self._base_fusion_policy
+        self.base.config.fusion_policy = self.config.fusion_policy
         self.current_sample_source = self._sample_source()
         self.current_attempt += 1
         self.context.update(
@@ -1095,6 +1114,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "eligible_seeds": self.curriculum.eligible_seeds(),
                 "selectable_seeds": list(self.current_selectable_seeds),
                 "episode_sample_source": self.current_sample_source,
+                "curriculum_mode": self.current_curriculum_mode,
                 "mastery_sample_source": self.current_sample_source,
                 "loadout_reason": self.current_loadout_reason,
                 "excluded_new_plants": list(self.current_excluded_new_plants),
@@ -1364,6 +1384,47 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.frontier_mastery_reset_reason = str(frontier_mastery_reset_reason or "")
 
         selected_loadout_count = len(self.current_loadout)
+        unlocked_now = set(self.curriculum.unlocked_seeds())
+        selectable_now = set(self.current_selectable_seeds)
+        action_counts = dict(summary.get("plant_action_counts") or {})
+        placement_counts = dict(summary.get("successful_placements_by_plant") or {})
+        invalid_by_plant = dict(summary.get("invalid_actions_by_plant") or {})
+        mask_by_slot = dict(summary.get("legal_actions_by_seed_slot") or {})
+        plant_availability: List[Dict[str, Any]] = []
+        for seed in SEED_PRIORITY:
+            slot_indices = [index for index, selected in enumerate(self.current_loadout) if selected == seed]
+            mask_valid_count = sum(int(mask_by_slot.get(str(index), mask_by_slot.get(index, 0)) or 0) for index in slot_indices)
+            selected_count = int(action_counts.get(seed, 0) or 0)
+            placed_count = int(placement_counts.get(seed, 0) or 0)
+            if seed not in unlocked_now:
+                reason = "not_unlocked_or_not_reported_by_bridge"
+            elif seed not in selectable_now:
+                reason = "unlocked_but_not_selectable"
+            elif not slot_indices:
+                reason = "selectable_but_not_in_loadout"
+            elif mask_valid_count <= 0:
+                reason = "selected_but_never_mask_valid"
+            elif selected_count <= 0:
+                reason = "valid_but_policy_ignored"
+            elif placed_count <= 0:
+                reason = "selected_but_never_successfully_placed"
+            else:
+                reason = "used_successfully"
+            plant_availability.append(
+                {
+                    "plant": seed,
+                    "unlocked": seed in unlocked_now,
+                    "selectable": seed in selectable_now,
+                    "included_in_selected_loadout": bool(slot_indices),
+                    "represented_in_observation": bool(slot_indices),
+                    "model_action_slots": slot_indices,
+                    "mask_valid_action_count": mask_valid_count,
+                    "policy_selected_count": selected_count,
+                    "successful_placement_count": placed_count,
+                    "invalid_action_count": int(invalid_by_plant.get(seed, 0) or 0),
+                    "reason": reason,
+                }
+            )
         progress = AdventureGeneralistProgress(
             episode=self.episode_index,
             level=episode_level,
@@ -1401,6 +1462,22 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             timeout_classification=str(summary.get("timeout_classification") or "none"),
             reward=float(summary.get("episode_reward") or 0.0),
             length=int(summary.get("episode_length") or 0),
+            plant_availability=plant_availability,
+            plant_action_counts=action_counts,
+            successful_placements_by_plant=placement_counts,
+            invalid_actions_by_plant=invalid_by_plant,
+            action_mask_validity_by_seed_slot={str(key): int(value or 0) for key, value in mask_by_slot.items()},
+            fusion_attempts_by_pair=dict(summary.get("fusion_attempts_by_pair") or {}),
+            fusion_successes_by_pair=dict(summary.get("fusion_successes_by_pair") or {}),
+            fusion_depth_counts=dict(summary.get("fusion_depth_counts") or {}),
+            highest_fusion_tier=int(summary.get("highest_fusion_tier") or 0),
+            recursive_fusion_count=int(summary.get("recursive_fusion_count") or 0),
+            action_freeze_count=int(summary.get("action_freeze_count") or 0),
+            reward_component_totals={
+                str(key): float(value or 0.0)
+                for key, value in summary.items()
+                if str(key).endswith("_reward_total") or str(key).endswith("_penalty_total")
+            },
             frontier_win_streak=int(self.frontier_win_streak),
             frontier_win_streak_required=int(self.frontier_win_streak_required),
             frontier_mastery_ready=bool(frontier_mastery_ready),
@@ -1595,6 +1672,27 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             return list(self.current_loadout), blocked_reason
 
         self.current_loadout = list(decision.selected_loadout[:effective_capacity])
+        if getattr(self, "current_curriculum_mode", "frontier") == "later_plant":
+            later_candidates = [
+                seed
+                for seed in ("PotatoMine", "Chomper", "SnowPea", "Repeater")
+                if seed in selection_candidates
+            ]
+            for later_seed in later_candidates:
+                if later_seed in self.current_loadout:
+                    break
+                replacement = next(
+                    (
+                        index
+                        for index in range(len(self.current_loadout) - 1, -1, -1)
+                        if self.current_loadout.count(self.current_loadout[index]) > 1
+                    ),
+                    len(self.current_loadout) - 1,
+                )
+                if replacement >= 0:
+                    self.current_loadout[replacement] = later_seed
+                    decision.loadout_reason = f"{decision.loadout_reason}+later_plant_curriculum"
+                break
         self.current_loadout_reason = str(decision.loadout_reason or "")
         self.current_seed_order_source = str(decision.seed_order_source or self.seed_order_source)
         self.current_seed_order_preserved = bool(decision.seed_order_preserved)
@@ -1697,6 +1795,22 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             return "frontier"
         return requested
 
+    def _sample_curriculum_mode(self) -> str:
+        weighted: List[Tuple[str, float]] = []
+        if bool(getattr(self.config, "enable_fusion_curriculum", False)):
+            weighted.append(("fusion_chain", max(0.0, float(getattr(self.config, "fusion_curriculum_prob", 0.20)))))
+        if bool(getattr(self.config, "enable_later_plant_curriculum", False)):
+            weighted.append(("later_plant", max(0.0, float(getattr(self.config, "later_plant_curriculum_prob", 0.10)))))
+        if bool(getattr(self.config, "enable_coach_fusion_sampling", False)):
+            weighted.append(("coach_fusion", max(0.0, float(getattr(self.config, "coach_fusion_prob", 0.10)))))
+        draw = random.random()
+        running = 0.0
+        for name, probability in weighted:
+            running += probability
+            if draw < min(1.0, running):
+                return name
+        return "frontier"
+
     def _safe_adventure_state(self) -> Dict[str, Any]:
         try:
             state = self.base.adventure_screen_state()
@@ -1741,6 +1855,18 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "selectable_seeds": list(progress.selectable_seeds),
             "eligible_seeds": list(progress.eligible_seeds),
             "excluded_new_plants": list(progress.excluded_new_plants),
+            "plant_availability": list(progress.plant_availability),
+            "plant_action_counts": dict(progress.plant_action_counts),
+            "successful_placements_by_plant": dict(progress.successful_placements_by_plant),
+            "invalid_actions_by_plant": dict(progress.invalid_actions_by_plant),
+            "action_mask_validity_by_seed_slot": dict(progress.action_mask_validity_by_seed_slot),
+            "fusion_attempts_by_pair": dict(progress.fusion_attempts_by_pair),
+            "fusion_successes_by_pair": dict(progress.fusion_successes_by_pair),
+            "fusion_depth_counts": dict(progress.fusion_depth_counts),
+            "highest_fusion_tier": int(progress.highest_fusion_tier),
+            "recursive_fusion_count": int(progress.recursive_fusion_count),
+            "action_freeze_count": int(progress.action_freeze_count),
+            "reward_component_totals": dict(progress.reward_component_totals),
             "post_win_transition": dict(progress.post_win_transition),
             "post_win_blocked_reason": progress.post_win_blocked_reason,
             "post_win_last_state": dict(progress.post_win_last_state),

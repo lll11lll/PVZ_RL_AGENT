@@ -60,9 +60,9 @@ def run_compatibility_table_cases(results: List[Dict[str, Any]]) -> None:
                 (not F.are_fusion_compatible(1, 2)) and (not F.are_fusion_compatible(2, 1)))
     assert_case(results, "Peashooter + CherryBomb is legal (both directions)",
                 F.are_fusion_compatible(0, 2) and F.are_fusion_compatible(2, 0))
-    # Self-pairs and unknowns are not compatible unless explicitly listed.
-    assert_case(results, "self-pairs are not compatible by default",
-                (not F.are_fusion_compatible(1, 1)) and (not F.are_fusion_compatible(0, 0)))
+    # The two self-upgrades explicitly listed in FUSION_RULES are compatible.
+    assert_case(results, "known self-fusions are compatible",
+                F.are_fusion_compatible(1, 1) and F.are_fusion_compatible(0, 0))
     assert_case(results, "unknown plant ids are not compatible",
                 not F.are_fusion_compatible(999, 0))
     # Name-based + alias-based resolution agrees with id-based resolution.
@@ -104,8 +104,12 @@ def run_legality_helper_cases(results: List[Dict[str, Any]]) -> None:
     # Case 3: Peashooter tile + CherryBomb seed -> legal fusion.
     assert_case(results, "Case3 Peashooter+CherryBomb legal",
                 F.is_legal_fusion_action(board_observation((2, 4, PEASHOOTER)), 2, 4, 3))
-    # Case 4: empty tile + Peashooter -> empty_tile (fusion illegal).
-    assert_case(results, "Case4 empty tile -> empty_tile",
+    assert_case(results, "Case4 SunFlower+SunFlower legal",
+                F.is_legal_fusion_action(board_observation((2, 4, SUNFLOWER)), 2, 4, 0))
+    assert_case(results, "Case5 Peashooter+Peashooter legal",
+                F.is_legal_fusion_action(board_observation((2, 4, PEASHOOTER)), 2, 4, 1))
+    # Empty tile + Peashooter -> empty_tile (fusion illegal).
+    assert_case(results, "Case6 empty tile -> empty_tile",
                 F.get_fusion_illegal_reason(board_observation(None), 2, 4, 1) == "empty_tile")
     # fusion disabled / sun / cooldown reasons.
     assert_case(results, "fusion disabled reason",
@@ -132,6 +136,8 @@ def run_mask_cases(results: List[Dict[str, Any]]) -> None:
     on_incompatible = env_on._python_action_filter(fuse_incompatible, obs, bridge_actions=bridge)
     on_plant_empty = env_on._python_action_filter(plant_empty, obs, bridge_actions=bridge)
     off_compatible = env_off._python_action_filter(fuse_compatible, obs, bridge_actions=bridge)
+    obs["legalActions"] = list(bridge)
+    complete_mask = env_on.action_mask(obs)
 
     assert_case(results, "mask exposes legal compatible fusion action",
                 on_compatible == (True, ""), {"decoded": decoded, "result": on_compatible})
@@ -141,22 +147,28 @@ def run_mask_cases(results: List[Dict[str, Any]]) -> None:
                 on_plant_empty == (True, ""), on_plant_empty)
     assert_case(results, "occupied tile stays illegal when fusion mask disabled",
                 off_compatible == (False, "occupied_cell"), off_compatible)
-    # Plant on an occupied tile is never legal (separate rule from fusion).
-    plant_on_occupied = env_on._python_action_filter(encode(0, 2, 4), obs, bridge_actions=[0, encode(0, 2, 4)])
-    # slot 0 = SunFlower onto SunFlower -> incompatible fusion, and a normal plant is also illegal here.
-    assert_case(results, "planting over an occupied tile is illegal",
-                plant_on_occupied[0] is False, plant_on_occupied)
+    assert_case(results, "complete action mask includes compatible fusion",
+                bool(complete_mask[fuse_compatible]), complete_mask[fuse_compatible])
+    assert_case(results, "complete action mask includes SunFlower self-fusion",
+                bool(complete_mask[encode(0, 2, 4)]), complete_mask[encode(0, 2, 4)])
+    assert_case(results, "complete action mask excludes incompatible fusion",
+                not bool(complete_mask[fuse_incompatible]), complete_mask[fuse_incompatible])
+    sunflower_self_fusion = env_on._python_action_filter(
+        encode(0, 2, 4), obs, bridge_actions=[0, encode(0, 2, 4)]
+    )
+    assert_case(results, "mask exposes SunFlower self-fusion",
+                sunflower_self_fusion == (True, ""), sunflower_self_fusion)
 
     diag = env_on._fusion_mask_diagnostics(obs)
     assert_case(results, "mask diagnostics report available + incompatible counts",
-                diag["fusion_actions_available_count"] == 1
-                and diag["fusion_actions_masked_incompatible_count"] == 3
+                diag["fusion_actions_available_count"] == 2
+                and diag["fusion_actions_masked_incompatible_count"] == 2
                 and diag["fusion_candidate_tiles"] == [(2, 4)]
                 and isinstance(diag["fusion_compatibility_table"], dict),
                 diag)
     diag_off = env_off._fusion_mask_diagnostics(obs)
     assert_case(results, "mask diagnostics report disabled suppression when off",
-                diag_off["fusion_actions_masked_disabled_count"] == 1
+                diag_off["fusion_actions_masked_disabled_count"] == 2
                 and diag_off["fusion_actions_available_count"] == 0,
                 diag_off)
 
@@ -185,6 +197,16 @@ def run_coach_cases(results: List[Dict[str, Any]]) -> None:
                 compatible.rejected_reason != "incompatible_pair"
                 and compatible.rejected_reason != "empty_tile",
                 compatible.to_dict())
+
+    sunflower_self = validate_fuse("fuse 0 2 4", sunflower_tile)
+    assert_case(results, "coach accepts SunFlower+SunFlower past compatibility gate",
+                sunflower_self.rejected_reason != "incompatible_pair",
+                sunflower_self.to_dict())
+
+    peashooter_self = validate_fuse("fuse 1 2 4", peashooter_tile)
+    assert_case(results, "coach accepts Peashooter+Peashooter past compatibility gate",
+                peashooter_self.rejected_reason != "incompatible_pair",
+                peashooter_self.to_dict())
 
     # fuse 3 2 4 = CherryBomb seed onto SunFlower -> incompatible.
     incompatible = validate_fuse("fuse 3 2 4", sunflower_tile)

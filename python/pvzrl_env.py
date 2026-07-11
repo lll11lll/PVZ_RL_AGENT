@@ -32,6 +32,7 @@ from pvzrl_fusion import (
     default_fusion_diagnostics,
     fusion_compatibility_table,
     fusion_live_fields,
+    fusion_tier,
     get_fusion_illegal_reason,
     merge_episode_fusion_stats,
     normalize_fusion_policy,
@@ -212,6 +213,11 @@ class RewardConfig:
     # design: fusion should help the policy, not dominate the reward function.
     fusion_attempt_reward: float = 0.02
     fusion_success_reward: float = 0.50
+    fusion_new_recipe_reward: float = 0.15
+    fusion_recursive_reward: float = 0.20
+    fusion_tier2_reward: float = 0.10
+    fusion_tier3_reward: float = 0.25
+    fusion_repeat_reward_multiplier: float = 0.25
     fusion_threatened_row_bonus: float = 0.15
     fusion_active_wave_bonus: float = 0.10
     fusion_defensive_value_bonus: float = 0.10
@@ -232,6 +238,9 @@ class PvZEnvConfig:
     host: str = "127.0.0.1"
     port: int = 32323
     timeout: float = 10.0
+    enable_action_watchdog: bool = True
+    action_timeout_seconds: float = 10.0
+    save_freeze_debug_bundle: bool = True
     step_seconds: float = 0.25
     plant_types: List[int] = field(default_factory=lambda: list(DEFAULT_PLANT_TYPES))
     row_count: int = 5
@@ -259,6 +268,9 @@ class PvZEnvConfig:
     # on such a tile is routed to the fusion bridge).  Default False preserves
     # the historical behavior where every occupied tile is illegal.
     fusion_action_mask_enabled: bool = False
+    enable_fusion_chain_rewards: bool = False
+    enable_recipe_discovery_reward: bool = False
+    enable_repeat_recipe_decay: bool = False
     run_mode: str = RUN_MODE_FIXED_TRAIN
     target_level: int = 0
     tactical_masks: bool = False
@@ -471,6 +483,14 @@ class EpisodeLog:
     fusion_by_result_type: Dict[str, int] = field(default_factory=dict)
     fusion_by_source_type: Dict[str, int] = field(default_factory=dict)
     fusion_by_row: Dict[str, int] = field(default_factory=dict)
+    fusion_attempts_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_successes_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_failures_by_pair: Dict[str, int] = field(default_factory=dict)
+    fusion_result_counts: Dict[str, int] = field(default_factory=dict)
+    fusion_depth_counts: Dict[str, int] = field(default_factory=dict)
+    recursive_fusion_count: int = 0
+    high_tier_fusion_count: int = 0
+    highest_fusion_tier: int = 0
     fusion_under_threat_count: int = 0
     fusion_near_buckethead_count: int = 0
     fusion_near_conehead_count: int = 0
@@ -485,6 +505,10 @@ class EpisodeLog:
     fusion_reward_total: float = 0.0
     fusion_attempt_reward_total: float = 0.0
     fusion_success_reward_total: float = 0.0
+    fusion_new_recipe_reward_total: float = 0.0
+    fusion_recursive_reward_total: float = 0.0
+    fusion_tier_reward_total: float = 0.0
+    fusion_repeat_decay_total: float = 0.0
     fusion_threatened_row_bonus_total: float = 0.0
     fusion_active_wave_bonus_total: float = 0.0
     fusion_defensive_value_bonus_total: float = 0.0
@@ -494,14 +518,26 @@ class EpisodeLog:
     fusion_bridge_error_penalty_total: float = 0.0
     fusion_spam_penalty_total: float = 0.0
     fusion_reward_capped: bool = False
+    fusion_last_reward_delta: float = 0.0
+    fusion_last_reward_reason: str = ""
+    fusion_last_usefulness_bonus: float = 0.0
+    fusion_last_source: str = ""
 
 
 class PvZBridgeClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 32323, timeout: float = 10.0, debug_performance: bool = False):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 32323,
+        timeout: float = 10.0,
+        debug_performance: bool = False,
+        action_timeout: Optional[float] = None,
+    ):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.debug_performance = debug_performance
+        self.action_timeout = max(0.1, float(action_timeout if action_timeout is not None else timeout))
         self._sock: Optional[socket.socket] = None
         self._reader = None
         self._writer = None
@@ -534,8 +570,9 @@ class PvZBridgeClient:
     def request(self, command: str, **payload: Any) -> Dict[str, Any]:
         started = time.perf_counter()
         self.connect()
+        request_timeout = self.action_timeout if command in {"step", "fusion_step"} else self.timeout
         if self._sock is not None:
-            self._sock.settimeout(self.timeout)
+            self._sock.settimeout(request_timeout)
         assert self._reader is not None and self._writer is not None
         message = {"command": command, **payload}
         try:
@@ -546,12 +583,19 @@ class PvZBridgeClient:
             self.close()
             raise BridgeTimeoutError(
                 command,
-                self.timeout,
-                f"PvZRL bridge request timed out waiting for command={command!r} after {self.timeout:.1f}s.",
+                request_timeout,
+                f"PvZRL bridge request timed out waiting for command={command!r} after {request_timeout:.1f}s.",
             ) from exc
         if not line:
             raise ConnectionError("PvZRL bridge disconnected.")
         response = json.loads(line)
+        if not response.get("ok", False) and str(response.get("error") or "").strip().lower() == "timeout":
+            self.close()
+            raise BridgeTimeoutError(
+                command,
+                request_timeout,
+                str(response.get("details") or "Unity main thread did not process the action before the bridge deadline."),
+            )
         if not response.get("ok", False):
             raise RuntimeError(f"bridge error: {response.get('error')} {response.get('details')}")
         data = response.get("data", {})
@@ -892,6 +936,11 @@ class PvZGymEnv:
             self.config.port,
             self.config.timeout,
             debug_performance=self.config.debug_performance,
+            action_timeout=(
+                self.config.action_timeout_seconds
+                if self.config.enable_action_watchdog
+                else self.config.timeout
+            ),
         )
         self.previous_observation: Optional[Dict[str, Any]] = None
         self.process: Optional[subprocess.Popen[Any]] = None
@@ -911,6 +960,7 @@ class PvZGymEnv:
         self._executed_coach_command_ids: set[int] = set()
         self._last_executed_coach_command_id: Optional[int] = None
         self._coach_fusion_fresh_after_timestamp = time.time()
+        self._fusion_recipes_seen_run: set[str] = set()
         self._reset_reward_episode_state()
 
     def _run_mode(self) -> str:
@@ -4162,7 +4212,11 @@ class PvZGymEnv:
         )
         rejection = validation_rejection or select_rejection
         if rejection:
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, None, rejected_reason=rejection)
+            # Candidate selection/validation happens before an action is attempted.
+            # Keep it observable without turning every no-candidate step into a
+            # failed fusion or a reward event.
+            if candidate is not None:
+                diagnostics = apply_fusion_attempt_result(diagnostics, candidate, None, rejected_reason=rejection)
             self._last_fusion_diagnostics = diagnostics
             return None, diagnostics
         assert candidate is not None
@@ -4180,15 +4234,23 @@ class PvZGymEnv:
                 return_observation=False,
             )
         except Exception as exc:
+            result = self._failed_fusion_action_result(
+                candidate=candidate,
+                reason="bridge_error",
+                requested_action=requested_action,
+                executed_action=executed_action,
+                source="scripted",
+                bridge_error=str(exc),
+            )
             diagnostics = apply_fusion_attempt_result(
                 diagnostics,
                 candidate,
-                None,
-                rejected_reason="exception",
+                result,
+                rejected_reason="bridge_error",
                 bridge_error=str(exc),
             )
             self._last_fusion_diagnostics = diagnostics
-            return None, diagnostics
+            return result, diagnostics
         if isinstance(result, dict):
             result["requestedAction"] = int(requested_action)
             result["executedAction"] = int(executed_action)
@@ -4207,8 +4269,7 @@ class PvZGymEnv:
             )
             diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
             self._last_fusion_diagnostics = diagnostics
-            if bool(result.get("fusionSucceeded") or result.get("fusionAttempted") or result.get("plantPlaced")):
-                return result, diagnostics
+            return result, diagnostics
         return None, diagnostics
 
     def _maybe_execute_model_fusion(
@@ -4290,11 +4351,19 @@ class PvZGymEnv:
                 return_observation=False,
             )
         except Exception as exc:
+            result = self._failed_fusion_action_result(
+                candidate=candidate,
+                reason="bridge_error",
+                requested_action=requested_action,
+                executed_action=executed_action,
+                source="model_action_mask",
+                bridge_error=str(exc),
+            )
             diagnostics = apply_fusion_attempt_result(
-                diagnostics, candidate, None, rejected_reason="exception", bridge_error=str(exc)
+                diagnostics, candidate, result, rejected_reason="bridge_error", bridge_error=str(exc)
             )
             self._last_fusion_diagnostics = diagnostics
-            return None, diagnostics
+            return result, diagnostics
         if isinstance(result, dict):
             result["requestedAction"] = int(requested_action)
             result["executedAction"] = int(executed_action)
@@ -4326,6 +4395,10 @@ class PvZGymEnv:
     _FUSION_REWARD_COMPONENT_NAMES = (
         "fusion_attempt_reward",
         "fusion_success_reward",
+        "fusion_new_recipe_reward",
+        "fusion_recursive_reward",
+        "fusion_tier_reward",
+        "fusion_repeat_decay",
         "fusion_threatened_row_bonus",
         "fusion_active_wave_bonus",
         "fusion_defensive_value_bonus",
@@ -4350,6 +4423,8 @@ class PvZGymEnv:
         self._fusion_last_source = ""
         self._recent_fusion_attempts: Deque[Tuple[int, int, int, str, int]] = deque(maxlen=20)
         self._fusion_event_counter = 0
+        self._fusion_recipes_seen_episode: set[str] = set()
+        self._fusion_recipe_counts_episode: Counter[str] = Counter()
 
     def _record_fusion_reward_component(self, name: str, value: float) -> None:
         """Track a fusion reward component contribution for diagnostics/metrics."""
@@ -4369,9 +4444,9 @@ class PvZGymEnv:
             return positive_delta
         remaining = max(0.0, cap - float(getattr(self, "_fusion_reward_positive_total", 0.0)))
         allowed = min(positive_delta, remaining)
-        if allowed < positive_delta - 1e-9:
-            self._fusion_reward_capped = True
         self._fusion_reward_positive_total = float(getattr(self, "_fusion_reward_positive_total", 0.0)) + allowed
+        if allowed < positive_delta - 1e-9 or self._fusion_reward_positive_total >= cap - 1e-9:
+            self._fusion_reward_capped = True
         return allowed
 
     def _is_fusion_spam(self, row: int, col: int, seed_slot: int, reason: str) -> bool:
@@ -4379,10 +4454,14 @@ class PvZGymEnv:
         recent = getattr(self, "_recent_fusion_attempts", None)
         if not recent:
             return False
-        key = (int(row), int(col), int(seed_slot))
-        same_location = sum(1 for (r, c, s, _reason, _step) in recent if (r, c, s) == key)
+        key = (int(row), int(col), int(seed_slot), str(reason or "failed"))
+        same_rejection = sum(
+            1
+            for (r, c, s, prior_reason, _step) in recent
+            if (r, c, s, prior_reason) == key
+        )
         recent_rejections = sum(1 for (_r, _c, _s, rs, _step) in recent if rs)
-        if same_location >= 2:
+        if same_rejection >= 1:
             return True
         if reason and recent_rejections >= 3:
             return True
@@ -4449,6 +4528,8 @@ class PvZGymEnv:
         col = self._safe_int(fusion_event.get("col"), default=-1)
         seed_slot = self._safe_int(fusion_event.get("seed_slot"), default=-1)
         success = bool(fusion_event.get("success"))
+        legal = bool(fusion_event.get("legal", success))
+        attempted = bool(fusion_event.get("attempted", success))
         board_changed = bool(fusion_event.get("board_changed", success))
         reason = str(fusion_event.get("reason") or "")
         source = str(fusion_event.get("source") or "model")
@@ -4456,19 +4537,79 @@ class PvZGymEnv:
         self._fusion_last_source = source
         self._fusion_last_usefulness_bonus = 0.0
 
-        spam = self._is_fusion_spam(row, col, seed_slot, reason if not (success and board_changed) else "")
-        self._recent_fusion_attempts.append((row, col, seed_slot, reason if not success else "", self._fusion_event_counter))
+        confirmed_success = bool(success and legal and board_changed)
+        bad_reason = reason or ("no_board_change" if success and not board_changed else "failed")
+        spam_reasons = {
+            FUSION_ILLEGAL_INCOMPATIBLE,
+            "empty_tile",
+            "exception",
+            "bridge_error",
+            "fusion_bridge_unavailable",
+            "fusion_probe_failed",
+            "fusion_no_effect",
+            "no_board_change",
+            "failed",
+        }
+        spam = bool(not confirmed_success and bad_reason in spam_reasons and self._is_fusion_spam(
+            row, col, seed_slot, bad_reason
+        ))
+        self._recent_fusion_attempts.append(
+            (row, col, seed_slot, "" if confirmed_success else bad_reason, self._fusion_event_counter)
+        )
         self._fusion_event_counter += 1
 
         positive = 0.0
         negative = 0.0
+        positive_components: List[Tuple[str, float]] = []
         reasons: List[str] = []
 
-        if success and board_changed:
-            positive += float(cfg.fusion_attempt_reward)
-            self._record_fusion_reward_component("fusion_attempt_reward", cfg.fusion_attempt_reward)
-            positive += float(cfg.fusion_success_reward)
-            self._record_fusion_reward_component("fusion_success_reward", cfg.fusion_success_reward)
+        if legal and attempted:
+            value = float(cfg.fusion_attempt_reward)
+            positive += value
+            positive_components.append(("fusion_attempt_reward", value))
+
+        if confirmed_success:
+            value = float(cfg.fusion_success_reward)
+            positive += value
+            positive_components.append(("fusion_success_reward", value))
+            existing_plant = self._safe_int(fusion_event.get("existing_plant"), default=-1)
+            selected_seed = self._safe_int(fusion_event.get("selected_seed"), default=-1)
+            recipe_key = f"{fusion_plant_name(selected_seed)} + {fusion_plant_name(existing_plant)}"
+            prior_recipe_count = int(self._fusion_recipe_counts_episode.get(recipe_key, 0))
+            new_recipe_episode = recipe_key not in self._fusion_recipes_seen_episode
+            new_recipe_run = recipe_key not in self._fusion_recipes_seen_run
+            self._fusion_recipe_counts_episode[recipe_key] += 1
+            self._fusion_recipes_seen_episode.add(recipe_key)
+            self._fusion_recipes_seen_run.add(recipe_key)
+            result_payload = fusion_event.get("result") if isinstance(fusion_event.get("result"), dict) else {}
+            resulting_plant = result_payload.get("resultingPlantAfter") if isinstance(result_payload.get("resultingPlantAfter"), dict) else {}
+            candidate = result_payload.get("fusionCandidate") if isinstance(result_payload.get("fusionCandidate"), dict) else {}
+            result_type = self._safe_int(
+                resulting_plant.get("plantType"),
+                resulting_plant.get("type"),
+                candidate.get("predicted_result_type"),
+                default=-1,
+            )
+            result_tier = fusion_tier(result_type)
+            recursive = fusion_tier(existing_plant) > 0
+
+            if self.config.enable_recipe_discovery_reward and new_recipe_episode:
+                value = float(cfg.fusion_new_recipe_reward)
+                positive += value
+                positive_components.append(("fusion_new_recipe_reward", value))
+                reasons.append("new_recipe_episode")
+                if new_recipe_run:
+                    reasons.append("new_recipe_run")
+            if self.config.enable_fusion_chain_rewards and recursive:
+                value = float(cfg.fusion_recursive_reward)
+                positive += value
+                positive_components.append(("fusion_recursive_reward", value))
+                reasons.append("recursive")
+            if self.config.enable_fusion_chain_rewards and result_tier >= 2:
+                value = float(cfg.fusion_tier3_reward if result_tier >= 3 else cfg.fusion_tier2_reward)
+                positive += value
+                positive_components.append(("fusion_tier_reward", value))
+                reasons.append(f"tier_{result_tier}")
             bonuses = self._fusion_usefulness_bonus(
                 row,
                 col,
@@ -4479,11 +4620,19 @@ class PvZGymEnv:
             )
             for name, value in bonuses.items():
                 positive += float(value)
-                self._record_fusion_reward_component(name, value)
-                self._fusion_last_usefulness_bonus += float(value)
+                positive_components.append((name, float(value)))
+            if self.config.enable_repeat_recipe_decay and prior_recipe_count >= 2 and positive > 0.0:
+                multiplier = max(0.0, min(1.0, float(cfg.fusion_repeat_reward_multiplier)))
+                reduced_positive = positive * multiplier
+                decay = reduced_positive - positive
+                positive_components = [(name, value * multiplier) for name, value in positive_components]
+                negative += decay
+                self._record_fusion_reward_component("fusion_repeat_decay", decay)
+                positive = reduced_positive
+                reasons.append("repeat_decay")
             reasons.append("success")
         else:
-            penalty_reason = reason or "failed"
+            penalty_reason = reason or ("failed" if not success else "fusion_no_effect")
             if penalty_reason == FUSION_ILLEGAL_INCOMPATIBLE:
                 negative += float(cfg.fusion_incompatible_penalty)
                 self._record_fusion_reward_component("fusion_incompatible_penalty", cfg.fusion_incompatible_penalty)
@@ -4500,6 +4649,14 @@ class PvZGymEnv:
                 "seed_unavailable",
                 "fusion_policy_none",
                 "fusion_not_available",
+                "target_not_available",
+                "gameplay_not_ready",
+                "not_gameplay",
+                "seed_selection_active",
+                "terminal_or_transition_state",
+                "reward_or_unlock_screen_active",
+                "startup_stale_command_blocked",
+                "coach_command_already_executed",
             }:
                 # Pre-condition blocks are not the model's fault: no penalty, no reward.
                 penalty_reason = ""
@@ -4515,6 +4672,18 @@ class PvZGymEnv:
             reasons.append("spam")
 
         capped_positive = self._apply_fusion_reward_cap(positive)
+        remaining_positive = capped_positive
+        for name, raw_value in positive_components:
+            applied_value = min(max(0.0, raw_value), max(0.0, remaining_positive))
+            if applied_value > 0.0:
+                self._record_fusion_reward_component(name, applied_value)
+                if name in {
+                    "fusion_threatened_row_bonus",
+                    "fusion_active_wave_bonus",
+                    "fusion_defensive_value_bonus",
+                }:
+                    self._fusion_last_usefulness_bonus += applied_value
+                remaining_positive -= applied_value
         net = capped_positive + negative
         self._fusion_reward_total = float(getattr(self, "_fusion_reward_total", 0.0)) + net
         self._fusion_last_reward_delta = net
@@ -4525,7 +4694,16 @@ class PvZGymEnv:
         source = str(action_result.get("fusionExecutionSource") or "")
         if source == "model_action_mask":
             return "model"
-        coach_source = str(action_result.get("coach_command_source") or action_result.get("coachCommandSource") or "")
+        coach_payload = action_result.get("humanCoach") if isinstance(action_result.get("humanCoach"), dict) else {}
+        coach_source = str(
+            action_result.get("coach_command_source")
+            or action_result.get("coachCommandSource")
+            or coach_payload.get("source")
+            or ""
+        )
+        coach_mode = str(coach_payload.get("commandMode") or coach_payload.get("command_mode") or "")
+        if coach_mode == "assist":
+            return "assist"
         if coach_source in {"human", "gui", "human_coach"}:
             return "human_coach"
         if coach_source in {"stream", "stream_coach"}:
@@ -4557,6 +4735,13 @@ class PvZGymEnv:
         if not is_fusion:
             return None
         success = bool(action_result.get("fusionSucceeded") or action_result.get("fusion_success"))
+        legal = bool(candidate.get("fusion_legal", success))
+        bridge_method = str(action_result.get("bridgeMethodUsed") or action_result.get("bridge_method_used") or "")
+        attempted = bool(
+            success
+            or action_result.get("fusionAttempted")
+            or (bridge_method and bridge_method != "none")
+        )
         changed = self._safe_int(action_result.get("changedTileCount"), action_result.get("changed_tile_count"), default=(1 if success else 0))
         reason = "" if success else str(
             action_result.get("fusionRejectedReason")
@@ -4564,9 +4749,13 @@ class PvZGymEnv:
             or action_result.get("bridgeResultReason")
             or "failed"
         )
+        if reason in {FUSION_ILLEGAL_INCOMPATIBLE, "empty_tile"}:
+            legal = False
         return {
             "source": self._fusion_source_from_result(action_result),
             "success": success,
+            "legal": legal,
+            "attempted": attempted,
             "board_changed": success and changed > 0,
             "reason": reason,
             "row": self._safe_int(decoded.get("row"), action_result.get("sourceRow"), candidate.get("source_row"), default=-1),
@@ -4595,6 +4784,10 @@ class PvZGymEnv:
             "fusion_reward_total": round(float(getattr(self, "_fusion_reward_total", 0.0)), 6),
             "fusion_attempt_reward_total": round(float(totals.get("fusion_attempt_reward", 0.0)), 6),
             "fusion_success_reward_total": round(float(totals.get("fusion_success_reward", 0.0)), 6),
+            "fusion_new_recipe_reward_total": round(float(totals.get("fusion_new_recipe_reward", 0.0)), 6),
+            "fusion_recursive_reward_total": round(float(totals.get("fusion_recursive_reward", 0.0)), 6),
+            "fusion_tier_reward_total": round(float(totals.get("fusion_tier_reward", 0.0)), 6),
+            "fusion_repeat_decay_total": round(float(totals.get("fusion_repeat_decay", 0.0)), 6),
             "fusion_threatened_row_bonus_total": round(float(totals.get("fusion_threatened_row_bonus", 0.0)), 6),
             "fusion_active_wave_bonus_total": round(float(totals.get("fusion_active_wave_bonus", 0.0)), 6),
             "fusion_defensive_value_bonus_total": round(float(totals.get("fusion_defensive_value_bonus", 0.0)), 6),
@@ -4626,6 +4819,45 @@ class PvZGymEnv:
             return None
         return max(0.0, time.time() - timestamp)
 
+    def _failed_fusion_action_result(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        reason: str,
+        requested_action: int,
+        executed_action: int,
+        source: str,
+        bridge_error: str = "",
+    ) -> Dict[str, Any]:
+        """Build a reward-visible result for a fusion that reached an attempt and failed."""
+        return {
+            "action": int(executed_action),
+            "requestedAction": int(requested_action),
+            "executedAction": int(executed_action),
+            "fusionAttempted": True,
+            "fusionSucceeded": False,
+            "fusion_success": False,
+            "fusionOverrideApplied": False,
+            "illegalAction": True,
+            "illegalReason": str(reason),
+            "fusionRejectedReason": str(reason),
+            "bridgeResultReason": str(reason),
+            "bridgeError": str(bridge_error or ""),
+            "changedTileCount": 0,
+            "changed_tile_count": 0,
+            "bridgeMethodUsed": "error" if bridge_error else "none",
+            "fusionExecutionSource": str(source),
+            "fusionCandidate": compact_candidate(candidate),
+            "decoded": {
+                "kind": "fusion",
+                "sourcePlantType": int(candidate.get("source_plant_type", -1)),
+                "ingredientPlantType": int(candidate.get("target_or_ingredient_type", -1)),
+                "resultPlantType": int(candidate.get("predicted_result_type", -1)),
+                "row": int(candidate.get("source_row", -1)),
+                "column": int(candidate.get("source_col", -1)),
+            },
+        }
+
     def _coach_fusion_freshness_rejection(
         self,
         pre_observation: Dict[str, Any],
@@ -4656,6 +4888,8 @@ class PvZGymEnv:
         executed_action: int,
         candidate: Dict[str, Any],
         coach_bridge_command: Dict[str, Any],
+        attempted: bool = False,
+        bridge_error: str = "",
     ) -> Dict[str, Any]:
         startup_blocked = str(reason) == "startup_stale_command_blocked"
         if startup_blocked:
@@ -4667,7 +4901,7 @@ class PvZGymEnv:
             "action": int(executed_action),
             "requestedAction": int(requested_action),
             "executedAction": int(executed_action),
-            "fusionAttempted": False,
+            "fusionAttempted": bool(attempted),
             "fusionSucceeded": False,
             "fusion_success": False,
             "fusionOverrideApplied": False,
@@ -4677,6 +4911,9 @@ class PvZGymEnv:
             "fusionRejectedReason": str(reason),
             "bridgeResultReason": str(reason),
             "bridge_result_reason": str(reason),
+            "bridgeError": str(bridge_error or ""),
+            "coach_command_source": str(coach_bridge_command.get("coach_command_source") or ""),
+            "fusionExecutionSource": str(coach_bridge_command.get("coach_command_source") or "human_coach"),
             "fusionScope": scope,
             "fusion_scope": scope,
             "requestedSourceRow": int(candidate.get("source_row", -1)),
@@ -4701,8 +4938,8 @@ class PvZGymEnv:
             "global_fusion_side_effect": False,
             "duplicateStackDetected": False,
             "duplicate_stack_detected": False,
-            "bridgeMethodUsed": "none",
-            "bridge_method_used": "none",
+            "bridgeMethodUsed": "error" if bridge_error else "none",
+            "bridge_method_used": "error" if bridge_error else "none",
             "executed_from_fresh_coach_command": False,
             "coach_command_age_seconds": age_seconds,
             "startup_command_blocked": bool(startup_blocked),
@@ -4820,9 +5057,17 @@ class PvZGymEnv:
             return result, diagnostics
         rejection = self._coach_fusion_rejection_reason(pre_observation, candidate, action_count=action_count)
         if rejection:
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, None, rejected_reason=rejection)
+            result = self._blocked_coach_fusion_result(
+                reason=rejection,
+                requested_action=requested_action,
+                executed_action=executed_action,
+                candidate=candidate,
+                coach_bridge_command=coach_bridge_command,
+                attempted=True,
+            )
+            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result, rejected_reason=rejection)
             self._last_fusion_diagnostics = diagnostics
-            return None, diagnostics
+            return result, diagnostics
         command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
         command_age_seconds = self._coach_command_age_seconds(coach_bridge_command)
         try:
@@ -4845,15 +5090,24 @@ class PvZGymEnv:
                 return_observation=False,
             )
         except Exception as exc:
+            result = self._blocked_coach_fusion_result(
+                reason="bridge_error",
+                requested_action=requested_action,
+                executed_action=executed_action,
+                candidate=candidate,
+                coach_bridge_command=coach_bridge_command,
+                attempted=True,
+                bridge_error=str(exc),
+            )
             diagnostics = apply_fusion_attempt_result(
                 diagnostics,
                 candidate,
-                None,
-                rejected_reason="exception",
+                result,
+                rejected_reason="bridge_error",
                 bridge_error=str(exc),
             )
             self._last_fusion_diagnostics = diagnostics
-            return None, diagnostics
+            return result, diagnostics
         if isinstance(result, dict):
             self._enforce_fusion_scope_contract(result)
             if command_id is not None:
@@ -4867,6 +5121,10 @@ class PvZGymEnv:
             result["coach_command_age_seconds"] = command_age_seconds
             result["startup_command_blocked"] = False
             result["coach_command_queue_cleared_on_reset"] = bool(self._coach_command_queue_cleared_on_reset)
+            result["coach_command_source"] = str(coach_bridge_command.get("coach_command_source") or "")
+            result["fusionExecutionSource"] = str(
+                coach_bridge_command.get("coach_command_source") or "human_coach"
+            )
             result["executed_coach_command_id"] = command_id
             result["last_executed_coach_command_id"] = self._last_executed_coach_command_id
             result["fusionCandidate"] = compact_candidate(candidate)
@@ -4929,11 +5187,13 @@ class PvZGymEnv:
         source_type = int(candidate.get("source_plant_type", -1))
         source_instance = int(candidate.get("source_instance_id", 0))
         source_found = False
+        tile_occupied = False
         for plant in observation.get("plants", []) or []:
             if not isinstance(plant, dict):
                 continue
             if int(plant.get("row", -1)) != row or int(plant.get("column", -1)) != col:
                 continue
+            tile_occupied = True
             if int(plant.get("type", -1)) != source_type:
                 continue
             plant_instance = int(plant.get("instanceId", plant.get("instanceID", 0)) or 0)
@@ -4942,7 +5202,7 @@ class PvZGymEnv:
             source_found = True
             break
         if not source_found:
-            return "source_not_found"
+            return "source_not_found" if tile_occupied else "empty_tile"
         slot_index = int(candidate.get("ingredient_seed_slot_index", -1))
         ingredient_type = int(candidate.get("target_or_ingredient_type", -1))
         slot_found = False
@@ -6150,6 +6410,30 @@ class PvZGymEnv:
             allowed, _ = self._python_action_filter(action_id, obs, bridge_actions=bridge_actions)
             if allowed:
                 mask[action_id] = 1
+        # Normal bridge legal-actions deliberately exclude occupied cells. Add
+        # compatible occupied-tile actions explicitly so MaskablePPO can select
+        # a fusion using the existing slot/cell action identity.
+        if self._fusion_action_mask_enabled():
+            slots = seed_slots_from_observation(obs, self.config.plant_types)
+            occupied_cells = {
+                (
+                    self._safe_int(plant.get("row"), default=-1),
+                    self._safe_int(plant.get("column"), default=-1),
+                )
+                for plant in (obs.get("plants", []) or [])
+                if isinstance(plant, dict)
+            }
+            for slot_position, slot in enumerate(slots):
+                slot_index = self._safe_int(slot.get("slotIndex"), default=slot_position)
+                for row, column in occupied_cells:
+                    if not (0 <= row < rows and 0 <= column < cols):
+                        continue
+                    action_id = 1 + slot_index * rows * cols + row * cols + column
+                    if not 0 <= action_id < action_count:
+                        continue
+                    allowed, _ = self._python_action_filter(action_id, obs, bridge_actions=bridge_actions)
+                    if allowed:
+                        mask[action_id] = 1
         if self._tactical_masks_enabled():
             mask, _ = self._apply_tactical_action_mask(obs, mask)
         return mask
