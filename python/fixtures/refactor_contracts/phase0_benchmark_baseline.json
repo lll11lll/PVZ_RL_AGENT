@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "command": "python ./python/benchmark_hotpaths.py --samples 30 --rounds 3 --json-out ./runs/benchmarks/phase0_python_baseline.json",
+  "environment": {
+    "implementation": "CPython",
+    "platform": "Windows-10-10.0.19045-SP0",
+    "python": "3.14.0"
+  },
+  "methodology": {
+    "clock": "perf_counter_ns",
+    "fixture": "synthetic_dense_5x10_25plants_30zombies",
+    "gc_disabled_during_samples": true,
+    "p95": "nearest_rank",
+    "rounds": 3,
+    "samples_per_round": 30
+  },
+  "contracts": {
+    "dense_observation_sha256": "8d0260e4bf163a150b78d1cfc1ebbd48fa5660081adb9882ad571e44c7b313e7",
+    "identity_mask_sha256": "80f460d9b9c96968dc6b683c0c7ac848eba201063f0d2aeb22fecf74aab2b5c4",
+    "identity_mask_true_count": 433,
+    "identity_vector_sha256": "8c2d354712897de4edd7158f23b4885224f789b59f564807ea43fabab6a0be6f",
+    "identity_vector_size": 4297
+  },
+  "results_ms": {
+    "action_mask_fixed_dense": {"median": 1.8603, "p95": 3.5211},
+    "action_mask_identity_dense": {"median": 11.25345, "p95": 12.8124},
+    "action_mask_identity_low_sun": {"median": 2.63705, "p95": 3.2915},
+    "action_mask_identity_cooldown": {"median": 1.51315, "p95": 1.5571},
+    "action_mask_identity_no_fusion": {"median": 8.6765, "p95": 9.1198},
+    "observation_encode_fixed_sparse": {"median": 0.206, "p95": 0.2201},
+    "observation_encode_identity_sparse": {"median": 0.5377, "p95": 0.5553},
+    "reward_breakdown_dense": {"median": 0.2715, "p95": 0.2855},
+    "fusion_candidate_scan_dense": {"median": 5.81045, "p95": 6.119},
+    "live_status_build_dense": {"median": 21.82135, "p95": 22.5792},
+    "live_status_json_serialize": {"median": 0.17645, "p95": 0.1912},
+    "live_status_atomic_write": {"median": 4.2492, "p95": 4.5812},
+    "gui_unchanged_status_read_parse": {"median": 0.40765, "p95": 0.6202},
+    "gui_status_signature_only": {"median": 0.0289, "p95": 0.0332}
+  },
+  "limitations": [
+    "No live bridge or Unity timing",
+    "No PPO inference or rollout SPS",
+    "No full Tk widget rendering",
+    "Filesystem results depend on Windows cache and device state"
+  ]
+}

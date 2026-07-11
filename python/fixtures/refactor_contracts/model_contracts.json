@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "protected_generalist": {
+    "source_model_path": "runs/ppo_adventure_generalist_14slot_identity_v1_20260627_172727/checkpoints/ppo_pvz_370000_steps.zip",
+    "source_metadata_path": "runs/ppo_adventure_generalist_14slot_identity_v1_20260627_172727/model_metadata.json",
+    "action_space_mode": "adventure_14slot_identity",
+    "action_count": 701,
+    "max_seed_slots": 14,
+    "identity_seed_slots": true,
+    "observation_version": "adventure_14slot_identity_v1",
+    "action_decoder_version": "seedslot14x50_plus_wait_v1",
+    "decoder_wait_action": 0,
+    "placement_action_range": [1, 700],
+    "rows": 5,
+    "cols": 10,
+    "cells_per_seed_slot": 50,
+    "observation_shape": [4297],
+    "num_timesteps": 370000,
+    "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
+    "plant_types": [1, 1, 0, 0]
+  },
+  "fixed_control": {
+    "source_model_path": "python/runs/ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_130623/model.zip",
+    "source_metadata_path": "python/runs/ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_130623/model_metadata.json",
+    "action_space_mode": "fixed",
+    "action_count": 201,
+    "max_seed_slots": 4,
+    "identity_seed_slots": false,
+    "observation_version": "fixed_slot_v1",
+    "action_decoder_version": "fixed_slot_4x50_plus_wait_v1",
+    "decoder_wait_action": 0,
+    "placement_action_range": [1, 200],
+    "rows": 5,
+    "cols": 10,
+    "cells_per_seed_slot": 50,
+    "observation_shape": [357],
+    "num_timesteps": 350368,
+    "seed_list": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
+    "plant_types": [1, 0, 3, 2]
+  }
+}

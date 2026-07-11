@@ -1,0 +1,214 @@
+{
+  "boardFound": true,
+  "canReadBoard": true,
+  "createPlantFound": true,
+  "gameplayReady": true,
+  "actualGameplayReady": true,
+  "seedSelectionActive": false,
+  "seedSelectionPanelActive": false,
+  "blockingRewardUiActive": false,
+  "rowCount": 5,
+  "columnCount": 10,
+  "actionCount": 701,
+  "sun": 175,
+  "wave": 3,
+  "maxWave": 10,
+  "killCount": 7,
+  "time": 12.5,
+  "moreZombiesComing": true,
+  "done": false,
+  "over": false,
+  "plantCount": 3,
+  "visiblePlantObjectCount": 3,
+  "zombieCount": 2,
+  "totalPlantHealth": 950,
+  "logicalMowerCount": 5,
+  "frameCount": 1234,
+  "screenState": "gameplay",
+  "terminalHint": "",
+  "legalActionCount": 6,
+  "legalActions": [
+    0,
+    2,
+    10,
+    51,
+    124,
+    174
+  ],
+  "unlockedSeedNames": [
+    "SunFlower",
+    "Peashooter",
+    "WallNut",
+    "CherryBomb"
+  ],
+  "availableSeedNames": [
+    "SunFlower",
+    "Peashooter",
+    "WallNut",
+    "CherryBomb"
+  ],
+  "selectedSeedNames": [
+    "SunFlower",
+    "SunFlower",
+    "Peashooter",
+    "Peashooter"
+  ],
+  "unlockedSeedPlantTypes": [1, 0, 3, 2],
+  "visibleSeedPlantTypes": [1, 0, 3, 2],
+  "seedSlots": [
+    {
+      "slotIndex": 0,
+      "cardInstanceId": 1000,
+      "plantType": 1,
+      "plantTypeName": "SunFlower",
+      "seedCost": 50,
+      "ready": true,
+      "disabled": false,
+      "isAvailable": true,
+      "rawCooldown": 0.0,
+      "fullCooldown": 7.5,
+      "currentCooldown": 0.0,
+      "usable": true,
+      "source": "fixture"
+    },
+    {
+      "slotIndex": 1,
+      "cardInstanceId": 1001,
+      "plantType": 1,
+      "plantTypeName": "SunFlower",
+      "seedCost": 100,
+      "ready": false,
+      "disabled": false,
+      "isAvailable": true,
+      "rawCooldown": 3.75,
+      "fullCooldown": 7.5,
+      "currentCooldown": 3.75,
+      "usable": true,
+      "source": "fixture"
+    },
+    {
+      "slotIndex": 2,
+      "cardInstanceId": 1002,
+      "plantType": 0,
+      "plantTypeName": "Peashooter",
+      "seedCost": 100,
+      "ready": true,
+      "disabled": false,
+      "isAvailable": true,
+      "rawCooldown": 0.0,
+      "fullCooldown": 7.5,
+      "currentCooldown": 0.0,
+      "usable": true,
+      "source": "fixture"
+    },
+    {
+      "slotIndex": 3,
+      "cardInstanceId": 1003,
+      "plantType": 0,
+      "plantTypeName": "Peashooter",
+      "seedCost": 200,
+      "ready": true,
+      "disabled": false,
+      "isAvailable": true,
+      "rawCooldown": 0.0,
+      "fullCooldown": 7.5,
+      "currentCooldown": 0.0,
+      "usable": true,
+      "source": "fixture"
+    }
+  ],
+  "plants": [
+    {
+      "row": 0,
+      "column": 0,
+      "type": 1,
+      "typeName": "SunFlower",
+      "instanceId": 2000,
+      "health": 300,
+      "maxHealth": 300,
+      "attackCooldown": 0.0,
+      "produceCooldown": 8.0
+    },
+    {
+      "row": 2,
+      "column": 3,
+      "type": 0,
+      "typeName": "Peashooter",
+      "instanceId": 2001,
+      "health": 250,
+      "maxHealth": 300,
+      "attackCooldown": 0.75,
+      "produceCooldown": 0.0
+    },
+    {
+      "row": 4,
+      "column": 9,
+      "type": 1030,
+      "typeName": "Repeater",
+      "instanceId": 2002,
+      "health": 400,
+      "maxHealth": 400,
+      "attackCooldown": 0.25,
+      "produceCooldown": 0.0
+    }
+  ],
+  "visiblePlants": [],
+  "zombies": [
+    {
+      "row": 1,
+      "type": 2,
+      "x": 7.5,
+      "health": 270,
+      "maxHealth": 270
+    },
+    {
+      "row": 4,
+      "type": 4,
+      "x": 4.0,
+      "health": 500,
+      "maxHealth": 900
+    }
+  ],
+  "lanes": [
+    {
+      "row": 0,
+      "zombieCount": 0,
+      "nearestZombieX": null,
+      "nearestZombieHealth": 0,
+      "nearestZombieType": 0,
+      "danger": 0.0
+    },
+    {
+      "row": 1,
+      "zombieCount": 1,
+      "nearestZombieX": 7.5,
+      "nearestZombieHealth": 270,
+      "nearestZombieType": 2,
+      "danger": 0.25
+    },
+    {
+      "row": 2,
+      "zombieCount": 0,
+      "nearestZombieX": null,
+      "nearestZombieHealth": 0,
+      "nearestZombieType": 0,
+      "danger": 0.0
+    },
+    {
+      "row": 3,
+      "zombieCount": 0,
+      "nearestZombieX": null,
+      "nearestZombieHealth": 0,
+      "nearestZombieType": 0,
+      "danger": 0.0
+    },
+    {
+      "row": 4,
+      "zombieCount": 1,
+      "nearestZombieX": 4.0,
+      "nearestZombieHealth": 500,
+      "nearestZombieType": 4,
+      "danger": 0.6
+    }
+  ]
+}
