@@ -2751,6 +2751,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.log_history_chars = sum(len(line) for line in self.log_history)
         if not hasattr(self, "log_dropped_lines"):
             self.log_dropped_lines = 0
+        previous_history_length = len(self.log_history)
         self.log_history.extend(lines)
         self.log_history_chars += sum(len(line) for line in lines)
 
@@ -2764,6 +2765,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             del self.log_history[:drop_count]
             self.log_history_chars = max(0, retained_chars)
             self.log_dropped_lines += drop_count
+        incoming_drop_count = max(0, drop_count - previous_history_length)
+        retained_text = "".join(lines[incoming_drop_count:])
         if self.log_text is None:
             return
         filter_var = getattr(self, "log_filter_var", None)
@@ -2775,7 +2778,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         if filtering:
             self._request_log_view_refresh()
             return
-        self._append_unfiltered_log_view(text, drop_count)
+        self._append_unfiltered_log_view(retained_text, drop_count)
 
     def _append_unfiltered_log_view(self, text: str, drop_count: int) -> None:
         if self.log_text is None:
@@ -2790,7 +2793,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             if notice:
                 self.log_text.insert("1.0", notice)
             self._log_notice_present = bool(notice)
-        self.log_text.insert("end", text)
+        if text:
+            self.log_text.insert("end", text)
         if pause_var is None or not pause_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")

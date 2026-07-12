@@ -320,6 +320,32 @@ def test_log_rollover_updates_widget_incrementally_without_full_rebuild() -> Non
     assert len(dashboard.log_history) == LOG_HISTORY_MAX_LINES
 
 
+def test_oversized_incoming_log_text_never_bypasses_retention_in_widget() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_text = FakeText()
+    dashboard.log_pause_autoscroll_var = FakeVar()
+
+    dashboard._append_log("x" * (LOG_HISTORY_MAX_CHARS + 1))
+
+    assert dashboard.log_history == []
+    assert dashboard.log_history_chars == 0
+    assert dashboard.log_dropped_lines == 1
+    assert not any(index == "end" and len(text) > LOG_HISTORY_MAX_CHARS for index, text in dashboard.log_text.insert_calls)
+
+
+def test_oversized_incoming_log_batch_inserts_only_retained_suffix() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_text = FakeText()
+    dashboard.log_pause_autoscroll_var = FakeVar()
+    incoming = "".join(f"line {index}\n" for index in range(LOG_HISTORY_MAX_LINES + 25))
+
+    dashboard._append_log(incoming)
+
+    retained = "".join(f"line {index}\n" for index in range(25, LOG_HISTORY_MAX_LINES + 25))
+    assert dashboard.log_history == retained.splitlines(keepends=True)
+    assert dashboard.log_text.insert_calls[-1] == ("end", retained)
+
+
 def test_filtered_log_bursts_schedule_only_one_full_refresh() -> None:
     dashboard = _bare_dashboard()
     dashboard.log_text = FakeText()
