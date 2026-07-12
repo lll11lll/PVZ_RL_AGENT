@@ -24,7 +24,7 @@ from pvzrl_registry import PlantRegistryError, get_plant_registry
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "scripts" / "generate_bridge_registry.py"
 GENERATED_CSHARP = ROOT / "src" / "PvZRLBridge" / "GeneratedPlantRegistry.cs"
-BRIDGE_SOURCE = ROOT / "src" / "PvZRLBridge" / "BridgeMod.cs"
+BRIDGE_SOURCE_DIR = ROOT / "src" / "PvZRLBridge"
 BUILD_SCRIPT = ROOT / "scripts" / "build_bridge.ps1"
 GUI_SOURCE = ROOT / "python" / "pvzrl_gui.py"
 
@@ -171,7 +171,10 @@ def test_generated_bridge_registry_is_deterministic_and_complete(tmp_path: Path)
 
 
 def test_bridge_uses_generated_fallbacks_after_runtime_card_sources() -> None:
-    bridge = BRIDGE_SOURCE.read_text(encoding="utf-8")
+    bridge = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(BRIDGE_SOURCE_DIR.glob("*.cs"), key=lambda path: path.name)
+    )
     build = BUILD_SCRIPT.read_text(encoding="utf-8")
     get_cost_start = bridge.index("private PlantCostInfo GetPlantCost")
     get_cost_end = bridge.index("private static PlantCostInfo GetFallbackPlantCost", get_cost_start)
