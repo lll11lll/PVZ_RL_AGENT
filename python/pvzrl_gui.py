@@ -2906,7 +2906,12 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
                 process.kill()
             except OSError as exc:
                 self._append_log(f"ERROR: Final close-time kill failed: {exc}\n")
-            self._close_deadline = time.monotonic() + STOP_KILL_WAIT_SECONDS
+            if process.poll() is None:
+                self._append_log(
+                    "ERROR: Process did not report exit by the hard GUI close deadline; "
+                    "closing the dashboard after final kill attempt.\n"
+                )
+            process = None
 
         if process is not None and process.poll() is None:
             self._schedule_after("_close_after_id", CLOSE_POLL_MS, self._poll_close_cleanup)

@@ -115,6 +115,17 @@ class TimeoutThenKillProcess(ImmediateExitProcess):
         return int(self.returncode)
 
 
+class NeverExitProcess(ImmediateExitProcess):
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired("test", timeout)
+
+
 def _bare_dashboard() -> PvZDashboard:
     dashboard = PvZDashboard.__new__(PvZDashboard)
     dashboard.root = FakeRoot()
@@ -177,6 +188,25 @@ def test_close_drains_bounded_queue_before_destroy() -> None:
     dashboard._on_close()
     assert dashboard.root.destroyed is True
     assert dashboard.log_queue.empty()
+
+
+def test_close_hard_deadline_destroys_root_when_process_never_exits() -> None:
+    dashboard = _bare_dashboard()
+    process = NeverExitProcess()
+    dashboard.active_process = process
+    dashboard.active_process_name = "training"
+
+    dashboard._on_close()
+    assert dashboard._stopper_thread is not None
+    dashboard._stopper_thread.join(timeout=1.0)
+    dashboard._close_deadline = time.monotonic() - 1.0
+    dashboard._poll_close_cleanup()
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls >= 1
+    assert dashboard._destroyed is True
+    assert dashboard.root.destroyed is True
+    assert dashboard._close_after_id is None
 
 
 def test_stop_escalates_only_after_grace_timeout() -> None:
