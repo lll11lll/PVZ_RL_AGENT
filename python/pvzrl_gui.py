@@ -59,6 +59,7 @@ from pvzrl_registry import get_plant_registry
 POLL_MS = 1000
 LOG_HISTORY_MAX_LINES = 5000
 LOG_HISTORY_MAX_CHARS = 1_000_000
+LOG_VIEW_REFRESH_MIN_SECONDS = 0.1
 CLOSE_POLL_MS = 50
 PROCESS_THREAD_JOIN_SECONDS = 0.2
 CLOSE_LOG_DRAIN_SECONDS = 0.3
@@ -396,7 +397,11 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         self._stopping_process: Optional[subprocess.Popen[str]] = None
         self._poll_after_id: Optional[str] = None
         self._log_after_id: Optional[str] = None
+        self._log_view_after_id: Optional[str] = None
         self._close_after_id: Optional[str] = None
+        self._last_log_view_refresh_at = 0.0
+        self._log_view_dirty = False
+        self._log_notice_present = False
         self._closing = False
         self._destroyed = False
         self._close_deadline = 0.0
@@ -2754,11 +2759,14 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         plt.close(fig)
 
     def clear_logs(self) -> None:
+        self._cancel_after("_log_view_after_id")
         history = getattr(self, "log_history", None)
         if history is not None:
             history.clear()
         self.log_history_chars = 0
         self.log_dropped_lines = 0
+        self._log_view_dirty = False
+        self._log_notice_present = False
         if self.log_text is None:
             return
         self.log_text.configure(state="normal")
@@ -2797,16 +2805,48 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         filtering = (filter_var is not None and filter_var.get().strip()) or (
             severity_var is not None and severity_var.get() != "All"
         )
-        if filtering or drop_count:
-            self._refresh_log_view()
+        if filtering:
+            self._request_log_view_refresh()
             return
+        self._append_unfiltered_log_view(text, drop_count)
+
+    def _append_unfiltered_log_view(self, text: str, drop_count: int) -> None:
+        if self.log_text is None:
+            return
+        pause_var = getattr(self, "log_pause_autoscroll_var", None)
         self.log_text.configure(state="normal")
+        if drop_count:
+            if bool(getattr(self, "_log_notice_present", False)):
+                self.log_text.delete("1.0", "2.0")
+            self.log_text.delete("1.0", f"{drop_count + 1}.0")
+            notice = self._log_drop_notice()
+            if notice:
+                self.log_text.insert("1.0", notice)
+            self._log_notice_present = bool(notice)
         self.log_text.insert("end", text)
         if pause_var is None or not pause_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _request_log_view_refresh(self) -> None:
+        self._log_view_dirty = True
+        elapsed = time.monotonic() - float(getattr(self, "_last_log_view_refresh_at", 0.0) or 0.0)
+        if elapsed >= LOG_VIEW_REFRESH_MIN_SECONDS:
+            self._refresh_log_view()
+            return
+        if getattr(self, "_log_view_after_id", None) is not None:
+            return
+        delay_ms = max(1, int((LOG_VIEW_REFRESH_MIN_SECONDS - elapsed) * 1000))
+        self._schedule_after("_log_view_after_id", delay_ms, self._flush_log_view_refresh)
+
+    def _flush_log_view_refresh(self) -> None:
+        self._log_view_after_id = None
+        if self._destroyed or not bool(getattr(self, "_log_view_dirty", False)):
+            return
+        self._refresh_log_view()
+
     def _refresh_log_view(self) -> None:
+        self._cancel_after("_log_view_after_id")
         if self.log_text is None:
             return
         search = self.log_filter_var.get().strip().lower()
@@ -2834,6 +2874,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         if not self.log_pause_autoscroll_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        self._last_log_view_refresh_at = time.monotonic()
+        self._log_view_dirty = False
+        self._log_notice_present = bool(self._log_drop_notice())
 
     def _log_drop_notice(self) -> str:
         dropped = int(getattr(self, "log_dropped_lines", 0) or 0)

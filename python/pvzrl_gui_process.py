@@ -213,6 +213,7 @@ class ProcessLogMixin:
     def _cancel_scheduled_callbacks(self, *, include_close: bool = True) -> None:
         self._cancel_after("_poll_after_id")
         self._cancel_after("_log_after_id")
+        self._cancel_after("_log_view_after_id")
         if include_close:
             self._cancel_after("_close_after_id")
 

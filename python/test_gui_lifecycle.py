@@ -48,6 +48,29 @@ class FakeVar:
     def set(self, value: str) -> None:
         self.value = str(value)
 
+    def get(self) -> str:
+        return self.value
+
+
+class FakeText:
+    def __init__(self) -> None:
+        self.configure_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[tuple[str, str]] = []
+        self.insert_calls: list[tuple[str, str]] = []
+        self.see_calls: list[str] = []
+
+    def configure(self, **kwargs: Any) -> None:
+        self.configure_calls.append(dict(kwargs))
+
+    def delete(self, start: str, end: str) -> None:
+        self.delete_calls.append((start, end))
+
+    def insert(self, index: str, text: str) -> None:
+        self.insert_calls.append((index, text))
+
+    def see(self, index: str) -> None:
+        self.see_calls.append(index)
+
 
 class ImmediateExitProcess:
     def __init__(self) -> None:
@@ -268,6 +291,46 @@ def test_log_queue_and_retained_history_are_bounded_with_drop_accounting() -> No
     assert len(dashboard.log_history) <= LOG_HISTORY_MAX_LINES
     assert dashboard.log_history_chars <= LOG_HISTORY_MAX_CHARS
     assert dashboard.log_dropped_lines >= 20
+
+
+def test_log_rollover_updates_widget_incrementally_without_full_rebuild() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_text = FakeText()
+    dashboard.log_history = ["old\n"] * LOG_HISTORY_MAX_LINES
+    dashboard.log_history_chars = sum(len(line) for line in dashboard.log_history)
+    dashboard.log_pause_autoscroll_var = FakeVar()
+
+    dashboard._append_log("new\n" * 25)
+
+    assert ("1.0", "26.0") in dashboard.log_text.delete_calls
+    assert ("1.0", "end") not in dashboard.log_text.delete_calls
+    assert dashboard.log_text.insert_calls[0][0] == "1.0"
+    assert dashboard.log_text.insert_calls[-1] == ("end", "new\n" * 25)
+    assert len(dashboard.log_history) == LOG_HISTORY_MAX_LINES
+
+
+def test_filtered_log_bursts_schedule_only_one_full_refresh() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_text = FakeText()
+    dashboard.log_filter_var = FakeVar()
+    dashboard.log_filter_var.value = "needle"
+    dashboard.log_severity_var = FakeVar()
+    dashboard.log_severity_var.value = "All"
+    dashboard.log_pause_autoscroll_var = FakeVar()
+    dashboard._last_log_view_refresh_at = time.monotonic()
+    dashboard._log_view_after_id = None
+    refresh_calls: list[bool] = []
+    dashboard._refresh_log_view = lambda: refresh_calls.append(True)
+
+    dashboard._append_log("needle one\n")
+    callback_id = dashboard._log_view_after_id
+    dashboard._append_log("needle two\n")
+
+    assert callback_id is not None
+    assert dashboard._log_view_after_id == callback_id
+    assert len(dashboard.root.callbacks) == 1
+    dashboard.root.callbacks[callback_id]()
+    assert refresh_calls == [True]
 
 
 def test_unchanged_live_status_uses_cached_parse_and_recomputes_age(tmp_path: Path) -> None:
