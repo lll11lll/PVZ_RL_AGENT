@@ -86,8 +86,9 @@ public sealed partial class BridgeMod
             obs.ZombieMaxX = board.zombieMaxX;
             AddSpeedDiagnostics(obs, board);
 
-            AddPlantCosts(obs);
-            AddCardCooldowns(obs);
+            List<CardUI>? observationCards = null;
+            AddPlantCosts(obs, ref observationCards);
+            AddCardCooldowns(obs, ref observationCards);
             AddPlants(board, obs);
             if (includeDebugArrays)
             {
@@ -269,11 +270,18 @@ public sealed partial class BridgeMod
         obs.UnknownVisibleSeedNames = Array.Empty<string>();
     }
 
-    private void AddPlantCosts(ObservationDto obs)
+    private void AddPlantCosts(
+        ObservationDto obs,
+        ref List<CardUI>? observationCards)
     {
+        var resolvedCosts = new Dictionary<int, PlantCostInfo>();
         foreach (var plantTypeId in _config.PlantTypes)
         {
-            var cost = GetPlantCost(plantTypeId);
+            if (!resolvedCosts.TryGetValue(plantTypeId, out var cost))
+            {
+                cost = GetPlantCost(plantTypeId, ref observationCards);
+                resolvedCosts[plantTypeId] = cost;
+            }
             obs.PlantCosts.Add(new PlantCostDto
             {
                 PlantType = plantTypeId,
@@ -284,11 +292,14 @@ public sealed partial class BridgeMod
         }
     }
 
-    private void AddCardCooldowns(ObservationDto obs)
+    private void AddCardCooldowns(
+        ObservationDto obs,
+        ref List<CardUI>? observationCards)
     {
         foreach (var plantTypeId in _config.PlantTypes)
         {
-            obs.CardCooldowns.Add(GetCardCooldown(plantTypeId));
+            obs.CardCooldowns.Add(
+                GetCardCooldown(plantTypeId, ref observationCards));
         }
     }
 
@@ -553,6 +564,14 @@ public sealed partial class BridgeMod
 
     private PlantCostInfo GetPlantCost(int plantTypeId)
     {
+        List<CardUI>? cards = null;
+        return GetPlantCost(plantTypeId, ref cards);
+    }
+
+    private PlantCostInfo GetPlantCost(
+        int plantTypeId,
+        ref List<CardUI>? cards)
+    {
         if (_seedRuntimeCache.Valid &&
             !_seedRuntimeCache.SeedSelectionActive &&
             _seedRuntimeCache.CachedPlantCosts.TryGetValue(plantTypeId, out var cachedCost) &&
@@ -566,7 +585,9 @@ public sealed partial class BridgeMod
             };
         }
 
-        var fromCard = TryReadPlantCostFromCards(plantTypeId);
+        var fromCard = TryReadPlantCostFromCards(
+            plantTypeId,
+            ResolveCardUiSnapshot(ref cards));
         if (fromCard != null)
         {
             return fromCard;
@@ -589,39 +610,33 @@ public sealed partial class BridgeMod
         };
     }
 
-    private PlantCostInfo? TryReadPlantCostFromCards(int plantTypeId)
+    private PlantCostInfo? TryReadPlantCostFromCards(
+        int plantTypeId,
+        IReadOnlyList<CardUI> cards)
     {
         var candidates = new List<int>();
-        try
+        foreach (var card in cards)
         {
-            var cards = Object.FindObjectsOfType<CardUI>();
-            foreach (var card in cards)
+            try
             {
-                try
+                if (card == null || (int)card.thePlantType != plantTypeId)
                 {
-                    if (card == null || (int)card.thePlantType != plantTypeId)
-                    {
-                        continue;
-                    }
-
-                    var active = false;
-                    try { active = card.gameObject != null && card.gameObject.activeInHierarchy; } catch { }
-                    var selectedOrBanked = SafeCardSelectedOrBanked(card);
-                    var cost = Math.Max(0, card.theSeedCost);
-                    if (active && selectedOrBanked && cost > 0)
-                    {
-                        candidates.Add(cost);
-                    }
+                    continue;
                 }
-                catch
+
+                var active = false;
+                try { active = card.gameObject != null && card.gameObject.activeInHierarchy; } catch { }
+                var selectedOrBanked = SafeCardSelectedOrBanked(card);
+                var cost = Math.Max(0, card.theSeedCost);
+                if (active && selectedOrBanked && cost > 0)
                 {
-                    // Ignore stale CardUI wrappers and continue searching.
+                    candidates.Add(cost);
                 }
             }
-        }
-        catch
-        {
-            // Card UI is not available on every scene. The limited fallback below is intentional.
+            catch
+            {
+                // Ignore stale CardUI wrappers and continue searching.
+            }
         }
 
         if (candidates.Count == 0)
@@ -639,13 +654,23 @@ public sealed partial class BridgeMod
 
     private CardCooldownDto GetCardCooldown(int plantTypeId)
     {
+        List<CardUI>? cards = null;
+        return GetCardCooldown(plantTypeId, ref cards);
+    }
+
+    private CardCooldownDto GetCardCooldown(
+        int plantTypeId,
+        ref List<CardUI>? cards)
+    {
         if (TryGetCachedGameplayCardCooldown(plantTypeId, out var cachedCooldown))
         {
             return cachedCooldown;
         }
 
-        var cards = FindCardsForPlant(plantTypeId);
-        if (cards.Count == 0)
+        var matchingCards = FindCardsForPlant(
+            plantTypeId,
+            ResolveCardUiSnapshot(ref cards));
+        if (matchingCards.Count == 0)
         {
             return new CardCooldownDto
             {
@@ -658,7 +683,7 @@ public sealed partial class BridgeMod
         }
 
         CardCooldownDto? best = null;
-        foreach (var card in cards)
+        foreach (var card in matchingCards)
         {
             try
             {
@@ -687,7 +712,7 @@ public sealed partial class BridgeMod
             };
         }
 
-        best.MatchingCardCount = cards.Count;
+        best.MatchingCardCount = matchingCards.Count;
         return best;
     }
 
@@ -957,22 +982,56 @@ public sealed partial class BridgeMod
 
     private List<CardUI> FindCardsForPlant(int plantTypeId)
     {
+        return FindCardsForPlant(plantTypeId, ScanCardUiSnapshot());
+    }
+
+    private static List<CardUI> FindCardsForPlant(
+        int plantTypeId,
+        IReadOnlyList<CardUI> cards)
+    {
         var result = new List<CardUI>();
+        foreach (var card in cards)
+        {
+            try
+            {
+                if (card != null && (int)card.thePlantType == plantTypeId)
+                {
+                    result.Add(card);
+                }
+            }
+            catch
+            {
+                // Ignore stale CardUI wrappers.
+            }
+        }
+
+        return result;
+    }
+
+    private static IReadOnlyList<CardUI> ResolveCardUiSnapshot(
+        ref List<CardUI>? cards)
+    {
+        cards ??= ScanCardUiSnapshot();
+        return cards;
+    }
+
+    private static List<CardUI> ScanCardUiSnapshot()
+    {
+        var cards = new List<CardUI>();
         try
         {
-            var cards = Object.FindObjectsOfType<CardUI>();
-            foreach (var card in cards)
+            foreach (var card in Object.FindObjectsOfType<CardUI>())
             {
                 try
                 {
-                    if (card != null && (int)card.thePlantType == plantTypeId)
+                    if (card != null)
                     {
-                        result.Add(card);
+                        cards.Add(card);
                     }
                 }
                 catch
                 {
-                    // Ignore stale CardUI wrappers.
+                    // Ignore stale CardUI wrappers and retain the rest.
                 }
             }
         }
@@ -980,8 +1039,7 @@ public sealed partial class BridgeMod
         {
             // Card UI is not available on every scene.
         }
-
-        return result;
+        return cards;
     }
 
     private bool TryStartCardCooldown(int plantTypeId, out string source)
