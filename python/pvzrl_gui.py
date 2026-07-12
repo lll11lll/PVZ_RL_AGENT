@@ -47,9 +47,11 @@ from pvzrl_gui_process import (
 )
 from pvzrl_gui_status import (
     LIVE_MAX_AGE_SECONDS,
+    MISSING,
     STALE_MAX_AGE_SECONDS,
     DiagnosticsRenderKey,
     LiveStatusReader,
+    NormalizedStatusIndex,
     classify_live_health,
     diagnostics_render_key,
 )
@@ -70,7 +72,6 @@ DEFAULT_LIVE_STATUS_PATH = Path("runs") / "live_status.json"
 DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
 DEFAULT_HUMAN_COACH_LOG_PATH = Path("runs") / "human_coach.jsonl"
 DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
-MISSING = object()
 _PLANT_REGISTRY = get_plant_registry()
 _FOUR_SLOT_CURRENT = _PLANT_REGISTRY.require_gui_preset("four_slot_current")
 _FOUR_SLOT_DUPLICATE = _PLANT_REGISTRY.require_gui_preset("four_slot_duplicate")
@@ -3408,6 +3409,17 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
             return default
         return fmt_value(value)
 
+    def _set_live_variable(self, variable: Any, value: Any) -> bool:
+        target = str(value)
+        try:
+            current = str(variable.get())
+        except (AttributeError, tk.TclError):
+            current = ""
+        if current == target:
+            return False
+        variable.set(value)
+        return True
+
     def _set_coach_live_fields(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             payload = {}
@@ -3448,10 +3460,10 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         ):
             if not hasattr(self, var_name):
                 setattr(self, var_name, _FallbackStringVar())
-        self.human_coach_enabled_status_var.set(
+        self._set_live_variable(self.human_coach_enabled_status_var,
             self._live_value_text(payload, ["human_coach_enabled", "human_coach.human_coach_enabled"])
         )
-        self.human_coach_last_command_var.set(
+        self._set_live_variable(self.human_coach_last_command_var,
             self._live_value_text(
                 payload,
                 [
@@ -3461,7 +3473,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
                 ],
             )
         )
-        self.human_coach_last_action_var.set(
+        self._set_live_variable(self.human_coach_last_action_var,
             self._live_value_text(
                 payload,
                 [
@@ -3471,7 +3483,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
                 ],
             )
         )
-        self.human_coach_last_error_var.set(
+        self._set_live_variable(self.human_coach_last_error_var,
             self._live_value_text(
                 payload,
                 [
@@ -3486,20 +3498,20 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
                 ],
             )
         )
-        self.human_coach_override_count_var.set(
+        self._set_live_variable(self.human_coach_override_count_var,
             self._live_value_text(payload, ["human_coach_override_count", "human_coach.override_count"])
         )
-        self.human_coach_match_count_var.set(
+        self._set_live_variable(self.human_coach_match_count_var,
             self._live_value_text(payload, ["human_coach_match_count", "human_coach.match_count"])
         )
-        self.human_coach_reward_total_var.set(
+        self._set_live_variable(self.human_coach_reward_total_var,
             self._live_value_text(payload, ["human_coach_reward_total", "human_coach.reward_total"])
         )
 
-        self.stream_coach_enabled_status_var.set(
+        self._set_live_variable(self.stream_coach_enabled_status_var,
             self._live_value_text(payload, ["coach.stream_coach_enabled", "stream_coach.stream_coach_enabled", "stream_coach_enabled"])
         )
-        self.stream_coach_platform_status_var.set(
+        self._set_live_variable(self.stream_coach_platform_status_var,
             self._live_value_text(payload, ["coach.stream_coach_mode", "stream_coach.stream_coach_mode", "stream_coach_mode", "coach.stream_coach_platform", "stream_coach_platform", "stream_coach.stream_coach_platform"])
         )
         dry_run = self._first_value(
@@ -3514,17 +3526,17 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
         )
         dry_run_status_var = getattr(self, "stream_coach_dry_run_status_var", None)
         if dry_run_status_var is not None:
-            dry_run_status_var.set(f"dry-run={fmt_value(dry_run)} / apply={fmt_value(apply_enabled)}")
-        self.stream_coach_alive_status_var.set(
+            self._set_live_variable(dry_run_status_var, f"dry-run={fmt_value(dry_run)} / apply={fmt_value(apply_enabled)}")
+        self._set_live_variable(self.stream_coach_alive_status_var,
             self._live_value_text(payload, ["coach.stream_coach_alive_status", "stream_coach.stream_coach_alive_status", "stream_coach_alive_status", "coach.stream_coach_alive", "stream_coach.stream_coach_alive", "stream_coach_alive"])
         )
-        self.stream_coach_last_message_var.set(
+        self._set_live_variable(self.stream_coach_last_message_var,
             self._live_value_text(payload, ["coach.last_stream_message", "stream_coach.last_stream_message", "last_stream_message", "coach.stream_coach_last_message", "stream_coach_last_message", "stream_coach.stream_coach_last_message"])
         )
-        self.stream_coach_last_parsed_command_var.set(
+        self._set_live_variable(self.stream_coach_last_parsed_command_var,
             self._live_value_text(payload, ["coach.last_stream_parsed_command", "stream_coach.last_stream_parsed_command", "last_stream_parsed_command", "coach.stream_coach_last_parsed_command", "stream_coach_last_parsed_command", "stream_coach.stream_coach_last_parsed_command"])
         )
-        self.stream_coach_last_applied_command_var.set(
+        self._set_live_variable(self.stream_coach_last_applied_command_var,
             self._live_value_text(payload, ["coach.last_applied_coach_command", "stream_coach.last_applied_coach_command", "last_applied_coach_command", "coach.stream_coach_last_applied_command", "stream_coach_last_applied_command", "stream_coach.stream_coach_last_applied_command"])
         )
         accepted = self._first_value(
@@ -3542,60 +3554,60 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
             ["coach.last_stream_command_status", "stream_coach.last_stream_command_status", "last_stream_command_status", "coach.stream_coach_last_command_status", "stream_coach_last_command_status", "stream_coach.stream_coach_last_command_status"],
             default="n/a",
         )
-        self.stream_coach_accept_reject_var.set(f"{accepted} / {rejected} ({status})")
-        self.stream_coach_last_reject_reason_var.set(
+        self._set_live_variable(self.stream_coach_accept_reject_var, f"{accepted} / {rejected} ({status})")
+        self._set_live_variable(self.stream_coach_last_reject_reason_var,
             self._live_value_text(payload, ["coach.last_stream_reject_reason", "stream_coach.last_stream_reject_reason", "last_stream_reject_reason", "coach.stream_coach_last_reject_reason", "stream_coach_last_reject_reason", "stream_coach.stream_coach_last_reject_reason"])
         )
-        self.stream_coach_pending_count_var.set(
+        self._set_live_variable(self.stream_coach_pending_count_var,
             self._live_value_text(payload, ["coach.pending_stream_commands", "stream_coach.pending_stream_commands", "pending_stream_commands", "stream_coach_pending_message_count"])
         )
-        self.stream_coach_top_command_var.set(
+        self._set_live_variable(self.stream_coach_top_command_var,
             self._live_value_text(payload, ["coach.stream_coach_top_commands", "stream_coach.stream_coach_top_commands", "stream_coach_top_commands", "stream_coach.top_commands"])
         )
-        self.stream_coach_last_selected_command_var.set(
+        self._set_live_variable(self.stream_coach_last_selected_command_var,
             self._live_value_text(payload, ["coach.last_validated_coach_command", "stream_coach.last_validated_coach_command", "last_validated_coach_command", "coach.stream_coach_last_command", "stream_coach_last_command", "stream_coach.stream_coach_last_command"])
         )
-        self.stream_coach_last_action_var.set(
+        self._set_live_variable(self.stream_coach_last_action_var,
             self._live_value_text(payload, ["coach.stream_coach_last_action", "stream_coach.stream_coach_last_action", "stream_coach_last_action"])
         )
-        self.stream_coach_rejected_count_var.set(
+        self._set_live_variable(self.stream_coach_rejected_count_var,
             self._live_value_text(payload, ["coach.stream_coach_rejected_count", "stream_coach.stream_coach_rejected_count", "stream_coach_rejected_count"])
         )
-        self.stream_coach_last_vote_count_var.set(
+        self._set_live_variable(self.stream_coach_last_vote_count_var,
             self._live_value_text(payload, ["coach.stream_coach_last_vote_count", "stream_coach.stream_coach_last_vote_count", "stream_coach_last_vote_count"])
         )
-        self.stream_coach_override_count_var.set(
+        self._set_live_variable(self.stream_coach_override_count_var,
             self._live_value_text(payload, ["coach.stream_coach_override_count", "stream_coach.stream_coach_override_count", "stream_coach_override_count"])
         )
-        self.stream_coach_match_count_var.set(
+        self._set_live_variable(self.stream_coach_match_count_var,
             self._live_value_text(payload, ["coach.stream_coach_match_count", "stream_coach.stream_coach_match_count", "stream_coach_match_count"])
         )
-        self.stream_coach_reward_total_var.set(
+        self._set_live_variable(self.stream_coach_reward_total_var,
             self._live_value_text(payload, ["coach.stream_coach_reward_total", "stream_coach.stream_coach_reward_total", "stream_coach_reward_total"])
         )
 
-        self.fusion_bridge_enabled_status_var.set(
+        self._set_live_variable(self.fusion_bridge_enabled_status_var,
             self._live_value_text(payload, ["fusion_bridge_enabled", "fusion.fusion_bridge_enabled"])
         )
-        self.fusion_bridge_available_var.set(
+        self._set_live_variable(self.fusion_bridge_available_var,
             self._live_value_text(payload, ["fusion_bridge_available", "fusion.fusion_bridge_available", "fusion.fusion_available"])
         )
-        self.fusion_last_command_var.set(
+        self._set_live_variable(self.fusion_last_command_var,
             self._live_value_text(payload, ["fusion_last_command", "fusion.fusion_last_command", "stream_fusion_last_command", "stream_coach.stream_fusion_last_command"])
         )
-        self.fusion_last_result_var.set(
+        self._set_live_variable(self.fusion_last_result_var,
             self._live_value_text(payload, ["fusion_last_result", "fusion.fusion_last_result", "stream_fusion_last_result", "stream_coach.stream_fusion_last_result"])
         )
-        self.fusion_attempt_count_var.set(
+        self._set_live_variable(self.fusion_attempt_count_var,
             self._live_value_text(payload, ["fusion_attempted_count", "fusion.fusion_attempted_count", "stream_coach_fusion_attempt_count", "stream_coach.stream_coach_fusion_attempt_count"])
         )
-        self.fusion_success_count_var.set(
+        self._set_live_variable(self.fusion_success_count_var,
             self._live_value_text(payload, ["fusion_success_count", "fusion.fusion_success_count", "stream_coach_fusion_success_count", "stream_coach.stream_coach_fusion_success_count"])
         )
-        self.fusion_failure_count_var.set(
+        self._set_live_variable(self.fusion_failure_count_var,
             self._live_value_text(payload, ["fusion_failed_count", "fusion.fusion_failed_count", "stream_coach_fusion_failure_count", "stream_coach.stream_coach_fusion_failure_count"])
         )
-        self.fusion_rejected_count_var.set(
+        self._set_live_variable(self.fusion_rejected_count_var,
             self._live_value_text(payload, ["fusion_rejected_count", "fusion.fusion_rejected_count", "stream_coach_fusion_rejected_count", "stream_coach.stream_coach_fusion_rejected_count"])
         )
 
@@ -3907,27 +3919,19 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
     def _as_dict(self, value: Any) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
 
+    def _status_index_for(self, payload: Any) -> NormalizedStatusIndex:
+        index = getattr(self, "_normalized_status_index", None)
+        if index is not None and index.contains(payload):
+            return index
+        index = NormalizedStatusIndex(payload)
+        self._normalized_status_index = index
+        return index
+
     def _lookup_path(self, payload: Any, path: str) -> Any:
-        current = payload
-        for part in path.split("."):
-            if not isinstance(current, dict):
-                return MISSING
-            if part in current:
-                current = current[part]
-                continue
-            lower_lookup = {str(key).lower(): key for key in current.keys()}
-            key = lower_lookup.get(part.lower())
-            if key is None:
-                return MISSING
-            current = current[key]
-        return current
+        return self._status_index_for(payload).lookup(payload, path)
 
     def _first_value(self, payload: Any, paths: List[str], default: Any = None) -> Any:
-        for path in paths:
-            value = self._lookup_path(payload, path)
-            if value is not MISSING and value is not None and value != "":
-                return value
-        return default
+        return self._status_index_for(payload).first(payload, paths, default)
 
     def _wave_text(self, payload: Dict[str, Any]) -> Any:
         wave = self._first_value(payload, ["gameplay.wave", "current_wave", "wave", "wave_text"])

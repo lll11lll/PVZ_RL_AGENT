@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 
 LIVE_MAX_AGE_SECONDS = 5.0
@@ -41,6 +41,53 @@ def first_status_value(payload: Any, paths: Tuple[str, ...], default: Any = None
         if value is not MISSING and value is not None and value != "":
             return value
     return default
+
+
+class NormalizedStatusIndex:
+    """Cache case-insensitive dictionary keys once for compatibility lookups."""
+
+    def __init__(self, payload: Any) -> None:
+        self.payload = payload
+        self._lower_keys: Dict[int, Dict[str, Any]] = {}
+        self._objects: set[int] = set()
+        self._visit(payload)
+
+    def _visit(self, value: Any) -> None:
+        if isinstance(value, dict):
+            object_id = id(value)
+            if object_id in self._objects:
+                return
+            self._objects.add(object_id)
+            self._lower_keys[object_id] = {str(key).lower(): key for key in value.keys()}
+            for item in value.values():
+                self._visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                self._visit(item)
+
+    def contains(self, value: Any) -> bool:
+        return isinstance(value, dict) and id(value) in self._objects
+
+    def lookup(self, payload: Any, path: str) -> Any:
+        current = payload
+        for part in path.split("."):
+            if not isinstance(current, dict):
+                return MISSING
+            if part in current:
+                current = current[part]
+                continue
+            key = self._lower_keys.get(id(current), {}).get(part.lower())
+            if key is None:
+                return MISSING
+            current = current[key]
+        return current
+
+    def first(self, payload: Any, paths: Iterable[str], default: Any = None) -> Any:
+        for path in paths:
+            value = self.lookup(payload, path)
+            if value is not MISSING and value is not None and value != "":
+                return value
+        return default
 
 
 def classify_live_health(age: float, payload: Optional[StatusPayload] = None) -> str:

@@ -72,6 +72,17 @@ class FakeText:
         self.see_calls.append(index)
 
 
+class CountingVar(FakeVar):
+    def __init__(self, value: str = "") -> None:
+        super().__init__()
+        self.value = value
+        self.set_count = 0
+
+    def set(self, value: str) -> None:
+        self.set_count += 1
+        super().set(value)
+
+
 class ImmediateExitProcess:
     def __init__(self) -> None:
         self.returncode: int | None = None
@@ -370,6 +381,40 @@ def test_health_aliases_preserve_case_insensitive_empty_fallbacks(tmp_path: Path
         0.0,
         {"Blocked_Reason": "post_win_next_screen_timeout"},
     ) == "BLOCKED_POST_WIN"
+
+
+def test_status_index_reuses_case_insensitive_alias_map() -> None:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    payload = {"Primary": "", "Nested": {"Value": 7}}
+
+    assert dashboard._lookup_path(payload, "nested.value") == 7
+    first_index = dashboard._normalized_status_index
+    assert dashboard._first_value(payload, ["primary", "nested.value"]) == 7
+    assert dashboard._status_index_for(payload["Nested"]) is first_index
+
+
+def test_unchanged_coach_fields_do_not_rewrite_string_vars() -> None:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    payload = {
+        "human_coach_enabled": True,
+        "stream_coach_enabled": True,
+        "stream_coach_mode": "mock",
+        "fusion_bridge_enabled": True,
+    }
+    before = set(vars(dashboard))
+    dashboard._set_coach_live_fields(payload)
+    created = [name for name in vars(dashboard) if name not in before and name.endswith("_var")]
+    for name in created:
+        current = getattr(dashboard, name).get()
+        setattr(dashboard, name, CountingVar(str(current)))
+
+    dashboard._set_coach_live_fields(payload)
+    assert sum(getattr(dashboard, name).set_count for name in created) == 0
+
+    changed = dict(payload)
+    changed["human_coach_enabled"] = False
+    dashboard._set_coach_live_fields(changed)
+    assert dashboard.human_coach_enabled_status_var.set_count == 1
 
 
 def test_malformed_cache_recovers_after_rotation(tmp_path: Path) -> None:
