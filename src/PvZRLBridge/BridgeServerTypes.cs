@@ -41,7 +41,6 @@ internal sealed class BridgeConfig
     public int DebugSunSampleInterval { get; set; } = 25;
     public List<int> PlantTypes { get; } = new() { (int)PlantType.SunFlower, (int)PlantType.Peashooter };
 }
-
 internal enum PendingRequestState
 {
     Queued = 0,
@@ -309,4 +308,3 @@ internal sealed class BridgeResponse
     public static BridgeResponse Fail(string error, string? details = null) =>
         new() { Ok = false, Error = error, Details = details };
 }
-
