@@ -26,6 +26,7 @@ import numpy as np
 from pvzrl_adventure import LiveStatusWriter, build_live_status
 from pvzrl_fusion import build_fusion_diagnostics
 from pvzrl_gui import PvZDashboard
+from pvzrl_gui_status import MISSING, NormalizedStatusIndex, diagnostics_render_key
 from pvzrl_observation_facts import StepFactsCache, build_step_facts
 from test_refactor_support import (
     array_sha256,
@@ -117,6 +118,47 @@ def recursive_json_keys_types(value: Any) -> Dict[str, Any]:
     if isinstance(value, str):
         return {"type": "string"}
     return {"type": type(value).__name__}
+
+
+def legacy_case_insensitive_lookup(payload: Any, path: str) -> Any:
+    current = payload
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        if part in current:
+            current = current[part]
+            continue
+        lower_lookup = {str(key).lower(): key for key in current.keys()}
+        key = lower_lookup.get(part.lower())
+        if key is None:
+            return None
+        current = current[key]
+    return current
+
+
+class _BenchmarkVar:
+    def __init__(self, value: Any = "") -> None:
+        self.value = value
+
+    def get(self) -> Any:
+        return self.value
+
+    def set(self, value: Any) -> None:
+        self.value = value
+
+
+class _BenchmarkText:
+    def configure(self, **_kwargs: Any) -> None:
+        return None
+
+    def delete(self, _start: str, _end: str) -> None:
+        return None
+
+    def insert(self, _index: str, _text: str) -> None:
+        return None
+
+    def see(self, _index: str) -> None:
+        return None
 
 
 def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
@@ -268,6 +310,115 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         )
         live_payload = build_live_status(identity, live_context, live_state, {})
         live_status_schema = recursive_json_keys_types(live_payload)
+        status_paths = (
+            "COACH.Stream_Coach_Enabled",
+            "Human_Coach.Human_Coach_Last_Command",
+            "Stream_Coach.Stream_Coach_Top_Commands",
+            "Fusion.Fusion_Success_Count",
+            "Seed_Inventory.Max_Seed_Slots",
+            "Compatibility.Model_Family",
+            "Adventure.Current_Level",
+            "Reward.Episode_Reward",
+        )
+        status_index = NormalizedStatusIndex(live_payload)
+        legacy_alias_projection = [
+            legacy_case_insensitive_lookup(live_payload, path)
+            for path in status_paths
+        ]
+        indexed_alias_projection = [
+            None if (value := status_index.lookup(live_payload, path)) is MISSING else value
+            for path in status_paths
+        ]
+        if indexed_alias_projection != legacy_alias_projection:
+            raise AssertionError("indexed GUI status aliases differ from legacy lookup")
+
+        def legacy_status_alias_pass() -> int:
+            return sum(
+                1
+                for _ in range(25)
+                for path in status_paths
+                if legacy_case_insensitive_lookup(live_payload, path) is not None
+            )
+
+        def indexed_status_alias_pass() -> int:
+            return sum(
+                1
+                for _ in range(25)
+                for path in status_paths
+                if (
+                    (value := status_index.lookup(live_payload, path)) is not MISSING
+                    and value is not None
+                )
+            )
+
+        results["gui_status_casefold_lookup_legacy"] = measure(
+            legacy_status_alias_pass,
+            samples=samples,
+            rounds=rounds,
+        )
+        results["gui_status_casefold_lookup_indexed"] = measure(
+            indexed_status_alias_pass,
+            samples=samples,
+            rounds=rounds,
+        )
+        render_key = diagnostics_render_key(live_payload, "LIVE", False)
+        equal_payload = copy.deepcopy(live_payload)
+        equal_payload["updated_at"] = float(equal_payload.get("updated_at", 0.0)) + 1.0
+        results["gui_render_key_same_payload"] = measure(
+            lambda: diagnostics_render_key(
+                live_payload,
+                "LIVE",
+                False,
+                previous=render_key,
+            ),
+            samples=samples,
+            rounds=rounds,
+        )
+        results["gui_render_key_equal_fresh_payload"] = measure(
+            lambda: diagnostics_render_key(
+                equal_payload,
+                "LIVE",
+                False,
+                previous=render_key,
+            ),
+            samples=samples,
+            rounds=rounds,
+        )
+        coach_dashboard = PvZDashboard.__new__(PvZDashboard)
+        coach_dashboard._set_coach_live_fields(live_payload)
+        results["gui_coach_unchanged_view_apply"] = measure(
+            lambda: coach_dashboard._set_coach_live_fields(live_payload),
+            samples=samples,
+            rounds=rounds,
+        )
+
+        legacy_log_history = [f"line {index}\n" for index in range(5000)]
+
+        def legacy_log_rollover_rebuild() -> int:
+            retained = legacy_log_history[1:] + ["new line\n"]
+            rendered = (
+                "[gui] log retention dropped 1 older line(s); showing the newest 5000 line(s).\n"
+                + "".join(retained)
+            )
+            return len(rendered)
+
+        log_dashboard = PvZDashboard.__new__(PvZDashboard)
+        log_dashboard.log_text = _BenchmarkText()
+        log_dashboard.log_history = list(legacy_log_history)
+        log_dashboard.log_history_chars = sum(len(line) for line in log_dashboard.log_history)
+        log_dashboard.log_dropped_lines = 0
+        log_dashboard.log_pause_autoscroll_var = _BenchmarkVar(False)
+        log_dashboard._log_notice_present = False
+        results["gui_log_rollover_legacy_rebuild"] = measure(
+            legacy_log_rollover_rebuild,
+            samples=samples,
+            rounds=rounds,
+        )
+        results["gui_log_rollover_incremental"] = measure(
+            lambda: log_dashboard._append_log("new line\n"),
+            samples=samples,
+            rounds=rounds,
+        )
         results["live_status_json_serialize"] = measure(
             lambda: json.dumps(live_payload, indent=2),
             samples=samples,
@@ -368,6 +519,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
                     "no live bridge or Unity timing",
                     "no PPO inference or rollout SPS",
                     "no full Tk widget rendering",
+                    "GUI log rollover timings use a no-op text-widget surrogate",
                     "filesystem results depend on Windows cache and device state",
                 ],
                 "gui_default_generalist_configuration": {
@@ -398,6 +550,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
                     json.dumps(live_payload).encode("utf-8")
                 ),
                 "live_status_recursive_keys_types_sha256": json_sha256(live_status_schema),
+                "gui_status_alias_projection_sha256": json_sha256(legacy_alias_projection),
                 "live_status_write_frequency": {
                     "ordinary_attempts": ordinary_frequency.attempts,
                     "ordinary_payload_builds": ordinary_frequency.payload_builds,
