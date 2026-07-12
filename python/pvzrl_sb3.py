@@ -69,6 +69,7 @@ from pvzrl_rewards import (
     RewardConfig,
     merge_reward_components,
 )
+from pvzrl_runtime_state import EpisodeRuntimeState, WatchdogRuntimeState
 from pvzrl_seed_inventory import (
     adventure_identity_features,
     seed_inventory_v2_features,
@@ -307,22 +308,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._observation_ownership_established = False
         self.transition_pending = False
         self._transition_pending_reason = ""
-        self._step_count = 0
-        self._episode_reward = 0.0
-        self._episode_plants = 0
-        self._episode_illegal = 0
-        self._episode_index = -1
-        self._episode_sun_spent = 0
-        self._episode_legal_action_total = 0
-        self._start_kills = 0
-        self._start_mowers = 0
-        self._last_reset_success = True
-        self._last_reset_seconds = 0.0
+        self.episode_state = EpisodeRuntimeState()
+        self.watchdog_state = WatchdogRuntimeState.empty()
         self._last_action_mask_ms = 0.0
         self._perf_samples = 0
         self._perf_totals: Dict[str, float] = {}
         self._perf_report_interval = 100
-        self._global_step_count = 0
         self._reset_action_diagnostics()
         self._sun_diag_report_interval = 500
         self._sun_diag_spawn_window = 0
@@ -394,6 +385,39 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             if self.config.stream_coach_mock_script:
                 print(f"[coach] mock stream script={self.config.stream_coach_mock_script}")
         self._reset_lane_episode_diagnostics({})
+
+    def _episode_runtime_state(self) -> EpisodeRuntimeState:
+        state = getattr(self, "episode_state", None)
+        if not isinstance(state, EpisodeRuntimeState):
+            state = EpisodeRuntimeState()
+            self.episode_state = state
+        return state
+
+    # Private compatibility projections retained for bridge-free helpers that
+    # construct lightweight wrappers without invoking ``__init__``.
+    @property
+    def _episode_index(self) -> int:
+        return self._episode_runtime_state().index
+
+    @_episode_index.setter
+    def _episode_index(self, value: int) -> None:
+        self._episode_runtime_state().index = int(value)
+
+    @property
+    def _step_count(self) -> int:
+        return self._episode_runtime_state().step_count
+
+    @_step_count.setter
+    def _step_count(self, value: int) -> None:
+        self._episode_runtime_state().step_count = int(value)
+
+    @property
+    def _episode_reward(self) -> float:
+        return self._episode_runtime_state().reward_total
+
+    @_episode_reward.setter
+    def _episode_reward(self, value: float) -> None:
+        self._episode_runtime_state().reward_total = float(value)
 
     def _adopt_observation(
         self,
@@ -477,6 +501,60 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 f"boundary={boundary} adopted={adopted_identity.token} current={wrapper_identity.token}"
             )
         self._last_observation_identity = wrapper_identity
+
+    def _initialize_episode_accounting(
+        self,
+        observation: Dict[str, Any],
+        reset_payload: Dict[str, Any],
+        *,
+        source: str,
+        include_reset_safety_fields: bool,
+    ) -> StepFacts:
+        """Initialize common wrapper accounting at a verified board boundary."""
+
+        self._adopt_observation(observation, source=source)
+        reset_seconds = float(
+            reset_payload.get("timeToPlayableSeconds")
+            or (float(reset_payload.get("reset_ms", 0.0) or 0.0) / 1000.0)
+            or 0.0
+        )
+        self.episode_state.begin(
+            start_kills=int(observation.get("killCount", 0)),
+            start_mowers=int(
+                observation.get(
+                    "logicalMowerCount",
+                    observation.get("rowCount", self.rows),
+                )
+            ),
+            reset_success=bool(
+                reset_payload.get("resetSuccess", reset_payload.get("ok", True))
+            ),
+            reset_seconds=reset_seconds,
+        )
+        self._reset_lane_episode_diagnostics(observation)
+        self._episode_reset_reward_ui_cleanup_count = self._safe_int_value(
+            reset_payload.get("resetRewardUiCleanupCount"),
+            default=0,
+        )
+        self._episode_reset_reward_ui_cleanup_blocked_count = self._safe_int_value(
+            reset_payload.get("resetRewardUiCleanupBlockedCount"),
+            default=0,
+        )
+        self._episode_reset_after_false_reward_signal_count = self._safe_int_value(
+            reset_payload.get("resetAfterFalseRewardSignalCount"),
+            default=0,
+        )
+        if include_reset_safety_fields:
+            self._episode_blocked_cleanup_during_gameplay_count += self._safe_int_value(
+                reset_payload.get("blockedCleanupDuringGameplayCount"),
+                default=0,
+            )
+            self._episode_suspicious_cleanup_reward_ui_count += self._safe_int_value(
+                reset_payload.get("suspiciousCleanupRewardUiCount"),
+                default=0,
+            )
+        self._reset_sun_diagnostic_baseline(observation)
+        return self.base._step_facts_cache.get(observation, self.config.plant_types)
 
     def get_env_metadata(self) -> Dict[str, Any]:
         metadata = self.config.get_env_metadata()
@@ -585,45 +663,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             reset_payload["wrapperRequiredSeedFlow"] = True
         self._last_episode_ended_by_timeout = False
         self._last_episode_ended_by_win = False
-        self._adopt_observation(observation, source="reset")
-        self._episode_index += 1
-        self._step_count = 0
-        self._episode_reward = 0.0
-        self._episode_plants = 0
-        self._episode_illegal = 0
-        self._episode_sun_spent = 0
-        self._episode_legal_action_total = 0
-        self._start_kills = int(observation.get("killCount", 0))
-        self._start_mowers = int(observation.get("logicalMowerCount", observation.get("rowCount", self.rows)))
-        self._last_reset_success = bool(reset_payload.get("resetSuccess", reset_payload.get("ok", True)))
-        self._last_reset_seconds = float(
-            reset_payload.get("timeToPlayableSeconds")
-            or (float(reset_payload.get("reset_ms", 0.0) or 0.0) / 1000.0)
-            or 0.0
+        facts = self._initialize_episode_accounting(
+            observation,
+            reset_payload,
+            source="reset",
+            include_reset_safety_fields=True,
         )
-        self._reset_lane_episode_diagnostics(observation)
-        self._episode_reset_reward_ui_cleanup_count = self._safe_int_value(
-            reset_payload.get("resetRewardUiCleanupCount"),
-            default=0,
-        )
-        self._episode_reset_reward_ui_cleanup_blocked_count = self._safe_int_value(
-            reset_payload.get("resetRewardUiCleanupBlockedCount"),
-            default=0,
-        )
-        self._episode_reset_after_false_reward_signal_count = self._safe_int_value(
-            reset_payload.get("resetAfterFalseRewardSignalCount"),
-            default=0,
-        )
-        self._episode_blocked_cleanup_during_gameplay_count += self._safe_int_value(
-            reset_payload.get("blockedCleanupDuringGameplayCount"),
-            default=0,
-        )
-        self._episode_suspicious_cleanup_reward_ui_count += self._safe_int_value(
-            reset_payload.get("suspiciousCleanupRewardUiCount"),
-            default=0,
-        )
-        self._reset_sun_diagnostic_baseline(observation)
-        facts = self.base._step_facts_cache.get(observation, self.config.plant_types)
         return self._encode_observation(observation, facts=facts), {"raw_observation": observation, **reset_info}
 
     def start_episode_from_observation(
@@ -653,37 +698,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             f"seed_slots={observation.get('seedSlotCount')} "
             f"legalActionCount={legal_action_count_for_log}"
         )
-        self._adopt_observation(observation, source="adventure_start")
-        self._episode_index += 1
-        self._step_count = 0
-        self._episode_reward = 0.0
-        self._episode_plants = 0
-        self._episode_illegal = 0
-        self._episode_sun_spent = 0
-        self._episode_legal_action_total = 0
-        self._start_kills = int(observation.get("killCount", 0))
-        self._start_mowers = int(observation.get("logicalMowerCount", observation.get("rowCount", self.rows)))
-        self._last_reset_success = bool(reset_payload.get("resetSuccess", reset_payload.get("ok", True)))
-        self._last_reset_seconds = float(
-            reset_payload.get("timeToPlayableSeconds")
-            or (float(reset_payload.get("reset_ms", 0.0) or 0.0) / 1000.0)
-            or 0.0
+        facts = self._initialize_episode_accounting(
+            observation,
+            reset_payload,
+            source="adventure_start",
+            include_reset_safety_fields=False,
         )
-        self._reset_lane_episode_diagnostics(observation)
-        self._episode_reset_reward_ui_cleanup_count = self._safe_int_value(
-            reset_payload.get("resetRewardUiCleanupCount"),
-            default=0,
-        )
-        self._episode_reset_reward_ui_cleanup_blocked_count = self._safe_int_value(
-            reset_payload.get("resetRewardUiCleanupBlockedCount"),
-            default=0,
-        )
-        self._episode_reset_after_false_reward_signal_count = self._safe_int_value(
-            reset_payload.get("resetAfterFalseRewardSignalCount"),
-            default=0,
-        )
-        self._reset_sun_diagnostic_baseline(observation)
-        facts = self.base._step_facts_cache.get(observation, self.config.plant_types)
         return self._encode_observation(observation, facts=facts), {"raw_observation": observation, **reset_info}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -735,7 +755,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             legal_policy_actions = self._legal_actions_from_mask(action_mask)
             self.stream_coach_controller.poll_source(
                 username="mock_source",
-                step_index=self._global_step_count,
+                step_index=self.episode_state.global_step_count,
             )
             stream_fusion_enabled = bool(
                 self.config.stream_coach_fusion_enabled
@@ -1028,8 +1048,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             board = observation if isinstance(observation, dict) else {}
             self.intervention_logger.log(
                 run_id=str(getattr(self.config, "run_id", "") or self.config.run_mode),
-                episode_id=int(self._episode_index),
-                step=int(self._global_step_count),
+                episode_id=int(self.episode_state.index),
+                step=int(self.episode_state.global_step_count),
                 mode="eval" if "eval" in str(self.config.run_mode).lower() else "train",
                 model_action=int(ppo_action),
                 human_command=intervention_command,
@@ -1045,9 +1065,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 metadata={"selected_action": int(policy_action), "command_mode": self.config.human_coach_command_mode},
             )
         self._adopt_observation(observation, source="step")
-        self._step_count += 1
-        self._global_step_count += 1
-        self._episode_reward += float(reward)
+        self.episode_state.record_step(float(reward))
         self._record_sun_diagnostics(observation)
         self._record_lane_diagnostics(bridge_action, observation, info)
         self._record_reward_breakdown(info)
@@ -1068,19 +1086,19 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             if placement.get("success") or action_result.get("plantPlaced") or action_result.get("fusionSucceeded"):
                 self._episode_successful_placements_by_plant[plant_label] += 1
         if action_result.get("illegalAction"):
-            self._episode_illegal += 1
+            self.episode_state.illegal_actions += 1
         if placement.get("success"):
-            self._episode_plants += 1
+            self.episode_state.plants_placed += 1
         if action_result.get("costPaid") or placement.get("costPaid"):
             sun_before = int(action_result.get("sunBefore") or placement.get("sunBefore") or 0)
             sun_after = int(action_result.get("sunAfter") or placement.get("sunAfter") or observation.get("sun", 0))
             spent = max(0, sun_before - sun_after)
             if spent == 0:
                 spent = int(action_result.get("plantCost") or placement.get("plantCost") or 0)
-            self._episode_sun_spent += max(0, spent)
+            self.episode_state.sun_spent += max(0, spent)
         legal_actions = info.get("legal_actions") or observation.get("legalActions", [])
         if isinstance(legal_actions, list):
-            self._episode_legal_action_total += len(legal_actions)
+            self.episode_state.legal_action_total += len(legal_actions)
 
         terminal_reason = str(info.get("terminal_reason") or "")
         done_reason = str(info.get("done_reason") or "") or classify_done_reason(observation)
@@ -1091,7 +1109,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 done_reason = "none"
         elif terminal_reason == "game_over_restart_screen":
             done_reason = "loss"
-            print(f"[terminal] reason={terminal_reason} step={self._step_count}")
+            print(f"[terminal] reason={terminal_reason} step={self.episode_state.step_count}")
         if done_reason == "win" and not terminal_reason:
             terminal_reason = "win"
             info["terminal_reason"] = "win"
@@ -1099,7 +1117,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         if done_reason == "win":
             print(
                 "[terminal] reason=win "
-                f"step={self._step_count} "
+                f"step={self.episode_state.step_count} "
                 f"wave={observation.get('wave')}/{observation.get('maxWave')} "
                 f"run_mode={self.config.run_mode}"
             )
@@ -1109,14 +1127,14 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             or bool(done)
         )
         truncated = False
-        if not terminated and self.config.max_steps > 0 and self._step_count >= self.config.max_steps:
+        if not terminated and self.config.max_steps > 0 and self.episode_state.step_count >= self.config.max_steps:
             truncated = True
             done_reason = "timeout"
             terminal_reason = "timeout"
             timeout_event = {
                 "event": "timeout_reset_requested",
                 "timeout_type": "max_steps",
-                "episode_step": self._step_count,
+                "episode_step": self.episode_state.step_count,
                 "max_steps": self.config.max_steps,
                 "allowed": True,
                 "wave": observation.get("wave"),
@@ -1139,15 +1157,15 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             self._reset_requires_seed_flow_next = True
             print(
                 "[reset] timeout_reset_requested "
-                f"episode_step={self._step_count} max_steps={self.config.max_steps} "
+                f"episode_step={self.episode_state.step_count} max_steps={self.config.max_steps} "
                 f"wave={observation.get('wave')}/{observation.get('maxWave')} "
                 f"run_mode={self.config.run_mode}"
             )
             print("[reset] timeout episode truncated; next reset requires full seed flow")
 
-        final_kills = int(observation.get("killCount", self._start_kills))
-        final_mowers = int(observation.get("logicalMowerCount", self._start_mowers))
-        avg_legal_actions = self._episode_legal_action_total / max(1, self._step_count)
+        final_kills = int(observation.get("killCount", self.episode_state.start_kills))
+        final_mowers = int(observation.get("logicalMowerCount", self.episode_state.start_mowers))
+        avg_legal_actions = self.episode_state.legal_action_total / max(1, self.episode_state.step_count)
         placement_context_total = (
             self._episode_plants_in_threatened_row_count
             + self._episode_plants_in_unthreatened_row_count
@@ -1155,17 +1173,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         episode_summary = {
             "run_mode": self.config.run_mode,
             "target_level": int(self.config.target_level or 0),
-            "episode": self._episode_index,
+            "episode": self.episode_state.index,
             "result": done_reason,
-            "reward_total": self._episode_reward,
+            "reward_total": self.episode_state.reward_total,
             "done_reason": done_reason,
-            "episode_reward": self._episode_reward,
-            "episode_length": self._step_count,
+            "episode_reward": self.episode_state.reward_total,
+            "episode_length": self.episode_state.step_count,
             "terminal_reason": terminal_reason,
             "final_wave": int(observation.get("wave", 0)),
             "max_wave": int(observation.get("maxWave", 0)),
-            "zombies_killed": max(0, final_kills - self._start_kills),
-            "plants_placed": self._episode_plants,
+            "zombies_killed": max(0, final_kills - self.episode_state.start_kills),
+            "plants_placed": self.episode_state.plants_placed,
             "plant_action_counts": self._plain_counter_dict(self._episode_plant_action_counts),
             "successful_placements_by_plant": self._plain_counter_dict(self._episode_successful_placements_by_plant),
             "invalid_actions_by_plant": self._plain_counter_dict(self._episode_invalid_actions_by_plant),
@@ -1173,14 +1191,14 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "peashooters_planted": sum(self._episode_peashooter_placements_by_row.values()),
             "wallnuts_planted": sum(self._episode_wallnut_placements_by_row.values()),
             "cherrybombs_planted": self._episode_cherrybomb_used_count,
-            "sun_spent": self._episode_sun_spent,
+            "sun_spent": self.episode_state.sun_spent,
             "sun_remaining": int(observation.get("sun", 0)),
-            "mowers_lost": max(0, self._start_mowers - final_mowers),
-            "mower_losses": max(0, self._start_mowers - final_mowers),
-            "reset_success": self._last_reset_success,
-            "reset_seconds": self._last_reset_seconds,
+            "mowers_lost": max(0, self.episode_state.start_mowers - final_mowers),
+            "mower_losses": max(0, self.episode_state.start_mowers - final_mowers),
+            "reset_success": self.episode_state.reset_success,
+            "reset_seconds": self.episode_state.reset_seconds,
             "bridge_errors": 0,
-            "illegal_actions": self._episode_illegal,
+            "illegal_actions": self.episode_state.illegal_actions,
             "avg_legal_actions": avg_legal_actions,
             "legal_action_count_mean": avg_legal_actions,
             "plants_by_row": self._row_dict(self._episode_final_plants_by_row),
@@ -1209,8 +1227,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             ),
             "wait_actions": self._episode_wait_actions,
             "plant_actions": self._episode_plant_actions,
-            "wait_action_percent": 100.0 * self._episode_wait_actions / max(1, self._step_count),
-            "plant_action_percent": 100.0 * self._episode_plant_actions / max(1, self._step_count),
+            "wait_action_percent": 100.0 * self._episode_wait_actions / max(1, self.episode_state.step_count),
+            "plant_action_percent": 100.0 * self._episode_plant_actions / max(1, self.episode_state.step_count),
             "plant_actions_by_row": self._row_dict(self._episode_plant_actions_by_row),
             "peashooter_actions_by_row": self._row_dict(self._episode_peashooter_actions_by_row),
             "sunflower_actions_by_row": self._row_dict(self._episode_sunflower_actions_by_row),
@@ -1259,7 +1277,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "sunflower_overbuild_before_defense_count": self._episode_sunflower_overbuild_before_defense_count,
             "sunflower_overbuild_count": self._episode_sunflower_overbuild_before_defense_count,
             "peashooter_coverage_rate_by_step": (
-                self._episode_peashooter_coverage_rate_sum / max(1, self._step_count)
+                self._episode_peashooter_coverage_rate_sum / max(1, self.episode_state.step_count)
             ),
             "legal_actions_by_seed_slot": self._row_dict(
                 self._episode_legal_actions_by_seed_slot,
@@ -1312,7 +1330,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "high_danger_unanswered_steps": self._episode_high_danger_unanswered_steps,
             "mower_exposure_steps": self._episode_mower_exposure_steps,
             "max_row_danger": self._episode_max_row_danger,
-            "avg_row_danger": self._episode_avg_row_danger_sum / max(1, self._step_count),
+            "avg_row_danger": self._episode_avg_row_danger_sum / max(1, self.episode_state.step_count),
             "tactical_mask_enabled": self._episode_tactical_mask_enabled,
             "wallnut_actions_masked": self._episode_wallnut_actions_masked,
             "cherrybomb_actions_masked": self._episode_cherrybomb_actions_masked,
@@ -1325,7 +1343,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "tough_zombie_response_count": self._episode_tough_zombie_response_count,
             "fusion_policy": self.fusion_policy,
             "fusion_candidate_count_total": self.fusion_candidate_count_total,
-            "fusion_candidate_count_avg": self.fusion_candidate_count_total / max(1, self._step_count),
+            "fusion_candidate_count_avg": self.fusion_candidate_count_total / max(1, self.episode_state.step_count),
             "fusion_attempted_count": self.fusion_attempted_count,
             "fusion_success_count": self.fusion_success_count,
             "fusion_failed_count": self.fusion_failed_count,
@@ -1402,8 +1420,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 "terminal_reason": terminal_reason,
                 "final_wave": episode_summary["final_wave"],
                 "zombies_killed": episode_summary["zombies_killed"],
-                "plants_placed": self._episode_plants,
-                "illegal_actions": self._episode_illegal,
+                "plants_placed": self.episode_state.plants_placed,
+                "illegal_actions": self.episode_state.illegal_actions,
             }
         )
         if self.config.debug_performance:
@@ -1715,12 +1733,15 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
 
         if not (self.config.debug_performance or self.config.debug_sun):
             return
-        if self._global_step_count <= 0 or self._global_step_count % self._sun_diag_report_interval != 0:
+        if (
+            self.episode_state.global_step_count <= 0
+            or self.episode_state.global_step_count % self._sun_diag_report_interval != 0
+        ):
             return
 
         payload = {
-            "step": self._global_step_count,
-            "episode": self._episode_index,
+            "step": self.episode_state.global_step_count,
+            "episode": self.episode_state.index,
             "currentTimeScale": observation.get("unityTimeScale"),
             "requestedGameSpeed": observation.get("requestedGameSpeed"),
             "gameSpeedMode": observation.get("gameSpeedMode"),
@@ -2077,12 +2098,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             pass
         first_peashooter_row = self._safe_int_value(diag.get("first_peashooter_row"), default=-1)
         if first_peashooter_row >= 0 and self._episode_first_peashooter_by_row_step.get(first_peashooter_row, 0) <= 0:
-            self._episode_first_peashooter_by_row_step[first_peashooter_row] = self._step_count
+            self._episode_first_peashooter_by_row_step[first_peashooter_row] = self.episode_state.step_count
         first_defense_row = self._safe_int_value(diag.get("first_defense_row"), default=-1)
         if first_defense_row >= 0 and self._episode_first_defense_step_by_row.get(first_defense_row, 0) <= 0:
-            self._episode_first_defense_step_by_row[first_defense_row] = self._step_count
+            self._episode_first_defense_step_by_row[first_defense_row] = self.episode_state.step_count
         if bool(diag.get("all_rows_peashooter_covered")) and self._episode_all_rows_peashooter_covered_step <= 0:
-            self._episode_all_rows_peashooter_covered_step = self._step_count
+            self._episode_all_rows_peashooter_covered_step = self.episode_state.step_count
             self._episode_sunflower_count_when_first_full_coverage = self._safe_int_value(
                 diag.get("sunflower_count_when_first_full_coverage"),
                 default=-1,
@@ -2284,14 +2305,11 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         super().close()
 
     def _reset_action_diagnostics(self) -> None:
-        self._action_durations: List[float] = []
-        self._action_freeze_count = 0
-        self._action_freezes_by_type: Counter[str] = Counter()
-        self._action_freezes_by_plant: Counter[str] = Counter()
-        self._action_freezes_by_fusion_pair: Counter[str] = Counter()
-        self._action_freezes_by_grid: Counter[str] = Counter()
-        self._action_freezes_by_screen_state: Counter[str] = Counter()
-        self._action_freezes_by_level: Counter[str] = Counter()
+        state = getattr(self, "watchdog_state", None)
+        if isinstance(state, WatchdogRuntimeState):
+            state.reset_episode()
+        else:
+            self.watchdog_state = WatchdogRuntimeState.empty()
 
     @staticmethod
     def _action_state_summary(observation: Dict[str, Any], *, detailed: bool = True) -> Dict[str, Any]:
@@ -2437,8 +2455,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         pre_plants, pre_cooldowns = self._action_change_signatures(pre_observation)
         post_plants, post_cooldowns = self._action_change_signatures(post_observation)
         record = {
-            "episode": int(self._episode_index),
-            "step_index": int(self._step_count + 1),
+            "episode": int(self.episode_state.index),
+            "step_index": int(self.episode_state.step_count + 1),
             "level": pre_summary.get("level"),
             "selected_action_id": int(policy_action),
             "bridge_action_id": int(bridge_action),
@@ -2484,15 +2502,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "detail_persisted": detailed,
             "anomaly": anomaly,
         }
-        self._action_durations.append(float(duration))
-        if timed_out:
-            self._action_freeze_count += 1
-            self._action_freezes_by_type[action_type] += 1
-            self._action_freezes_by_plant[plant_name or "unknown"] += 1
-            self._action_freezes_by_fusion_pair[fusion_pair or "not_fusion"] += 1
-            self._action_freezes_by_grid[f"{row},{col}"] += 1
-            self._action_freezes_by_screen_state[str(pre_summary.get("screen_state") or "unknown")] += 1
-            self._action_freezes_by_level[str(pre_summary.get("level") or "unknown")] += 1
+        self.watchdog_state.record(
+            float(duration),
+            timed_out=bool(timed_out),
+            action_type=action_type,
+            plant=plant_name,
+            fusion_pair=fusion_pair,
+            row=row,
+            column=col,
+            screen_state=pre_summary.get("screen_state"),
+            level=pre_summary.get("level"),
+        )
         if self.config.enable_action_watchdog and self.config.action_diagnostics_path and detailed:
             path = Path(self.config.action_diagnostics_path)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -2501,32 +2521,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         if timed_out and self.config.save_freeze_debug_bundle and self.config.freeze_debug_dir:
             bundle_dir = Path(self.config.freeze_debug_dir)
             bundle_dir.mkdir(parents=True, exist_ok=True)
-            bundle_path = bundle_dir / f"action_freeze_ep{self._episode_index}_step{self._step_count + 1}_{int(started_at * 1000)}.json"
+            bundle_path = bundle_dir / (
+                f"action_freeze_ep{self.episode_state.index}_"
+                f"step{self.episode_state.step_count + 1}_{int(started_at * 1000)}.json"
+            )
             bundle_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
             record["debug_bundle_path"] = str(bundle_path)
         return record
 
     def _action_diagnostic_summary(self) -> Dict[str, Any]:
-        durations = sorted(self._action_durations)
-        if durations:
-            p95_index = min(len(durations) - 1, max(0, int(np.ceil(0.95 * len(durations))) - 1))
-            mean_duration = float(sum(durations) / len(durations))
-            max_duration = float(durations[-1])
-            p95_duration = float(durations[p95_index])
-        else:
-            mean_duration = max_duration = p95_duration = 0.0
-        return {
-            "mean_action_duration_seconds": mean_duration,
-            "max_action_duration_seconds": max_duration,
-            "p95_action_duration_seconds": p95_duration,
-            "action_freeze_count": int(self._action_freeze_count),
-            "freezes_by_action_type": dict(self._action_freezes_by_type),
-            "freezes_by_plant": dict(self._action_freezes_by_plant),
-            "freezes_by_fusion_pair": dict(self._action_freezes_by_fusion_pair),
-            "freezes_by_grid_coordinate": dict(self._action_freezes_by_grid),
-            "freezes_by_screen_state": dict(self._action_freezes_by_screen_state),
-            "freezes_by_level": dict(self._action_freezes_by_level),
-        }
+        return self.watchdog_state.compatibility_summary()
 
     def _encode_observation(
         self,
