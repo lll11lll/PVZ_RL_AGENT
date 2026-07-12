@@ -223,7 +223,7 @@ internal static class BridgeLifecycleHarness
 
     private static void ObservationSchemaIsStable()
     {
-        const string expectedHash = "ad898bdc96741cf97875926327aae9b10d3ae4aab84a6cbc68f6ab3d33f0f5db";
+        const string expectedHash = "c0d34a11cb12f53e0e0a84d82bf35022b73bf3eaeb9e83706bc6e4b3b005b6b5";
         var properties = typeof(ObservationDto).GetProperties(
             BindingFlags.Public | BindingFlags.Instance);
         Check(properties.Length == 122, "ObservationDto property count changed");
@@ -260,6 +260,18 @@ internal static class BridgeLifecycleHarness
         if (type == typeof(byte) || type == typeof(short) || type == typeof(int) || type == typeof(long)) return "integer";
         if (type == typeof(float) || type == typeof(double) || type == typeof(decimal)) return "number";
         if (type == typeof(string)) return "string";
+        if (type.Namespace == typeof(ObservationDto).Namespace &&
+            type.Name.EndsWith("Dto", StringComparison.Ordinal))
+        {
+            var properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            return "object{" + string.Join(
+                ",",
+                properties
+                    .Select(property =>
+                        JsonNamingPolicy.CamelCase.ConvertName(property.Name) +
+                        ":" + JsonShape(property.PropertyType))
+                    .OrderBy(value => value, StringComparer.Ordinal)) + "}";
+        }
         return "object";
     }
 
