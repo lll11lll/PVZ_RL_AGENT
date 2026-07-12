@@ -315,4 +315,3 @@ class GuiCommandMixin:
 
     def _command_text(self, command: List[str]) -> str:
         return subprocess.list2cmdline(command)
-
