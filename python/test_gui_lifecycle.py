@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import pvzrl_gui_process
 from pvzrl_gui import (
     LOG_DRAIN_MAX_ITEMS,
     LOG_HISTORY_MAX_CHARS,
@@ -194,6 +195,46 @@ def test_second_launch_is_rejected_without_starting_subprocess() -> None:
 
     assert dashboard.active_process_name == "current"
     assert messages == ["ERROR: Cannot launch replacement; current is still running.\n"]
+
+
+def test_launch_process_preserves_popen_contract(tmp_path: Path, monkeypatch: Any) -> None:
+    dashboard = _bare_dashboard()
+    dashboard.project_root = tmp_path
+    dashboard.repo_root = tmp_path
+    dashboard.active_run_var = FakeVar()
+    captured: dict[str, Any] = {}
+
+    class Process(ImmediateExitProcess):
+        stdout = None
+
+    def fake_popen(command: list[str], **kwargs: Any) -> Process:
+        captured["command"] = list(command)
+        captured["kwargs"] = dict(kwargs)
+        return Process()
+
+    monkeypatch.setattr(pvzrl_gui_process.subprocess, "Popen", fake_popen)
+    command = [
+        "python",
+        "train.py",
+        "--run-dir",
+        "runs/snapshot",
+        "--live-status-path",
+        "runs/live_status.json",
+    ]
+
+    dashboard.launch_process("training", command)
+    assert dashboard._reader_thread is not None
+    dashboard._reader_thread.join(timeout=1.0)
+
+    assert captured["command"] == command
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+    assert captured["kwargs"]["env"]["PYTHONUNBUFFERED"] == "1"
+    assert captured["kwargs"]["stdout"] is subprocess.PIPE
+    assert captured["kwargs"]["stderr"] is subprocess.STDOUT
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["bufsize"] == 1
+    assert dashboard.active_run_path == str((tmp_path / "runs/snapshot").resolve())
+    assert dashboard.process_status_var.value == "Running: training"
 
 
 def test_poll_and_log_callbacks_are_tracked_and_bounded() -> None:
