@@ -233,7 +233,7 @@ Rollback boundary: local commit subject `fix: harden PvZRL lifecycle boundaries`
 
 ### Phase 2 - canonical metadata and resolved configuration
 
-Status: complete pending rollback commit.
+Status: complete.
 
 Implemented:
 
@@ -264,6 +264,42 @@ Residual Phase 2 boundaries:
 - Fusion-result identity and recipes remain separate until Phase 3 so this phase does not change recursive/self-fusion behavior.
 - The schedule is runnable in this checkout and explicitly labeled as requiring local gitignored artifacts; it is not represented as a portable model bundle.
 
-Rollback boundary: local commit subject `refactor: establish canonical PvZRL metadata`; its hash and final independent-review result will be recorded after the phase gate closes.
+Rollback boundary: local commit `87aee4a` (`refactor: establish canonical PvZRL metadata`).
 
-Later phase results, benchmark comparisons, live verification, independent review findings, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.
+### Phase 3 - authoritative action and fusion pipeline
+
+Status: complete pending rollback commit.
+
+Implemented:
+
+- Added `pvzrl_actions.py` with immutable `ActionIntent`, `ActionDecision`, and `ActionResult` records. Policy, legacy, and bridge identities remain explicit; source metadata and execution payloads are deeply immutable; the bridge remains the final runtime authority.
+- Replaced separate mask, diagnostic, Python-filter, coach, and execution decisions with one pure validator and one complete decision cache. Cache reuse requires a content digest of the full observation and bridge legal actions plus a fingerprint of every legality-affecting configuration value. A mutated observation with the same frame counter, changed bridge actions, changed tactical input, or changed fusion/configuration state invalidates the cache.
+- Preserved fixed, dynamic-14, and Adventure identity action layouts. The dynamic coach adapter now converts policy action `0..700` to the correct legacy bridge identity while retaining the original policy intent; regression coverage specifically locks dynamic wait `700 -> 0` and placement `1 -> 2`.
+- Traced live model, random-baseline, scripted-baseline/fusion, human, stream/mock, GUI/manual, debug CLI, and Adventure-model paths. GUI/manual/debug sources survive coach parsing and SB3 arbitration; coach match/pending context remains in source metadata even when the model selected the same action.
+- Replaced overlapping fusion result and compatibility tables with immutable `FusionRecipe` records for Peashooter self-fusion, both recursive pea upgrades, and Twin SunFlower. Compatibility is derived from recipes plus two explicit runtime-only relationships (SunFlower/Peashooter and Peashooter/CherryBomb), for which Python deliberately invents no result.
+- Routed model, scripted, human, stream/mock, GUI, manual, and debug fusion requests through one source-parameterized validation/execution adapter. A shared scope/postcondition contract replaces the previous environment and coach copies; the bridge's tile-scoped mutation result remains authoritative.
+- Added stable fusion event IDs. Diagnostics, coach/stream outcomes, success/failure counts, and fusion reward application each suppress duplicate handling of the same event. A pre-execution rejection remains observable but is not misreported as a bridge attempt.
+- Retained the exact five-key `FUSION_RULES` compatibility view and the existing private Python-filter/fusion entry-point wrappers during the one-phase adapter window. Removed the old model/scripted/coach execution bodies, duplicated coach resource/occupancy validation, duplicated fusion postcondition validator, unused tactical-mask branch, and zero-caller action/cache helpers.
+
+Compatibility and test evidence:
+
+- Full pytest gate: PASS, 148 tests plus 10 subtests. The dedicated Phase 3 contract file passes all 37 tests.
+- Phase 3 contract coverage exhaustively checks all 201/701 policy identities, every bit in both 701 layouts, non-5x10 stride behavior, observation/spec action-count mismatch, cache reuse/invalidation, all action/fusion sources, deep immutability, exact schemas/reasons, all recipes and runtime-only cases, recursive IDs, tile scope, and exactly-once attempt/outcome/reward handling.
+- All nine retained standalone regression entry points: PASS.
+- Dependency check and `compileall`: PASS.
+- Bridge lifecycle/build gate: PASS, 7,051 deterministic checks and zero compiler warnings.
+- Protected June 27 generalist metadata dry-run and actual load: PASS with `(701, (4297,), 370000)`. Fixed control: PASS with `(201, (357,), 350368)`. Neither checkpoint nor adjacent metadata was changed.
+- The benchmark contract hashes and 433-bit legal-mask count are unchanged. The five-round/50-sample final run records dense identity mask median/p95 `11.253/12.812 -> 1.371/1.426 ms`; fixed mask `1.860/3.521 -> 0.713/0.797`; low-sun identity mask `2.637/3.292 -> 1.189/1.280`; and no-fusion identity mask `8.677/9.120 -> 1.334/1.396`. A forced cold identity miss is `9.488/11.111 ms`; same-frame reuse is the measured hot path.
+- Other medians remain within the benchmark policy: fixed/identity encoding `0.206/0.538 -> 0.205/0.534 ms`, reward `0.272 -> 0.272`, fusion scan `5.810 -> 5.685`, live-status serialization `0.176 -> 0.161`, atomic write `4.249 -> 4.321`, and unchanged GUI poll `0.408 -> 0.037`. Live-status construction falls from `21.821 -> 3.014 ms` because it reuses the same proven mask decision.
+
+Measured deviation and residual boundary:
+
+- The supplied Phase 3 estimate targeted an 800-1,500 runtime-line reduction. The final pre-commit physical runtime diff is `+2,656/-935` (net `+1,721`), with `+1,663` test lines. This target is not met and is not being relabeled as met. The increase comes from explicit immutable action/fusion records, cache proofs, source/result schemas, and exactly-once contracts; old execution and validation bodies were removed rather than retained beside them. Later phases must deliver overall repository reduction without compressing readable safety code merely to hit a number.
+- Fusion diagnostics still classify occupied tile/slot pairs through the shared fusion validator after the action cache is built. Phase 4 will replace that remaining scan with immutable per-observation facts while preserving its compatibility-first reason ordering.
+- Live bridge/game execution remains intentionally unclaimed at this boundary. The newly built DLL is not installed until the final live gate can preserve the current installed bridge as a recovery point and test placement, legal/illegal/recursive fusion, reset, transitions, short train/resume, and evaluation together.
+
+Independent review found and drove fixes for mismatched cached intent/bridge identities, dynamic coach policy-versus-legacy indexing, implicit `plant`-to-fusion conversion, missing structured terminal/timeout results, caller-supplied recipe-result drift, runtime-only result invention, and missing failed-event copy replay. The final focused rerun is green. The review also confirmed the remaining fusion-diagnostics scan is a Phase 4 facts/index concern rather than a second execution authority.
+
+Rollback boundary: pending local Phase 3 commit after independent review.
+
+Later phase results, live verification, final independent reviews, code statistics, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.

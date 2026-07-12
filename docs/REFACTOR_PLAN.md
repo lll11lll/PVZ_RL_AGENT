@@ -19,6 +19,7 @@ The supplied `PvZRL Internal Architecture Refinement Plan` is the initial roadma
 | Game state | Plants vs. Zombies owns authoritative plants, zombies, waves, cooldowns, sun, progression, and spawning. Unity objects are read or mutated only from the bridge's Melon `OnUpdate` thread. |
 | Bridge request state | `src/PvZRLBridge/BridgeMod.cs` owns the localhost TCP server, request queue, Unity-thread dispatch, configuration, observation DTOs, UI/seed caches, placement, fusion, reset, and speed control. |
 | Base environment | `python/pvzrl_env.py` owns bridge calls, lifecycle/reset acceptance, Python legality safeguards, rewards, corruption detection, fusion accounting, and terminal classification. |
+| Action decisions | `python/pvzrl_actions.py` owns immutable policy/legacy/bridge action intents, pure Python legality decisions, frame/config cache proofs, and structured execution results. The base environment owns the cache and the bridge remains final authority. |
 | RL adapter | `python/pvzrl_sb3.py` owns numeric observation encoding, policy-action translation, MaskablePPO masks, coach arbitration, watchdog diagnostics, episode counters, and summaries. |
 | Adventure | `python/pvzrl_adventure.py` owns inference progression and transitions. `python/pvzrl_adventure_generalist.py` owns training curriculum, replay/frontier decisions, unlock state, loadouts, and strict startup identity. |
 | GUI | `python/pvzrl_gui.py` owns Tk state, command construction, subprocess control, log display, live-status reading/rendering, and local moderation UI. It does not own gameplay state. |
@@ -31,8 +32,8 @@ The supplied `PvZRL Internal Architecture Refinement Plan` is the initial roadma
 - Fixed training: `train_ppo.py -> build_config -> train -> DummyVecEnv/Monitor -> PvZMaskedPPOEnv -> MaskablePPO.learn -> ExperimentCallback`.
 - Fixed evaluation: `train_ppo.py -> evaluate -> metadata validation -> MaskablePPO.load -> run_eval_episode`.
 - Adventure evaluation: `train_ppo.py -> adventure_evaluate -> run_adventure_eval`, optionally through `ModelRouter`.
-- Action: MaskablePPO mask -> policy action conversion -> human/stream coach arbitration -> base environment revalidation -> bridge command -> fresh observation -> reward and episode accounting.
-- Fusion: Python recipe/compatibility logic and masks -> source-specific routing -> bridge mouse/reflection execution -> postcondition checks -> shared Python reward accounting.
+- Action: source-attributed policy intent -> one cached pure decision -> mask/coach/diagnostic/execution projections -> policy-to-legacy bridge conversion -> final bridge validation -> structured result -> reward and episode accounting.
+- Fusion: immutable recipe/runtime-only compatibility registry -> source-attributed fusion intent -> one validation/execution adapter -> bridge mouse/reflection execution -> shared tile-scope contract -> event-ID-deduplicated diagnostics and reward accounting.
 - Plant deletion remains outside the policy/manual action surface. Destruction is limited to reset, stale-object cleanup, and board recovery.
 
 ## Immutable compatibility contracts
@@ -92,7 +93,7 @@ Unless a separately documented defect correction has focused regression coverage
 | 0 | Baseline, behavior locks, fixtures, benchmarks, plan/report | Complete | Full existing Python baseline, bridge build, checkpoint loads, new contract tests, benchmark record |
 | 1 | Request deadlines/shutdown, seed cache warnings, shared JSONL tailing, GUI close, confirmed defects/dead code | Complete | Deterministic stale-request, shutdown, partial-record, GUI lifecycle tests; zero-warning bridge build; full baseline |
 | 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
-| 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Pending | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
+| 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Complete | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Pending | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
 | 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Pending | Recorded lifecycle trace equivalence and live startup/win/loss/timeout/replay/Adventure checks |
 | 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Pending | Build after every split, DTO snapshots, zero warnings, live placement/fusion/reset/seed checks |

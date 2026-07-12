@@ -24,14 +24,24 @@ from pvzrl_action_space import (
     decode_policy_action,
     legacy_action_to_policy_action,
     normalize_action_space_mode,
+    policy_action_to_legacy_action,
+)
+from pvzrl_actions import (
+    ACTION_KIND_FUSION,
+    ActionDecision,
+    ActionValidationConfig,
+    build_action_intent,
+    validate_policy_action as validate_authoritative_policy_action,
 )
 from pvzrl_fusion import (
     FUSION_ILLEGAL_EMPTY_TILE,
     FUSION_ILLEGAL_INCOMPATIBLE,
-    are_fusion_compatible,
+    enforce_fusion_scope_contract,
+    fusion_intent_from_candidate,
     plant_name as fusion_plant_name,
     plant_type_at_cell,
     seed_plant_type_for_slot,
+    validate_fusion_intent,
 )
 from pvzrl_file_tail import IncrementalLineTailReader
 
@@ -399,6 +409,16 @@ class QueueCoachCommandSource:
         return self.clear_pending()
 
 
+class _SourcedCoachCommandText(str):
+    """String-compatible queue item that retains JSONL source attribution."""
+
+    def __new__(cls, value: str, *, source: str, timestamp: float) -> "_SourcedCoachCommandText":
+        item = str.__new__(cls, value)
+        item.source = str(source)
+        item.timestamp = float(timestamp)
+        return item
+
+
 class FileCoachCommandSource:
     """Consume newly appended local mock commands from a plain text or JSONL file."""
 
@@ -415,16 +435,24 @@ class FileCoachCommandSource:
         self._last_error = ""
         for line in self._tail.read_lines():
             stripped = line.strip()
+            payload: Optional[Dict[str, Any]] = None
             if stripped.startswith("{"):
                 try:
-                    json.loads(stripped)
+                    decoded = json.loads(stripped)
+                    payload = decoded if isinstance(decoded, dict) else None
                 except json.JSONDecodeError:
                     self._tail.note_malformed_record("json_decode_error")
                     self._last_error = "json_decode_error"
                     continue
             text = _command_text_from_line(line)
             if text:
-                self._queue.append(text)
+                source = str((payload or {}).get("source") or "")
+                if source:
+                    raw_timestamp = (payload or {}).get("timestamp")
+                    timestamp = _safe_float(raw_timestamp, default=time.time())
+                    self._queue.append(_SourcedCoachCommandText(text, timestamp=timestamp, source=source))
+                else:
+                    self._queue.append(text)
         self._offset = self._tail.offset
         if not self._last_error and self._tail.last_error:
             self._last_error = self._tail.last_error
@@ -485,6 +513,7 @@ class HumanCoachOverrideHook:
         self._pending_command: Optional[CoachCommand] = None
         self._pending_reason: str = ""
         self._issued_command_ids: Set[int] = set()
+        self._accounted_fusion_event_ids: Set[str] = set()
 
     @classmethod
     def from_config(cls, config: HumanCoachConfig, source: Optional[CommandSource] = None) -> "HumanCoachOverrideHook":
@@ -518,7 +547,11 @@ class HumanCoachOverrideHook:
             return None
         if isinstance(raw, CoachCommand):
             return self._ensure_command_id(raw)
-        return parse_coach_command(str(raw), source=self.stats.platform)
+        return parse_coach_command(
+            str(raw),
+            timestamp=_safe_float(getattr(raw, "timestamp", None), default=time.time()),
+            source=str(getattr(raw, "source", "") or self.stats.platform),
+        )
 
     @staticmethod
     def _ensure_command_id(command: CoachCommand) -> CoachCommand:
@@ -873,10 +906,24 @@ class HumanCoachOverrideHook:
             self.stats.last_executed_coach_command_id = int(decision.command.coach_command_id)
         self.stats.selected_bridge_command = None
         if decision.command is not None and decision.command.kind == "fuse" and decision.validation is not None and decision.validation.legal:
-            self.stats.fusion_attempt_count += 1
             action_result = info.get("action_result") if isinstance(info, dict) else {}
             if not isinstance(action_result, dict):
                 action_result = {}
+            event_id = str(
+                action_result.get("fusionEventId")
+                or action_result.get("fusion_event_id")
+                or f"coach-command:{int(decision.command.coach_command_id)}"
+            )
+            if event_id in self._accounted_fusion_event_ids:
+                return 0.0
+            self._accounted_fusion_event_ids.add(event_id)
+            fusion_attempted = bool(
+                action_result.get("fusionAttempted")
+                if "fusionAttempted" in action_result
+                else True
+            )
+            if fusion_attempted:
+                self.stats.fusion_attempt_count += 1
             placement = action_result.get("placement") if isinstance(action_result.get("placement"), dict) else {}
             self._validate_fusion_postconditions(action_result, placement)
             self.stats.last_fusion_execution_mode = str(
@@ -1008,14 +1055,14 @@ class HumanCoachOverrideHook:
                 or action_result.get("fusion_success")
                 or action_result.get("fusionOverrideApplied")
             )
-            if fusion_success:
+            if fusion_success and fusion_attempted:
                 self.stats.fusion_success_count += 1
                 self.stats.last_fusion_result = "success"
                 self.stats.last_rejected_reason = ""
                 self.stats.last_error = ""
                 if self.reward_enabled:
                     components[COACH_REWARD_FUSION_SUCCESS_COMPONENT] += self.fusion_success_reward
-            else:
+            elif fusion_attempted:
                 self.stats.fusion_failure_count += 1
                 self.stats.last_fusion_result = "failed"
                 failure_reason = str(
@@ -1073,191 +1120,12 @@ class HumanCoachOverrideHook:
 
     @staticmethod
     def _validate_fusion_postconditions(action_result: Dict[str, Any], placement: Dict[str, Any]) -> None:
-        if not isinstance(action_result, dict):
-            return
-        if not isinstance(placement, dict):
-            placement = {}
-
-        reported_success = bool(
-            action_result.get("fusionSucceeded")
-            or action_result.get("fusion_success")
-            or action_result.get("fusionOverrideApplied")
+        del placement  # the shared helper reads and updates result["placement"]
+        enforce_fusion_scope_contract(
+            action_result,
+            require_dedicated_execution=True,
+            require_occupied_source=True,
         )
-        if not reported_success:
-            return
-
-        source_tile_occupied_before = bool(
-            action_result.get("sourceTileOccupiedBefore")
-            if "sourceTileOccupiedBefore" in action_result
-            else placement.get("sourceTileOccupiedBefore")
-        )
-        fusion_execution_mode = str(
-            action_result.get("fusionExecutionMode")
-            or placement.get("fusionExecutionMode")
-            or ""
-        )
-        duplicate_stack_detected = bool(
-            action_result.get("duplicateStackDetected")
-            or placement.get("duplicateStackDetected")
-        )
-        changed_tile_count = _safe_int(
-            action_result.get("changedTileCount"),
-            action_result.get("changed_tile_count"),
-            placement.get("changedTileCount"),
-            placement.get("changed_tile_count"),
-            default=0,
-        )
-        changed_tiles = action_result.get("changedTiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = action_result.get("changed_tiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = placement.get("changedTiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = placement.get("changed_tiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = []
-        requested_source_row = _safe_int(
-            action_result.get("requestedSourceRow"),
-            action_result.get("requested_source_row"),
-            placement.get("requestedSourceRow"),
-            placement.get("requested_source_row"),
-            default=-1,
-        )
-        requested_source_col = _safe_int(
-            action_result.get("requestedSourceCol"),
-            action_result.get("requested_source_col"),
-            placement.get("requestedSourceCol"),
-            placement.get("requested_source_col"),
-            default=-1,
-        )
-        non_source_tiles_changed = bool(
-            action_result.get("nonSourceTilesChanged")
-            if "nonSourceTilesChanged" in action_result
-            else action_result.get("non_source_tiles_changed")
-            if "non_source_tiles_changed" in action_result
-            else placement.get("nonSourceTilesChanged")
-            if "nonSourceTilesChanged" in placement
-            else placement.get("non_source_tiles_changed")
-        )
-        global_fusion_side_effect = bool(
-            action_result.get("globalFusionSideEffect")
-            if "globalFusionSideEffect" in action_result
-            else action_result.get("global_fusion_side_effect")
-            if "global_fusion_side_effect" in action_result
-            else placement.get("globalFusionSideEffect")
-            if "globalFusionSideEffect" in placement
-            else placement.get("global_fusion_side_effect")
-        )
-
-        changed_tile_matches_requested = False
-        if changed_tile_count == 1 and isinstance(changed_tiles, list) and changed_tiles:
-            first_tile = changed_tiles[0]
-            if isinstance(first_tile, dict):
-                changed_row = _safe_int(
-                    first_tile.get("row"),
-                    first_tile.get("sourceRow"),
-                    first_tile.get("source_row"),
-                    default=-1,
-                )
-                changed_col = _safe_int(
-                    first_tile.get("column"),
-                    first_tile.get("col"),
-                    first_tile.get("sourceCol"),
-                    first_tile.get("source_col"),
-                    default=-1,
-                )
-                changed_tile_matches_requested = (
-                    requested_source_row >= 0
-                    and requested_source_col >= 0
-                    and changed_row == requested_source_row
-                    and changed_col == requested_source_col
-                )
-
-        if not non_source_tiles_changed and isinstance(changed_tiles, list):
-            for tile in changed_tiles:
-                if not isinstance(tile, dict):
-                    continue
-                tile_row = _safe_int(
-                    tile.get("row"),
-                    tile.get("sourceRow"),
-                    tile.get("source_row"),
-                    default=-1,
-                )
-                tile_col = _safe_int(
-                    tile.get("column"),
-                    tile.get("col"),
-                    tile.get("sourceCol"),
-                    tile.get("source_col"),
-                    default=-1,
-                )
-                if tile_row != requested_source_row or tile_col != requested_source_col:
-                    non_source_tiles_changed = True
-                    break
-
-        failure_reason = ""
-        bridge_result_reason = str(
-            action_result.get("bridgeResultReason")
-            or placement.get("bridgeResultReason")
-            or ""
-        )
-        if not source_tile_occupied_before:
-            failure_reason = "source_tile_not_occupied"
-            bridge_result_reason = bridge_result_reason or failure_reason
-        elif fusion_execution_mode != "dedicated_fusion":
-            failure_reason = "bridge_rejected"
-            bridge_result_reason = bridge_result_reason or "fusion_not_dedicated_path"
-        elif duplicate_stack_detected:
-            failure_reason = "duplicate_stack_detected"
-            bridge_result_reason = bridge_result_reason or failure_reason
-        elif non_source_tiles_changed or global_fusion_side_effect or changed_tile_count > 1:
-            failure_reason = "global_fusion_side_effect"
-            bridge_result_reason = "fusion_mutated_non_source_tiles"
-        elif changed_tile_count != 1 or not changed_tile_matches_requested:
-            failure_reason = "fusion_no_effect"
-            bridge_result_reason = bridge_result_reason or failure_reason
-
-        if not failure_reason:
-            return
-
-        action_result["fusionSucceeded"] = False
-        action_result["fusion_success"] = False
-        action_result["fusionOverrideApplied"] = False
-        action_result["illegalAction"] = True
-        action_result["illegalReason"] = failure_reason
-        action_result["fusionRejectedReason"] = failure_reason
-        action_result["bridgeResultReason"] = bridge_result_reason
-        action_result["bridge_result_reason"] = bridge_result_reason
-        action_result["changedTileCount"] = changed_tile_count
-        action_result["changed_tile_count"] = changed_tile_count
-        action_result["nonSourceTilesChanged"] = bool(non_source_tiles_changed)
-        action_result["non_source_tiles_changed"] = bool(non_source_tiles_changed)
-        action_result["globalFusionSideEffect"] = bool(
-            failure_reason == "global_fusion_side_effect" or global_fusion_side_effect
-        )
-        action_result["global_fusion_side_effect"] = bool(
-            failure_reason == "global_fusion_side_effect" or global_fusion_side_effect
-        )
-        if failure_reason == "global_fusion_side_effect":
-            action_result["fusionScope"] = "global_side_effect_detected"
-            action_result["fusion_scope"] = "global_side_effect_detected"
-        if placement:
-            placement["success"] = False
-            placement["illegalReason"] = failure_reason
-            placement["bridgeResultReason"] = bridge_result_reason
-            placement["bridge_result_reason"] = bridge_result_reason
-            placement["changedTileCount"] = changed_tile_count
-            placement["changed_tile_count"] = changed_tile_count
-            placement["nonSourceTilesChanged"] = bool(non_source_tiles_changed)
-            placement["non_source_tiles_changed"] = bool(non_source_tiles_changed)
-            placement["globalFusionSideEffect"] = bool(
-                failure_reason == "global_fusion_side_effect" or global_fusion_side_effect
-            )
-            placement["global_fusion_side_effect"] = bool(
-                failure_reason == "global_fusion_side_effect" or global_fusion_side_effect
-            )
-            if failure_reason == "global_fusion_side_effect":
-                placement["fusionScope"] = "global_side_effect_detected"
-                placement["fusion_scope"] = "global_side_effect_detected"
 
     def _base_reward_components(self, *, match: bool, override: bool, legal_execution: bool) -> Dict[str, float]:
         components = {
@@ -1447,6 +1315,7 @@ def validate_coach_command(
             Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]],
         ]
     ] = None,
+    policy_decision_resolver: Optional[Callable[[int], ActionDecision]] = None,
 ) -> CoachActionValidation:
     observation = observation if isinstance(observation, dict) else {}
     rows = int(observation.get("rowCount") or rows)
@@ -1482,7 +1351,15 @@ def validate_coach_command(
                 rejected_reason=rejected_reason or COACH_REJECTION_FUSION_BRIDGE_REJECTED,
                 diagnostics=diagnostics,
             )
-        wait_validation = _validate_policy_action(command, int(spec.wait_action), spec, observation, action_mask, plant_types)
+        wait_validation = _validate_policy_action(
+            command,
+            int(spec.wait_action),
+            spec,
+            observation,
+            action_mask,
+            plant_types,
+            policy_decision_resolver=policy_decision_resolver,
+        )
         if not wait_validation.legal:
             return _validation(
                 command,
@@ -1507,9 +1384,6 @@ def validate_coach_command(
         bounds_reason = _validate_seed_cell_bounds(command, spec, observation, plant_types)
         if bounds_reason:
             return _validation(command, False, rejected_reason=bounds_reason)
-        block_reason = _placement_block_reason_for_command(command, observation)
-        if block_reason:
-            return _validation(command, False, rejected_reason=block_reason)
         action, reason = _encode_slot_cell_action(
             int(command.seed_index if command.seed_index is not None else -1),
             int(command.row if command.row is not None else -1),
@@ -1518,10 +1392,16 @@ def validate_coach_command(
         )
         if action is None:
             return _validation(command, False, rejected_reason=reason)
-        return _validate_policy_action(command, action, spec, observation, action_mask, plant_types)
+        return _validate_policy_action(
+            command, action, spec, observation, action_mask, plant_types,
+            policy_decision_resolver=policy_decision_resolver,
+        )
 
     if command.kind == "wait":
-        return _validate_policy_action(command, int(spec.wait_action), spec, observation, action_mask, plant_types)
+        return _validate_policy_action(
+            command, int(spec.wait_action), spec, observation, action_mask, plant_types,
+            policy_decision_resolver=policy_decision_resolver,
+        )
 
     if command.kind == "defend":
         row = int(command.row if command.row is not None else -1)
@@ -1537,7 +1417,10 @@ def validate_coach_command(
         )
         if action is None:
             return _validation(command, False, rejected_reason="no_legal_defense_action")
-        return _validate_policy_action(command, action, spec, observation, action_mask, plant_types)
+        return _validate_policy_action(
+            command, action, spec, observation, action_mask, plant_types,
+            policy_decision_resolver=policy_decision_resolver,
+        )
 
     if command.kind == "economy":
         action = _choose_high_level_action(
@@ -1550,7 +1433,10 @@ def validate_coach_command(
         )
         if action is None:
             return _validation(command, False, rejected_reason="no_legal_economy_action")
-        return _validate_policy_action(command, action, spec, observation, action_mask, plant_types)
+        return _validate_policy_action(
+            command, action, spec, observation, action_mask, plant_types,
+            policy_decision_resolver=policy_decision_resolver,
+        )
 
     return _validation(command, False, rejected_reason="unknown_command")
 
@@ -1587,6 +1473,45 @@ def validate_coach_command_for_env(
             }
 
         fusion_probe = _unavailable_probe
+    decision_owner = getattr(env, "base", None) or env
+    decision_fn = getattr(decision_owner, "action_decision", None)
+    policy_decision_resolver: Optional[Callable[[int], ActionDecision]] = None
+    if callable(decision_fn):
+        def _resolve_policy_decision(action: int) -> ActionDecision:
+            policy_action = int(action)
+            legacy_action = int(
+                policy_action_to_legacy_action(
+                    policy_action,
+                    mode=mode,
+                    rows=rows,
+                    cols=cols,
+                )
+            )
+            source = str(command.source or "human_coach")
+            source_metadata = {
+                "coach_command_id": int(command.coach_command_id),
+                "coach_command_kind": str(command.kind),
+            }
+            intent = build_action_intent(
+                policy_action,
+                source=source,
+                mode=mode,
+                observation=observation,
+                plant_types=plant_types,
+                max_seed_slots=max_seed_slots,
+                rows=rows,
+                cols=cols,
+                source_metadata=source_metadata,
+            )
+            return decision_fn(
+                legacy_action,
+                observation=observation,
+                source=source,
+                source_metadata=source_metadata,
+                intent=intent,
+            )
+
+        policy_decision_resolver = _resolve_policy_decision
     return validate_coach_command(
         command,
         action_space_mode=mode,
@@ -1598,6 +1523,7 @@ def validate_coach_command_for_env(
         cols=cols,
         fusion_enabled=fusion_enabled,
         fusion_bridge_probe=fusion_probe,
+        policy_decision_resolver=policy_decision_resolver,
     )
 
 
@@ -1682,19 +1608,6 @@ def _active_seed_slot_count(
     return None
 
 
-def _placement_block_reason_for_command(command: CoachCommand, observation: Dict[str, Any]) -> str:
-    seed_index = int(command.seed_index if command.seed_index is not None else -1)
-    row = int(command.row if command.row is not None else -1)
-    col = int(command.col if command.col is not None else -1)
-    slot = _seed_slot_for_index(observation, seed_index=seed_index)
-    slot_block_reason = _seed_slot_block_reason(observation, slot)
-    if slot_block_reason:
-        return slot_block_reason
-    if _cell_occupied_for_validation(observation, row=row, col=col):
-        return COACH_REJECTION_OCCUPIED_CELL
-    return ""
-
-
 def _seed_slot_for_index(observation: Dict[str, Any], *, seed_index: int) -> Optional[Dict[str, Any]]:
     slots = observation.get("seedSlots")
     if not isinstance(slots, list):
@@ -1763,14 +1676,38 @@ def _fusion_compatibility_rejection(
         return "", diagnostics
     if selected_type is None:
         return "", diagnostics  # cannot resolve the seed's plant type; let the bridge decide
-    if not are_fusion_compatible(existing_type, selected_type):
+    intent = fusion_intent_from_candidate(
+        {
+            "source_plant_type": int(existing_type),
+            "source_plant_name": diagnostics["fusion_existing_plant_name"],
+            "source_row": row,
+            "source_col": col,
+            "target_or_ingredient_type": int(selected_type),
+            "target_or_ingredient_name": diagnostics["fusion_selected_seed_name"],
+            "ingredient_seed_slot_index": seed_index,
+        },
+        source=str(command.source or "human"),
+    )
+    decision = validate_fusion_intent(
+        intent,
+        observation,
+        fusion_enabled=True,
+        fusion_bridge_available=True,
+        plant_types=plant_types,
+        check_seed_resources=False,
+    )
+    if not decision.legal:
+        if decision.rejection_reason != FUSION_ILLEGAL_INCOMPATIBLE:
+            # Bounds/emptiness have already been handled above.  Defer any
+            # transient or bridge-specific condition to the authoritative probe.
+            return "", diagnostics
         diagnostics["fusion_incompatible_pair"] = {
             "existing": diagnostics["fusion_existing_plant_name"],
             "selected": diagnostics["fusion_selected_seed_name"],
             "row": row,
             "col": col,
         }
-        return COACH_REJECTION_FUSION_INCOMPATIBLE, diagnostics
+        return decision.rejection_reason, diagnostics
     return "", diagnostics
 
 
@@ -1785,26 +1722,6 @@ def _log_fusion_rejection(command: CoachCommand, reason: str, diagnostics: Dict[
     )
 
 
-def _cell_occupied_for_validation(observation: Dict[str, Any], *, row: int, col: int) -> bool:
-    for key in ("plants", "visiblePlants"):
-        values = observation.get(key)
-        if not isinstance(values, list):
-            continue
-        for plant in values:
-            if not isinstance(plant, dict):
-                continue
-            if key == "visiblePlants" and (
-                not bool(plant.get("activeInHierarchy", True))
-                or not bool(plant.get("inBoardBounds", True))
-            ):
-                continue
-            prow = _safe_int(plant.get("row"), default=-1)
-            pcol = _safe_int(plant.get("column"), plant.get("col"), default=-1)
-            if prow == int(row) and pcol == int(col):
-                return True
-    return False
-
-
 def _validate_policy_action(
     command: CoachCommand,
     action: int,
@@ -1812,36 +1729,77 @@ def _validate_policy_action(
     observation: Dict[str, Any],
     action_mask: Optional[Any],
     plant_types: Sequence[int],
+    *,
+    policy_decision_resolver: Optional[Callable[[int], ActionDecision]] = None,
 ) -> CoachActionValidation:
     action = int(action)
     if action < 0 or action >= int(spec.action_count):
         return _validation(command, False, policy_action=action, rejected_reason="action_out_of_bounds")
-    if not _has_legality_signal(action_mask, observation):
-        if action == int(spec.wait_action):
-            decoded = decode_policy_action(
-                action,
-                mode=spec.mode,
-                observation=observation,
-                plant_types=list(plant_types),
-                max_seed_slots=spec.max_seed_slots,
-                rows=spec.rows,
-                cols=spec.cols,
-            )
-            return _validation(command, True, policy_action=action, decoded=decoded)
-        return _validation(command, False, policy_action=action, rejected_reason="missing_legality_signal")
-    if not _policy_action_allowed(action, spec, observation, action_mask):
-        return _validation(command, False, policy_action=action, rejected_reason="illegal_action")
-    decoded = decode_policy_action(
-        action,
-        mode=spec.mode,
-        observation=observation,
-        plant_types=list(plant_types),
-        max_seed_slots=spec.max_seed_slots,
-        rows=spec.rows,
-        cols=spec.cols,
-    )
-    if int(decoded.get("kind", -1)) == -1:
-        return _validation(command, False, policy_action=action, rejected_reason="invalid_action_decode")
+    has_signal = _has_legality_signal(action_mask, observation)
+    allowed_policy_actions = _legal_policy_actions(spec, observation, action_mask)
+    bridge_actions = {
+        int(policy_action_to_legacy_action(policy, mode=spec.mode, rows=spec.rows, cols=spec.cols))
+        for policy in allowed_policy_actions
+    }
+    validation_observation = dict(observation)
+    validation_observation.setdefault("rowCount", int(spec.rows))
+    validation_observation.setdefault("columnCount", int(spec.cols))
+    validation_observation.setdefault("gameplayReady", True)
+    validation_observation.setdefault("boardFound", True)
+    validation_observation.setdefault("canReadBoard", True)
+    if not isinstance(validation_observation.get("seedSlots"), list) and plant_types:
+        validation_observation["seedSlots"] = [
+            {"slotIndex": index, "plantType": int(plant_type), "usable": True, "ready": True, "seedCost": 0}
+            for index, plant_type in enumerate(plant_types)
+        ]
+    if policy_decision_resolver is not None:
+        decision = policy_decision_resolver(action)
+    else:
+        decision = validate_authoritative_policy_action(
+            action,
+            source=str(command.source or "human_coach"),
+            observation=validation_observation,
+            config=ActionValidationConfig(
+                action_space_mode=spec.mode,
+                plant_types=tuple(int(value) for value in plant_types),
+                max_seed_slots=int(spec.max_seed_slots),
+                rows=int(spec.rows),
+                cols=int(spec.cols),
+            ),
+            bridge_legal_actions=bridge_actions,
+            source_metadata={
+                "coach_command_id": int(command.coach_command_id),
+                "coach_command_kind": str(command.kind),
+            },
+        )
+    decoded = decision.intent.to_dict().get("decoded_action") or {}
+    if command.kind == "plant" and decision.resolved_action_kind == ACTION_KIND_FUSION:
+        # Occupied-tile fusion remains an explicit ``fuse`` coach command.
+        # A model-visible fusion mask must not silently change the semantics of
+        # a manual ``plant`` command.
+        return _validation(
+            command,
+            False,
+            policy_action=action,
+            rejected_reason=COACH_REJECTION_OCCUPIED_CELL,
+            decoded=decoded,
+        )
+    if not decision.legal:
+        reason = str(decision.rejection_reason or "illegal_action")
+        if command.kind != "plant" or reason not in {
+            COACH_REJECTION_SLOT_NOT_USABLE,
+            COACH_REJECTION_SLOT_DISABLED,
+            COACH_REJECTION_COOLDOWN_NOT_READY,
+            COACH_REJECTION_INSUFFICIENT_SUN,
+            COACH_REJECTION_OCCUPIED_CELL,
+            "invalid_action_decode",
+        }:
+            reason = "missing_legality_signal" if not has_signal and action != int(spec.wait_action) else "illegal_action"
+        return _validation(command, False, policy_action=action, rejected_reason=reason, decoded=decoded)
+    if has_signal and action not in allowed_policy_actions:
+        return _validation(command, False, policy_action=action, rejected_reason="illegal_action", decoded=decoded)
+    if not has_signal and action != int(spec.wait_action):
+        return _validation(command, False, policy_action=action, rejected_reason="missing_legality_signal", decoded=decoded)
     return _validation(command, True, policy_action=action, decoded=decoded)
 
 

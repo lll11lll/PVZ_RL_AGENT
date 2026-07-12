@@ -301,6 +301,9 @@ class FusionRewardPolicyTests(unittest.TestCase):
             ({"humanCoach": {"source": "human", "commandMode": "override"}}, "human_coach"),
             ({"humanCoach": {"source": "stream"}}, "stream_coach"),
             ({"humanCoach": {"source": "human", "commandMode": "assist"}}, "assist"),
+            ({"fusionIntentSource": "gui", "coach_command_source": "human"}, "gui"),
+            ({"fusionIntentSource": "manual"}, "manual"),
+            ({"fusionIntentSource": "debug"}, "debug"),
         )
         for result, expected in cases:
             with self.subTest(expected=expected):

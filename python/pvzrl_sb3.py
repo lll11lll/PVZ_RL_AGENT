@@ -19,6 +19,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from pvzrl_actions import build_action_intent
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ACTION_SPACE_FIXED,
@@ -718,12 +719,63 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         action_started_at = time.time()
         action_started_perf = time.perf_counter()
         pre_action_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
+        action_source = "model"
+        raw_action_source = "model"
+        source_platform = ""
+        if coach_decision is not None and (
+            bool(coach_decision.override_applied) or selected_bridge_command is not None
+        ):
+            raw_action_source = str(
+                coach_decision.command.source
+                if coach_decision.command is not None
+                else "human"
+            ).strip().lower()
+            action_source = {
+                "human": "human_coach",
+                "stream": "stream_coach",
+                "mock_stream": "stream_coach",
+            }.get(raw_action_source, raw_action_source or "human_coach")
+            source_platform = str(self.config.human_coach_platform or raw_action_source)
+        elif (
+            stream_decision is not None
+            and bool(stream_decision.selected)
+            and bool(self.config.stream_coach_apply_enabled)
+            and not bool(self.config.stream_coach_dry_run)
+        ):
+            action_source = "stream_coach"
+            raw_action_source = str(
+                (stream_decision.selected_command or {}).get("source")
+                or (stream_decision.selected_command or {}).get("platform")
+                or "stream"
+            ).strip().lower()
+            source_platform = str(self.config.stream_coach_platform or "mock")
+        structured_intent = build_action_intent(
+            policy_action,
+            source=action_source,
+            mode=self.action_spec.mode,
+            observation=pre_action_observation,
+            plant_types=self.config.plant_types,
+            max_seed_slots=self.action_spec.max_seed_slots,
+            rows=self.rows,
+            cols=self.cols,
+            bridge_command=selected_bridge_command,
+            source_metadata={
+                "ppo_action": int(ppo_action),
+                "selected_policy_action": int(policy_action),
+                "coach_event": str(coach_context.get("event") or ""),
+                "raw_source": raw_action_source,
+                "platform": source_platform,
+                "command_mode": str(self.config.human_coach_command_mode or ""),
+                "stream_mode": str(self.config.stream_coach_mode or ""),
+            },
+        )
         action_exception = ""
         try:
             observation, reward, done, _, info = self.base.step(
                 bridge_action,
                 coach_bridge_command=selected_bridge_command,
                 coach_context=coach_context if coach_context else None,
+                action_intent=structured_intent,
             )
         except BridgeTimeoutError as exc:
             action_exception = str(exc)

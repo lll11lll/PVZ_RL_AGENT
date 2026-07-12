@@ -12,7 +12,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Sequence, Set, Tuple, Union
 
 from pvzrl_action_space import build_action_space_spec, normalize_action_space_mode
 from pvzrl_file_tail import IncrementalLineTailReader
@@ -1277,6 +1277,7 @@ class StreamCoachController:
         self._stale_messages_cleared = 0
         self._clear_count = 0
         self._last_clear_reason = ""
+        self._accounted_fusion_event_ids: Set[str] = set()
         start_fn = getattr(self.source, "start", None)
         if callable(start_fn):
             start_fn()
@@ -1353,9 +1354,23 @@ class StreamCoachController:
     def apply_step_outcome(self, decision: CrowdCoachDecision, info: Dict[str, Any]) -> None:
         if not bool(getattr(decision, "selected", False)) or bool(getattr(decision, "pending", False)):
             return
-        self.aggregator.record_applied_decision(decision)
         selected_command = getattr(decision, "selected_command", None)
         selected_bridge_command = getattr(decision, "selected_bridge_command", None)
+        action_result = info.get("action_result") if isinstance(info, dict) else {}
+        if not isinstance(action_result, dict):
+            action_result = {}
+        if isinstance(selected_bridge_command, dict):
+            command_id_for_event = _safe_int(selected_bridge_command.get("coach_command_id"), default=0)
+            event_id = str(
+                action_result.get("fusionEventId")
+                or action_result.get("fusion_event_id")
+                or (f"coach-command:{command_id_for_event}" if command_id_for_event > 0 else "")
+            )
+            if event_id and event_id in self._accounted_fusion_event_ids:
+                return
+            if event_id:
+                self._accounted_fusion_event_ids.add(event_id)
+        self.aggregator.record_applied_decision(decision)
         if isinstance(selected_bridge_command, dict):
             self.aggregator.stream_coach_selected_bridge_command = None
         command_id = None
@@ -1365,11 +1380,14 @@ class StreamCoachController:
             self.aggregator.stream_coach_last_executed_command_id = int(command_id)
         if not isinstance(selected_bridge_command, dict):
             return
-        self.aggregator.stream_coach_fusion_attempt_count += 1
+        fusion_attempted = bool(
+            action_result.get("fusionAttempted")
+            if "fusionAttempted" in action_result
+            else True
+        )
+        if fusion_attempted:
+            self.aggregator.stream_coach_fusion_attempt_count += 1
         self.aggregator.stream_coach_fusion_last_command = dict(selected_command) if isinstance(selected_command, dict) else None
-        action_result = info.get("action_result") if isinstance(info, dict) else {}
-        if not isinstance(action_result, dict):
-            action_result = {}
         placement = action_result.get("placement") if isinstance(action_result.get("placement"), dict) else {}
         fusion_succeeded = bool(
             action_result.get("fusionSucceeded")
@@ -1413,10 +1431,13 @@ class StreamCoachController:
             action_result.get("globalFusionSideEffect")
             or placement.get("globalFusionSideEffect")
         )
-        if fusion_succeeded:
+        if fusion_succeeded and fusion_attempted:
             self.aggregator.stream_coach_fusion_success_count += 1
-        else:
+        elif fusion_attempted:
             self.aggregator.stream_coach_fusion_failure_count += 1
+            self.aggregator.stream_coach_fusion_rejected_count += 1
+            self.aggregator.stream_coach_last_error = bridge_reason
+        else:
             self.aggregator.stream_coach_fusion_rejected_count += 1
             self.aggregator.stream_coach_last_error = bridge_reason
 

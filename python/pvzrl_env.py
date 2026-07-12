@@ -15,28 +15,49 @@ import socket
 import subprocess
 import time
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from pvzrl_actions import (
+    ActionDecision,
+    ActionDecisionCache,
+    ActionIntent,
+    ActionResult,
+    ActionValidationConfig,
+    build_action_decision_cache,
+    build_action_intent,
+    build_action_validation_context,
+    compatible_pairs_for_observation,
+    validate_action_intent,
+)
 from pvzrl_fusion import (
     FUSION_ILLEGAL_INCOMPATIBLE,
     FUSION_POLICY_NONE,
     FUSION_POLICY_SCRIPTED,
-    apply_fusion_attempt_result,
+    FUSION_SOURCE_MODEL,
+    FUSION_SOURCE_SCRIPTED,
+    FusionDecision,
+    FusionIntent,
+    account_fusion_execution_once,
     are_fusion_compatible,
     build_fusion_diagnostics,
     choose_scripted_fusion_candidate,
     compact_candidate,
     count_tough_zombies_by_row,
     default_fusion_diagnostics,
+    enforce_fusion_scope_contract,
     fusion_compatibility_table,
     fusion_live_fields,
+    fusion_execution_from_result,
+    fusion_intent_from_candidate,
     fusion_tier,
     get_fusion_illegal_reason,
     merge_episode_fusion_stats,
+    normalize_fusion_source,
     normalize_fusion_policy,
     plant_name as fusion_plant_name,
+    validate_fusion_intent,
     validate_scripted_fusion_candidate,
 )
 from pvzrl_registry import (
@@ -942,6 +963,10 @@ class PvZGymEnv:
             ),
         )
         self.previous_observation: Optional[Dict[str, Any]] = None
+        self._action_decision_cache: Optional[ActionDecisionCache] = None
+        self._action_decision_cache_hits = 0
+        self._action_decision_cache_misses = 0
+        self._action_decision_cache_last_hit = False
         self.process: Optional[subprocess.Popen[Any]] = None
         self._steps_since_seed_screen_check = self.config.seed_screen_check_interval
         self._last_episode_ended_by_timeout = False
@@ -4105,6 +4130,198 @@ class PvZGymEnv:
         self._last_fusion_diagnostics = diagnostics
         return diagnostics
 
+    def _next_fusion_pipeline_event_id(self, source: str) -> str:
+        counter = int(getattr(self, "_fusion_pipeline_event_counter", 0)) + 1
+        self._fusion_pipeline_event_counter = counter
+        epoch = int(getattr(self, "_fusion_pipeline_epoch", 0))
+        return f"fusion:{epoch}:{str(source or 'manual')}:{counter}"
+
+    def _execute_fusion_intent(
+        self,
+        pre_observation: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+        intent: FusionIntent,
+        *,
+        precondition_rejection: str = "",
+        require_known_recipe: bool = False,
+        coach_bridge_command: Optional[Dict[str, Any]] = None,
+        rejection_attempted: bool = False,
+        return_rejection_result: bool = False,
+        rejection_reason_aliases: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Validate, execute, scope-check, decorate, and account one fusion.
+
+        Model, scripted, human, stream, GUI/manual, and debug requests all enter
+        here after source-specific parsing.  Unity's ``fusion_step`` response is
+        still the final authority; Python only supplies a pure preflight guard.
+        """
+
+        event_id = self._next_fusion_pipeline_event_id(intent.source)
+        decision = validate_fusion_intent(
+            intent,
+            pre_observation,
+            fusion_enabled=True,
+            fusion_bridge_available=bool(hasattr(getattr(self, "client", None), "request")),
+            plant_types=self.config.plant_types,
+            check_seed_resources=True,
+            precondition_rejection=precondition_rejection,
+            require_known_recipe=require_known_recipe,
+        )
+        if not decision.legal and isinstance(rejection_reason_aliases, dict):
+            aliased_reason = str(rejection_reason_aliases.get(decision.rejection_reason) or decision.rejection_reason)
+            if aliased_reason != decision.rejection_reason:
+                decision = FusionDecision(
+                    intent=decision.intent,
+                    legal=False,
+                    rejection_reason=aliased_reason,
+                    recipe=decision.recipe,
+                    compatibility_kind=decision.compatibility_kind,
+                    bridge_command=decision.bridge_command,
+                )
+        candidate = intent.candidate_dict()
+        result: Optional[Dict[str, Any]] = None
+        attempted = False
+        bridge_completed = False
+
+        if not decision.legal:
+            if isinstance(coach_bridge_command, dict):
+                result = self._blocked_coach_fusion_result(
+                    reason=decision.rejection_reason,
+                    requested_action=int(intent.requested_action),
+                    executed_action=int(intent.executed_action),
+                    candidate=candidate,
+                    coach_bridge_command=coach_bridge_command,
+                    attempted=bool(rejection_attempted),
+                )
+            elif return_rejection_result:
+                result = self._failed_fusion_action_result(
+                    candidate=candidate,
+                    reason=decision.rejection_reason,
+                    requested_action=int(intent.requested_action),
+                    executed_action=int(intent.executed_action),
+                    source=self._legacy_fusion_execution_source(intent),
+                    attempted=bool(rejection_attempted),
+                )
+            attempted = bool(rejection_attempted)
+        else:
+            bridge_payload = dict(decision.bridge_command)
+            if isinstance(coach_bridge_command, dict):
+                command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
+                bridge_payload.update(
+                    {
+                        "coach_command_id": int(command_id or 0),
+                        "coach_command_timestamp": float(coach_bridge_command.get("coach_command_timestamp") or 0.0),
+                        "executed_from_fresh_coach_command": True,
+                        "coach_command_age_seconds": self._coach_command_age_seconds(coach_bridge_command),
+                        "coach_command_queue_cleared_on_reset": bool(self._coach_command_queue_cleared_on_reset),
+                        "startup_command_blocked": False,
+                    }
+                )
+            attempted = True
+            try:
+                raw_result = self.client.request("fusion_step", **bridge_payload, return_observation=False)
+                if isinstance(raw_result, dict):
+                    result = raw_result
+                    bridge_completed = True
+                else:
+                    raise RuntimeError("fusion_step returned a non-object response")
+            except Exception as exc:
+                reason = "bridge_error"
+                if isinstance(coach_bridge_command, dict):
+                    result = self._blocked_coach_fusion_result(
+                        reason=reason,
+                        requested_action=int(intent.requested_action),
+                        executed_action=int(intent.executed_action),
+                        candidate=candidate,
+                        coach_bridge_command=coach_bridge_command,
+                        attempted=True,
+                        bridge_error=str(exc),
+                    )
+                else:
+                    result = self._failed_fusion_action_result(
+                        candidate=candidate,
+                        reason=reason,
+                        requested_action=int(intent.requested_action),
+                        executed_action=int(intent.executed_action),
+                        source=self._legacy_fusion_execution_source(intent),
+                        bridge_error=str(exc),
+                        attempted=True,
+                    )
+
+        if isinstance(result, dict):
+            result.setdefault("requestedAction", int(intent.requested_action))
+            result.setdefault("executedAction", int(intent.executed_action))
+            result.setdefault("fusionAttempted", bool(attempted))
+            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
+            result["fusionExecutionSource"] = self._legacy_fusion_execution_source(intent)
+            result["fusionIntentSource"] = str(intent.source)
+            result["fusionEventId"] = event_id
+            result.setdefault("requestedSourceRow", int(intent.source_row))
+            result.setdefault("requestedSourceCol", int(intent.source_col))
+            result.setdefault("requestedSourceInstanceId", int(intent.source_instance_id))
+            result["fusionCandidate"] = compact_candidate(candidate)
+            result["fusionIntent"] = {
+                "source": str(intent.source),
+                "row": int(intent.source_row),
+                "column": int(intent.source_col),
+                "seed_slot": int(intent.ingredient_seed_slot_index),
+                "source_plant_type": int(intent.source_plant_type),
+                "ingredient_plant_type": int(intent.ingredient_plant_type),
+                "predicted_result_type": int(intent.predicted_result_type),
+                "compatibility_kind": str(intent.compatibility_kind),
+            }
+            result.setdefault(
+                "decoded",
+                {
+                    "kind": "fusion",
+                    "sourcePlantType": int(intent.source_plant_type),
+                    "ingredientPlantType": int(intent.ingredient_plant_type),
+                    "resultPlantType": int(intent.predicted_result_type),
+                    "row": int(intent.source_row),
+                    "column": int(intent.source_col),
+                },
+            )
+            self._enforce_fusion_scope_contract(result)
+            if isinstance(coach_bridge_command, dict):
+                command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
+                result["coachFusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
+                result.setdefault("executed_from_fresh_coach_command", bool(bridge_completed))
+                result.setdefault("coach_command_age_seconds", self._coach_command_age_seconds(coach_bridge_command))
+                result.setdefault("startup_command_blocked", False)
+                result.setdefault("coach_command_queue_cleared_on_reset", bool(self._coach_command_queue_cleared_on_reset))
+                result.setdefault("coach_command_source", str(coach_bridge_command.get("coach_command_source") or ""))
+                result.setdefault("executed_coach_command_id", command_id)
+                if bridge_completed and command_id is not None:
+                    self._executed_coach_command_ids.add(int(command_id))
+                    self._last_executed_coach_command_id = int(command_id)
+                result["last_executed_coach_command_id"] = self._last_executed_coach_command_id
+
+        execution = fusion_execution_from_result(
+            decision,
+            result,
+            event_id=event_id,
+            attempted=bool(attempted),
+            rejection_reason=decision.rejection_reason,
+        )
+        accounted = getattr(self, "_fusion_accounted_event_ids", None)
+        if not isinstance(accounted, set):
+            accounted = set()
+            self._fusion_accounted_event_ids = accounted
+        diagnostics, applied = account_fusion_execution_once(diagnostics, execution, accounted)
+        if isinstance(result, dict):
+            result["fusionAccountingApplied"] = bool(applied)
+        self._last_fusion_diagnostics = diagnostics
+        return result, diagnostics
+
+    @staticmethod
+    def _legacy_fusion_execution_source(intent: FusionIntent) -> str:
+        explicit = str(intent.metadata.get("legacy_execution_source") or "")
+        if explicit:
+            return explicit
+        if intent.source == FUSION_SOURCE_MODEL:
+            return "model_action_mask"
+        return str(intent.source)
+
     def _maybe_execute_scripted_fusion(
         self,
         pre_observation: Dict[str, Any],
@@ -4126,66 +4343,27 @@ class PvZGymEnv:
             action_already_executed=False,
         )
         rejection = validation_rejection or select_rejection
-        if rejection:
-            # Candidate selection/validation happens before an action is attempted.
-            # Keep it observable without turning every no-candidate step into a
-            # failed fusion or a reward event.
-            if candidate is not None:
-                diagnostics = apply_fusion_attempt_result(diagnostics, candidate, None, rejected_reason=rejection)
+        # A no-candidate scan is observational, not an attempted fusion.  Once a
+        # concrete candidate exists, every source uses the same pipeline.
+        if candidate is None:
             self._last_fusion_diagnostics = diagnostics
             return None, diagnostics
-        assert candidate is not None
-        try:
-            result = self.client.request(
-                "fusion_step",
-                source_instance_id=int(candidate.get("source_instance_id") or 0),
-                source_row=int(candidate.get("source_row")),
-                source_col=int(candidate.get("source_col")),
-                source_plant_type=int(candidate.get("source_plant_type")),
-                ingredient_seed_slot_index=int(candidate.get("ingredient_seed_slot_index")),
-                ingredient_plant_type=int(candidate.get("target_or_ingredient_type")),
-                predicted_result_type=int(candidate.get("predicted_result_type") or -1),
-                predicted_result_name=str(candidate.get("predicted_result_name") or ""),
-                return_observation=False,
-            )
-        except Exception as exc:
-            result = self._failed_fusion_action_result(
-                candidate=candidate,
-                reason="bridge_error",
-                requested_action=requested_action,
-                executed_action=executed_action,
-                source="scripted",
-                bridge_error=str(exc),
-            )
-            diagnostics = apply_fusion_attempt_result(
-                diagnostics,
-                candidate,
-                result,
-                rejected_reason="bridge_error",
-                bridge_error=str(exc),
-            )
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        if isinstance(result, dict):
-            result["requestedAction"] = int(requested_action)
-            result["executedAction"] = int(executed_action)
-            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
-            result["fusionCandidate"] = compact_candidate(candidate)
-            result.setdefault(
-                "decoded",
-                {
-                    "kind": "fusion",
-                    "sourcePlantType": int(candidate.get("source_plant_type", -1)),
-                    "ingredientPlantType": int(candidate.get("target_or_ingredient_type", -1)),
-                    "resultPlantType": int(candidate.get("predicted_result_type", -1)),
-                    "row": int(candidate.get("source_row", -1)),
-                    "column": int(candidate.get("source_col", -1)),
-                },
-            )
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        return None, diagnostics
+        intent = fusion_intent_from_candidate(
+            candidate,
+            source=FUSION_SOURCE_SCRIPTED,
+            requested_action=requested_action,
+            executed_action=executed_action,
+            metadata={"legacy_execution_source": "scripted"},
+        )
+        return self._execute_fusion_intent(
+            pre_observation,
+            diagnostics,
+            intent,
+            precondition_rejection=rejection,
+            require_known_recipe=True,
+            rejection_attempted=False,
+            return_rejection_result=False,
+        )
 
     def _maybe_execute_model_fusion(
         self,
@@ -4216,22 +4394,6 @@ class PvZGymEnv:
         occupied, existing_type = self._cell_occupancy(pre_observation, row, col)
         if not occupied:
             return None, diagnostics  # empty tile -> normal placement, let bridge step handle it
-        if not are_fusion_compatible(existing_type, seed_type):
-            # Mask should have blocked this; record and decline to plant over a plant.
-            candidate = {
-                "source_plant_type": int(existing_type),
-                "source_plant_name": fusion_plant_name(existing_type),
-                "source_row": row,
-                "source_col": col,
-                "target_or_ingredient_type": int(seed_type),
-                "target_or_ingredient_name": fusion_plant_name(seed_type),
-                "ingredient_seed_slot_index": slot_index,
-            }
-            diagnostics = apply_fusion_attempt_result(
-                diagnostics, candidate, None, rejected_reason=FUSION_ILLEGAL_INCOMPATIBLE
-            )
-            self._last_fusion_diagnostics = diagnostics
-            return None, diagnostics
         source_plant = self._plant_at_cell(pre_observation, row, col)
         slots = seed_slots_from_observation(pre_observation, self.config.plant_types)
         slot = slots[slot_index] if 0 <= slot_index < len(slots) else {}
@@ -4252,46 +4414,22 @@ class PvZGymEnv:
             "fusion_legal": True,
             "fusion_blocked_reason": "",
         }
-        try:
-            result = self.client.request(
-                "fusion_step",
-                source_instance_id=int(candidate.get("source_instance_id") or 0),
-                source_row=row,
-                source_col=col,
-                source_plant_type=int(existing_type),
-                ingredient_seed_slot_index=int(candidate.get("ingredient_seed_slot_index")),
-                ingredient_plant_type=int(seed_type),
-                predicted_result_type=-1,
-                predicted_result_name="",
-                return_observation=False,
-            )
-        except Exception as exc:
-            result = self._failed_fusion_action_result(
-                candidate=candidate,
-                reason="bridge_error",
-                requested_action=requested_action,
-                executed_action=executed_action,
-                source="model_action_mask",
-                bridge_error=str(exc),
-            )
-            diagnostics = apply_fusion_attempt_result(
-                diagnostics, candidate, result, rejected_reason="bridge_error", bridge_error=str(exc)
-            )
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        if isinstance(result, dict):
-            result["requestedAction"] = int(requested_action)
-            result["executedAction"] = int(executed_action)
-            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
-            result["fusionExecutionSource"] = "model_action_mask"
-            result["fusionCandidate"] = compact_candidate(candidate)
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
-            self._last_fusion_diagnostics = diagnostics
-            # The model deliberately chose a fusion (occupied tile); return the
-            # bridge outcome whether it succeeded or was cleanly rejected so we
-            # never fall through to planting a normal seed over an existing plant.
-            return result, diagnostics
-        return None, diagnostics
+        intent = fusion_intent_from_candidate(
+            candidate,
+            source=FUSION_SOURCE_MODEL,
+            requested_action=requested_action,
+            executed_action=executed_action,
+            metadata={"legacy_execution_source": "model_action_mask"},
+        )
+        # Always return an occupied-tile decision (including a clean rejection)
+        # so a stale/mismatched mask can never fall through to normal placement.
+        return self._execute_fusion_intent(
+            pre_observation,
+            diagnostics,
+            intent,
+            rejection_attempted=False,
+            return_rejection_result=True,
+        )
 
     def _plant_at_cell(self, observation: Dict[str, Any], row: int, column: int) -> Optional[Dict[str, Any]]:
         for plant in observation.get("plants", []) or []:
@@ -4338,6 +4476,10 @@ class PvZGymEnv:
         self._fusion_last_source = ""
         self._recent_fusion_attempts: Deque[Tuple[int, int, int, str, int]] = deque(maxlen=20)
         self._fusion_event_counter = 0
+        self._fusion_pipeline_epoch = int(getattr(self, "_fusion_pipeline_epoch", 0)) + 1
+        self._fusion_pipeline_event_counter = 0
+        self._fusion_accounted_event_ids: set[str] = set()
+        self._fusion_reward_accounted_event_ids: set[str] = set()
         self._fusion_recipes_seen_episode: set[str] = set()
         self._fusion_recipe_counts_episode: Counter[str] = Counter()
 
@@ -4606,6 +4748,9 @@ class PvZGymEnv:
         return net
 
     def _fusion_source_from_result(self, action_result: Dict[str, Any]) -> str:
+        intent_source = str(action_result.get("fusionIntentSource") or action_result.get("fusion_intent_source") or "")
+        if intent_source:
+            return normalize_fusion_source(intent_source)
         source = str(action_result.get("fusionExecutionSource") or "")
         if source == "model_action_mask":
             return "model"
@@ -4690,7 +4835,22 @@ class PvZGymEnv:
         fusion_event = self._fusion_event_from_action_result(action_result, observation)
         if fusion_event is None:
             return 0.0
-        return self._compute_fusion_reward(fusion_event)
+        event_id = str((action_result or {}).get("fusionEventId") or (action_result or {}).get("fusion_event_id") or "")
+        if event_id:
+            accounted = getattr(self, "_fusion_reward_accounted_event_ids", None)
+            if not isinstance(accounted, set):
+                accounted = set()
+                self._fusion_reward_accounted_event_ids = accounted
+            if event_id in accounted:
+                if isinstance(action_result, dict):
+                    action_result["fusionRewardDuplicateSuppressed"] = True
+                return 0.0
+            accounted.add(event_id)
+        reward_delta = self._compute_fusion_reward(fusion_event)
+        if isinstance(action_result, dict) and event_id:
+            action_result["fusionRewardApplied"] = True
+            action_result["fusionRewardDelta"] = float(reward_delta)
+        return reward_delta
 
     def _fusion_reward_live_fields(self) -> Dict[str, Any]:
         """Cumulative per-episode fusion reward accounting for diagnostics/metrics."""
@@ -4743,13 +4903,14 @@ class PvZGymEnv:
         executed_action: int,
         source: str,
         bridge_error: str = "",
+        attempted: bool = True,
     ) -> Dict[str, Any]:
         """Build a reward-visible result for a fusion that reached an attempt and failed."""
         return {
             "action": int(executed_action),
             "requestedAction": int(requested_action),
             "executedAction": int(executed_action),
-            "fusionAttempted": True,
+            "fusionAttempted": bool(attempted),
             "fusionSucceeded": False,
             "fusion_success": False,
             "fusionOverrideApplied": False,
@@ -4865,84 +5026,7 @@ class PvZGymEnv:
         }
 
     def _enforce_fusion_scope_contract(self, result: Dict[str, Any]) -> None:
-        if not isinstance(result, dict):
-            return
-        reported_success = bool(result.get("fusionSucceeded") or result.get("fusion_success") or result.get("fusionOverrideApplied"))
-        changed_tile_count = self._safe_int(result.get("changedTileCount"), result.get("changed_tile_count"), default=0)
-        changed_tiles = result.get("changedTiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = result.get("changed_tiles")
-        if not isinstance(changed_tiles, list):
-            changed_tiles = []
-        requested_row = self._safe_int(result.get("requestedSourceRow"), result.get("requested_source_row"), default=-1)
-        requested_col = self._safe_int(result.get("requestedSourceCol"), result.get("requested_source_col"), default=-1)
-        non_source_changed = bool(
-            result.get("nonSourceTilesChanged")
-            if "nonSourceTilesChanged" in result
-            else result.get("non_source_tiles_changed")
-        )
-        global_side_effect = bool(
-            result.get("globalFusionSideEffect")
-            if "globalFusionSideEffect" in result
-            else result.get("global_fusion_side_effect")
-        )
-        source_tile_changed = False
-        for tile in changed_tiles:
-            if not isinstance(tile, dict):
-                continue
-            row = self._safe_int(tile.get("row"), tile.get("sourceRow"), tile.get("source_row"), default=-1)
-            col = self._safe_int(tile.get("column"), tile.get("col"), tile.get("sourceCol"), tile.get("source_col"), default=-1)
-            if row == requested_row and col == requested_col:
-                source_tile_changed = True
-            else:
-                non_source_changed = True
-        if not reported_success and not (non_source_changed or global_side_effect or changed_tile_count > 1):
-            return
-        if changed_tile_count == 1 and source_tile_changed and not non_source_changed and not global_side_effect:
-            return
-        failure_reason = "global_fusion_side_effect" if non_source_changed or global_side_effect or changed_tile_count > 1 else "fusion_no_effect"
-        bridge_reason = "fusion_mutated_non_source_tiles" if failure_reason == "global_fusion_side_effect" else failure_reason
-        result["fusionSucceeded"] = False
-        result["fusion_success"] = False
-        result["fusionOverrideApplied"] = False
-        result["coachFusionOverrideApplied"] = False
-        result["illegalAction"] = True
-        result["illegalReason"] = failure_reason
-        result["fusionRejectedReason"] = failure_reason
-        result["bridgeResultReason"] = bridge_reason
-        result["bridge_result_reason"] = bridge_reason
-        result["changedTileCount"] = changed_tile_count
-        result["changed_tile_count"] = changed_tile_count
-        result["changedTiles"] = changed_tiles
-        result["changed_tiles"] = changed_tiles
-        result["nonSourceTilesChanged"] = bool(non_source_changed)
-        result["non_source_tiles_changed"] = bool(non_source_changed)
-        result["globalFusionSideEffect"] = bool(failure_reason == "global_fusion_side_effect")
-        result["global_fusion_side_effect"] = bool(failure_reason == "global_fusion_side_effect")
-        if failure_reason == "global_fusion_side_effect":
-            result["fusionScope"] = "global_side_effect_detected"
-            result["fusion_scope"] = "global_side_effect_detected"
-        placement = result.get("placement")
-        if isinstance(placement, dict):
-            placement.update(
-                {
-                    "success": False,
-                    "illegalReason": failure_reason,
-                    "bridgeResultReason": bridge_reason,
-                    "bridge_result_reason": bridge_reason,
-                    "changedTileCount": changed_tile_count,
-                    "changed_tile_count": changed_tile_count,
-                    "changedTiles": changed_tiles,
-                    "changed_tiles": changed_tiles,
-                    "nonSourceTilesChanged": bool(non_source_changed),
-                    "non_source_tiles_changed": bool(non_source_changed),
-                    "globalFusionSideEffect": bool(failure_reason == "global_fusion_side_effect"),
-                    "global_fusion_side_effect": bool(failure_reason == "global_fusion_side_effect"),
-                }
-            )
-            if failure_reason == "global_fusion_side_effect":
-                placement["fusionScope"] = "global_side_effect_detected"
-                placement["fusion_scope"] = "global_side_effect_detected"
+        enforce_fusion_scope_contract(result)
 
     def _maybe_execute_coach_fusion_command(
         self,
@@ -4959,105 +5043,38 @@ class PvZGymEnv:
             return None, diagnostics
         candidate = self._coach_fusion_candidate_from_bridge_command(coach_bridge_command)
         freshness_rejection = self._coach_fusion_freshness_rejection(pre_observation, coach_bridge_command)
-        if freshness_rejection:
-            result = self._blocked_coach_fusion_result(
-                reason=freshness_rejection,
-                requested_action=requested_action,
-                executed_action=executed_action,
-                candidate=candidate,
-                coach_bridge_command=coach_bridge_command,
-            )
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result, rejected_reason=freshness_rejection)
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        rejection = self._coach_fusion_rejection_reason(pre_observation, candidate, action_count=action_count)
-        if rejection:
-            result = self._blocked_coach_fusion_result(
-                reason=rejection,
-                requested_action=requested_action,
-                executed_action=executed_action,
-                candidate=candidate,
-                coach_bridge_command=coach_bridge_command,
-                attempted=True,
-            )
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result, rejected_reason=rejection)
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        command_id = self._coach_command_id_from_bridge_command(coach_bridge_command)
-        command_age_seconds = self._coach_command_age_seconds(coach_bridge_command)
-        try:
-            result = self.client.request(
-                "fusion_step",
-                source_instance_id=int(coach_bridge_command.get("source_instance_id") or 0),
-                source_row=int(coach_bridge_command.get("source_row")),
-                source_col=int(coach_bridge_command.get("source_col")),
-                source_plant_type=int(coach_bridge_command.get("source_plant_type")),
-                ingredient_seed_slot_index=int(coach_bridge_command.get("ingredient_seed_slot_index")),
-                ingredient_plant_type=int(coach_bridge_command.get("ingredient_plant_type")),
-                predicted_result_type=int(coach_bridge_command.get("predicted_result_type") or -1),
-                predicted_result_name=str(coach_bridge_command.get("predicted_result_name") or ""),
-                coach_command_id=int(command_id or 0),
-                coach_command_timestamp=float(coach_bridge_command.get("coach_command_timestamp") or 0.0),
-                executed_from_fresh_coach_command=True,
-                coach_command_age_seconds=command_age_seconds,
-                coach_command_queue_cleared_on_reset=bool(self._coach_command_queue_cleared_on_reset),
-                startup_command_blocked=False,
-                return_observation=False,
-            )
-        except Exception as exc:
-            result = self._blocked_coach_fusion_result(
-                reason="bridge_error",
-                requested_action=requested_action,
-                executed_action=executed_action,
-                candidate=candidate,
-                coach_bridge_command=coach_bridge_command,
-                attempted=True,
-                bridge_error=str(exc),
-            )
-            diagnostics = apply_fusion_attempt_result(
-                diagnostics,
-                candidate,
-                result,
-                rejected_reason="bridge_error",
-                bridge_error=str(exc),
-            )
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        if isinstance(result, dict):
-            self._enforce_fusion_scope_contract(result)
-            if command_id is not None:
-                self._executed_coach_command_ids.add(int(command_id))
-                self._last_executed_coach_command_id = int(command_id)
-            result["requestedAction"] = int(requested_action)
-            result["executedAction"] = int(executed_action)
-            result["fusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
-            result["coachFusionOverrideApplied"] = bool(result.get("fusionSucceeded"))
-            result["executed_from_fresh_coach_command"] = True
-            result["coach_command_age_seconds"] = command_age_seconds
-            result["startup_command_blocked"] = False
-            result["coach_command_queue_cleared_on_reset"] = bool(self._coach_command_queue_cleared_on_reset)
-            result["coach_command_source"] = str(coach_bridge_command.get("coach_command_source") or "")
-            result["fusionExecutionSource"] = str(
-                coach_bridge_command.get("coach_command_source") or "human_coach"
-            )
-            result["executed_coach_command_id"] = command_id
-            result["last_executed_coach_command_id"] = self._last_executed_coach_command_id
-            result["fusionCandidate"] = compact_candidate(candidate)
-            result.setdefault(
-                "decoded",
-                {
-                    "kind": "fusion",
-                    "sourcePlantType": int(coach_bridge_command.get("source_plant_type", -1)),
-                    "ingredientPlantType": int(coach_bridge_command.get("ingredient_plant_type", -1)),
-                    "resultPlantType": int(coach_bridge_command.get("predicted_result_type", -1)),
-                    "row": int(coach_bridge_command.get("source_row", -1)),
-                    "column": int(coach_bridge_command.get("source_col", -1)),
-                },
-            )
-            diagnostics = apply_fusion_attempt_result(diagnostics, candidate, result)
-            self._last_fusion_diagnostics = diagnostics
-            return result, diagnostics
-        return None, diagnostics
+        rejection = freshness_rejection or self._coach_fusion_rejection_reason(
+            pre_observation,
+            candidate,
+            action_count=action_count,
+        )
+        raw_source = str(coach_bridge_command.get("coach_command_source") or "human_coach")
+        intent = fusion_intent_from_candidate(
+            candidate,
+            source=raw_source,
+            requested_action=requested_action,
+            executed_action=executed_action,
+            metadata={"legacy_execution_source": raw_source},
+        )
+        return self._execute_fusion_intent(
+            pre_observation,
+            diagnostics,
+            intent,
+            precondition_rejection=rejection,
+            coach_bridge_command=coach_bridge_command,
+            # Stale/startup commands never reached execution.  Other coach
+            # preflight failures historically represent an attempted command.
+            rejection_attempted=bool(rejection and not freshness_rejection),
+            return_rejection_result=True,
+            rejection_reason_aliases={
+                "invalid_row": "invalid_row_col",
+                "invalid_col": "invalid_row_col",
+                "invalid_seed_slot": "target_not_available",
+                "seed_unavailable": "target_not_available",
+                "cooldown_not_ready": "target_not_available",
+                "insufficient_sun": "target_not_available",
+            },
+        )
 
     def _coach_fusion_candidate_from_bridge_command(self, coach_bridge_command: Dict[str, Any]) -> Dict[str, Any]:
         candidate = coach_bridge_command.get("candidate")
@@ -5099,45 +5116,10 @@ class PvZGymEnv:
         cols = int(observation.get("columnCount") or self.config.column_count or 10)
         if not (0 <= row < rows and 0 <= col < cols):
             return "invalid_row_col"
-        source_type = int(candidate.get("source_plant_type", -1))
-        source_instance = int(candidate.get("source_instance_id", 0))
-        source_found = False
-        tile_occupied = False
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            if int(plant.get("row", -1)) != row or int(plant.get("column", -1)) != col:
-                continue
-            tile_occupied = True
-            if int(plant.get("type", -1)) != source_type:
-                continue
-            plant_instance = int(plant.get("instanceId", plant.get("instanceID", 0)) or 0)
-            if source_instance > 0 and plant_instance > 0 and source_instance != plant_instance:
-                continue
-            source_found = True
-            break
-        if not source_found:
-            return "source_not_found" if tile_occupied else "empty_tile"
-        slot_index = int(candidate.get("ingredient_seed_slot_index", -1))
-        ingredient_type = int(candidate.get("target_or_ingredient_type", -1))
-        slot_found = False
-        for slot in observation.get("seedSlots", []) or []:
-            if not isinstance(slot, dict):
-                continue
-            if int(slot.get("slotIndex", -1)) != slot_index:
-                continue
-            if int(slot.get("plantType", -1)) != ingredient_type:
-                return "target_not_available"
-            cost = int(slot.get("seedCost", 0) or 0)
-            sun = int(observation.get("sun", 0) or 0)
-            if not bool(slot.get("ready", True)) or not bool(slot.get("usable", True)) or bool(slot.get("disabled", False)):
-                return "target_not_available"
-            if sun < cost:
-                return "target_not_available"
-            slot_found = True
-            break
-        if not slot_found:
-            return "target_not_available"
+        # Source identity, slot identity, compatibility, CardUI cost/cooldown,
+        # and unlock/readiness are handled once by validate_fusion_intent in the
+        # shared execution adapter.  This forwarding hook owns only coach-only
+        # lifecycle precedence retained for compatibility.
         return ""
 
     def step(
@@ -5146,8 +5128,46 @@ class PvZGymEnv:
         *,
         coach_bridge_command: Optional[Dict[str, Any]] = None,
         coach_context: Optional[Dict[str, Any]] = None,
+        action_intent: Optional[ActionIntent] = None,
+        action_source: str = "direct",
+        action_source_metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         step_started = time.perf_counter()
+
+        def attach_structured_action_result(
+            observation: Dict[str, Any],
+            action_result: Dict[str, Any],
+            *,
+            decision: Optional[ActionDecision] = None,
+            executed: bool,
+        ) -> ActionDecision:
+            resolved_decision = decision
+            if resolved_decision is None:
+                context_payload = dict(coach_context or {})
+                source = str(context_payload.get("source") or action_source or "direct")
+                metadata = dict(action_source_metadata or {})
+                if context_payload:
+                    metadata.update(context_payload)
+                resolved_decision = self.action_decision(
+                    int(action),
+                    observation,
+                    source=source,
+                    source_metadata=metadata,
+                    bridge_command=coach_bridge_command,
+                    intent=action_intent,
+                )
+            structured = ActionResult.from_execution(
+                resolved_decision,
+                dict(action_result),
+                executed=bool(executed),
+            )
+            action_result["structuredActionResult"] = structured.to_dict(
+                include_execution_result=False
+            )
+            action_result["actionIntent"] = resolved_decision.intent.to_dict()
+            action_result["actionDecision"] = resolved_decision.to_dict()
+            return resolved_decision
+
         def restart_terminal_return(
             observation: Dict[str, Any],
             action_result: Dict[str, Any],
@@ -5156,6 +5176,11 @@ class PvZGymEnv:
             done_reason: Optional[str] = None,
             adventure_state: Optional[Dict[str, Any]] = None,
         ) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+            attach_structured_action_result(
+                observation,
+                action_result,
+                executed=False,
+            )
             reward_events: Dict[str, Any] = {}
             reward_breakdown = self.compute_reward_breakdown(
                 self.previous_observation,
@@ -5282,12 +5307,21 @@ class PvZGymEnv:
         coach_context_payload = dict(coach_context) if isinstance(coach_context, dict) else None
         executed_action = requested_action
         pre_step_mask = self.action_mask(pre_observation)
-        pre_step_mask_blocked = False
+        decision_source = str((coach_context_payload or {}).get("source") or action_source or "direct")
+        decision_metadata = dict(action_source_metadata or {})
+        if coach_context_payload:
+            decision_metadata.update(coach_context_payload)
+        pre_step_decision = self.action_decision(
+            requested_action,
+            pre_observation,
+            source=decision_source,
+            source_metadata=decision_metadata,
+            bridge_command=coach_bridge_payload,
+            intent=action_intent,
+        )
+        pre_step_mask_blocked = bool(requested_action != 0 and not pre_step_decision.legal)
         pre_step_audit: Dict[str, Any] = {}
-        if requested_action != 0 and not (
-            0 <= requested_action < len(pre_step_mask) and bool(pre_step_mask[requested_action])
-        ):
-            pre_step_mask_blocked = True
+        if pre_step_mask_blocked:
             pre_step_audit = self.action_legality_audit(requested_action, pre_observation, pre_step_mask)
             executed_action = 0
 
@@ -5354,6 +5388,12 @@ class PvZGymEnv:
                 "bridgeTimeout": True,
                 "observation": observation,
             }
+            attach_structured_action_result(
+                observation,
+                action_result,
+                decision=pre_step_decision,
+                executed=True,
+            )
             reward_events: Dict[str, Any] = {}
             reward_breakdown = self.compute_reward_breakdown(
                 self.previous_observation,
@@ -5406,6 +5446,12 @@ class PvZGymEnv:
                 action_result["humanCoach"] = human_coach_payload
             if pre_step_mask_blocked:
                 action_result["preStepMaskAudit"] = pre_step_audit
+            attach_structured_action_result(
+                pre_observation,
+                action_result,
+                decision=pre_step_decision,
+                executed=True,
+            )
         time.sleep(self.config.step_seconds)
         observation = action_result.get("observation") if isinstance(action_result, dict) else None
         if not isinstance(observation, dict):
@@ -6331,51 +6377,180 @@ class PvZGymEnv:
             ),
         }
 
+    def _action_validation_config(self, observation: Dict[str, Any]) -> ActionValidationConfig:
+        rows = int(observation.get("rowCount") or self.config.row_count)
+        cols = int(observation.get("columnCount") or self.config.column_count)
+        slots = seed_slots_from_observation(observation, self.config.plant_types)
+        cells = max(1, rows * cols)
+        default_action_count = 1 + len(slots) * cells
+        action_count = max(0, int(observation.get("actionCount") or default_action_count))
+        encoded_slot_capacity = (max(0, action_count - 1) + cells - 1) // cells
+        max_seed_slots = max(len(slots), encoded_slot_capacity)
+        return ActionValidationConfig(
+            action_space_mode="fixed",
+            plant_types=tuple(int(value) for value in self.config.plant_types),
+            max_seed_slots=max_seed_slots,
+            rows=rows,
+            cols=cols,
+            fusion_action_mask_enabled=self._fusion_action_mask_enabled(),
+            tactical_masks=bool(getattr(self.config, "tactical_masks", False)),
+            wallnut_tactical_mask=bool(getattr(self.config, "wallnut_tactical_mask", False)),
+            cherrybomb_tactical_mask=bool(getattr(self.config, "cherrybomb_tactical_mask", False)),
+            fusion_compatible_pairs=compatible_pairs_for_observation(
+                observation,
+                self.config.plant_types,
+                are_fusion_compatible,
+            ),
+            compatibility_version="relevant_observation_pairs_v1",
+        )
+
+    def _tactical_action_rejections(
+        self,
+        observation: Dict[str, Any],
+        action_count: int,
+    ) -> Dict[int, str]:
+        if not self._tactical_masks_enabled():
+            return {}
+        tactical_enabled = bool(getattr(self.config, "tactical_masks", False))
+        wallnut_enabled = tactical_enabled or bool(getattr(self.config, "wallnut_tactical_mask", False))
+        cherry_enabled = tactical_enabled or bool(getattr(self.config, "cherrybomb_tactical_mask", False))
+        rejections: Dict[int, str] = {}
+        for action_id in range(1, max(0, int(action_count))):
+            decoded = decode_action(action_id, observation, self.config.plant_types)
+            if int(decoded.get("kind", 0)) != 1:
+                continue
+            plant_type = int(decoded.get("plant_type", -1))
+            row = int(decoded.get("row", -1))
+            column = int(decoded.get("column", -1))
+            if plant_type == 3 and wallnut_enabled:
+                allowed, reason = self._wallnut_tactical_action_allowed(observation, row, column)
+                if not allowed:
+                    rejections[action_id] = f"tactical_wallnut_{reason}"
+            elif plant_type == 2 and cherry_enabled:
+                allowed, reason = self._cherrybomb_tactical_action_allowed(observation, row, column)
+                if not allowed:
+                    rejections[action_id] = f"tactical_cherrybomb_{reason}"
+        return rejections
+
+    def _action_cache_for(
+        self,
+        observation: Dict[str, Any],
+        *,
+        bridge_actions: Optional[List[int]] = None,
+    ) -> ActionDecisionCache:
+        resolved_bridge_actions = [
+            int(action)
+            for action in (
+                bridge_actions if bridge_actions is not None else self.bridge_legal_actions(observation)
+            )
+        ]
+        validation_config = self._action_validation_config(observation)
+        action_count = max(
+            0,
+            int(observation.get("actionCount") or validation_config.spec.action_count),
+        )
+        restart_screen = is_restart_screen_observation(observation)
+        context = build_action_validation_context(
+            observation,
+            config=validation_config,
+            bridge_legal_actions=resolved_bridge_actions,
+            restart_screen=restart_screen,
+        )
+        cached = self._action_decision_cache
+        if cached is not None and cached.key == context.cache_key:
+            self._action_decision_cache_hits += 1
+            self._action_decision_cache_last_hit = True
+            return cached
+        tactical_rejections = self._tactical_action_rejections(observation, action_count)
+        if tactical_rejections:
+            tactical = tuple(sorted((int(action), str(reason)) for action, reason in tactical_rejections.items()))
+            context = replace(
+                context,
+                tactical_rejections=tactical,
+                tactical_rejection_by_action=dict(tactical),
+            )
+        cache = build_action_decision_cache(
+            observation,
+            config=validation_config,
+            bridge_legal_actions=resolved_bridge_actions,
+            restart_screen=restart_screen,
+            tactical_rejections=tactical_rejections,
+            source="mask",
+            context=context,
+        )
+        self._action_decision_cache = cache
+        self._action_decision_cache_misses += 1
+        self._action_decision_cache_last_hit = False
+        return cache
+
+    def action_cache_diagnostics(self) -> Dict[str, Any]:
+        cache = self._action_decision_cache
+        return {
+            "hits": int(self._action_decision_cache_hits),
+            "misses": int(self._action_decision_cache_misses),
+            "last_hit": bool(self._action_decision_cache_last_hit),
+            "key": cache.key.to_dict() if cache is not None else None,
+            "action_count": len(cache.decisions) if cache is not None else 0,
+            "legal_action_count": (
+                sum(1 for allowed in cache.mask if allowed) if cache is not None else 0
+            ),
+        }
+
+    def action_decision(
+        self,
+        action: int,
+        observation: Optional[Dict[str, Any]] = None,
+        *,
+        source: str = "execution_safeguard",
+        source_metadata: Optional[Dict[str, Any]] = None,
+        bridge_command: Optional[Dict[str, Any]] = None,
+        bridge_actions: Optional[List[int]] = None,
+        intent: Optional[ActionIntent] = None,
+    ) -> ActionDecision:
+        obs = observation or self.previous_observation or self.observe()
+        cache = self._action_cache_for(obs, bridge_actions=bridge_actions)
+        action_id = int(action)
+        resolved_intent = intent
+        if resolved_intent is None:
+            resolved_intent = build_action_intent(
+                action_id,
+                source=source,
+                mode=cache.context.config.action_space_mode,
+                observation=obs,
+                plant_types=cache.context.config.plant_types,
+                max_seed_slots=cache.context.config.max_seed_slots,
+                rows=cache.context.config.rows,
+                cols=cache.context.config.cols,
+                bridge_command=bridge_command,
+                source_metadata=source_metadata,
+            )
+        if (
+            resolved_intent.bridge_action != action_id
+            or resolved_intent.legacy_action != action_id
+        ):
+            return ActionDecision(
+                intent=resolved_intent,
+                legal=False,
+                rejection_reason="action_identity_mismatch",
+                frame_identity=cache.context.frame_identity.token,
+                config_fingerprint=cache.context.config_fingerprint,
+                resolved_action_kind=resolved_intent.action_kind,
+                bridge_authoritative=True,
+                cache_reused=False,
+            )
+        cached_decision = cache.decision_for(
+            action_id,
+            intent=resolved_intent,
+            cache_reused=True,
+        )
+        if cached_decision is not None:
+            return cached_decision
+        return validate_action_intent(resolved_intent, cache.context)
+
     def action_mask(self, observation: Optional[Dict[str, Any]] = None) -> List[int]:
         obs = observation or self.previous_observation or self.observe()
-        rows = int(obs.get("rowCount") or self.config.row_count)
-        cols = int(obs.get("columnCount") or self.config.column_count)
-        slot_count = len(seed_slots_from_observation(obs, self.config.plant_types))
-        action_count = int(obs.get("actionCount") or (1 + slot_count * rows * cols))
-        mask = [0] * action_count
-        mask[0] = 1
-        bridge_actions = self.bridge_legal_actions(obs)
-        for action in bridge_actions:
-            action_id = int(action)
-            if action_id == 0:
-                continue
-            if not 0 <= action_id < action_count:
-                continue
-            allowed, _ = self._python_action_filter(action_id, obs, bridge_actions=bridge_actions)
-            if allowed:
-                mask[action_id] = 1
-        # Normal bridge legal-actions deliberately exclude occupied cells. Add
-        # compatible occupied-tile actions explicitly so MaskablePPO can select
-        # a fusion using the existing slot/cell action identity.
-        if self._fusion_action_mask_enabled():
-            slots = seed_slots_from_observation(obs, self.config.plant_types)
-            occupied_cells = {
-                (
-                    self._safe_int(plant.get("row"), default=-1),
-                    self._safe_int(plant.get("column"), default=-1),
-                )
-                for plant in (obs.get("plants", []) or [])
-                if isinstance(plant, dict)
-            }
-            for slot_position, slot in enumerate(slots):
-                slot_index = self._safe_int(slot.get("slotIndex"), default=slot_position)
-                for row, column in occupied_cells:
-                    if not (0 <= row < rows and 0 <= column < cols):
-                        continue
-                    action_id = 1 + slot_index * rows * cols + row * cols + column
-                    if not 0 <= action_id < action_count:
-                        continue
-                    allowed, _ = self._python_action_filter(action_id, obs, bridge_actions=bridge_actions)
-                    if allowed:
-                        mask[action_id] = 1
-        if self._tactical_masks_enabled():
-            mask, _ = self._apply_tactical_action_mask(obs, mask)
-        return mask
+        cache = self._action_cache_for(obs)
+        return [1 if allowed else 0 for allowed in cache.mask]
 
     def mask_diagnostics(
         self,
@@ -6383,26 +6558,56 @@ class PvZGymEnv:
         mask: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         obs = observation or self.previous_observation or self.observe()
-        current_mask = mask if mask is not None else self.action_mask(obs)
         bridge_actions = self.bridge_legal_actions(obs)
+        cache = self._action_cache_for(obs, bridge_actions=bridge_actions)
+        current_mask = mask if mask is not None else [1 if allowed else 0 for allowed in cache.mask]
         blocked_counts: Counter[str] = Counter()
-        base_mask = [0] * len(current_mask)
-        if base_mask:
-            base_mask[0] = 1
         for action in bridge_actions:
             action_id = int(action)
             if action_id <= 0:
                 continue
-            allowed, reason = self._python_action_filter(action_id, obs, bridge_actions=bridge_actions)
-            if not allowed:
-                blocked_counts[reason or "filtered"] += 1
-            elif 0 <= action_id < len(base_mask):
-                base_mask[action_id] = 1
+            decision = cache.decision_for(action_id)
+            if decision is not None and not decision.legal:
+                blocked_counts[decision.rejection_reason or "filtered"] += 1
         tactical_diag: Dict[str, Any] = {}
         if self._tactical_masks_enabled():
-            _, tactical_diag = self._apply_tactical_action_mask(obs, base_mask)
-            for reason, count in (tactical_diag.get("tactical_mask_block_reason_counts") or {}).items():
-                blocked_counts[str(reason)] += int(count)
+            tactical_enabled = bool(getattr(self.config, "tactical_masks", False))
+            wallnut_enabled = tactical_enabled or bool(getattr(self.config, "wallnut_tactical_mask", False))
+            cherry_enabled = tactical_enabled or bool(getattr(self.config, "cherrybomb_tactical_mask", False))
+            tactical_counts: Counter[str] = Counter()
+            wallnut_masked = 0
+            cherrybomb_masked = 0
+            wallnut_available = 0
+            cherrybomb_available = 0
+            for action in bridge_actions:
+                action_id = int(action)
+                if action_id <= 0:
+                    continue
+                decision = cache.decision_for(action_id)
+                if decision is None:
+                    continue
+                reason = str(decision.rejection_reason or "")
+                if reason.startswith("tactical_wallnut_"):
+                    wallnut_masked += 1
+                    tactical_counts[reason] += 1
+                elif reason.startswith("tactical_cherrybomb_"):
+                    cherrybomb_masked += 1
+                    tactical_counts[reason] += 1
+                elif decision.legal and decision.selected_plant_type == 3:
+                    wallnut_available += 1
+                elif decision.legal and decision.selected_plant_type == 2:
+                    cherrybomb_available += 1
+            tactical_diag = {
+                "tactical_mask_enabled": bool(wallnut_enabled or cherry_enabled),
+                "wallnut_tactical_mask_enabled": bool(wallnut_enabled),
+                "cherrybomb_tactical_mask_enabled": bool(cherry_enabled),
+                "wallnut_actions_masked": int(wallnut_masked),
+                "cherrybomb_actions_masked": int(cherrybomb_masked),
+                "wallnut_actions_available": int(wallnut_available),
+                "cherrybomb_actions_available": int(cherrybomb_available),
+                "mask_all_but_wait_count": 1 if sum(1 for value in current_mask if value) <= 1 else 0,
+                "tactical_mask_block_reason_counts": dict(sorted(tactical_counts.items())),
+            }
         return {
             "legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(obs, current_mask),
             "bridge_legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(obs, bridge_actions),
@@ -6410,6 +6615,7 @@ class PvZGymEnv:
             "python_legal_action_count": sum(1 for allowed in current_mask if allowed),
             "bridge_legal_action_count": len(bridge_actions),
             "slot_readiness_by_seed_slot": self._slot_readiness_by_seed_slot(obs),
+            "action_cache": self.action_cache_diagnostics(),
             **self._fusion_mask_diagnostics(obs),
             **tactical_diag,
         }
@@ -6420,76 +6626,6 @@ class PvZGymEnv:
             or getattr(self.config, "wallnut_tactical_mask", False)
             or getattr(self.config, "cherrybomb_tactical_mask", False)
         )
-
-    def _apply_tactical_action_mask(self, observation: Dict[str, Any], mask: List[int]) -> Tuple[List[int], Dict[str, Any]]:
-        tactical_enabled = bool(getattr(self.config, "tactical_masks", False))
-        wallnut_enabled = tactical_enabled or bool(getattr(self.config, "wallnut_tactical_mask", False))
-        cherry_enabled = tactical_enabled or bool(getattr(self.config, "cherrybomb_tactical_mask", False))
-        if not (wallnut_enabled or cherry_enabled):
-            return mask, {
-                "tactical_mask_enabled": False,
-                "wallnut_actions_masked": 0,
-                "cherrybomb_actions_masked": 0,
-                "wallnut_actions_available": 0,
-                "cherrybomb_actions_available": 0,
-                "mask_all_but_wait_count": 0,
-            }
-        adjusted = list(mask)
-        blocked_counts: Counter[str] = Counter()
-        wallnut_masked = 0
-        cherry_masked = 0
-        for action_id, allowed in enumerate(mask):
-            if action_id == 0 or not bool(allowed):
-                continue
-            try:
-                decoded = decode_action(action_id, observation, self.config.plant_types)
-            except Exception:
-                continue
-            if int(decoded.get("kind", 0)) != 1:
-                continue
-            plant_type = int(decoded.get("plant_type", -1))
-            row = int(decoded.get("row", -1))
-            column = int(decoded.get("column", -1))
-            if plant_type == 3 and wallnut_enabled:
-                ok, reason = self._wallnut_tactical_action_allowed(observation, row, column)
-                if not ok:
-                    adjusted[action_id] = 0
-                    wallnut_masked += 1
-                    blocked_counts[f"tactical_wallnut_{reason}"] += 1
-            elif plant_type == 2 and cherry_enabled:
-                ok, reason = self._cherrybomb_tactical_action_allowed(observation, row, column)
-                if not ok:
-                    adjusted[action_id] = 0
-                    cherry_masked += 1
-                    blocked_counts[f"tactical_cherrybomb_{reason}"] += 1
-        if adjusted:
-            adjusted[0] = 1
-        wallnut_available = 0
-        cherry_available = 0
-        for action_id, allowed in enumerate(adjusted):
-            if action_id == 0 or not bool(allowed):
-                continue
-            try:
-                decoded = decode_action(action_id, observation, self.config.plant_types)
-            except Exception:
-                continue
-            plant_type = int(decoded.get("plant_type", -1))
-            if plant_type == 3:
-                wallnut_available += 1
-            elif plant_type == 2:
-                cherry_available += 1
-        all_but_wait = 1 if sum(1 for value in adjusted if value) <= 1 else 0
-        return adjusted, {
-            "tactical_mask_enabled": bool(wallnut_enabled or cherry_enabled),
-            "wallnut_tactical_mask_enabled": bool(wallnut_enabled),
-            "cherrybomb_tactical_mask_enabled": bool(cherry_enabled),
-            "wallnut_actions_masked": int(wallnut_masked),
-            "cherrybomb_actions_masked": int(cherry_masked),
-            "wallnut_actions_available": int(wallnut_available),
-            "cherrybomb_actions_available": int(cherry_available),
-            "mask_all_but_wait_count": int(all_but_wait),
-            "tactical_mask_block_reason_counts": dict(sorted(blocked_counts.items())),
-        }
 
     def _wallnut_tactical_action_allowed(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, str]:
         if row < 0 or column < 0:
@@ -6550,13 +6686,23 @@ class PvZGymEnv:
         action_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         action_id = int(action)
-        current_mask = mask if mask is not None else self.action_mask(before)
         bridge_actions = self.bridge_legal_actions(before)
-        decoded = decode_action(action_id, before, self.config.plant_types)
+        cache = self._action_cache_for(before, bridge_actions=bridge_actions)
+        current_mask = mask if mask is not None else [1 if allowed else 0 for allowed in cache.mask]
+        decision = cache.decision_for(action_id)
+        if decision is None:
+            decision = self.action_decision(
+                action_id,
+                before,
+                source="diagnostic",
+                bridge_actions=bridge_actions,
+            )
+        decoded = dict(decision.intent.decoded_action)
         slot_index = int(decoded.get("slot_index", -1))
         slot_before = self._seed_slot_snapshot(before, slot_index)
         slot_after = self._seed_slot_snapshot(after or {}, slot_index)
-        allowed, filter_reason = self._python_action_filter(action_id, before, bridge_actions=bridge_actions)
+        allowed = bool(decision.legal)
+        filter_reason = str(decision.rejection_reason or "")
         plant_type = int(decoded.get("plant_type", -1))
         return {
             "action": action_id,
@@ -6581,6 +6727,9 @@ class PvZGymEnv:
             "illegalReason": str(action_result.get("illegalReason") or "") if isinstance(action_result, dict) else "",
             "legalActionsBySeedSlotBefore": self._legal_actions_by_seed_slot(before, current_mask),
             "bridgeLegalActionsBySeedSlotBefore": self._legal_actions_by_seed_slot(before, bridge_actions),
+            "actionIntent": decision.intent.to_dict(),
+            "actionDecision": decision.to_dict(),
+            "actionCacheKey": cache.key.to_dict(),
         }
 
     def _python_action_filter(
@@ -6589,69 +6738,13 @@ class PvZGymEnv:
         observation: Dict[str, Any],
         bridge_actions: Optional[List[int]] = None,
     ) -> Tuple[bool, str]:
-        action_id = int(action)
-        if action_id == 0:
-            return True, ""
-        if is_restart_screen_observation(observation):
-            return False, "restart_screen"
-        if not bool(observation.get("gameplayReady")):
-            return False, "gameplay_not_ready"
-        if not bool(observation.get("boardFound")) or not bool(observation.get("canReadBoard", True)):
-            return False, "board_not_readable"
-        if bool(observation.get("seedSelectionActive")):
-            return False, "seed_selection_active"
-
-        rows = int(observation.get("rowCount") or 0)
-        cols = int(observation.get("columnCount") or 0)
-        if rows <= 0 or cols <= 0:
-            return False, "invalid_board_dimensions"
-
-        decoded = decode_action(action_id, observation, self.config.plant_types)
-        if int(decoded.get("kind", 0)) != 1:
-            return False, "invalid_action_decode"
-        row = int(decoded.get("row", -1))
-        column = int(decoded.get("column", -1))
-        if not (0 <= row < rows and 0 <= column < cols):
-            return False, "target_out_of_bounds"
-
-        slots = seed_slots_from_observation(observation, self.config.plant_types)
-        slot_index = int(decoded.get("slot_index", -1))
-        if not (0 <= slot_index < len(slots)):
-            return False, "seed_slot_index_out_of_range"
-        slot = slots[slot_index]
-        if int(slot.get("slotIndex", slot_index)) != slot_index:
-            return False, "seed_slot_index_mismatch"
-        if not bool(slot.get("usable", False)):
-            return False, "slot_not_usable"
-        if bool(slot.get("disabled", False)):
-            return False, "slot_disabled"
-        if not bool(slot.get("ready", False)):
-            return False, "cooldown_not_ready"
-        current_cooldown = self._safe_float(slot.get("currentCooldown"), default=0.0)
-        full_cooldown = self._safe_float(slot.get("fullCooldown"), default=0.0)
-        if full_cooldown > 0.05 and current_cooldown > 0.05:
-            return False, "cooldown_not_ready"
-        cost = max(0, self._safe_int(slot.get("seedCost"), default=0))
-        if int(observation.get("sun", 0) or 0) < cost:
-            return False, "insufficient_sun"
-        occupied, existing_type = self._cell_occupancy(observation, row, column)
-        if occupied:
-            # Occupied tile: a normal plant action is illegal here, but a *fuse*
-            # action may be legal when fusion is enabled and the selected seed is
-            # compatible with the plant already on the tile.  Fusion actions are
-            # not present in the bridge's normal placement legal-actions set, so
-            # we deliberately do not require bridge membership for them; the step
-            # path routes the placement to the fusion bridge instead.
-            if not self._fusion_action_mask_enabled():
-                return False, "occupied_cell"
-            seed_type = self._safe_int(slot.get("plantType"), default=-1)
-            if not are_fusion_compatible(existing_type, seed_type):
-                return False, FUSION_ILLEGAL_INCOMPATIBLE
-            return True, ""
-        legal_set = set(int(item) for item in (bridge_actions if bridge_actions is not None else self.bridge_legal_actions(observation)))
-        if action_id not in legal_set:
-            return False, "bridge_legal_actions_missing"
-        return True, ""
+        decision = self.action_decision(
+            int(action),
+            observation,
+            source="python_filter",
+            bridge_actions=bridge_actions,
+        )
+        return bool(decision.legal), str(decision.rejection_reason or "")
 
     def _fusion_action_mask_enabled(self) -> bool:
         return bool(getattr(self.config, "fusion_action_mask_enabled", False))
@@ -6712,10 +6805,6 @@ class PvZGymEnv:
                         out["fusion_actions_masked_disabled_count"] += 1
         out["fusion_candidate_tiles"] = sorted(available_tiles)
         return out
-
-    def _cell_occupied(self, observation: Dict[str, Any], row: int, column: int) -> bool:
-        occupied, _ = self._cell_occupancy(observation, row, column)
-        return occupied
 
     def _cell_occupancy(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, int]:
         """Return (occupied, plant_type) for a cell; plant_type is -1 when empty."""
@@ -10035,7 +10124,11 @@ def run_episode(
     while max_steps == 0 or log.episode_length < max_steps:
         try:
             action = select_action(env, policy, observation, rng)
-            observation, reward, done, _, info = env.step(action)
+            observation, reward, done, _, info = env.step(
+                action,
+                action_source="random" if policy == "random" else "scripted",
+                action_source_metadata={"baseline_policy": str(policy)},
+            )
         except Exception as exc:
             log.bridge_errors += 1
             log.done_reason = "bridge_error"
@@ -11452,7 +11545,11 @@ def main() -> int:
             ensure_configured()
             if args.wait_gameplay_ready:
                 env.wait_for_gameplay_ready(timeout=args.gameplay_ready_timeout, poll_seconds=args.poll_seconds)
-            obs, reward, done, truncated, info = env.step(args.action)
+            obs, reward, done, truncated, info = env.step(
+                args.action,
+                action_source="debug",
+                action_source_metadata={"entrypoint": "--action"},
+            )
             print(json.dumps({"observation": obs, "reward": reward, "done": done, "truncated": truncated, "info": info}, indent=2))
         if args.smoke_test:
             prepare_active_board()

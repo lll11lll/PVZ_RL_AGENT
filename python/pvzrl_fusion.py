@@ -8,7 +8,9 @@ remains the final source of legality for any actual fusion execution.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Dict, Iterable, List, Mapping, MutableSet, Optional, Set, Tuple
 
 from pvzrl_registry import get_plant_registry, normalize_plant_name
 
@@ -21,7 +23,63 @@ FUSION_POLICY_ALIASES = {
     "assist": FUSION_POLICY_SCRIPTED,
 }
 
+FUSION_SOURCE_MODEL = "model"
+FUSION_SOURCE_SCRIPTED = "scripted"
+FUSION_SOURCE_HUMAN = "human_coach"
+FUSION_SOURCE_STREAM = "stream_coach"
+FUSION_SOURCE_GUI = "gui"
+FUSION_SOURCE_MANUAL = "manual"
+FUSION_SOURCE_DEBUG = "debug"
+FUSION_SOURCES = frozenset(
+    {
+        FUSION_SOURCE_MODEL,
+        FUSION_SOURCE_SCRIPTED,
+        FUSION_SOURCE_HUMAN,
+        FUSION_SOURCE_STREAM,
+        FUSION_SOURCE_GUI,
+        FUSION_SOURCE_MANUAL,
+        FUSION_SOURCE_DEBUG,
+    }
+)
+_FUSION_SOURCE_ALIASES = MappingProxyType(
+    {
+        "model_action_mask": FUSION_SOURCE_MODEL,
+        "policy": FUSION_SOURCE_MODEL,
+        "human": FUSION_SOURCE_HUMAN,
+        "human_coach": FUSION_SOURCE_HUMAN,
+        "stream": FUSION_SOURCE_STREAM,
+        "stream_coach": FUSION_SOURCE_STREAM,
+        "mock_stream": FUSION_SOURCE_STREAM,
+        "viewer": FUSION_SOURCE_STREAM,
+        "gui": FUSION_SOURCE_GUI,
+        "manual": FUSION_SOURCE_MANUAL,
+        "scripted": FUSION_SOURCE_SCRIPTED,
+        "assist": FUSION_SOURCE_SCRIPTED,
+        "debug": FUSION_SOURCE_DEBUG,
+    }
+)
+
 _PLANT_REGISTRY = get_plant_registry()
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_deep_thaw(item) for item in value}
+    return value
 
 
 def _required_base_plant_id(name: str) -> int:
@@ -56,48 +114,174 @@ FUSION_REJECTION_REASONS = (
     "exception",
 )
 
-FUSION_RESULT_NAMES = {
+FUSION_RESULT_NAMES: Mapping[int, str] = MappingProxyType({
     1030: "Repeater",
     1031: "Threepeater",
     1032: "GatlingPea",
     1033: "TwinSunFlower",
-}
-PLANT_NAMES = {
+})
+PLANT_NAMES: Mapping[int, str] = MappingProxyType({
     **{definition.plant_type_id: definition.canonical_name for definition in _PLANT_REGISTRY.plants},
     **FUSION_RESULT_NAMES,
-}
+})
 
-# A tiny first-pass allowlist.  Unknown mappings are observed but never executed.
-FUSION_RULES: Dict[Tuple[int, int], Dict[str, Any]] = {
-    (0, 0): {
-        "predicted_result_name": "Repeater",
-        "predicted_result_type": 1030,
-        "reason": "Peashooter-on-Peashooter should improve lane DPS.",
-        "role": "dps",
-        "scripted_enabled": True,
-    },
-    (1030, 0): {
-        "predicted_result_name": "Threepeater",
-        "predicted_result_type": 1031,
-        "reason": "Peashooter on Repeater advances the recursive pea fusion chain.",
-        "role": "dps",
-        "scripted_enabled": True,
-    },
-    (1031, 0): {
-        "predicted_result_name": "GatlingPea",
-        "predicted_result_type": 1032,
-        "reason": "Peashooter on Threepeater completes the high-tier pea fusion chain.",
-        "role": "dps",
-        "scripted_enabled": True,
-    },
-    (1, 1): {
-        "predicted_result_name": "TwinSunFlower",
-        "predicted_result_type": 1033,
-        "reason": "SunFlower-on-SunFlower is known economy fusion but is not a defensive assist.",
-        "role": "economy",
-        "scripted_enabled": False,
-    },
-}
+
+def normalize_fusion_source(value: Any) -> str:
+    """Return the stable source label used by the shared fusion pipeline."""
+
+    source = str(value or FUSION_SOURCE_MANUAL).strip().lower().replace("-", "_")
+    return str(_FUSION_SOURCE_ALIASES.get(source, source if source in FUSION_SOURCES else FUSION_SOURCE_MANUAL))
+
+
+def _ingredient_fallback_metadata(plant_type: int) -> Tuple[int, float]:
+    definition = _PLANT_REGISTRY.get_by_id(int(plant_type))
+    if definition is None:
+        return 0, 0.0
+    return int(definition.fallback_cost), float(definition.fallback_cooldown)
+
+
+@dataclass(frozen=True, slots=True)
+class FusionRecipe:
+    """Immutable known-result recipe.
+
+    Runtime CardUI values and bridge legality remain authoritative.  The cost,
+    cooldown, and unlock fields describe the fallback/validation contract; they
+    never override a live seed packet or a bridge rejection.
+    """
+
+    source_plant_type: int
+    ingredient_plant_type: int
+    result_plant_type: int
+    result_plant_name: str
+    reason: str
+    role: str
+    scripted_enabled: bool
+    ingredient_fallback_cost: int
+    ingredient_fallback_cooldown: float
+    runtime_cost_authoritative: bool = True
+    runtime_cooldown_authoritative: bool = True
+    runtime_unlock_authoritative: bool = True
+
+    @property
+    def pair(self) -> Tuple[int, int]:
+        return int(self.source_plant_type), int(self.ingredient_plant_type)
+
+    def to_legacy_rule(self) -> Mapping[str, Any]:
+        return MappingProxyType(
+            {
+                "predicted_result_name": self.result_plant_name,
+                "predicted_result_type": int(self.result_plant_type),
+                "reason": self.reason,
+                "role": self.role,
+                "scripted_enabled": bool(self.scripted_enabled),
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeFusionCompatibilityCase:
+    """A bridge-supported pair for which Python must not invent a result."""
+
+    first_plant_type: int
+    second_plant_type: int
+    reason: str
+
+    @property
+    def canonical_pair(self) -> Tuple[int, int]:
+        return tuple(sorted((int(self.first_plant_type), int(self.second_plant_type))))  # type: ignore[return-value]
+
+
+def _recipe(
+    source: int,
+    ingredient: int,
+    result: int,
+    result_name: str,
+    reason: str,
+    role: str,
+    scripted_enabled: bool,
+) -> FusionRecipe:
+    fallback_cost, fallback_cooldown = _ingredient_fallback_metadata(ingredient)
+    return FusionRecipe(
+        source_plant_type=int(source),
+        ingredient_plant_type=int(ingredient),
+        result_plant_type=int(result),
+        result_plant_name=str(result_name),
+        reason=str(reason),
+        role=str(role),
+        scripted_enabled=bool(scripted_enabled),
+        ingredient_fallback_cost=fallback_cost,
+        ingredient_fallback_cooldown=fallback_cooldown,
+    )
+
+
+# The one authoritative result-producing recipe registry.  Recursive result IDs
+# intentionally live in the mod-result namespace (1030-1033); numeric seed ID 7
+# remains the canonical base-game Repeater seed and is never conflated with 1030.
+FUSION_RECIPES: Tuple[FusionRecipe, ...] = (
+    _recipe(
+        PEASHOOTER_ID,
+        PEASHOOTER_ID,
+        1030,
+        "Repeater",
+        "Peashooter-on-Peashooter should improve lane DPS.",
+        "dps",
+        True,
+    ),
+    _recipe(
+        1030,
+        PEASHOOTER_ID,
+        1031,
+        "Threepeater",
+        "Peashooter on Repeater advances the recursive pea fusion chain.",
+        "dps",
+        True,
+    ),
+    _recipe(
+        1031,
+        PEASHOOTER_ID,
+        1032,
+        "GatlingPea",
+        "Peashooter on Threepeater completes the high-tier pea fusion chain.",
+        "dps",
+        True,
+    ),
+    _recipe(
+        SUNFLOWER_ID,
+        SUNFLOWER_ID,
+        1033,
+        "TwinSunFlower",
+        "SunFlower-on-SunFlower is known economy fusion but is not a defensive assist.",
+        "economy",
+        False,
+    ),
+)
+FUSION_RECIPES_BY_PAIR: Mapping[Tuple[int, int], FusionRecipe] = MappingProxyType(
+    {recipe.pair: recipe for recipe in FUSION_RECIPES}
+)
+
+# These pairs are intentionally compatibility-only.  The live bridge probes and
+# resolves them; Python must not infer a result plant from either relationship.
+RUNTIME_ONLY_FUSION_COMPATIBILITY_CASES: Tuple[RuntimeFusionCompatibilityCase, ...] = (
+    RuntimeFusionCompatibilityCase(
+        SUNFLOWER_ID,
+        PEASHOOTER_ID,
+        "The mod exposes SunFlower/Peashooter at runtime, but no stable Python result mapping is known.",
+    ),
+    RuntimeFusionCompatibilityCase(
+        PEASHOOTER_ID,
+        CHERRYBOMB_ID,
+        "The mod exposes Peashooter/CherryBomb at runtime, but no stable Python result mapping is known.",
+    ),
+)
+RUNTIME_ONLY_FUSION_COMPATIBILITY: frozenset[Tuple[int, int]] = frozenset(
+    case.canonical_pair for case in RUNTIME_ONLY_FUSION_COMPATIBILITY_CASES
+)
+
+# Deprecated compatibility view.  It is derived from FUSION_RECIPES and deeply
+# immutable so callers cannot create recipe/compatibility drift.
+FUSION_RULES: Mapping[Tuple[int, int], Mapping[str, Any]] = MappingProxyType(
+    {recipe.pair: recipe.to_legacy_rule() for recipe in FUSION_RECIPES}
+)
 
 CONEHEAD_TYPES = {2, 12}
 BUCKETHEAD_TYPES = {4, 13}
@@ -119,41 +303,46 @@ BUCKETHEAD_TYPES = {4, 13}
 # Fusion-result names are a separate namespace layered over base seed names.
 # Result aliases intentionally win for ambiguous text such as ``Repeater``;
 # numeric base seed ID 7 still resolves through the canonical plant registry.
-FUSION_RESULT_NAME_TO_ID: Dict[str, int] = {
+FUSION_RESULT_NAME_TO_ID: Mapping[str, int] = MappingProxyType({
     "repeater": 1030,
     "threepeater": 1031,
     "3pea": 1031,
     "gatlingpea": 1032,
     "twinsunflower": 1033,
-}
-PLANT_NAME_TO_ID: Dict[str, int] = {
+})
+_BASE_PLANT_NAME_TO_ID: Dict[str, int] = {
     key: definition.plant_type_id
     for key, definition in _PLANT_REGISTRY.by_normalized_name.items()
 }
-PLANT_NAME_TO_ID.update(FUSION_RESULT_NAME_TO_ID)
+_BASE_PLANT_NAME_TO_ID.update(FUSION_RESULT_NAME_TO_ID)
+PLANT_NAME_TO_ID: Mapping[str, int] = MappingProxyType(_BASE_PLANT_NAME_TO_ID)
 
-# The authoritative compatibility table, keyed by plant id.  Relationships are
-# treated as symmetric (see ``_FUSION_COMPATIBILITY_SYMMETRIC``); list a pair in
-# either direction and both directions become legal.  Compatibility is
-# explicit: a pair that does not appear here is NOT fusable.
-FUSION_COMPATIBILITY: Dict[int, Set[int]] = {
-    # Keep the two known self-upgrades in sync with FUSION_RULES above.
-    SUNFLOWER_ID: {SUNFLOWER_ID, PEASHOOTER_ID},
-    PEASHOOTER_ID: {PEASHOOTER_ID, SUNFLOWER_ID, CHERRYBOMB_ID, 1030, 1031},
-    CHERRYBOMB_ID: {PEASHOOTER_ID},
-    1030: {PEASHOOTER_ID},
-    1031: {PEASHOOTER_ID},
-}
+def _build_fusion_compatibility() -> Mapping[int, frozenset[int]]:
+    compatibility: Dict[int, Set[int]] = {}
+    for recipe in FUSION_RECIPES:
+        source, ingredient = recipe.pair
+        compatibility.setdefault(source, set()).add(ingredient)
+        compatibility.setdefault(ingredient, set()).add(source)
+    for case in RUNTIME_ONLY_FUSION_COMPATIBILITY_CASES:
+        first, second = case.canonical_pair
+        compatibility.setdefault(first, set()).add(second)
+        compatibility.setdefault(second, set()).add(first)
+    return MappingProxyType({plant: frozenset(partners) for plant, partners in compatibility.items()})
 
 
-FUSION_TIER_BY_TYPE: Dict[int, int] = {
+# Deprecated compatibility view, derived solely from recipes and the explicitly
+# documented runtime-only cases above.
+FUSION_COMPATIBILITY: Mapping[int, frozenset[int]] = _build_fusion_compatibility()
+
+
+FUSION_TIER_BY_TYPE: Mapping[int, int] = MappingProxyType({
     PEASHOOTER_ID: 0,
     1030: 1,
     1031: 2,
     1032: 3,
     SUNFLOWER_ID: 0,
     1033: 1,
-}
+})
 
 
 def fusion_tier(plant: Any) -> int:
@@ -210,16 +399,225 @@ FUSION_ILLEGAL_COOLDOWN = "cooldown_not_ready"
 FUSION_ILLEGAL_INSUFFICIENT_SUN = "insufficient_sun"
 
 
-def _symmetric_closure(table: Dict[int, Set[int]]) -> Dict[int, Set[int]]:
+def fusion_recipe(existing_plant: Any, selected_seed: Any) -> Optional[FusionRecipe]:
+    """Return an exact directional result recipe, never a compatibility guess."""
+
+    existing = normalize_plant_name_or_id(existing_plant)
+    selected = normalize_plant_name_or_id(selected_seed)
+    if existing is None or selected is None:
+        return None
+    return FUSION_RECIPES_BY_PAIR.get((int(existing), int(selected)))
+
+
+def fusion_compatibility_kind(existing_plant: Any, selected_seed: Any) -> str:
+    """Classify a compatible pair without inventing a runtime-only result."""
+
+    existing = normalize_plant_name_or_id(existing_plant)
+    selected = normalize_plant_name_or_id(selected_seed)
+    if existing is None or selected is None:
+        return "none"
+    pair = (int(existing), int(selected))
+    if pair in FUSION_RECIPES_BY_PAIR or (pair[1], pair[0]) in FUSION_RECIPES_BY_PAIR:
+        return "recipe"
+    if tuple(sorted(pair)) in RUNTIME_ONLY_FUSION_COMPATIBILITY:
+        return "runtime_only"
+    return "none"
+
+
+@dataclass(frozen=True, slots=True)
+class FusionIntent:
+    """Source-attributed, tile-scoped request consumed by every fusion path."""
+
+    source: str
+    source_row: int
+    source_col: int
+    ingredient_seed_slot_index: int
+    source_plant_type: int
+    ingredient_plant_type: int
+    source_instance_id: int = 0
+    ingredient_card_instance_id: int = 0
+    predicted_result_type: int = -1
+    predicted_result_name: str = ""
+    requested_action: int = 0
+    executed_action: int = 0
+    source_plant_name: str = ""
+    ingredient_plant_name: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}), repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", normalize_fusion_source(self.source))
+        for field_name in (
+            "source_row",
+            "source_col",
+            "ingredient_seed_slot_index",
+            "source_plant_type",
+            "ingredient_plant_type",
+            "source_instance_id",
+            "ingredient_card_instance_id",
+            "predicted_result_type",
+            "requested_action",
+            "executed_action",
+        ):
+            object.__setattr__(self, field_name, int(getattr(self, field_name)))
+        metadata = _deep_thaw(self.metadata) if isinstance(self.metadata, Mapping) else {}
+        object.__setattr__(self, "metadata", _deep_freeze(metadata))
+
+    @property
+    def recipe(self) -> Optional[FusionRecipe]:
+        return fusion_recipe(self.source_plant_type, self.ingredient_plant_type)
+
+    @property
+    def compatibility_kind(self) -> str:
+        return fusion_compatibility_kind(self.source_plant_type, self.ingredient_plant_type)
+
+    def candidate_dict(self) -> Dict[str, Any]:
+        candidate = _deep_thaw(self.metadata)
+        if not isinstance(candidate, dict):
+            candidate = {}
+        candidate.update(
+            {
+                "source_plant_type": int(self.source_plant_type),
+                "source_plant_name": self.source_plant_name or plant_name(self.source_plant_type),
+                "source_instance_id": int(self.source_instance_id),
+                "source_row": int(self.source_row),
+                "source_col": int(self.source_col),
+                "target_or_ingredient_type": int(self.ingredient_plant_type),
+                "target_or_ingredient_name": self.ingredient_plant_name or plant_name(self.ingredient_plant_type),
+                "ingredient_seed_slot_index": int(self.ingredient_seed_slot_index),
+                "ingredient_card_instance_id": int(self.ingredient_card_instance_id),
+                "predicted_result_type": int(self.predicted_result_type),
+                "predicted_result_name": str(self.predicted_result_name),
+            }
+        )
+        return candidate
+
+    def bridge_command_dict(self) -> Dict[str, Any]:
+        return {
+            "source_instance_id": int(self.source_instance_id),
+            "source_row": int(self.source_row),
+            "source_col": int(self.source_col),
+            "source_plant_type": int(self.source_plant_type),
+            "ingredient_seed_slot_index": int(self.ingredient_seed_slot_index),
+            "ingredient_plant_type": int(self.ingredient_plant_type),
+            "predicted_result_type": int(self.predicted_result_type),
+            "predicted_result_name": str(self.predicted_result_name),
+        }
+
+
+def fusion_intent_from_candidate(
+    candidate: Mapping[str, Any],
+    *,
+    source: str,
+    requested_action: int = 0,
+    executed_action: int = 0,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FusionIntent:
+    """Compatibility factory for bridge/model/scripted/coach candidate dicts."""
+
+    source_type = _safe_int(candidate.get("source_plant_type"), default=-1)
+    ingredient_type = _safe_int(candidate.get("target_or_ingredient_type"), candidate.get("ingredient_plant_type"), default=-1)
+    recipe = FUSION_RECIPES_BY_PAIR.get((source_type, ingredient_type))
+    compatibility_kind = fusion_compatibility_kind(source_type, ingredient_type)
+    if recipe is not None:
+        predicted_type = int(recipe.result_plant_type)
+        predicted_name = str(recipe.result_plant_name)
+    elif compatibility_kind != "none":
+        # Symmetric/reverse and runtime-only compatibility may be executable at
+        # the bridge, but Python has no authoritative directional result.
+        predicted_type = -1
+        predicted_name = ""
+    else:
+        predicted_type = _safe_int(candidate.get("predicted_result_type"), default=-1)
+        predicted_name = str(candidate.get("predicted_result_name") or "")
+    candidate_metadata = _deep_thaw(candidate)
+    if not isinstance(candidate_metadata, dict):
+        candidate_metadata = {}
+    if isinstance(metadata, Mapping):
+        extra_metadata = _deep_thaw(metadata)
+        if isinstance(extra_metadata, dict):
+            candidate_metadata.update(extra_metadata)
+    return FusionIntent(
+        source=source,
+        source_row=_safe_int(candidate.get("source_row"), default=-1),
+        source_col=_safe_int(candidate.get("source_col"), candidate.get("source_column"), default=-1),
+        ingredient_seed_slot_index=_safe_int(candidate.get("ingredient_seed_slot_index"), default=-1),
+        source_plant_type=source_type,
+        ingredient_plant_type=ingredient_type,
+        source_instance_id=_safe_int(candidate.get("source_instance_id"), default=0),
+        ingredient_card_instance_id=_safe_int(candidate.get("ingredient_card_instance_id"), default=0),
+        predicted_result_type=predicted_type,
+        predicted_result_name=predicted_name,
+        requested_action=int(requested_action),
+        executed_action=int(executed_action),
+        source_plant_name=str(candidate.get("source_plant_name") or ""),
+        ingredient_plant_name=str(candidate.get("target_or_ingredient_name") or candidate.get("ingredient_plant_name") or ""),
+        metadata=MappingProxyType(candidate_metadata),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FusionDecision:
+    """Pure legality decision reused before bridge execution by all sources."""
+
+    intent: FusionIntent
+    legal: bool
+    rejection_reason: str = ""
+    recipe: Optional[FusionRecipe] = None
+    compatibility_kind: str = "none"
+    bridge_command: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        bridge_command = _deep_thaw(self.bridge_command) if isinstance(self.bridge_command, Mapping) else {}
+        object.__setattr__(self, "bridge_command", _deep_freeze(bridge_command))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.intent.source,
+            "legal": bool(self.legal),
+            "rejection_reason": str(self.rejection_reason),
+            "compatibility_kind": str(self.compatibility_kind),
+            "bridge_command": _deep_thaw(self.bridge_command),
+            "candidate": self.intent.candidate_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FusionExecution:
+    """One bridge outcome plus its exactly-once accounting identity."""
+
+    decision: FusionDecision
+    event_id: str
+    attempted: bool
+    success: bool
+    rejection_reason: str
+    result: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}), repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        result = _deep_thaw(self.result) if isinstance(self.result, Mapping) else {}
+        object.__setattr__(self, "result", _deep_freeze(result))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "decision": self.decision.to_dict(),
+            "event_id": str(self.event_id),
+            "source": str(self.decision.intent.source),
+            "attempted": bool(self.attempted),
+            "success": bool(self.success),
+            "rejection_reason": str(self.rejection_reason),
+            "result": _deep_thaw(self.result),
+        }
+
+
+def _symmetric_closure(table: Mapping[int, Iterable[int]]) -> Mapping[int, frozenset[int]]:
     closure: Dict[int, Set[int]] = {}
     for source, partners in table.items():
         for partner in partners:
             closure.setdefault(int(source), set()).add(int(partner))
             closure.setdefault(int(partner), set()).add(int(source))
-    return closure
+    return MappingProxyType({plant: frozenset(partners) for plant, partners in closure.items()})
 
 
-_FUSION_COMPATIBILITY_SYMMETRIC: Dict[int, Set[int]] = _symmetric_closure(FUSION_COMPATIBILITY)
+_FUSION_COMPATIBILITY_SYMMETRIC: Mapping[int, frozenset[int]] = _symmetric_closure(FUSION_COMPATIBILITY)
 
 
 def normalize_plant_name_or_id(value: Any) -> Optional[int]:
@@ -421,6 +819,95 @@ def is_legal_fusion_action(
     """Return True only if the fusion is fully legal (see get_fusion_illegal_reason)."""
 
     return get_fusion_illegal_reason(observation, row, col, seed_slot, **kwargs) == FUSION_ILLEGAL_NONE
+
+
+def validate_fusion_intent(
+    intent: FusionIntent,
+    observation: Dict[str, Any],
+    *,
+    fusion_enabled: bool = True,
+    fusion_bridge_available: bool = True,
+    plant_types: Optional[Iterable[int]] = None,
+    check_seed_resources: bool = True,
+    precondition_rejection: str = "",
+    require_known_recipe: bool = False,
+) -> FusionDecision:
+    """Pure, source-independent fusion legality decision.
+
+    ``precondition_rejection`` carries source-specific lifecycle checks (fresh
+    coach command, scripted safety, and so on) into the shared pipeline without
+    changing the long-standing reason ordering inside the common validator.
+    The Unity bridge still decides whether a legal decision actually succeeds.
+    """
+
+    rejection = str(precondition_rejection or "")
+    observation = observation if isinstance(observation, dict) else {}
+    if not rejection:
+        rejection = get_fusion_illegal_reason(
+            observation,
+            int(intent.source_row),
+            int(intent.source_col),
+            int(intent.ingredient_seed_slot_index),
+            fusion_enabled=bool(fusion_enabled),
+            fusion_bridge_available=bool(fusion_bridge_available),
+            plant_types=plant_types,
+            check_seed_resources=bool(check_seed_resources),
+        )
+
+        # Preserve tile scoping and duplicate-slot identity.  A tile/slot that
+        # changed between parsing and execution is stale even if the newly
+        # observed pair happens to be compatible.
+        fundamental_rejections = {
+            FUSION_ILLEGAL_DISABLED,
+            FUSION_ILLEGAL_BRIDGE_UNAVAILABLE,
+            FUSION_ILLEGAL_INVALID_ROW,
+            FUSION_ILLEGAL_INVALID_COL,
+            FUSION_ILLEGAL_INVALID_SEED_SLOT,
+            FUSION_ILLEGAL_EMPTY_TILE,
+        }
+        if rejection not in fundamental_rejections:
+            actual_source = plant_type_at_cell(observation, intent.source_row, intent.source_col)
+            if actual_source is None or int(actual_source) != int(intent.source_plant_type):
+                rejection = "source_not_found"
+            else:
+                if intent.source_instance_id > 0:
+                    matching_instances = {
+                        _safe_int(plant.get("instanceId"), plant.get("instanceID"), default=0)
+                        for plant in observation.get("plants", []) or []
+                        if isinstance(plant, dict)
+                        and _safe_int(plant.get("row"), default=-1) == intent.source_row
+                        and _safe_int(plant.get("column"), default=-1) == intent.source_col
+                    }
+                    if matching_instances - {0} and intent.source_instance_id not in matching_instances:
+                        rejection = "source_not_found"
+                actual_ingredient = seed_plant_type_for_slot(
+                    observation,
+                    intent.ingredient_seed_slot_index,
+                    plant_types,
+                )
+                if not rejection and (
+                    actual_ingredient is None or int(actual_ingredient) != int(intent.ingredient_plant_type)
+                ):
+                    rejection = "target_not_available"
+
+    if not rejection:
+        candidate_block = str(intent.metadata.get("fusion_blocked_reason") or "")
+        candidate_legal = intent.metadata.get("fusion_legal")
+        if candidate_block:
+            rejection = candidate_block if candidate_block in FUSION_REJECTION_REASONS else "bridge_rejected"
+        elif candidate_legal is False:
+            rejection = "bridge_rejected"
+    if not rejection and require_known_recipe and intent.recipe is None:
+        rejection = "incomplete_fusion_mapping"
+
+    return FusionDecision(
+        intent=intent,
+        legal=not bool(rejection),
+        rejection_reason=rejection,
+        recipe=intent.recipe,
+        compatibility_kind=intent.compatibility_kind,
+        bridge_command=MappingProxyType(intent.bridge_command_dict()),
+    )
 
 
 def normalize_fusion_policy(value: Any) -> str:
@@ -700,45 +1187,31 @@ def validate_scripted_fusion_candidate(
 ) -> str:
     if candidate is None:
         return "fusion_not_available"
-    if action_count != expected_action_count:
-        return "action_space_mismatch"
-    if action_already_executed or reset_active:
-        return "unsafe_state"
-    if bool(observation.get("done")) or bool(observation.get("over")):
-        return "terminal_or_transition_state"
-    if bool(observation.get("seedSelectionActive")) or str(observation.get("screenState") or "") == "seed_selection":
-        return "seed_selection_active"
-    if bool(observation.get("blockingRewardUiActive")) or str(observation.get("screenState") or "") in {
-        "reward_unlock",
-        "reward_screen",
-        "level_complete_trophy",
-    }:
-        return "reward_or_unlock_screen_active"
-    if not bool(observation.get("boardFound", True)):
-        return "not_gameplay"
-    if not bool(observation.get("gameplayReady")):
-        return "gameplay_not_ready"
-    row = _safe_int(candidate.get("source_row"), default=-1)
-    col = _safe_int(candidate.get("source_col"), default=-1)
-    rows = _safe_int(observation.get("rowCount"), default=5)
-    cols = _safe_int(observation.get("columnCount"), default=10)
-    if not (0 <= row < rows and 0 <= col < cols):
-        return "invalid_row_col"
-    if not _source_exists(observation, candidate):
-        return "source_not_found"
-    if not _slot_available_for_candidate(observation, candidate):
-        return "target_not_available"
-    blocked = str(candidate.get("fusion_blocked_reason") or "")
-    if blocked:
-        return blocked if blocked in FUSION_REJECTION_REASONS else "bridge_rejected"
-    if not bool(candidate.get("fusion_legal")):
-        return "bridge_rejected"
-    if not _is_scripted_allowlisted(candidate):
-        return "incomplete_fusion_mapping"
-    score = float(candidate.get("strategic_score") or 0.0)
-    if score < 1.25:
-        return "low_strategic_value"
-    return ""
+    screen = str(observation.get("screenState") or "")
+    precondition = (
+        "action_space_mismatch" if action_count != expected_action_count else
+        "unsafe_state" if action_already_executed or reset_active else
+        "terminal_or_transition_state" if bool(observation.get("done")) or bool(observation.get("over")) else
+        "seed_selection_active" if bool(observation.get("seedSelectionActive")) or screen == "seed_selection" else
+        "reward_or_unlock_screen_active" if bool(observation.get("blockingRewardUiActive")) or screen in {"reward_unlock", "reward_screen", "level_complete_trophy"} else
+        "not_gameplay" if not bool(observation.get("boardFound", True)) else
+        "gameplay_not_ready" if not bool(observation.get("gameplayReady")) else ""
+    )
+    decision = validate_fusion_intent(
+        fusion_intent_from_candidate(candidate, source=FUSION_SOURCE_SCRIPTED),
+        observation,
+        precondition_rejection=precondition,
+        require_known_recipe=True,
+    )
+    reason = {
+        FUSION_ILLEGAL_INVALID_ROW: "invalid_row_col",
+        FUSION_ILLEGAL_INVALID_COL: "invalid_row_col",
+        FUSION_ILLEGAL_INVALID_SEED_SLOT: "target_not_available",
+        FUSION_ILLEGAL_SEED_UNAVAILABLE: "target_not_available",
+        FUSION_ILLEGAL_COOLDOWN: "target_not_available",
+        FUSION_ILLEGAL_INSUFFICIENT_SUN: "target_not_available",
+    }.get(decision.rejection_reason, decision.rejection_reason)
+    return reason or ("low_strategic_value" if float(candidate.get("strategic_score") or 0.0) < 1.25 else "")
 
 
 def compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -899,6 +1372,175 @@ def apply_fusion_attempt_result(
         diag["last_executed_coach_command_id"] = result.get("last_executed_coach_command_id", result.get("executed_coach_command_id"))
     diag["fusion_rejected_reasons"] = dict(sorted(reasons.items()))
     return diag
+
+
+def fusion_execution_from_result(
+    decision: FusionDecision,
+    result: Optional[Mapping[str, Any]],
+    *,
+    event_id: str,
+    attempted: Optional[bool] = None,
+    rejection_reason: str = "",
+) -> FusionExecution:
+    """Normalize a bridge/pre-execution result into one accounting event."""
+
+    payload = _deep_thaw(result) if isinstance(result, Mapping) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    success = bool(
+        payload.get("fusionSucceeded")
+        if "fusionSucceeded" in payload
+        else payload.get("fusion_success", False)
+    )
+    if attempted is None:
+        attempted = bool(
+            payload.get("fusionAttempted")
+            if "fusionAttempted" in payload
+            else bool(payload)
+        )
+    reason = "" if success else str(
+        rejection_reason
+        or payload.get("fusionRejectedReason")
+        or payload.get("illegalReason")
+        or payload.get("bridgeResultReason")
+        or decision.rejection_reason
+        or ("bridge_rejected" if attempted else "")
+    )
+    return FusionExecution(
+        decision=decision,
+        event_id=str(event_id),
+        attempted=bool(attempted),
+        success=bool(success),
+        rejection_reason=reason,
+        result=_deep_freeze(payload),
+    )
+
+
+def account_fusion_execution_once(
+    diagnostics: Dict[str, Any],
+    execution: FusionExecution,
+    accounted_event_ids: MutableSet[str],
+) -> Tuple[Dict[str, Any], bool]:
+    """Apply attempt/success/failure counters at most once for ``event_id``.
+
+    Returns ``(diagnostics, applied)``.  A validation rejection is observable
+    but is not miscounted as a bridge attempt.  A reached bridge call is exactly
+    one attempt and then exactly one success or failure.
+    """
+
+    event_id = str(execution.event_id or "").strip()
+    if not event_id:
+        raise ValueError("fusion accounting requires a non-empty event_id")
+    if event_id in accounted_event_ids:
+        return dict(diagnostics), False
+    accounted_event_ids.add(event_id)
+
+    result = _deep_thaw(execution.result) if execution.attempted else None
+    rejection = "" if execution.success else str(execution.rejection_reason or "")
+    updated = apply_fusion_attempt_result(
+        diagnostics,
+        execution.decision.intent.candidate_dict(),
+        result,
+        rejected_reason=rejection,
+        bridge_error=(
+            str(execution.result.get("bridgeError") or "")
+            if execution.attempted and str(execution.result.get("bridgeError") or "")
+            else None
+        ),
+    )
+    updated["fusion_last_event_id"] = event_id
+    updated["fusion_last_source"] = execution.decision.intent.source
+    updated["fusion_last_attempted"] = bool(execution.attempted)
+    updated["fusion_last_success"] = bool(execution.success)
+    updated["fusion_accounting_applied"] = True
+    return updated, True
+
+
+def enforce_fusion_scope_contract(
+    result: Dict[str, Any],
+    *,
+    require_dedicated_execution: bool = False,
+    require_occupied_source: bool = False,
+) -> str:
+    """Reject non-tile-scoped or structurally invalid bridge fusion results.
+
+    The mapping is updated in place for legacy callers and the rejection reason
+    is returned.  Environment execution uses the tile-scope checks; the coach
+    compatibility wrapper additionally requests the historical dedicated-path
+    and occupied-source postconditions.
+    """
+
+    if not isinstance(result, dict):
+        return ""
+    placement = result.get("placement") if isinstance(result.get("placement"), dict) else {}
+
+    def value(*keys: str, default: Any = None) -> Any:
+        for payload in (result, placement):
+            for key in keys:
+                if key in payload and payload.get(key) is not None:
+                    return payload.get(key)
+        return default
+
+    success = bool(value("fusionSucceeded", "fusion_success", "fusionOverrideApplied", default=False))
+    changed_count = _safe_int(value("changedTileCount", "changed_tile_count"), default=0)
+    changed_tiles = value("changedTiles", "changed_tiles", default=[])
+    changed_tiles = changed_tiles if isinstance(changed_tiles, list) else []
+    requested_row = _safe_int(value("requestedSourceRow", "requested_source_row"), default=-1)
+    requested_col = _safe_int(value("requestedSourceCol", "requested_source_col"), default=-1)
+    non_source_changed = bool(value("nonSourceTilesChanged", "non_source_tiles_changed", default=False))
+    global_side_effect = bool(value("globalFusionSideEffect", "global_fusion_side_effect", default=False))
+    source_tile_changed = False
+    for tile in changed_tiles:
+        if not isinstance(tile, dict):
+            continue
+        row = _safe_int(tile.get("row"), tile.get("sourceRow"), tile.get("source_row"), default=-1)
+        col = _safe_int(tile.get("column"), tile.get("col"), tile.get("sourceCol"), tile.get("source_col"), default=-1)
+        if row == requested_row and col == requested_col:
+            source_tile_changed = True
+        else:
+            non_source_changed = True
+
+    failure = ""
+    bridge_reason = str(value("bridgeResultReason", "bridge_result_reason", default="") or "")
+    if success and require_occupied_source and not bool(value("sourceTileOccupiedBefore", "source_tile_occupied_before")):
+        failure, bridge_reason = "source_tile_not_occupied", bridge_reason or "source_tile_not_occupied"
+    elif success and require_dedicated_execution and str(value("fusionExecutionMode", "fusion_execution_mode") or "") != "dedicated_fusion":
+        failure, bridge_reason = "bridge_rejected", bridge_reason or "fusion_not_dedicated_path"
+    elif success and bool(value("duplicateStackDetected", "duplicate_stack_detected", default=False)):
+        failure, bridge_reason = "duplicate_stack_detected", bridge_reason or "duplicate_stack_detected"
+    elif non_source_changed or global_side_effect or changed_count > 1:
+        failure, bridge_reason = "global_fusion_side_effect", "fusion_mutated_non_source_tiles"
+    elif success and (changed_count != 1 or not source_tile_changed):
+        failure, bridge_reason = "fusion_no_effect", bridge_reason or "fusion_no_effect"
+    if not failure:
+        return ""
+
+    updates = {
+        "fusionSucceeded": False,
+        "fusion_success": False,
+        "fusionOverrideApplied": False,
+        "coachFusionOverrideApplied": False,
+        "illegalAction": True,
+        "illegalReason": failure,
+        "fusionRejectedReason": failure,
+        "bridgeResultReason": bridge_reason,
+        "bridge_result_reason": bridge_reason,
+        "changedTileCount": changed_count,
+        "changed_tile_count": changed_count,
+        "changedTiles": changed_tiles,
+        "changed_tiles": changed_tiles,
+        "nonSourceTilesChanged": bool(non_source_changed),
+        "non_source_tiles_changed": bool(non_source_changed),
+        "globalFusionSideEffect": bool(global_side_effect or failure == "global_fusion_side_effect"),
+        "global_fusion_side_effect": bool(global_side_effect or failure == "global_fusion_side_effect"),
+    }
+    if failure == "global_fusion_side_effect":
+        updates.update({"fusionScope": "global_side_effect_detected", "fusion_scope": "global_side_effect_detected"})
+    result.update(updates)
+    if placement:
+        placement.update(updates)
+        placement["success"] = False
+    return failure
 
 
 def merge_episode_fusion_stats(target: Any, diagnostics: Dict[str, Any]) -> None:
@@ -1100,40 +1742,6 @@ def _match_probe_candidate(
 def _slot_available(slot: Dict[str, Any], sun: int) -> bool:
     cost = _safe_int(slot.get("seedCost"), default=0)
     return bool(slot.get("usable", True)) and not bool(slot.get("disabled")) and bool(slot.get("ready")) and sun >= cost
-
-
-def _slot_available_for_candidate(observation: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
-    slot_index = _safe_int(candidate.get("ingredient_seed_slot_index"), default=-1)
-    ingredient_type = _safe_int(candidate.get("target_or_ingredient_type"), default=-1)
-    sun = _safe_int(observation.get("sun"), default=0)
-    for slot in observation.get("seedSlots", []) or []:
-        if not isinstance(slot, dict):
-            continue
-        if _safe_int(slot.get("slotIndex"), default=-2) != slot_index:
-            continue
-        if _safe_int(slot.get("plantType"), default=-3) != ingredient_type:
-            return False
-        return _slot_available(slot, sun)
-    return False
-
-
-def _source_exists(observation: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
-    row = _safe_int(candidate.get("source_row"), default=-1)
-    col = _safe_int(candidate.get("source_col"), default=-1)
-    source_type = _safe_int(candidate.get("source_plant_type"), default=-1)
-    source_instance = _safe_int(candidate.get("source_instance_id"), default=0)
-    for plant in observation.get("plants", []) or []:
-        if not isinstance(plant, dict):
-            continue
-        if _safe_int(plant.get("row"), default=-2) != row or _safe_int(plant.get("column"), default=-2) != col:
-            continue
-        if _safe_int(plant.get("type"), default=-3) != source_type:
-            continue
-        plant_instance = _safe_int(plant.get("instanceId"), plant.get("instanceID"), default=0)
-        if source_instance > 0 and plant_instance > 0 and plant_instance != source_instance:
-            continue
-        return True
-    return False
 
 
 def _is_scripted_allowlisted(candidate: Dict[str, Any]) -> bool:
