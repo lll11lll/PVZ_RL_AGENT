@@ -17,6 +17,7 @@ from pvzrl_action_space import (
     normalize_action_space_mode,
     spec_from_config,
 )
+from pvzrl_observation_layout import observation_shape_for_config
 
 
 MODEL_METADATA_FILENAME = "model_metadata.json"
@@ -32,6 +33,11 @@ BLOCKED_OBSERVATION = "observation_version_mismatch"
 BLOCKED_MAX_SEED_SLOTS = "max_seed_slots_mismatch"
 BLOCKED_DYNAMIC_SEED_SLOTS = "dynamic_seed_slots_mismatch"
 BLOCKED_ACTION_SPACE_MODE = "action_space_mode_mismatch"
+BLOCKED_METADATA_VERSION = "metadata_version_mismatch"
+BLOCKED_IDENTITY_SEED_SLOTS = "identity_seed_slots_mismatch"
+BLOCKED_OBSERVATION_SHAPE = "observation_shape_mismatch"
+BLOCKED_PLACEMENT_ACTION_RANGE = "placement_action_range_mismatch"
+BLOCKED_BOARD_GEOMETRY = "board_geometry_mismatch"
 
 
 @dataclass
@@ -110,6 +116,18 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _normalized_int_list(value: Any) -> List[int]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: List[int] = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            return []
+    return result
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -125,6 +143,7 @@ def model_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "seed_list": seed_list,
         "plant_types": plant_types,
         **spec.to_metadata(),
+        "observation_shape": observation_shape_from_config(config),
     }
     if config.get("created_at"):
         metadata["created_at"] = str(config.get("created_at"))
@@ -208,8 +227,14 @@ def env_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "rows": int(spec.rows),
         "cols": int(spec.cols),
         "cells_per_seed_slot": int(spec.rows) * int(spec.cols),
+        "observation_shape": observation_shape_from_config(updated),
         "model_family": str(updated.get("model_family") or ""),
     }
+
+
+def observation_shape_from_config(config: Dict[str, Any]) -> List[int]:
+    updated = apply_model_metadata_defaults(config)
+    return [int(value) for value in observation_shape_for_config(updated)]
 
 
 def expected_model_metadata_from_env(env_metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,6 +255,7 @@ def expected_model_metadata_from_env(env_metadata: Dict[str, Any]) -> Dict[str, 
         "rows": _optional_int(env_metadata.get("rows")),
         "cols": _optional_int(env_metadata.get("cols")),
         "cells_per_seed_slot": _optional_int(env_metadata.get("cells_per_seed_slot")),
+        "observation_shape": _normalized_int_list(env_metadata.get("observation_shape")),
     }
 
 
@@ -382,6 +408,7 @@ def validate_model_metadata(
     expected_config: Optional[Dict[str, Any]] = None,
     *,
     model_action_count: Optional[int] = None,
+    model_observation_shape: Optional[Any] = None,
     env_metadata: Optional[Dict[str, Any]] = None,
     allow_missing_model_metadata: bool = False,
 ) -> CompatibilityCheck:
@@ -405,6 +432,23 @@ def validate_model_metadata(
             inferred,
             expected,
             {},
+            env_metadata,
+            warnings,
+        )
+
+    actual = dict(actual)
+    if model_observation_shape is not None:
+        actual["loaded_observation_shape"] = _normalized_int_list(model_observation_shape)
+
+    metadata_version = _optional_int(actual.get("metadata_version"))
+    if metadata_version != MODEL_METADATA_VERSION:
+        return _compatibility_failure(
+            BLOCKED_METADATA_VERSION,
+            f"metadata_version: model={actual.get('metadata_version')!r}, supported={MODEL_METADATA_VERSION}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
             env_metadata,
             warnings,
         )
@@ -506,6 +550,45 @@ def validate_model_metadata(
             warnings,
         )
 
+    expected_observation_shape = _normalized_int_list(env_metadata.get("observation_shape"))
+    declared_observation_shape = _normalized_int_list(actual.get("observation_shape"))
+    if "observation_shape" in actual and not declared_observation_shape:
+        return _compatibility_failure(
+            BLOCKED_OBSERVATION_SHAPE,
+            f"metadata.observation_shape is malformed: model={actual.get('observation_shape')!r}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
+    if declared_observation_shape and declared_observation_shape != expected_observation_shape:
+        return _compatibility_failure(
+            BLOCKED_OBSERVATION_SHAPE,
+            f"metadata.observation_shape: model={declared_observation_shape}, environment={expected_observation_shape}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
+    loaded_observation_shape = _normalized_int_list(model_observation_shape)
+    if model_observation_shape is not None and (
+        not expected_observation_shape or loaded_observation_shape != expected_observation_shape
+    ):
+        return _compatibility_failure(
+            BLOCKED_OBSERVATION_SHAPE,
+            f"observation_space.shape: model={loaded_observation_shape}, environment={expected_observation_shape}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
+
     actual_max_seed_slots = _optional_int(actual.get("max_seed_slots"))
     env_max_seed_slots = _optional_int(env_metadata.get("max_seed_slots"))
     if actual_max_seed_slots is None or actual_max_seed_slots != env_max_seed_slots:
@@ -534,6 +617,20 @@ def validate_model_metadata(
             warnings,
         )
 
+    actual_identity_seed_slots = _bool_value(actual.get("identity_seed_slots", False))
+    env_identity_seed_slots = _bool_value(env_metadata.get("identity_seed_slots", False))
+    if actual_identity_seed_slots != env_identity_seed_slots:
+        return _compatibility_failure(
+            BLOCKED_IDENTITY_SEED_SLOTS,
+            f"identity_seed_slots: model={actual_identity_seed_slots}, environment={env_identity_seed_slots}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
+
     if actual_mode != env_mode:
         return _compatibility_failure(
             BLOCKED_ACTION_SPACE_MODE,
@@ -548,7 +645,7 @@ def validate_model_metadata(
 
     actual_wait = _optional_int(actual.get("decoder_wait_action"))
     env_wait = _optional_int(env_metadata.get("decoder_wait_action"))
-    if actual_wait is not None and env_wait is not None and actual_wait != env_wait:
+    if actual_wait is None or env_wait is None or actual_wait != env_wait:
         return _compatibility_failure(
             BLOCKED_ACTION_DECODER,
             f"decoder_wait_action: model={actual_wait}, environment={env_wait}",
@@ -559,6 +656,35 @@ def validate_model_metadata(
             env_metadata,
             warnings,
         )
+
+    actual_placement_range = _normalized_int_list(actual.get("placement_action_range"))
+    env_placement_range = _normalized_int_list(env_metadata.get("placement_action_range"))
+    if actual_placement_range != env_placement_range or len(actual_placement_range) != 2:
+        return _compatibility_failure(
+            BLOCKED_PLACEMENT_ACTION_RANGE,
+            f"placement_action_range: model={actual_placement_range}, environment={env_placement_range}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
+
+    for field_name in ("rows", "cols", "cells_per_seed_slot"):
+        actual_value = _optional_int(actual.get(field_name))
+        env_value = _optional_int(env_metadata.get(field_name))
+        if actual_value is None or env_value is None or actual_value != env_value:
+            return _compatibility_failure(
+                BLOCKED_BOARD_GEOMETRY,
+                f"{field_name}: model={actual.get(field_name)!r}, environment={env_value}",
+                metadata_path,
+                inferred,
+                expected,
+                actual,
+                env_metadata,
+                warnings,
+            )
 
     model_family = str(actual.get("model_family") or "")
     env_family = str(env_metadata.get("model_family") or "")
@@ -646,6 +772,10 @@ def model_compatibility_live_status(result: CompatibilityCheck) -> Dict[str, Any
         "max_seed_slots": _optional_int(env_metadata.get("max_seed_slots", model_metadata.get("max_seed_slots"))),
         "dynamic_seed_slots": _bool_value(env_metadata.get("dynamic_seed_slots", model_metadata.get("dynamic_seed_slots", False))),
         "identity_seed_slots": _bool_value(env_metadata.get("identity_seed_slots", model_metadata.get("identity_seed_slots", False))),
+        "model_observation_shape": _normalized_int_list(
+            model_metadata.get("loaded_observation_shape", model_metadata.get("observation_shape", []))
+        ),
+        "env_observation_shape": _normalized_int_list(env_metadata.get("observation_shape", [])),
         "metadata_path": result.metadata_path,
         "metadata_inferred": bool(result.metadata_inferred),
         "warnings": list(result.warnings),

@@ -39,6 +39,11 @@ from pvzrl_fusion import (
     plant_name as fusion_plant_name,
     validate_scripted_fusion_candidate,
 )
+from pvzrl_registry import (
+    DEFAULT_PLANT_REGISTRY_PATH,
+    get_plant_registry,
+    normalize_plant_name as normalize_registry_plant_name,
+)
 
 
 DEFAULT_PLANT_TYPES = [1, 0]  # SunFlower, Peashooter
@@ -46,7 +51,7 @@ LEVEL3_SPECIALIST_TARGET_LEVEL = 3
 LEVEL3_SPECIALIST_SEED_LIST = ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
 LEVEL3_SPECIALIST_PLANT_TYPES = [1, 0, 3, 2]
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLANT_REGISTRY_PATH = PROJECT_ROOT / "configs" / "plant_registry.json"
+PLANT_REGISTRY_PATH = DEFAULT_PLANT_REGISTRY_PATH
 LAWN_STRINGS_PATH = PROJECT_ROOT / "Game Files" / "Mods" / "PvZ_Fusion_Translator" / "Dumps" / "LawnStrings.json"
 LIFECYCLE_ACTIVE_GAMEPLAY = "active_gameplay"
 LIFECYCLE_POST_WIN_PENDING = "post_win_pending"
@@ -605,35 +610,30 @@ class PvZBridgeClient:
 
 
 def normalize_plant_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.strip().lower())
+    """Compatibility forwarding wrapper for the canonical registry normalizer."""
+
+    return normalize_registry_plant_name(value)
 
 
 def load_plant_registry(path: Path = PLANT_REGISTRY_PATH) -> Dict[str, Any]:
-    if not path.exists():
-        return {"version": 0, "plants": []}
-    return json.loads(path.read_text(encoding="utf-8"))
+    """Return the historical mutable payload backed by one cached parse."""
+
+    return get_plant_registry(path).to_legacy_payload()
 
 
 def registry_entries(path: Path = PLANT_REGISTRY_PATH) -> List[Dict[str, Any]]:
-    return list(load_plant_registry(path).get("plants", []))
+    """Return compatibility dicts while the immutable registry becomes canonical."""
+
+    return [definition.to_legacy_dict() for definition in get_plant_registry(path).plants]
 
 
 def registry_entry_by_type(plant_type: int) -> Optional[Dict[str, Any]]:
-    for entry in registry_entries():
-        if int(entry.get("plant_type_id", -999)) == int(plant_type):
-            return entry
-    return None
+    definition = get_plant_registry().get_by_id(plant_type)
+    return definition.to_legacy_dict() if definition is not None else None
 
 
 def resolve_seed_list(seed_list: List[str]) -> List[int]:
-    entries = registry_entries()
-    alias_map: Dict[str, int] = {}
-    for entry in entries:
-        plant_type = int(entry.get("plant_type_id", -999))
-        names = [str(entry.get("canonical_name", "")), *(str(alias) for alias in entry.get("aliases", []))]
-        for name in names:
-            if name:
-                alias_map[normalize_plant_name(name)] = plant_type
+    registry = get_plant_registry()
 
     resolved: List[int] = []
     unknown: List[str] = []
@@ -642,11 +642,11 @@ def resolve_seed_list(seed_list: List[str]) -> List[int]:
             if token.lstrip("-").isdigit():
                 resolved.append(int(token))
                 continue
-            key = normalize_plant_name(token)
-            if key not in alias_map:
+            plant_type = registry.resolve_name(token)
+            if plant_type is None:
                 unknown.append(token)
                 continue
-            resolved.append(alias_map[key])
+            resolved.append(plant_type)
 
     if unknown:
         raise ValueError(f"Unknown seed names in --seed-list: {unknown}. Add aliases to {PLANT_REGISTRY_PATH}.")
@@ -835,17 +835,16 @@ def counts_cover(actual: Counter, expected: Counter) -> bool:
 def format_counts(counts: Counter) -> str:
     if not counts:
         return "{}"
+    registry = get_plant_registry()
     parts = []
     for plant_type in sorted(counts):
-        entry = registry_entry_by_type(int(plant_type))
-        name = entry.get("canonical_name") if entry else str(plant_type)
+        name = registry.canonical_name(int(plant_type))
         parts.append(f"{name}({plant_type})={counts[plant_type]}")
     return "{" + ", ".join(parts) + "}"
 
 
 def plant_type_name(plant_type: int) -> str:
-    entry = registry_entry_by_type(int(plant_type))
-    return str(entry.get("canonical_name")) if entry else str(plant_type)
+    return get_plant_registry().canonical_name(int(plant_type))
 
 
 def counts_to_entries(counts: Counter) -> List[Dict[str, Any]]:

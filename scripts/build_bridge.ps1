@@ -5,13 +5,23 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $root "src\PvZRLBridge\BridgeMod.cs"
+$bridgeSource = Join-Path $root "src\PvZRLBridge\BridgeMod.cs"
+$generatedRegistrySource = Join-Path $root "src\PvZRLBridge\GeneratedPlantRegistry.cs"
+$registryGenerator = Join-Path $PSScriptRoot "generate_bridge_registry.py"
+$plantRegistry = Join-Path $root "configs\plant_registry.json"
+$sources = @($bridgeSource, $generatedRegistrySource)
 $outDir = Join-Path $root "src\PvZRLBridge\bin\Release\net6.0"
 $dll = Join-Path $outDir "PvZRLBridge.dll"
 $csc = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\Roslyn\csc.exe"
 
 if (-not (Test-Path $csc)) {
     throw "C# compiler was not found at $csc"
+}
+
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python $registryGenerator --registry $plantRegistry --output $generatedRegistrySource
+if ($LASTEXITCODE -ne 0) {
+    throw "Bridge registry generation failed."
 }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -58,7 +68,7 @@ $refArgs = $refs | ForEach-Object { "/reference:$_" }
     /nullable:enable `
     "/out:$dll" `
     $refArgs `
-    $source
+    $sources
 
 if ($LASTEXITCODE -ne 0) {
     throw "Bridge build failed."

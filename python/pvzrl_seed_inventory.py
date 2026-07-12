@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from pvzrl_registry import get_plant_registry
 
 
 SEED_INVENTORY_V2_FEATURES_PER_SLOT = 6
@@ -215,7 +214,7 @@ def adventure_identity_features(observation: Dict[str, Any], max_seed_slots: int
     ready_count = 0
     affordable_count = 0
     unlocked_selected_count = 0
-    registry = _plant_registry_by_type()
+    registry = get_plant_registry()
     for slot_index in range(max(0, int(max_seed_slots))):
         slot = slots[slot_index] if slot_index < len(slots) and isinstance(slots[slot_index], dict) else {}
         present = 1.0 if slot else 0.0
@@ -251,7 +250,10 @@ def adventure_identity_features(observation: Dict[str, Any], max_seed_slots: int
         if unlocked:
             unlocked_selected_count += 1
 
-        role = str(registry.get(plant_type, {}).get("role") or "unknown").strip().lower()
+        # ``plant_type`` is normalized once above; use the immutable index
+        # directly inside this observation hot loop to avoid repeated coercion.
+        definition = registry.by_id.get(plant_type)
+        role = str(definition.role if definition is not None else "unknown").strip().lower()
         if role not in ADVENTURE_IDENTITY_ROLE_NAMES:
             role = "unknown"
         features.extend(
@@ -331,21 +333,3 @@ def _plant_identity_one_hot(plant_type: int) -> List[float]:
     else:
         values[-1] = 1.0
     return values
-
-
-@lru_cache(maxsize=1)
-def _plant_registry_by_type() -> Dict[int, Dict[str, Any]]:
-    path = Path(__file__).resolve().parents[1] / "configs" / "plant_registry.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    plants = payload.get("plants", []) if isinstance(payload, dict) else []
-    output: Dict[int, Dict[str, Any]] = {}
-    for plant in plants:
-        if not isinstance(plant, dict):
-            continue
-        plant_type = _safe_int(plant.get("plant_type_id"), -1)
-        if plant_type >= 0:
-            output[plant_type] = dict(plant)
-    return output

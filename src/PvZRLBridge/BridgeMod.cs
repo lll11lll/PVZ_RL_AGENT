@@ -3926,7 +3926,8 @@ public sealed class BridgeMod : MelonMod
         {
             return "";
         }
-        return ((PlantType)plantType).ToString();
+        var runtimeName = ((PlantType)plantType).ToString();
+        return GeneratedPlantRegistry.ResolveCanonicalNameFallback(plantType, runtimeName);
     }
 
     private static bool PlantNamesEquivalent(string? left, string? right)
@@ -5699,18 +5700,13 @@ public sealed class BridgeMod : MelonMod
 
     private static PlantCostInfo GetFallbackPlantCost(int plantTypeId)
     {
-        var fallback = plantTypeId switch
-        {
-            (int)PlantType.SunFlower => 50,
-            (int)PlantType.Peashooter => 100,
-            _ => 0
-        };
+        var hasFallback = GeneratedPlantRegistry.TryGetBridgeFallbackCost(plantTypeId, out var fallback);
 
         return new PlantCostInfo
         {
             PlantType = plantTypeId,
             Cost = fallback,
-            Source = fallback > 0
+            Source = hasFallback
                 ? "fallback_limited_registry"
                 : "unknown_cost"
         };

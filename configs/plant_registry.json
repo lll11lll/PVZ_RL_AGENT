@@ -1,6 +1,23 @@
 {
   "version": 1,
   "notes": "Plant metadata registry for PvZRL. Future plants may be added here, but PPO only uses entries with enabled_for_training=true.",
+  "gui_presets": [
+    {
+      "key": "four_slot_current",
+      "display_name": "4-slot current",
+      "seed_list": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
+    },
+    {
+      "key": "two_slot_stable",
+      "display_name": "2-slot stable",
+      "seed_list": ["SunFlower", "Peashooter"]
+    },
+    {
+      "key": "four_slot_duplicate",
+      "display_name": "4-slot duplicate",
+      "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+    }
+  ],
   "plants": [
     {
       "canonical_name": "SunFlower",
@@ -11,7 +28,8 @@
       "role": "economy",
       "description": "Produces extra sun. Current training uses it as the economy plant.",
       "source_of_metadata": "registry fallback; runtime cost/cooldown verified through CardUI when available",
-      "enabled_for_training": true
+      "enabled_for_training": true,
+      "bridge_fallback_enabled": true
     },
     {
       "canonical_name": "Peashooter",
@@ -22,7 +40,8 @@
       "role": "attacker",
       "description": "Shoots peas in its lane. Current training uses it as the basic attacker.",
       "source_of_metadata": "registry fallback; runtime cost/cooldown verified through CardUI when available",
-      "enabled_for_training": true
+      "enabled_for_training": true,
+      "bridge_fallback_enabled": true
     },
     {
       "canonical_name": "WallNut",

@@ -23,7 +23,7 @@ The supplied `PvZRL Internal Architecture Refinement Plan` is the initial roadma
 | Adventure | `python/pvzrl_adventure.py` owns inference progression and transitions. `python/pvzrl_adventure_generalist.py` owns training curriculum, replay/frontier decisions, unlock state, loadouts, and strict startup identity. |
 | GUI | `python/pvzrl_gui.py` owns Tk state, command construction, subprocess control, log display, live-status reading/rendering, and local moderation UI. It does not own gameplay state. |
 | Coach inputs | `python/pvzrl_human_coach.py`, `python/pvzrl_stream_coach.py`, and `python/pvzrl_assisted_coach.py` own local parsing, validation, queueing, aggregation, and intervention records. Human coach precedence is intentional. |
-| Configuration | CLI and JSON currently flow through `train_ppo.build_config()` into dictionaries, dataclasses, metadata, bridge configuration, and GUI commands. The precedence implementation is not yet authoritative. |
+| Configuration | CLI and JSON flow through `ConfigResolver` into a deeply immutable typed `ResolvedRunConfig`; `build_config()` provides the flat compatibility adapter for runtime dictionaries, metadata, bridge configuration, and GUI-launched commands. |
 | Artifacts | Trainer and Adventure writers emit live status, episode JSONL/CSV, progress, TensorBoard, metadata, checkpoints, and watchdog bundles. GUI consumes a compatibility-heavy view of live status. |
 
 ## Verified execution paths
@@ -91,7 +91,7 @@ Unless a separately documented defect correction has focused regression coverage
 | --- | --- | --- | --- |
 | 0 | Baseline, behavior locks, fixtures, benchmarks, plan/report | Complete | Full existing Python baseline, bridge build, checkpoint loads, new contract tests, benchmark record |
 | 1 | Request deadlines/shutdown, seed cache warnings, shared JSONL tailing, GUI close, confirmed defects/dead code | Complete | Deterministic stale-request, shutdown, partial-record, GUI lifecycle tests; zero-warning bridge build; full baseline |
-| 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Pending | Registry parity, precedence matrix, model/action/observation metadata snapshots |
+| 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
 | 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Pending | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Pending | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
 | 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Pending | Recorded lifecycle trace equivalence and live startup/win/loss/timeout/replay/Adventure checks |

@@ -63,10 +63,9 @@ from pvzrl_human_coach import (
     human_coach_live_status_defaults,
     human_coach_live_status_from_hook,
 )
+from pvzrl_observation_layout import build_observation_layout
 from pvzrl_seed_inventory import (
-    adventure_identity_feature_count,
     adventure_identity_features,
-    seed_inventory_v2_feature_count,
     seed_inventory_v2_features,
 )
 from pvzrl_stream_coach import StreamCoachController
@@ -285,24 +284,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             cols=self.cols,
         )
         self.action_count = self.action_spec.action_count
-        self.global_features = 12
-        self.card_slot_count = self.action_spec.max_seed_slots if self.action_spec.dynamic_seed_slots else len(self.config.plant_types)
-        self.card_features = 5 * self.card_slot_count
-        self.cell_features = 6 * self.cells
-        self.lane_features = 5 * self.rows
-        if self.action_spec.mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-            self.seed_inventory_features = adventure_identity_feature_count(self.action_spec.max_seed_slots)
-        elif self.action_spec.dynamic_seed_slots:
-            self.seed_inventory_features = seed_inventory_v2_feature_count(self.action_spec.max_seed_slots)
-        else:
-            self.seed_inventory_features = 0
-        self.observation_size = (
-            self.global_features
-            + self.card_features
-            + self.cell_features
-            + self.lane_features
-            + self.seed_inventory_features
+        observation_layout = build_observation_layout(
+            self.action_spec,
+            plant_type_count=len(self.config.plant_types),
         )
+        self.global_features = observation_layout.global_features
+        self.card_slot_count = observation_layout.card_slot_count
+        self.card_features = observation_layout.card_features
+        self.cell_features = observation_layout.cell_features
+        self.lane_features = observation_layout.lane_features
+        self.seed_inventory_features = observation_layout.seed_inventory_features
+        self.observation_size = observation_layout.total_features
         self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(self.observation_size,), dtype=np.float32)
         self.action_space = spaces.Discrete(self.action_count)
         self._last_observation: Optional[Dict[str, Any]] = None
@@ -403,6 +395,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         metadata["identity_seed_slots"] = bool(self.action_spec.identity_seed_slots)
         metadata["observation_version"] = self.action_spec.observation_version
         metadata["action_decoder_version"] = self.action_spec.action_decoder_version
+        metadata["observation_shape"] = [int(value) for value in self.observation_space.shape]
         return metadata
 
     def _clear_coach_command_state_on_reset(self, *, reason: str = "reset") -> bool:

@@ -231,4 +231,39 @@ Residual Phase 1 limitation: the deterministic C# harness exercises the request 
 
 Rollback boundary: local commit subject `fix: harden PvZRL lifecycle boundaries`; its hash will be recorded in the final phase table.
 
+### Phase 2 - canonical metadata and resolved configuration
+
+Status: complete pending rollback commit.
+
+Implemented:
+
+- Added `pvzrl_registry.py` as the one parsed, validated, deeply immutable Python plant registry. Its 12 definitions expose canonical names, aliases, IDs, fallback cost/cooldown, category/role, unlock/training/fusion/GUI metadata containers, training eligibility, and explicit bridge-fallback eligibility. Default-path lookups use a pre-resolved cache key so the cache itself does not add filesystem resolution to observation encoding.
+- Retained the existing `pvzrl_env` registry APIs as defensive-copy forwarding adapters. Seed-list resolution, display names, Adventure identity features, GUI profiles, Level 3 IDs/loadout, and base-plant fusion identities now derive from indexed canonical definitions and named GUI presets. Fusion-result IDs remain an explicit separate overlay until the authoritative fusion-recipe migration in Phase 3.
+- Added deterministic bridge generation from `configs/plant_registry.json`. `build_bridge.ps1` regenerates and compiles `GeneratedPlantRegistry.cs`; the bridge still reads cached/live `CardUI` cost first and uses generated values only for the two pre-existing limited fallbacks. The manually synchronized C# cost switch is gone.
+- Added a deeply immutable `ResolvedRunConfig` with typed optimization, environment, seed/action, Adventure, fusion, coach, diagnostics, artifacts, bridge, model-contract, and reward sections plus immutable value provenance. `build_config()` remains the flat-dictionary compatibility adapter, so existing consumers and `resolved_config.json` retain their keys and JSON value shapes.
+- Replaced scattered scalar/enable precedence branches with `ConfigResolver`: `explicit CLI > JSON > mode default > global default`. The four Adventure parser defaults that previously masked JSON now use an unset state; explicit run-mode aliases resolve before JSON; runtime dispatch uses the resolved mode; stream mode/platform aliases stay coherent; JSON/CLI `plant_types` must match canonical seed-slot order; and tracked metadata reasons survive resolution. Quick-wait, Level 3, and Adventure Generalist defaults are mode defaults rather than accidental parser values.
+- Added actionable warnings for recognized ignored legacy fields. `enable_fusion_diagnostics` is identified as a no-op; unused `proximity_penalty` warns in both top-level and nested reward shapes while remaining in resolved output during the compatibility window. `docs/CONFIGURATION.md` documents falsey values, provenance, aliases, legacy warnings, mode defaults, GUI launch behavior, and the adapter window.
+- Extended model compatibility checks across metadata version, identity-slot semantics, exact loaded observation shape, declared observation shape (including malformed values), wait action, placement range, rows, columns, and cells per slot. Metadata and the SB3 wrapper now share one pure observation-layout calculator; runtime environment metadata still records the actual Gym shape as final proof. Existing metadata without the additive shape field remains compatible when the loaded model proves the shape.
+- Repaired both root-relative paths in `configs/model_schedule.json`, corrected the utility artifact/run choice, and labeled the tracked file as a locally validated example whose model artifacts are intentionally gitignored. Both router stages now select, load, and validate from the repository root.
+
+Compatibility evidence:
+
+- The generated registry is byte-deterministic and hash-linked to its JSON source; every canonical entry appears once, only the original SunFlower/Peashooter bridge fallbacks are enabled, and no manual C# fallback switch remains.
+- The full pytest gate passes 111 tests plus 7 subtests. The reviewer's five-file registry/configuration/metadata contract gate passes 72 tests. Coverage includes deep immutability, parse-once behavior, named GUI presets, fusion-overlay separation, generator staleness, CardUI-first order, falsey and cross-mode precedence, dispatch routing, aliases, typed provenance/round trips, legacy warnings, plant-slot alignment, optional schedule portability, and every enforced model axis.
+- All nine retained standalone regression entry points pass after the final resolver and dispatch changes.
+- Both repaired schedule stages pass end-to-end `--router-dry-run`, including actual model load and `(201, (357,))` compatibility.
+- The protected June 27 checkpoint passes `--metadata-dry-run` with `(701, (4297,), 370000)`; the fixed control passes with `(201, (357,), 350368)`. Neither checkpoint or adjacent metadata file was modified.
+- The bridge builds with zero warnings, and the lifecycle harness still passes all 7,051 checks.
+- The Phase 0 benchmark contract hashes remain identical. A final five-round/50-sample confirmation shows identity observation encoding at `0.53770 -> 0.48600 ms` (`-9.6%`), fixed encoding at `0.20600 -> 0.19005 ms` (`-7.7%`), dense identity masks at `11.25345 -> 11.00010 ms` (`-2.3%`), fusion scans at `5.81045 -> 5.67800 ms` (`-2.3%`), live-status construction at `21.82135 -> 21.53770 ms` (`-1.3%`), and unchanged-status GUI polling at `0.40765 -> 0.04055 ms` (`-90.1%`). Earlier short reruns showed uniform host-load variance, so the higher-sample confirmation is the retained comparison.
+- Independent review found and drove fixes for GUI/fusion copies, ignored legacy fields, clean-clone schedule portability, run-mode and stream-alias precedence, main dispatch, JSON plant IDs, metadata shape drift/malformed values, shared observation width, provenance, and tracked metadata values. The final re-review found no other Phase 2 blocker; its last symmetric fixed-mode conflict was then fixed and regression-tested.
+
+Residual Phase 2 boundaries:
+
+- Runtime `CardUI` metadata remains authoritative and still needs the final live-game gate. The generator supplies fallbacks only; it does not replace Unity discovery.
+- The flat configuration adapter deliberately remains while later phases migrate runtime consumers. GUI widget-only state remains in `pvzrl_gui.py`; plant presets come from the registry and launched values enter the same CLI resolver.
+- Fusion-result identity and recipes remain separate until Phase 3 so this phase does not change recursive/self-fusion behavior.
+- The schedule is runnable in this checkout and explicitly labeled as requiring local gitignored artifacts; it is not represented as a portable model bundle.
+
+Rollback boundary: local commit subject `refactor: establish canonical PvZRL metadata`; its hash and final independent-review result will be recorded after the phase gate closes.
+
 Later phase results, benchmark comparisons, live verification, independent review findings, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.

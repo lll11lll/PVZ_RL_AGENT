@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 from pvzrl_adventure import (
     DEFAULT_ADVENTURE_HARD_MAX_STEPS,
@@ -56,6 +56,13 @@ from pvzrl_env import (
 )
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields, normalize_fusion_policy
 from pvzrl_human_coach import human_coach_live_status_defaults
+from pvzrl_config import (
+    CONFIG_UNSET,
+    ConfigSource,
+    ConfigResolver,
+    ResolvedRunConfig,
+    warn_ignored_legacy_fields,
+)
 from pvzrl_model_metadata import (
     CompatibilityCheck,
     apply_model_metadata_defaults,
@@ -576,13 +583,6 @@ def load_json(path: Optional[Path]) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def pick(args: argparse.Namespace, config: Dict[str, Any], key: str, fallback: Any) -> Any:
-    value = getattr(args, key)
-    if value is not None:
-        return value
-    return config.get(key, fallback)
-
-
 def pick_reward(args: argparse.Namespace, raw_config: Dict[str, Any], key: str, fallback: float) -> float:
     value = getattr(args, key, None)
     if value is not None:
@@ -593,7 +593,12 @@ def pick_reward(args: argparse.Namespace, raw_config: Dict[str, Any], key: str, 
     return float(raw_config.get(key, fallback))
 
 
-def build_reward_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[str, float]:
+def build_reward_config(
+    args: argparse.Namespace,
+    raw_config: Dict[str, Any],
+    *,
+    run_mode: Optional[str] = None,
+) -> Dict[str, float]:
     defaults = asdict(RewardConfig())
     reward = {
         key: pick_reward(args, raw_config, key, float(default_value))
@@ -606,10 +611,8 @@ def build_reward_config(args: argparse.Namespace, raw_config: Dict[str, Any]) ->
         reward["coach_match_reward"] = float(getattr(args, "human_coach_match_bonus"))
     if getattr(args, "coach_override_penalty", None) is None and getattr(args, "human_coach_override_penalty", None) is not None:
         reward["coach_override_penalty"] = float(getattr(args, "human_coach_override_penalty"))
-    cli_level3_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower() == RUN_MODE_LEVEL3_SPECIALIST
-    level3_requested = bool(getattr(args, "level3_train", False) or getattr(args, "level3_eval", False) or cli_level3_run_mode)
-    configured_run_mode = str(raw_config.get("run_mode", "") or "").strip().lower()
-    if level3_requested or configured_run_mode == RUN_MODE_LEVEL3_SPECIALIST:
+    effective_run_mode = run_mode or resolve_effective_run_mode(args, raw_config)
+    if effective_run_mode == RUN_MODE_LEVEL3_SPECIALIST:
         raw_reward = raw_config.get("reward", {})
         raw_reward = raw_reward if isinstance(raw_reward, dict) else {}
         for key, value in LEVEL3_REWARD_DEFAULTS.items():
@@ -732,6 +735,16 @@ def _model_action_count(model: Any) -> int:
         return -1
 
 
+def _model_observation_shape(model: Any) -> Optional[List[int]]:
+    shape = getattr(getattr(model, "observation_space", None), "shape", None)
+    if not isinstance(shape, (list, tuple)):
+        return None
+    try:
+        return [int(value) for value in shape]
+    except (TypeError, ValueError):
+        return None
+
+
 def compatibility_summary_from_report(result: CompatibilityCheck) -> Dict[str, Any]:
     expected = result.expected
     actual = result.actual
@@ -782,6 +795,7 @@ def loaded_model_compatibility_report(
         model_path,
         config,
         model_action_count=_model_action_count(model),
+        model_observation_shape=_model_observation_shape(model),
         env_metadata=env_metadata or env_metadata_for_config(config),
         allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
@@ -855,14 +869,19 @@ def validate_adventure_generalist_model_compatibility(
     *,
     model: Optional[Any] = None,
     model_action_count: Optional[int] = None,
+    model_observation_shape: Optional[Any] = None,
     env_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     env_metadata = env_metadata or env_metadata_for_config(config)
     loaded_action_count = _model_action_count(model) if model is not None else model_action_count
+    loaded_observation_shape = (
+        _model_observation_shape(model) if model is not None else model_observation_shape
+    )
     result = validate_model_metadata(
         model_path,
         config,
         model_action_count=loaded_action_count,
+        model_observation_shape=loaded_observation_shape,
         env_metadata=env_metadata,
         allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
@@ -969,39 +988,112 @@ def validate_adventure_generalist_model_compatibility(
     return summary
 
 
-def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[str, Any]:
-    quick_wait = bool(args.quick_wait or raw_config.get("quick_wait", False))
-    board_timeout = pick(args, raw_config, "board_timeout", 60.0 if quick_wait else 180.0)
-    gameplay_ready_timeout = pick(args, raw_config, "gameplay_ready_timeout", 30.0 if quick_wait else 60.0)
-    poll_seconds = pick(args, raw_config, "poll_seconds", 0.2 if quick_wait else 0.2)
-    level3_requested = bool(
-        getattr(args, "level3_train", False)
-        or getattr(args, "level3_eval", False)
-        or str(getattr(args, "run_mode", "") or "").strip().lower() == RUN_MODE_LEVEL3_SPECIALIST
-    )
+def resolve_effective_run_mode(args: argparse.Namespace, raw_config: Dict[str, Any]) -> str:
+    """Resolve mutually exclusive run modes with all explicit CLI forms first."""
+
+    specialized_cli_modes: List[str] = []
+    if getattr(args, "level3_train", False) or getattr(args, "level3_eval", False):
+        specialized_cli_modes.append(RUN_MODE_LEVEL3_SPECIALIST)
+    if getattr(args, "adventure_generalist_train", False):
+        specialized_cli_modes.append(ADVENTURE_GENERALIST_RUN_MODE_TRAIN)
+    if getattr(args, "adventure_generalist_eval", False):
+        specialized_cli_modes.append(ADVENTURE_GENERALIST_RUN_MODE_EVAL)
+    if getattr(args, "adventure_eval", False) or getattr(args, "adventure", False):
+        specialized_cli_modes.append(RUN_MODE_ADVENTURE_EVAL)
+    distinct_specialized_modes = list(dict.fromkeys(specialized_cli_modes))
+    if len(distinct_specialized_modes) > 1:
+        raise SystemExit(
+            "blocked_reason=invalid_cli: conflicting explicit run-mode shortcuts: "
+            + ",".join(distinct_specialized_modes)
+        )
+
+    explicit_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower()
+    shortcut_mode = distinct_specialized_modes[0] if distinct_specialized_modes else ""
+    if not shortcut_mode and not explicit_run_mode:
+        if bool(getattr(args, "train", False)):
+            shortcut_mode = "fixed_train"
+        elif bool(getattr(args, "eval", False)):
+            shortcut_mode = "fixed_eval"
+
+    if explicit_run_mode and shortcut_mode and explicit_run_mode != shortcut_mode:
+        raise SystemExit(
+            "blocked_reason=invalid_cli: --run-mode conflicts with explicit mode shortcut: "
+            f"{explicit_run_mode}!={shortcut_mode}"
+        )
+    if explicit_run_mode == "fixed_eval" and bool(getattr(args, "train", False)):
+        raise SystemExit("blocked_reason=invalid_cli: fixed_eval cannot be combined with --train.")
+    if explicit_run_mode == "fixed_train" and bool(getattr(args, "eval", False)):
+        raise SystemExit("blocked_reason=invalid_cli: fixed_train cannot be combined with --eval.")
+    if explicit_run_mode:
+        return explicit_run_mode
+    if shortcut_mode:
+        return shortcut_mode
+
     configured_run_mode = str(raw_config.get("run_mode", "") or "").strip().lower()
-    cli_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower()
-    adventure_generalist_train_requested = bool(
-        getattr(args, "adventure_generalist_train", False)
-        or cli_run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
-        or configured_run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
+    if configured_run_mode in {
+        "fixed_train",
+        "fixed_eval",
+        RUN_MODE_ADVENTURE_EVAL,
+        RUN_MODE_LEVEL3_SPECIALIST,
+        ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
+        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
+    }:
+        return configured_run_mode
+    if configured_run_mode:
+        raise SystemExit(f"blocked_reason=invalid_config_run_mode:{configured_run_mode}")
+    return "fixed_train"
+
+
+def _build_config_mapping(
+    args: argparse.Namespace,
+    raw_config: Dict[str, Any],
+    *,
+    resolution_sources: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    warn_ignored_legacy_fields(raw_config)
+    resolver = ConfigResolver(args, raw_config)
+    value = resolver.value
+    enabled = resolver.enabled
+    quick_wait = enabled("quick_wait")
+    board_timeout = value(
+        "board_timeout",
+        180.0,
+        mode_default=60.0 if quick_wait else CONFIG_UNSET,
     )
-    adventure_generalist_eval_requested = bool(
-        getattr(args, "adventure_generalist_eval", False)
-        or cli_run_mode == ADVENTURE_GENERALIST_RUN_MODE_EVAL
-        or configured_run_mode == ADVENTURE_GENERALIST_RUN_MODE_EVAL
+    gameplay_ready_timeout = value(
+        "gameplay_ready_timeout",
+        60.0,
+        mode_default=30.0 if quick_wait else CONFIG_UNSET,
     )
+    poll_seconds = value("poll_seconds", 0.2)
+    run_mode = resolve_effective_run_mode(args, raw_config)
+    explicit_mode_cli = bool(
+        getattr(args, "run_mode", None)
+        or getattr(args, "train", False)
+        or getattr(args, "eval", False)
+        or getattr(args, "level3_train", False)
+        or getattr(args, "level3_eval", False)
+        or getattr(args, "adventure", False)
+        or getattr(args, "adventure_eval", False)
+        or getattr(args, "adventure_generalist_train", False)
+        or getattr(args, "adventure_generalist_eval", False)
+    )
+    resolver.sources["run_mode"] = (
+        ConfigSource.CLI
+        if explicit_mode_cli
+        else ConfigSource.JSON
+        if "run_mode" in raw_config
+        else ConfigSource.GLOBAL_DEFAULT
+    )
+    level3_requested = run_mode == RUN_MODE_LEVEL3_SPECIALIST
+    adventure_generalist_train_requested = run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
+    adventure_generalist_eval_requested = run_mode == ADVENTURE_GENERALIST_RUN_MODE_EVAL
     adventure_generalist_requested = adventure_generalist_train_requested or adventure_generalist_eval_requested
-    raw_initial_loadout = pick(
-        args,
-        raw_config,
-        "initial_loadout",
-        ",".join(ADVENTURE_GENERALIST_INITIAL_LOADOUT),
-    )
+    raw_initial_loadout = value("initial_loadout", ",".join(ADVENTURE_GENERALIST_INITIAL_LOADOUT))
     initial_loadout = parse_initial_loadout(raw_initial_loadout)
     if adventure_generalist_requested:
         default_seed_list = ",".join(initial_loadout)
-    elif level3_requested or configured_run_mode == RUN_MODE_LEVEL3_SPECIALIST:
+    elif level3_requested:
         default_seed_list = ",".join(LEVEL3_SPECIALIST_SEED_LIST)
     else:
         default_seed_list = "SunFlower,Peashooter"
@@ -1010,30 +1102,49 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
     seed_order_source = SEED_ORDER_SOURCE_DEFAULT
     if adventure_generalist_requested and cli_seed_list is None and not config_seed_list_present:
         raw_seed_list = default_seed_list
+        resolver.sources["seed_list"] = ConfigSource.MODE_DEFAULT
     else:
-        raw_seed_list = pick(args, raw_config, "seed_list", default_seed_list)
+        raw_seed_list = value(
+            "seed_list",
+            "SunFlower,Peashooter",
+            mode_default=(
+                default_seed_list
+                if adventure_generalist_requested or level3_requested
+                else CONFIG_UNSET
+            ),
+        )
         if adventure_generalist_requested and (cli_seed_list is not None or config_seed_list_present):
             seed_order_source = SEED_ORDER_SOURCE_EXPLICIT
     if isinstance(raw_seed_list, list):
         seed_list = [str(seed).strip() for seed in raw_seed_list if str(seed).strip()]
     else:
         seed_list = parse_seed_list(str(raw_seed_list))
-    if args.plant_types:
-        plant_types = [int(part.strip()) for part in args.plant_types.split(",") if part.strip()]
-    elif level3_requested or configured_run_mode == RUN_MODE_LEVEL3_SPECIALIST:
-        plant_types = list(LEVEL3_SPECIALIST_PLANT_TYPES)
+    derived_plant_types = resolve_seed_list(seed_list)
+    raw_plant_types = value(
+        "plant_types",
+        derived_plant_types,
+        mode_default=list(LEVEL3_SPECIALIST_PLANT_TYPES) if level3_requested else CONFIG_UNSET,
+    )
+    if isinstance(raw_plant_types, str):
+        plant_types = [int(part.strip()) for part in raw_plant_types.split(",") if part.strip()]
+    elif isinstance(raw_plant_types, (list, tuple)):
+        plant_types = [int(part) for part in raw_plant_types]
     else:
-        plant_types = resolve_seed_list(seed_list)
+        raise SystemExit(
+            "blocked_reason=invalid_plant_types: expected comma-separated text or a JSON list of integers."
+        )
+    if plant_types != derived_plant_types:
+        raise SystemExit(
+            "blocked_reason=seed_plant_type_mismatch: seed_list and plant_types must preserve identical slot order; "
+            f"seed_list_resolves_to={derived_plant_types} configured_plant_types={plant_types}"
+        )
     requested_action_space_mode = normalize_action_space_mode(
-        pick(args, raw_config, "action_space_mode", ACTION_SPACE_FIXED)
+        value("action_space_mode", ACTION_SPACE_FIXED)
     )
-    experimental_dynamic = bool(
-        getattr(args, "experimental_dynamic_seed_slots", False)
-        or raw_config.get("experimental_dynamic_seed_slots", False)
-    )
+    experimental_dynamic = enabled("experimental_dynamic_seed_slots")
     if adventure_generalist_requested:
         requested_action_space_mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
-        plant_types = resolve_seed_list(seed_list)
+        plant_types = list(derived_plant_types)
         experimental_dynamic = False
     elif experimental_dynamic:
         requested_action_space_mode = ACTION_SPACE_DYNAMIC_14
@@ -1048,53 +1159,30 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
     elif args.train and args.run_dir is None:
         run_dir = str(default_train_run_dir(seed_list))
     elif (
-        (
-            args.eval
-            or getattr(args, "adventure_eval", False)
-            or getattr(args, "adventure", False)
-            or adventure_generalist_eval_requested
-        )
+        run_mode in {"fixed_eval", RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}
         and args.run_dir is None
         and getattr(args, "model", None) is not None
     ):
         run_dir = str(Path(args.model).resolve().parent)
     else:
-        run_dir = str(pick(args, raw_config, "run_dir", "runs/ppo_sunflower_peashooter"))
+        run_dir = str(value("run_dir", "runs/ppo_sunflower_peashooter"))
 
-    game_speed = float(pick(args, raw_config, "game_speed", 4.0))
-    game_speed_mode = str(pick(args, raw_config, "game_speed_mode", "game_speed"))
+    game_speed = float(value("game_speed", 4.0))
+    game_speed_mode = str(value("game_speed_mode", "game_speed"))
     if args.valid_speed_mode:
         game_speed_mode = "safe"
     fusion_policy = normalize_fusion_policy(
-        pick(args, raw_config, "fusion_policy", FUSION_POLICY_NONE)
+        value("fusion_policy", FUSION_POLICY_NONE)
     )
-    adventure_requested = bool(getattr(args, "adventure_eval", False) or getattr(args, "adventure", False))
-    explicit_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower()
-    if explicit_run_mode:
-        run_mode = explicit_run_mode
-    elif adventure_generalist_train_requested:
-        run_mode = ADVENTURE_GENERALIST_RUN_MODE_TRAIN
-    elif adventure_generalist_eval_requested:
-        run_mode = ADVENTURE_GENERALIST_RUN_MODE_EVAL
-    elif level3_requested:
-        run_mode = RUN_MODE_LEVEL3_SPECIALIST
-    elif adventure_requested:
-        run_mode = RUN_MODE_ADVENTURE_EVAL
-    elif configured_run_mode in {
-        "fixed_train",
-        "fixed_eval",
-        RUN_MODE_ADVENTURE_EVAL,
-        RUN_MODE_LEVEL3_SPECIALIST,
-        ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
-        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
-    }:
-        run_mode = configured_run_mode
-    elif bool(getattr(args, "eval", False)) and not bool(getattr(args, "train", False)):
-        run_mode = "fixed_eval"
-    else:
-        run_mode = "fixed_train"
+    adventure_requested = run_mode == RUN_MODE_ADVENTURE_EVAL
 
-    target_level = int(pick(args, raw_config, "target_level", LEVEL3_SPECIALIST_TARGET_LEVEL if run_mode == RUN_MODE_LEVEL3_SPECIALIST else 0))
+    target_level = int(
+        value(
+            "target_level",
+            0,
+            mode_default=LEVEL3_SPECIALIST_TARGET_LEVEL if run_mode == RUN_MODE_LEVEL3_SPECIALIST else CONFIG_UNSET,
+        )
+    )
     if run_mode == RUN_MODE_LEVEL3_SPECIALIST:
         if target_level != LEVEL3_SPECIALIST_TARGET_LEVEL:
             raise SystemExit("blocked_reason=invalid_level3_target_level: Level 3 specialist requires --target-level 3.")
@@ -1123,7 +1211,7 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
                 "Adventure Generalist requires adventure_14slot_identity."
             )
 
-    legacy_max_steps = int(pick(args, raw_config, "max_steps", 1000))
+    legacy_max_steps = int(value("max_steps", 1000))
     raw_adventure_soft = getattr(args, "adventure_soft_max_steps", None)
     if raw_adventure_soft is None:
         if run_mode in {RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_TRAIN, ADVENTURE_GENERALIST_RUN_MODE_EVAL} and getattr(args, "max_steps", None) is not None:
@@ -1133,7 +1221,7 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
     adventure_soft_max_steps = max(1, int(raw_adventure_soft))
     adventure_hard_max_steps = max(
         adventure_soft_max_steps,
-        int(pick(args, raw_config, "adventure_hard_max_steps", DEFAULT_ADVENTURE_HARD_MAX_STEPS)),
+        int(value("adventure_hard_max_steps", DEFAULT_ADVENTURE_HARD_MAX_STEPS)),
     )
     raw_final_wave_extension = getattr(args, "adventure_final_wave_extension", None)
     if raw_final_wave_extension is None:
@@ -1164,41 +1252,34 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         RUN_MODE_ADVENTURE_EVAL,
         ADVENTURE_GENERALIST_RUN_MODE_EVAL,
     }
-    randomize_seed_order = bool(
-        getattr(args, "randomize_seed_order", False)
-        or raw_config.get("randomize_seed_order", False)
-        or raw_config.get("seed_order_randomization", False)
+    randomize_seed_order = enabled(
+        "randomize_seed_order",
+        json_aliases=("seed_order_randomization",),
     )
     if adventure_generalist_requested and randomize_seed_order:
         seed_order_source = SEED_ORDER_SOURCE_RANDOMIZED
-    coach_allow_fusion_planning = bool(
-        getattr(args, "coach_allow_fusion_planning", False)
-        or raw_config.get("coach_allow_fusion_planning", False)
-    )
-    fusion_bridge_enabled = bool(
-        getattr(args, "fusion_bridge_enabled", False)
-        or raw_config.get("fusion_bridge_enabled", False)
-    )
-    human_coach_enabled = bool(
-        getattr(args, "human_coach_enabled", False)
-        or raw_config.get("human_coach_enabled", False)
-    )
+    coach_allow_fusion_planning = enabled("coach_allow_fusion_planning")
+    fusion_bridge_enabled = enabled("fusion_bridge_enabled")
+    human_coach_enabled = enabled("human_coach_enabled")
     human_coach_command_mode = str(
         getattr(args, "human_coach_command_mode", None)
         or raw_config.get("human_coach_command_mode", "override")
         or "override"
     ).strip().lower()
-    stream_coach_enabled = bool(
-        getattr(args, "stream_coach_enabled", False)
-        or raw_config.get("stream_coach_enabled", False)
-    )
-    stream_coach_mode = str(
-        getattr(args, "stream_coach_mode", None)
-        or raw_config.get("stream_coach_mode", "")
-        or getattr(args, "stream_coach_platform", None)
-        or raw_config.get("stream_coach_platform", "mock")
-        or "mock"
-    ).strip().lower()
+    stream_coach_enabled = enabled("stream_coach_enabled")
+    try:
+        stream_coach_mode = str(
+            resolver.aliased_value(
+                "stream_coach_mode",
+                "mock",
+                cli_keys=("stream_coach_mode", "stream_coach_platform"),
+                json_keys=("stream_coach_mode", "stream_coach_platform"),
+                skip_blank=True,
+            )
+        ).strip().lower()
+    except ValueError as exc:
+        raise SystemExit(f"blocked_reason=invalid_cli: {exc}") from exc
+    resolver.sources["stream_coach_platform"] = resolver.sources["stream_coach_mode"]
     default_coach_command_path = "runs/coach_commands.jsonl"
     raw_human_command_path = (
         getattr(args, "human_coach_command_path", None)
@@ -1217,20 +1298,19 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
     if stream_coach_enabled and not stream_coach_command_path:
         stream_coach_command_path = human_coach_command_path or default_coach_command_path
     human_coach_fusion_enabled = bool(
-        getattr(args, "human_coach_fusion_enabled", False)
-        or raw_config.get("human_coach_fusion_enabled", False)
+        enabled("human_coach_fusion_enabled")
         or coach_allow_fusion_planning
         or fusion_bridge_enabled
     )
     stream_coach_fusion_enabled = bool(
-        raw_config.get("stream_coach_fusion_enabled", False)
+        enabled("stream_coach_fusion_enabled")
         or coach_allow_fusion_planning
         or fusion_bridge_enabled
     )
-    stream_coach_apply_enabled = bool(
-        getattr(args, "stream_coach_apply", False)
-        or raw_config.get("stream_coach_apply_enabled", False)
-        or raw_config.get("stream_coach_apply", False)
+    stream_coach_apply_enabled = enabled(
+        "stream_coach_apply_enabled",
+        cli_key="stream_coach_apply",
+        json_aliases=("stream_coach_apply",),
     )
     stream_coach_dry_run = bool(raw_config.get("stream_coach_dry_run", True))
     if getattr(args, "stream_coach_apply", False):
@@ -1252,86 +1332,85 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
             if adventure_generalist_requested
             else str(raw_config.get("model_family", model_family_for_seed_list(seed_list)))
         ),
-        "total_timesteps": int(pick(args, raw_config, "total_timesteps", 25000)),
-        "learning_rate": float(pick(args, raw_config, "learning_rate", 3e-4)),
-        "n_steps": int(pick(args, raw_config, "n_steps", 512)),
-        "batch_size": int(pick(args, raw_config, "batch_size", 64)),
-        "gamma": float(pick(args, raw_config, "gamma", 0.99)),
-        "gae_lambda": float(pick(args, raw_config, "gae_lambda", 0.95)),
-        "ent_coef": float(pick(args, raw_config, "ent_coef", 0.01)),
-        "clip_range": float(pick(args, raw_config, "clip_range", 0.2)),
-        "verbose": int(pick(args, raw_config, "verbose", 1)),
+        "total_timesteps": int(value("total_timesteps", 25000)),
+        "learning_rate": float(value("learning_rate", 3e-4)),
+        "n_steps": int(value("n_steps", 512)),
+        "batch_size": int(value("batch_size", 64)),
+        "gamma": float(value("gamma", 0.99)),
+        "gae_lambda": float(value("gae_lambda", 0.95)),
+        "ent_coef": float(value("ent_coef", 0.01)),
+        "clip_range": float(value("clip_range", 0.2)),
+        "verbose": int(value("verbose", 1)),
         "max_steps": int(env_max_steps),
         "legacy_max_steps": int(legacy_max_steps),
         "adventure_soft_max_steps": int(adventure_soft_max_steps),
         "adventure_hard_max_steps": int(adventure_hard_max_steps),
         "adventure_final_wave_extension": bool(adventure_final_wave_extension),
-        "step_seconds": float(pick(args, raw_config, "step_seconds", 0.05)),
+        "step_seconds": float(value("step_seconds", 0.05)),
         "game_speed": game_speed,
         "game_speed_mode": game_speed_mode,
-        "start_sun": int(pick(args, raw_config, "start_sun", 500)),
-        "seed": int(pick(args, raw_config, "seed", 12345)),
+        "start_sun": int(value("start_sun", 500)),
+        "seed": int(value("seed", 12345)),
         "board_timeout": float(board_timeout),
         "gameplay_ready_timeout": float(gameplay_ready_timeout),
         "poll_seconds": float(poll_seconds),
-        "wait_gameplay_ready": bool(args.wait_gameplay_ready or raw_config.get("wait_gameplay_ready", True)),
-        "skip_board_wait": bool(args.skip_board_wait or raw_config.get("skip_board_wait", False)),
+        "wait_gameplay_ready": enabled("wait_gameplay_ready", True),
+        "skip_board_wait": enabled("skip_board_wait"),
         "quick_wait": quick_wait,
         "plant_types": plant_types,
         "action_space_mode": requested_action_space_mode,
         "experimental_dynamic_seed_slots": bool(experimental_dynamic),
-        "max_seed_slots": int(pick(args, raw_config, "max_seed_slots", 14 if adventure_generalist_requested else len(plant_types))),
-        "auto_select_seeds": bool(
-            args.auto_select_seeds or raw_config.get("auto_select_seeds", False) or adventure_generalist_requested
+        "max_seed_slots": int(
+            value(
+                "max_seed_slots",
+                len(plant_types),
+                mode_default=14 if adventure_generalist_requested else CONFIG_UNSET,
+            )
         ),
+        "auto_select_seeds": bool(enabled("auto_select_seeds") or adventure_generalist_requested),
         "seed_list": seed_list,
         "initial_loadout": list(initial_loadout),
         "configured_seed_list": list(seed_list),
         "seed_order_source": seed_order_source,
         "seed_order_preserved": True,
         "randomize_seed_order": bool(randomize_seed_order),
-        "seed_click_delay": float(pick(args, raw_config, "seed_click_delay", 0.35)),
-        "lets_rock_delay": float(pick(args, raw_config, "lets_rock_delay", 0.5)),
-        "post_start_delay": float(pick(args, raw_config, "post_start_delay", 1.0)),
-        "seed_screen_check_interval": int(pick(args, raw_config, "seed_screen_check_interval", 100)),
-        "debug_performance": bool(args.debug_performance or raw_config.get("debug_performance", False)),
-        "debug_observation": bool(args.debug_observation or raw_config.get("debug_observation", False)),
+        "seed_click_delay": float(value("seed_click_delay", 0.35)),
+        "lets_rock_delay": float(value("lets_rock_delay", 0.5)),
+        "post_start_delay": float(value("post_start_delay", 1.0)),
+        "seed_screen_check_interval": int(value("seed_screen_check_interval", 100)),
+        "debug_performance": enabled("debug_performance"),
+        "debug_observation": enabled("debug_observation"),
         "debug_sun": bool(
-            args.debug_sun
-            or raw_config.get("debug_sun", False)
-            or args.debug_performance
-            or raw_config.get("debug_performance", False)
+            enabled("debug_sun")
+            or enabled("debug_performance")
         ),
-        "debug_sun_sample_interval": int(pick(args, raw_config, "debug_sun_sample_interval", 25)),
+        "debug_sun_sample_interval": int(value("debug_sun_sample_interval", 25)),
         "fusion_policy": fusion_policy,
-        "fusion_action_mask_enabled": bool(
-            getattr(args, "fusion_action_mask_enabled", False)
-            or raw_config.get("fusion_action_mask_enabled", False)
-        ),
+        "fusion_action_mask_enabled": enabled("fusion_action_mask_enabled"),
         "enable_board_plant_identity": bool(
-            pick(args, raw_config, "enable_board_plant_identity", False)
+            value("enable_board_plant_identity", False)
         ),
-        "enable_fusion_chain_rewards": bool(pick(args, raw_config, "enable_fusion_chain_rewards", False)),
-        "enable_recipe_discovery_reward": bool(pick(args, raw_config, "enable_recipe_discovery_reward", False)),
-        "enable_repeat_recipe_decay": bool(pick(args, raw_config, "enable_repeat_recipe_decay", False)),
-        "enable_fusion_curriculum": bool(pick(args, raw_config, "enable_fusion_curriculum", False)),
-        "enable_later_plant_curriculum": bool(pick(args, raw_config, "enable_later_plant_curriculum", False)),
-        "enable_coach_fusion_sampling": bool(pick(args, raw_config, "enable_coach_fusion_sampling", False)),
-        "fusion_curriculum_prob": float(pick(args, raw_config, "fusion_curriculum_prob", 0.20)),
-        "later_plant_curriculum_prob": float(pick(args, raw_config, "later_plant_curriculum_prob", 0.10)),
-        "coach_fusion_prob": float(pick(args, raw_config, "coach_fusion_prob", 0.10)),
+        "enable_fusion_chain_rewards": bool(value("enable_fusion_chain_rewards", False)),
+        "enable_recipe_discovery_reward": bool(value("enable_recipe_discovery_reward", False)),
+        "enable_repeat_recipe_decay": bool(value("enable_repeat_recipe_decay", False)),
+        "enable_fusion_curriculum": bool(value("enable_fusion_curriculum", False)),
+        "enable_later_plant_curriculum": bool(value("enable_later_plant_curriculum", False)),
+        "enable_coach_fusion_sampling": bool(value("enable_coach_fusion_sampling", False)),
+        "fusion_curriculum_prob": float(value("fusion_curriculum_prob", 0.20)),
+        "later_plant_curriculum_prob": float(value("later_plant_curriculum_prob", 0.10)),
+        "coach_fusion_prob": float(value("coach_fusion_prob", 0.10)),
         "run_mode": run_mode,
         "target_level": int(target_level),
-        "tactical_masks": bool(getattr(args, "tactical_masks", False) or raw_config.get("tactical_masks", False)),
-        "wallnut_tactical_mask": bool(getattr(args, "wallnut_tactical_mask", False) or raw_config.get("wallnut_tactical_mask", False)),
-        "cherrybomb_tactical_mask": bool(getattr(args, "cherrybomb_tactical_mask", False) or raw_config.get("cherrybomb_tactical_mask", False)),
+        "tactical_masks": enabled("tactical_masks"),
+        "wallnut_tactical_mask": enabled("wallnut_tactical_mask"),
+        "cherrybomb_tactical_mask": enabled("cherrybomb_tactical_mask"),
         "adventure_eval_mode": bool(adventure_run_mode),
         "checkpoint_warm_start": bool(requested_training_continuation),
         "warm_start_used": False,
         "checkpoint_warm_start_reason": (
             "compatible_adventure_generalist_continuation_requested"
             if adventure_generalist_train_requested and requested_training_continuation
-            else ""
+            else str(value("checkpoint_warm_start_reason", "") or "")
         ),
         "resume_training": bool(requested_training_continuation),
         "resume_model_path": requested_model_path if requested_training_continuation else "",
@@ -1340,112 +1419,81 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
         "incompatible_with_4slot_specialist": bool(adventure_generalist_requested),
         "active_seed_slots_at_start": len(initial_loadout) if adventure_generalist_requested else len(seed_list),
         "unlock_aware_seed_curriculum": bool(
-            getattr(args, "unlock_aware_seed_curriculum", False)
-            or raw_config.get("unlock_aware_seed_curriculum", False)
-            or adventure_generalist_requested
+            enabled("unlock_aware_seed_curriculum") or adventure_generalist_requested
         ),
-        "seed_curriculum": str(pick(args, raw_config, "seed_curriculum", "conservative")),
-        "unlock_introduction_delay": int(pick(args, raw_config, "unlock_introduction_delay", 0)),
-        "new_plant_min_inclusion_prob": float(pick(args, raw_config, "new_plant_min_inclusion_prob", 0.15)),
+        "seed_curriculum": str(value("seed_curriculum", "conservative")),
+        "unlock_introduction_delay": int(value("unlock_introduction_delay", 0)),
+        "new_plant_min_inclusion_prob": float(value("new_plant_min_inclusion_prob", 0.15)),
         "infer_capacity_from_unlocks": bool(
-            pick(args, raw_config, "infer_capacity_from_unlocks", adventure_generalist_requested)
+            value(
+                "infer_capacity_from_unlocks",
+                False,
+                mode_default=True if adventure_generalist_requested else CONFIG_UNSET,
+            )
         ),
-        "allow_weak_unlocked_capacity_fallback": bool(
-            getattr(args, "allow_weak_unlocked_capacity_fallback", False)
-            or raw_config.get("allow_weak_unlocked_capacity_fallback", False)
-        ),
-        "adventure_replay_cleared_levels": bool(
-            getattr(args, "adventure_replay_cleared_levels", False)
-            or raw_config.get("adventure_replay_cleared_levels", False)
-        ),
-        "adventure_frontier_sample_prob": float(pick(args, raw_config, "adventure_frontier_sample_prob", 0.60)),
-        "adventure_recent_cleared_sample_prob": float(pick(args, raw_config, "adventure_recent_cleared_sample_prob", 0.30)),
-        "adventure_maintenance_sample_prob": float(pick(args, raw_config, "adventure_maintenance_sample_prob", 0.10)),
+        "allow_weak_unlocked_capacity_fallback": enabled("allow_weak_unlocked_capacity_fallback"),
+        "adventure_replay_cleared_levels": enabled("adventure_replay_cleared_levels"),
+        "adventure_frontier_sample_prob": float(value("adventure_frontier_sample_prob", 0.60)),
+        "adventure_recent_cleared_sample_prob": float(value("adventure_recent_cleared_sample_prob", 0.30)),
+        "adventure_maintenance_sample_prob": float(value("adventure_maintenance_sample_prob", 0.10)),
         "adventure_frontier_win_streak_required": max(
             1,
-            int(pick(args, raw_config, "adventure_frontier_win_streak_required", 1) or 1),
+            int(value("adventure_frontier_win_streak_required", 1) or 1),
         ),
         "adventure_generalist_strict_startup_validation": bool(adventure_generalist_strict_startup_validation),
-        "adventure_start_level": int(pick(args, raw_config, "adventure_start_level", 1)),
-        "max_adventure_levels": int(pick(args, raw_config, "max_adventure_levels", 5)),
-        "max_attempts_per_level": int(pick(args, raw_config, "max_attempts_per_level", 10)),
-        "advance_on_wins": int(pick(args, raw_config, "advance_on_wins", 1)),
-        "allow_missing_model_metadata": bool(
-            getattr(args, "allow_missing_model_metadata", False)
-            or raw_config.get("allow_missing_model_metadata", False)
-        ),
+        "adventure_start_level": int(value("adventure_start_level", 1)),
+        "max_adventure_levels": int(value("max_adventure_levels", 5)),
+        "max_attempts_per_level": int(value("max_attempts_per_level", 10)),
+        "advance_on_wins": int(value("advance_on_wins", 1)),
+        "allow_missing_model_metadata": enabled("allow_missing_model_metadata"),
         "human_coach_enabled": bool(human_coach_enabled),
         "human_coach_command_path": str(human_coach_command_path),
-        "human_coach_log_path": str(
-            getattr(args, "human_coach_log_path", None)
-            or raw_config.get("human_coach_log_path", "runs/human_coach.jsonl")
-            or ""
-        ),
-        "human_coach_reward": bool(
-            getattr(args, "human_coach_reward", False)
-            or raw_config.get("human_coach_reward", False)
-        ),
+        "human_coach_log_path": str(value("human_coach_log_path", "runs/human_coach.jsonl") or ""),
+        "human_coach_reward": enabled("human_coach_reward"),
         "human_coach_fusion_enabled": bool(human_coach_fusion_enabled),
         "human_coach_platform": str(raw_config.get("human_coach_platform", "mock") or "mock"),
         "human_coach_command_mode": human_coach_command_mode,
         "intervention_log_path": str(
-            getattr(args, "intervention_log_path", None)
-            or raw_config.get("intervention_log_path", "logs/interventions/interventions.jsonl")
+            value("intervention_log_path", "logs/interventions/interventions.jsonl")
         ),
         "stream_coach_enabled": bool(stream_coach_enabled),
         "stream_coach_mode": stream_coach_mode,
-        "stream_coach_platform": str(
-            getattr(args, "stream_coach_platform", None)
-            or stream_coach_mode
-            or raw_config.get("stream_coach_platform", "mock")
-            or "mock"
-        ),
+        "stream_coach_platform": stream_coach_mode,
         "stream_coach_window_sec": float(
-            pick(args, raw_config, "stream_coach_window_sec", 3.0)
+            value("stream_coach_window_sec", 3.0)
         ),
         "stream_coach_min_votes": int(
-            pick(args, raw_config, "stream_coach_min_votes", 2)
+            value("stream_coach_min_votes", 2)
         ),
         "stream_coach_max_actions_per_minute": int(
-            pick(args, raw_config, "stream_coach_max_actions_per_minute", 20)
+            value("stream_coach_max_actions_per_minute", 20)
         ),
         "stream_coach_command_path": str(stream_coach_command_path),
-        "stream_coach_mock_script": str(
-            getattr(args, "stream_coach_mock_script", None)
-            or raw_config.get("stream_coach_mock_script", "")
-            or ""
-        ),
+        "stream_coach_mock_script": str(value("stream_coach_mock_script", "") or ""),
         "stream_coach_dry_run": bool(stream_coach_dry_run),
         "stream_coach_apply_enabled": bool(stream_coach_apply_enabled),
-        "stream_coach_reward": bool(
-            getattr(args, "stream_coach_reward", False)
-            or raw_config.get("stream_coach_reward", False)
-        ),
-        "stream_coach_log_path": str(
-            getattr(args, "stream_coach_log_path", None)
-            or raw_config.get("stream_coach_log_path", "runs/stream_coach.jsonl")
-            or ""
-        ),
+        "stream_coach_reward": enabled("stream_coach_reward"),
+        "stream_coach_log_path": str(value("stream_coach_log_path", "runs/stream_coach.jsonl") or ""),
         "stream_coach_fusion_enabled": bool(stream_coach_fusion_enabled),
         "coach_allow_fusion_planning": bool(coach_allow_fusion_planning),
         "fusion_bridge_enabled": bool(fusion_bridge_enabled),
-        "reward": build_reward_config(args, raw_config),
+        "reward": build_reward_config(args, raw_config, run_mode=run_mode),
         "model_path": requested_model_path,
         "run_dir": run_dir,
-        "checkpoint_freq": int(pick(args, raw_config, "checkpoint_freq", 5000)),
-        "host": str(pick(args, raw_config, "host", "127.0.0.1")),
-        "port": int(pick(args, raw_config, "port", 32323)),
-        "timeout": float(pick(args, raw_config, "timeout", 10.0)),
-        "enable_action_watchdog": bool(pick(args, raw_config, "enable_action_watchdog", True)),
-        "action_timeout_seconds": float(pick(args, raw_config, "action_timeout_seconds", 10.0)),
-        "save_freeze_debug_bundle": bool(pick(args, raw_config, "save_freeze_debug_bundle", True)),
+        "checkpoint_freq": int(value("checkpoint_freq", 5000)),
+        "host": str(value("host", "127.0.0.1")),
+        "port": int(value("port", 32323)),
+        "timeout": float(value("timeout", 10.0)),
+        "enable_action_watchdog": bool(value("enable_action_watchdog", True)),
+        "action_timeout_seconds": float(value("action_timeout_seconds", 10.0)),
+        "save_freeze_debug_bundle": bool(value("save_freeze_debug_bundle", True)),
         "action_diagnostics_path": str(
-            pick(args, raw_config, "action_diagnostics_path", str(Path(run_dir) / "action_diagnostics.jsonl"))
+            value("action_diagnostics_path", str(Path(run_dir) / "action_diagnostics.jsonl"))
         ),
         "freeze_debug_dir": str(
-            pick(args, raw_config, "freeze_debug_dir", str(Path(run_dir) / "freeze_debug"))
+            value("freeze_debug_dir", str(Path(run_dir) / "freeze_debug"))
         ),
-        "game_exe": str(pick(args, raw_config, "game_exe", "") or ""),
+        "game_exe": str(value("game_exe", "") or ""),
     }
     config = apply_model_metadata_defaults(config)
     if run_mode == RUN_MODE_LEVEL3_SPECIALIST and action_count_for_config(config) != 201:
@@ -1457,7 +1505,23 @@ def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[s
             "blocked_reason=invalid_adventure_generalist_action_count: "
             f"expected {ADVENTURE_IDENTITY_ACTION_COUNT} got {action_count_for_config(config)}"
         )
+    if resolution_sources is not None:
+        resolution_sources.update(resolver.sources)
     return config
+
+
+def build_resolved_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> ResolvedRunConfig:
+    """Resolve CLI/JSON/default inputs into immutable typed sections."""
+
+    resolution_sources: Dict[str, Any] = {}
+    flat = _build_config_mapping(args, raw_config, resolution_sources=resolution_sources)
+    return ResolvedRunConfig.from_flat(flat, value_sources=resolution_sources)
+
+
+def build_config(args: argparse.Namespace, raw_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward-compatible flat adapter used by existing runtime consumers."""
+
+    return build_resolved_config(args, raw_config).to_flat_dict()
 
 
 def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
@@ -3215,10 +3279,10 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
             model=None,
             model_path=model_path,
             deterministic=bool(args.deterministic),
-            advance_on_wins=max(1, int(args.advance_on_wins)),
-            max_adventure_levels=max(1, int(args.max_adventure_levels)),
-            max_attempts_per_level=max(1, int(args.max_attempts_per_level)),
-            adventure_start_level=max(1, int(args.adventure_start_level)),
+            advance_on_wins=max(1, int(config["advance_on_wins"])),
+            max_adventure_levels=max(1, int(config["max_adventure_levels"])),
+            max_attempts_per_level=max(1, int(config["max_attempts_per_level"])),
+            adventure_start_level=max(1, int(config["adventure_start_level"])),
             conservative_seeds=bool(args.conservative_seeds),
             allow_new_plants=bool(args.allow_new_plants),
             live_status_path=args.live_status_path,
@@ -3269,10 +3333,10 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
         model=model,
         model_path=model_path,
         deterministic=bool(args.deterministic),
-        advance_on_wins=max(1, int(args.advance_on_wins)),
-        max_adventure_levels=max(1, int(args.max_adventure_levels)),
-        max_attempts_per_level=max(1, int(args.max_attempts_per_level)),
-        adventure_start_level=max(1, int(args.adventure_start_level)),
+        advance_on_wins=max(1, int(config["advance_on_wins"])),
+        max_adventure_levels=max(1, int(config["max_adventure_levels"])),
+        max_attempts_per_level=max(1, int(config["max_attempts_per_level"])),
+        adventure_start_level=max(1, int(config["adventure_start_level"])),
         conservative_seeds=bool(args.conservative_seeds),
         allow_new_plants=bool(args.allow_new_plants),
         live_status_path=args.live_status_path,
@@ -4101,14 +4165,17 @@ def check_deps() -> int:
     return 0
 
 
-def loaded_model_action_count(model_path: Path) -> int:
+def loaded_model_contract(model_path: Path) -> Tuple[int, Optional[List[int]]]:
     MaskablePPO = require_maskable_ppo()
     model = MaskablePPO.load(str(model_path))
-    value = getattr(getattr(model, "action_space", None), "n", None)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return -1
+    return _model_action_count(model), _model_observation_shape(model)
+
+
+def loaded_model_action_count(model_path: Path) -> int:
+    """Backward-compatible helper retained for external callers."""
+
+    action_count, _observation_shape = loaded_model_contract(model_path)
+    return action_count
 
 
 def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
@@ -4141,13 +4208,14 @@ def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
         payload = {"ok": False, "blocked_reason": "model_path_missing", "model_path": str(model_path)}
         print(json.dumps(payload, indent=2))
         return 1
-    model_action_count = loaded_model_action_count(model_path)
+    model_action_count, model_observation_shape = loaded_model_contract(model_path)
     if str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
         summary = validate_adventure_generalist_model_compatibility(
             model_path,
             config,
             "Adventure Generalist metadata dry run",
             model_action_count=model_action_count,
+            model_observation_shape=model_observation_shape,
             env_metadata=env_metadata_for_config(config),
         )
         payload = {
@@ -4162,6 +4230,7 @@ def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
         model_path,
         config,
         model_action_count=model_action_count,
+        model_observation_shape=model_observation_shape,
         env_metadata=env_metadata_for_config(config),
         allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
@@ -4180,7 +4249,7 @@ def router_dry_run(config: Dict[str, Any], args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 1
     router = ModelRouter.from_file(schedule_path)
-    level = args.dry_run_level or args.adventure_start_level or "1-1"
+    level = args.dry_run_level or config.get("adventure_start_level") or "1-1"
     unlocked = parse_seed_list(args.dry_run_unlocked_seeds or "SunFlower,Peashooter")
     available = parse_seed_list(args.dry_run_available_seeds or args.dry_run_unlocked_seeds or "SunFlower,Peashooter")
     decision = router.select_stage(level=level, unlocked_seeds=unlocked, available_seeds=available)
@@ -4202,11 +4271,12 @@ def router_dry_run(config: Dict[str, Any], args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 1
     selected_config = stage_config(config, decision.stage)
-    model_action_count = loaded_model_action_count(decision.stage.model_path)
+    model_action_count, model_observation_shape = loaded_model_contract(decision.stage.model_path)
     compatibility = validate_model_metadata(
         decision.stage.model_path,
         selected_config,
         model_action_count=model_action_count,
+        model_observation_shape=model_observation_shape,
         env_metadata=env_metadata_for_config(selected_config),
         allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
@@ -4223,7 +4293,35 @@ def router_dry_run(config: Dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def execution_route_for_config(
+    config: Dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    configured_mode_explicit: bool = False,
+) -> str:
+    """Return the runtime branch selected by the resolved run mode."""
+
+    run_mode = str(config.get("run_mode") or "")
+    if run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
+        return "train"
+    if run_mode in {RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}:
+        return "adventure_eval"
+    if run_mode == RUN_MODE_LEVEL3_SPECIALIST:
+        if bool(getattr(args, "level3_eval", False)) or (
+            bool(getattr(args, "eval", False)) and not bool(getattr(args, "train", False))
+        ):
+            return "fixed_eval"
+        if bool(getattr(args, "level3_train", False)) or bool(getattr(args, "train", False)):
+            return "train"
+        return ""
+    if run_mode == "fixed_eval":
+        return "fixed_eval" if bool(getattr(args, "eval", False)) or configured_mode_explicit else ""
+    if run_mode == "fixed_train":
+        return "train" if bool(getattr(args, "train", False)) or configured_mode_explicit else ""
+    return ""
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train/evaluate MaskablePPO for the limited PvZRL environment.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--train", action="store_true")
@@ -4304,10 +4402,10 @@ def main() -> int:
     parser.add_argument("--lets-rock-delay", type=float)
     parser.add_argument("--post-start-delay", type=float)
     parser.add_argument("--seed-screen-check-interval", type=int)
-    parser.add_argument("--advance-on-wins", type=int, default=1)
-    parser.add_argument("--max-adventure-levels", type=int, default=5)
-    parser.add_argument("--max-attempts-per-level", type=int, default=10)
-    parser.add_argument("--adventure-start-level", type=int, default=1)
+    parser.add_argument("--advance-on-wins", type=int, default=None)
+    parser.add_argument("--max-adventure-levels", type=int, default=None)
+    parser.add_argument("--max-attempts-per-level", type=int, default=None)
+    parser.add_argument("--adventure-start-level", type=int, default=None)
     parser.add_argument("--adventure-soft-max-steps", type=int, default=None)
     parser.add_argument("--adventure-hard-max-steps", type=int, default=None)
     parser.add_argument("--adventure-final-wave-extension", dest="adventure_final_wave_extension", action="store_true", default=None)
@@ -4487,7 +4585,11 @@ def main() -> int:
     parser.add_argument("--action-diagnostics-path")
     parser.add_argument("--freeze-debug-dir")
     parser.add_argument("--game-exe", dest="game_exe")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     if args.level3_train and args.level3_eval:
         raise SystemExit("blocked_reason=invalid_cli: --level3-train and --level3-eval are mutually exclusive.")
@@ -4513,27 +4615,28 @@ def main() -> int:
 
     raw_config = load_json(args.config)
     config = build_config(args, raw_config)
-    if config.get("run_mode") == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
-        args.train = True
     if args.metadata_dry_run:
         model_path = args.model or Path(config["model_path"] or Path(config["run_dir"]) / "model.zip")
         return metadata_dry_run(config, model_path)
     if args.router_dry_run:
         return router_dry_run(config, args)
-    adventure_generalist_train_requested = config.get("run_mode") == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
-    adventure_generalist_eval_requested = config.get("run_mode") == ADVENTURE_GENERALIST_RUN_MODE_EVAL
-    adventure_requested = bool(
-        args.adventure_eval
-        or args.adventure
-        or args.adventure_generalist_eval
-        or config.get("run_mode") in {RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}
+    configured_mode_explicit = bool(getattr(args, "run_mode", None) or "run_mode" in raw_config)
+    execution_route = execution_route_for_config(
+        config,
+        args,
+        configured_mode_explicit=configured_mode_explicit,
     )
-    if adventure_requested and args.train and not adventure_generalist_train_requested:
+    if execution_route == "adventure_eval" and args.train:
         raise SystemExit("Adventure eval is inference-only and cannot be combined with --train.")
-    if config.get("run_mode") == RUN_MODE_LEVEL3_SPECIALIST:
+    if config.get("run_mode") == ADVENTURE_GENERALIST_RUN_MODE_TRAIN and args.eval:
+        raise SystemExit(
+            "Adventure Generalist training cannot be combined with generic --eval; "
+            "run Adventure Generalist eval separately."
+        )
+    if config.get("run_mode") == RUN_MODE_LEVEL3_SPECIALIST and execution_route:
         candidate_model = args.model or Path(config["model_path"] or Path(config["run_dir"]) / "model.zip")
         verify_level3_specialist_start_state(config, args.live_status_path, candidate_model)
-    if args.train:
+    if execution_route == "train":
         run_dir = Path(config["run_dir"])
         with TeeOutput(run_dir / "train.log"):
             print(f"Run directory: {run_dir}")
@@ -4546,7 +4649,7 @@ def main() -> int:
                     raise SystemExit(f"Model not found: {model_path}")
                 evaluate(config, model_path, args.episodes, args.live_status_path)
             return 0
-    elif args.eval:
+    elif execution_route == "fixed_eval":
         model_path = args.model or Path(config["run_dir"]) / "model.zip"
         if not model_path.exists() and (Path(config["run_dir"]) / "final_model.zip").exists():
             model_path = Path(config["run_dir"]) / "final_model.zip"
@@ -4555,7 +4658,7 @@ def main() -> int:
         with TeeOutput(Path(config["run_dir"]) / "train.log"):
             evaluate(config, model_path, args.episodes, args.live_status_path)
         return 0
-    elif adventure_requested:
+    elif execution_route == "adventure_eval":
         model_path = args.model or Path(config["run_dir"]) / "model.zip"
         if args.model_schedule is not None:
             model_path = args.model or Path("")
@@ -4566,7 +4669,7 @@ def main() -> int:
         with TeeOutput(Path(config["run_dir"]) / "train.log"):
             adventure_evaluate(config, model_path, args)
         return 0
-    if not args.train and not args.eval and not adventure_requested:
+    if not execution_route:
         parser.print_help()
         return 1
     return 0

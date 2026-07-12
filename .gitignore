@@ -6,12 +6,12 @@ run
 docs/*
 !docs/REFACTOR_PLAN.md
 !docs/REFACTOR_REPORT.md
+!docs/CONFIGURATION.md
 configs/ppo_adventure_generalist_14slot_identity_v1.json
 # Model checkpoints and artifacts
 model.zip
 final_model.zip
 *.zip
-train.log
 live_status.json
 
 # Python virtual environments
@@ -68,9 +68,6 @@ desktop.ini
 
 # IDE-specific
 *.code-workspace
-.vscode/*
-!.vscode/settings.json
-!.vscode/extensions.json
 
 # macOS
 .AppleDouble

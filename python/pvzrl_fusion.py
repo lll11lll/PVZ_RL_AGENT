@@ -7,9 +7,10 @@ remains the final source of legality for any actual fusion execution.
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from pvzrl_registry import get_plant_registry, normalize_plant_name
 
 
 FUSION_POLICY_NONE = "none"
@@ -19,6 +20,21 @@ FUSION_POLICIES = {FUSION_POLICY_NONE, FUSION_POLICY_OBSERVE, FUSION_POLICY_SCRI
 FUSION_POLICY_ALIASES = {
     "assist": FUSION_POLICY_SCRIPTED,
 }
+
+_PLANT_REGISTRY = get_plant_registry()
+
+
+def _required_base_plant_id(name: str) -> int:
+    plant_id = _PLANT_REGISTRY.resolve_name(name)
+    if plant_id is None:
+        raise RuntimeError(f"canonical plant registry is missing required fusion base plant {name!r}")
+    return int(plant_id)
+
+
+PEASHOOTER_ID = _required_base_plant_id("Peashooter")
+SUNFLOWER_ID = _required_base_plant_id("SunFlower")
+CHERRYBOMB_ID = _required_base_plant_id("CherryBomb")
+WALLNUT_ID = _required_base_plant_id("WallNut")
 
 FUSION_REJECTION_REASONS = (
     "fusion_policy_none",
@@ -40,15 +56,15 @@ FUSION_REJECTION_REASONS = (
     "exception",
 )
 
-PLANT_NAMES = {
-    0: "Peashooter",
-    1: "SunFlower",
-    2: "CherryBomb",
-    3: "WallNut",
+FUSION_RESULT_NAMES = {
     1030: "Repeater",
     1031: "Threepeater",
     1032: "GatlingPea",
     1033: "TwinSunFlower",
+}
+PLANT_NAMES = {
+    **{definition.plant_type_id: definition.canonical_name for definition in _PLANT_REGISTRY.plants},
+    **FUSION_RESULT_NAMES,
 }
 
 # A tiny first-pass allowlist.  Unknown mappings are observed but never executed.
@@ -100,28 +116,21 @@ BUCKETHEAD_TYPES = {4, 13}
 #
 # Plant identity ids match configs/plant_registry.json.
 
-PEASHOOTER_ID = 0
-SUNFLOWER_ID = 1
-CHERRYBOMB_ID = 2
-WALLNUT_ID = 3
-
-# Canonical/alias plant name -> plant id.  Keys are normalized (lowercase,
-# alphanumeric only) by ``_normalize_name_key`` before lookup.
-PLANT_NAME_TO_ID: Dict[str, int] = {
-    "peashooter": PEASHOOTER_ID,
-    "pea": PEASHOOTER_ID,
-    "sunflower": SUNFLOWER_ID,
-    "sun": SUNFLOWER_ID,
-    "cherrybomb": CHERRYBOMB_ID,
-    "cherry": CHERRYBOMB_ID,
-    "wallnut": WALLNUT_ID,
-    "nut": WALLNUT_ID,
+# Fusion-result names are a separate namespace layered over base seed names.
+# Result aliases intentionally win for ambiguous text such as ``Repeater``;
+# numeric base seed ID 7 still resolves through the canonical plant registry.
+FUSION_RESULT_NAME_TO_ID: Dict[str, int] = {
     "repeater": 1030,
     "threepeater": 1031,
     "3pea": 1031,
     "gatlingpea": 1032,
     "twinsunflower": 1033,
 }
+PLANT_NAME_TO_ID: Dict[str, int] = {
+    key: definition.plant_type_id
+    for key, definition in _PLANT_REGISTRY.by_normalized_name.items()
+}
+PLANT_NAME_TO_ID.update(FUSION_RESULT_NAME_TO_ID)
 
 # The authoritative compatibility table, keyed by plant id.  Relationships are
 # treated as symmetric (see ``_FUSION_COMPATIBILITY_SYMMETRIC``); list a pair in
@@ -213,10 +222,6 @@ def _symmetric_closure(table: Dict[int, Set[int]]) -> Dict[int, Set[int]]:
 _FUSION_COMPATIBILITY_SYMMETRIC: Dict[int, Set[int]] = _symmetric_closure(FUSION_COMPATIBILITY)
 
 
-def _normalize_name_key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
-
-
 def normalize_plant_name_or_id(value: Any) -> Optional[int]:
     """Convert a plant name/id/seed-slot/plant dict into a canonical plant id.
 
@@ -251,7 +256,7 @@ def normalize_plant_name_or_id(value: Any) -> Optional[int]:
     if text.lstrip("-").isdigit():
         ivalue = int(text)
         return ivalue if ivalue >= 0 else None
-    return PLANT_NAME_TO_ID.get(_normalize_name_key(text))
+    return PLANT_NAME_TO_ID.get(normalize_plant_name(text))
 
 
 def are_fusion_compatible(existing_plant: Any, selected_seed: Any) -> bool:
@@ -431,7 +436,11 @@ def plant_name(plant_type: Any, fallback: str = "") -> str:
         plant_id = int(plant_type)
     except (TypeError, ValueError):
         return fallback or "unknown"
-    return fallback or PLANT_NAMES.get(plant_id, str(plant_id))
+    if fallback:
+        return fallback
+    if plant_id in FUSION_RESULT_NAMES:
+        return FUSION_RESULT_NAMES[plant_id]
+    return _PLANT_REGISTRY.canonical_name(plant_id)
 
 
 def default_fusion_diagnostics(policy: str = FUSION_POLICY_NONE) -> Dict[str, Any]:

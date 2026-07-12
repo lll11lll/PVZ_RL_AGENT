@@ -29,6 +29,8 @@ from pvzrl_assisted_coach import (
     InterventionJSONLLogger,
     queue_rows,
 )
+from pvzrl_action_space import ACTION_SPACE_ADVENTURE_14_IDENTITY
+from pvzrl_registry import get_plant_registry
 
 
 POLL_MS = 1000
@@ -55,22 +57,22 @@ DEFAULT_INTERVENTION_LOG_PATH = Path("logs") / "interventions" / "dashboard_inte
 LIVE_MAX_AGE_SECONDS = 5.0
 STALE_MAX_AGE_SECONDS = 30.0
 MISSING = object()
-ADVENTURE_DEFAULT_PLANT_TYPES = "1,0,3,2"
+_PLANT_REGISTRY = get_plant_registry()
+_FOUR_SLOT_CURRENT = _PLANT_REGISTRY.require_gui_preset("four_slot_current")
+_FOUR_SLOT_DUPLICATE = _PLANT_REGISTRY.require_gui_preset("four_slot_duplicate")
+_DEFAULT_PROFILE_NAME = _FOUR_SLOT_CURRENT.display_name
+ADVENTURE_DEFAULT_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
 FUSION_POLICY_CHOICES = ("none", "observe", "scripted", "assist")
 STREAM_COACH_PLATFORMS = ("mock", "twitch", "youtube")
 STRUCTURED_COACH_COMMANDS = tuple(command.value for command in AssistedCommandType)
 ASSISTED_EXECUTION_MODES = tuple(mode.value for mode in AssistedExecutionMode)
 LAB_MODES = ("Normal", "Assisted", "Fusion", "Curriculum")
-LEVEL3_SEED_LIST = "SunFlower,Peashooter,WallNut,CherryBomb"
-LEVEL3_PLANT_TYPES = "1,0,3,2"
+LEVEL3_SEED_LIST = _FOUR_SLOT_CURRENT.seed_csv
+LEVEL3_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
-ADVENTURE_GENERALIST_INITIAL_LOADOUT = "SunFlower,SunFlower,Peashooter,Peashooter"
-ADVENTURE_GENERALIST_ACTION_SPACE_MODE = "adventure_14slot_identity"
-PROFILES = {
-    "4-slot current": "SunFlower,Peashooter,WallNut,CherryBomb",
-    "2-slot stable": "SunFlower,Peashooter",
-    "4-slot duplicate": "SunFlower,SunFlower,Peashooter,Peashooter",
-}
+ADVENTURE_GENERALIST_INITIAL_LOADOUT = _FOUR_SLOT_DUPLICATE.seed_csv
+ADVENTURE_GENERALIST_ACTION_SPACE_MODE = ACTION_SPACE_ADVENTURE_14_IDENTITY
+PROFILES = {preset.display_name: preset.seed_csv for preset in _PLANT_REGISTRY.gui_presets}
 
 
 class _FallbackStringVar:
@@ -145,7 +147,7 @@ class PvZDashboard:
         self.max_steps_var = tk.StringVar(value="1000")
         self.step_seconds_var = tk.StringVar(value="0.05")
         self.game_speed_var = tk.StringVar(value="4.0")
-        self.seed_list_var = tk.StringVar(value=PROFILES["4-slot current"])
+        self.seed_list_var = tk.StringVar(value=_FOUR_SLOT_CURRENT.seed_csv)
         self.model_path_var = tk.StringVar(value=str(default_model) if default_model else "")
         self.episodes_var = tk.StringVar(value="10")
         self.run_dir_var = tk.StringVar(value="")
@@ -154,7 +156,7 @@ class PvZDashboard:
         self.board_timeout_var = tk.StringVar(value="60")
         self.gameplay_ready_timeout_var = tk.StringVar(value="30")
         self.checkpoint_freq_var = tk.StringVar(value="5000")
-        self.profile_var = tk.StringVar(value="4-slot current")
+        self.profile_var = tk.StringVar(value=_DEFAULT_PROFILE_NAME)
         self.fusion_policy_var = tk.StringVar(value="none")
         self.quick_wait_var = tk.BooleanVar(value=True)
         self.wait_gameplay_ready_var = tk.BooleanVar(value=True)
@@ -162,7 +164,7 @@ class PvZDashboard:
         self.debug_perf_var = tk.BooleanVar(value=False)
         self.fast_only_var = tk.BooleanVar(value=False)
         self.adventure_model_path_var = tk.StringVar(value=str(default_adventure_model) if default_adventure_model else "")
-        self.adventure_seed_list_var = tk.StringVar(value=PROFILES["4-slot current"])
+        self.adventure_seed_list_var = tk.StringVar(value=_FOUR_SLOT_CURRENT.seed_csv)
         self.adventure_plant_types_var = tk.StringVar(value=ADVENTURE_DEFAULT_PLANT_TYPES)
         self.adventure_episodes_var = tk.StringVar(value="5")
         self.adventure_max_levels_var = tk.StringVar(value="5")
