@@ -62,7 +62,7 @@ from pvzrl_human_coach import (
     human_coach_live_status_from_hook,
 )
 from pvzrl_observation_layout import build_observation_layout
-from pvzrl_observation_facts import StepFacts
+from pvzrl_observation_facts import ObservationIdentity, StepFacts, observation_identity
 from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
@@ -303,6 +303,10 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(self.observation_size,), dtype=np.float32)
         self.action_space = spaces.Discrete(self.action_count)
         self._last_observation: Optional[Dict[str, Any]] = None
+        self._last_observation_identity: Optional[ObservationIdentity] = None
+        self._observation_ownership_established = False
+        self.transition_pending = False
+        self._transition_pending_reason = ""
         self._step_count = 0
         self._episode_reward = 0.0
         self._episode_plants = 0
@@ -390,6 +394,89 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             if self.config.stream_coach_mock_script:
                 print(f"[coach] mock stream script={self.config.stream_coach_mock_script}")
         self._reset_lane_episode_diagnostics({})
+
+    def _adopt_observation(
+        self,
+        observation: Dict[str, Any],
+        *,
+        source: str,
+    ) -> ObservationIdentity:
+        """Make one bridge payload the base and policy observation owner."""
+
+        if not isinstance(observation, dict):
+            raise TypeError(f"{source} returned a non-dict observation")
+        identity = observation_identity(observation)
+        self.base.previous_observation = observation
+        self._last_observation = observation
+        self._last_observation_identity = identity
+        self._observation_ownership_established = True
+        self.transition_pending = False
+        self._transition_pending_reason = ""
+        return identity
+
+    def _begin_observation_transition(self, *, reason: str) -> None:
+        """Block policy access while Adventure UI effects advance the board."""
+
+        self.transition_pending = True
+        self._transition_pending_reason = str(reason or "adventure_transition")
+
+    def _assert_observation_synchronized(self, *, boundary: str) -> None:
+        """Reject policy work against divergent base/wrapper observation state."""
+
+        if self.transition_pending:
+            raise RuntimeError(
+                "policy observation unavailable while transition_pending "
+                f"boundary={boundary} reason={self._transition_pending_reason or 'adventure_transition'}"
+            )
+
+        wrapper_observation = self._last_observation
+        base_observation = self.base.previous_observation
+        wrapper_present = isinstance(wrapper_observation, dict)
+        base_present = isinstance(base_observation, dict)
+        if not wrapper_present and not base_present:
+            return
+
+        # Lightweight tests and compatibility callers historically inject only
+        # the wrapper observation.  Until the first owned adoption, keep that
+        # bridge-free setup valid; production reset/step paths always own both.
+        if wrapper_present and not base_present:
+            if self._observation_ownership_established:
+                raise RuntimeError(
+                    "base/wrapper observation synchronization failed "
+                    f"boundary={boundary} wrapper=present base=missing"
+                )
+            self._last_observation_identity = observation_identity(wrapper_observation)
+            return
+        if base_present and not wrapper_present:
+            self._adopt_observation(base_observation, source=f"{boundary}:base_only")
+            return
+
+        assert isinstance(wrapper_observation, dict)
+        assert isinstance(base_observation, dict)
+        if wrapper_observation is base_observation:
+            if self._last_observation_identity is None:
+                self._last_observation_identity = observation_identity(wrapper_observation)
+            return
+        wrapper_identity = observation_identity(wrapper_observation)
+        base_identity = observation_identity(base_observation)
+        same_token = wrapper_identity.token == base_identity.token
+        same_content = wrapper_identity.content_digest == base_identity.content_digest
+        if not (same_token and same_content):
+            raise RuntimeError(
+                "base/wrapper observation synchronization failed "
+                f"boundary={boundary} wrapper={wrapper_identity.token} base={base_identity.token}"
+            )
+
+        adopted_identity = self._last_observation_identity
+        if adopted_identity is not None and (
+            wrapper_identity.token != adopted_identity.token
+            or wrapper_identity.content_digest != adopted_identity.content_digest
+        ):
+            raise RuntimeError(
+                "adopted observation content changed before policy boundary "
+                f"boundary={boundary} adopted={adopted_identity.token} current={wrapper_identity.token}"
+            )
+        self._last_observation_identity = wrapper_identity
 
     def get_env_metadata(self) -> Dict[str, Any]:
         metadata = self.config.get_env_metadata()
@@ -498,7 +585,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             reset_payload["wrapperRequiredSeedFlow"] = True
         self._last_episode_ended_by_timeout = False
         self._last_episode_ended_by_win = False
-        self._last_observation = observation
+        self._adopt_observation(observation, source="reset")
         self._episode_index += 1
         self._step_count = 0
         self._episode_reward = 0.0
@@ -566,7 +653,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             f"seed_slots={observation.get('seedSlotCount')} "
             f"legalActionCount={legal_action_count_for_log}"
         )
-        self._last_observation = observation
+        self._adopt_observation(observation, source="adventure_start")
         self._episode_index += 1
         self._step_count = 0
         self._episode_reward = 0.0
@@ -600,6 +687,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         return self._encode_observation(observation, facts=facts), {"raw_observation": observation, **reset_info}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        self._assert_observation_synchronized(boundary="step")
         ppo_action = int(action)
         policy_action = int(action)
         coach_decision = None
@@ -956,7 +1044,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 reward_after=float(reward),
                 metadata={"selected_action": int(policy_action), "command_mode": self.config.human_coach_command_mode},
             )
-        self._last_observation = observation
+        self._adopt_observation(observation, source="step")
         self._step_count += 1
         self._global_step_count += 1
         self._episode_reward += float(reward)
@@ -1357,6 +1445,11 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info.update(episode_summary)
             info["episode_summary"] = episode_summary
 
+            if self.base._is_adventure_eval_mode():
+                self._begin_observation_transition(
+                    reason=f"adventure_terminal:{done_reason or terminal_reason or 'episode_end'}"
+                )
+
         facts = self.base._step_facts_cache.get_known(observation, self.config.plant_types)
         return self._encode_observation(observation, facts=facts), float(reward), terminated, truncated, info
 
@@ -1519,8 +1612,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         return payload
 
     def action_masks(self) -> np.ndarray:
+        self._assert_observation_synchronized(boundary="action_masks")
         started = time.perf_counter()
-        observation = self._last_observation or self.base.observe()
+        observation = self._last_observation
+        if not observation:
+            observation = self.base.observe()
+            self._adopt_observation(observation, source="action_masks_observe")
         mask = np.zeros(self.action_count, dtype=bool)
         raw_mask = self.base.action_mask(observation)
         if self.action_spec.dynamic_seed_slots:
