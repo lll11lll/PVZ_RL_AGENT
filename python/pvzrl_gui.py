@@ -35,6 +35,7 @@ from pvzrl_gui_commands import (
     STREAM_COACH_PLATFORMS,
     GuiCommandMixin,
 )
+from pvzrl_gui_coach import CoachCommandSink, CoachQueueCommand
 from pvzrl_gui_process import (
     LOG_BACKLOG_POLL_MS,
     LOG_DRAIN_BUDGET_SECONDS,
@@ -1628,17 +1629,14 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
             return
         try:
             queue_path = self._coach_command_queue_path()
-            queue_path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            with queue_path.open("a", encoding="utf-8") as handle:
-                for command in command_text.splitlines():
-                    payload = {"timestamp": timestamp, "source": "gui_fusion", "command": command}
-                    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            count = CoachCommandSink(queue_path).append(
+                CoachQueueCommand(command=command, source="gui_fusion")
+                for command in command_text.splitlines()
+            )
         except (OSError, ValueError) as exc:
             self.coach_queue_status_var.set(f"Queue error: fusion write failed ({exc})")
             self._append_log(f"ERROR: Failed to queue Fusion commands: {exc}\n")
             return
-        count = len(command_text.splitlines())
         self.coach_queue_status_var.set(f"Queued {count} Fusion command(s) at {time.strftime('%H:%M:%S')}")
         self._append_log(f"Queued {count} Fusion command(s) to {queue_path}.\n")
 
@@ -2196,19 +2194,17 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin):
             self._append_log(f"ERROR: Invalid coach command queue path: {exc}\n")
             return False
 
-        payload = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": str(source or "gui"),
-            "command": command,
-        }
-        normalized = str(parser_command or "").strip()
-        if normalized and normalized != command:
-            payload["parser_command"] = normalized
         try:
-            queue_path.parent.mkdir(parents=True, exist_ok=True)
-            with queue_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, sort_keys=True) + "\n")
-        except OSError as exc:
+            CoachCommandSink(queue_path).append(
+                [
+                    CoachQueueCommand(
+                        command=command,
+                        source=str(source or "gui"),
+                        parser_command=str(parser_command or ""),
+                    )
+                ]
+            )
+        except (OSError, ValueError) as exc:
             self.coach_queue_status_var.set(f"Queue error: write failed ({exc})")
             self._append_log(f"ERROR: Failed to append coach command to queue: {exc}\n")
             return False
