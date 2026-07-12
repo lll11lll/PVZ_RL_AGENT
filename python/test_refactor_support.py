@@ -30,7 +30,14 @@ def load_observation_fixture() -> Dict[str, Any]:
     return json.loads(OBSERVATION_FIXTURE.read_text(encoding="utf-8"))
 
 
-def make_wrapper(*, identity: bool, fusion_enabled: bool = True) -> PvZMaskedPPOEnv:
+def make_wrapper(
+    *,
+    identity: bool,
+    fusion_enabled: bool = True,
+    tactical_masks: bool = False,
+    wallnut_tactical_mask: bool = False,
+    cherrybomb_tactical_mask: bool = False,
+) -> PvZMaskedPPOEnv:
     config = PvZSB3Config(
         plant_types=list(STARTER_TYPES),
         seed_list=list(STARTER_NAMES),
@@ -38,6 +45,9 @@ def make_wrapper(*, identity: bool, fusion_enabled: bool = True) -> PvZMaskedPPO
         max_seed_slots=(14 if identity else 4),
         fusion_action_mask_enabled=bool(fusion_enabled),
         enable_board_plant_identity=bool(identity),
+        tactical_masks=bool(tactical_masks),
+        wallnut_tactical_mask=bool(wallnut_tactical_mask),
+        cherrybomb_tactical_mask=bool(cherrybomb_tactical_mask),
     )
     # Wrapper initialization prints coach diagnostics but does not open a bridge
     # connection.  Keep test/benchmark output machine-readable.

@@ -32,8 +32,6 @@ from pvzrl_action_space import (
 )
 from pvzrl_env import (
     DEFAULT_PLANT_TYPES,
-    REWARD_COMPONENT_FIELDS,
-    REWARD_EPISODE_TOTAL_FIELDS,
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
     RUN_MODE_ADVENTURE_EVAL,
@@ -43,7 +41,6 @@ from pvzrl_env import (
     PvZEnvConfig,
     PvZGymEnv,
     BridgeTimeoutError,
-    RewardConfig,
     classify_done_reason,
     plant_type_name,
     resolve_seed_list,
@@ -65,6 +62,13 @@ from pvzrl_human_coach import (
     human_coach_live_status_from_hook,
 )
 from pvzrl_observation_layout import build_observation_layout
+from pvzrl_observation_facts import StepFacts
+from pvzrl_rewards import (
+    REWARD_COMPONENT_FIELDS,
+    REWARD_EPISODE_TOTAL_FIELDS,
+    RewardConfig,
+    merge_reward_components,
+)
 from pvzrl_seed_inventory import (
     adventure_identity_features,
     seed_inventory_v2_features,
@@ -532,7 +536,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             default=0,
         )
         self._reset_sun_diagnostic_baseline(observation)
-        return self._encode_observation(observation), {"raw_observation": observation, **reset_info}
+        facts = self.base._step_facts_cache.get(observation, self.config.plant_types)
+        return self._encode_observation(observation, facts=facts), {"raw_observation": observation, **reset_info}
 
     def start_episode_from_observation(
         self,
@@ -591,7 +596,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             default=0,
         )
         self._reset_sun_diagnostic_baseline(observation)
-        return self._encode_observation(observation), {"raw_observation": observation, **reset_info}
+        facts = self.base._step_facts_cache.get(observation, self.config.plant_types)
+        return self._encode_observation(observation, facts=facts), {"raw_observation": observation, **reset_info}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         ppo_action = int(action)
@@ -1346,7 +1352,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info.update(episode_summary)
             info["episode_summary"] = episode_summary
 
-        return self._encode_observation(observation), float(reward), terminated, truncated, info
+        facts = self.base._step_facts_cache.get_known(observation, self.config.plant_types)
+        return self._encode_observation(observation, facts=facts), float(reward), terminated, truncated, info
 
     def _legal_actions_from_mask(self, action_mask: Optional[np.ndarray]) -> Optional[List[int]]:
         if action_mask is None:
@@ -1382,12 +1389,10 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         if delta == 0.0:
             return 0.0
         breakdown = info.get("reward_breakdown")
-        if not isinstance(breakdown, dict):
-            breakdown = {}
-        for key, value in components.items():
-            breakdown[key] = float(breakdown.get(key) or 0.0) + float(value)
-        breakdown["reward_total"] = float(breakdown.get("reward_total") or 0.0) + float(delta)
-        info["reward_breakdown"] = breakdown
+        info["reward_breakdown"] = merge_reward_components(
+            breakdown if isinstance(breakdown, dict) else {},
+            components,
+        )
         return float(delta)
 
     def _coach_live_status(self) -> Dict[str, Any]:
@@ -1657,9 +1662,14 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
 
     def _reset_lane_episode_diagnostics(self, observation: Dict[str, Any]) -> None:
         self._reset_action_diagnostics()
-        self._episode_final_plants_by_row: Counter[int] = self._plant_counts_by_row(observation)
-        self._episode_final_peashooters_by_row: Counter[int] = self._plant_counts_by_row(observation, plant_type=0)
-        self._episode_final_sunflowers_by_row: Counter[int] = self._plant_counts_by_row(observation, plant_type=1)
+        facts = self.base._step_facts_cache.get(observation, self.config.plant_types)
+        self._episode_final_plants_by_row = self._plant_counts_by_row(observation, facts=facts)
+        self._episode_final_peashooters_by_row = self._plant_counts_by_row(
+            observation, plant_type=0, facts=facts
+        )
+        self._episode_final_sunflowers_by_row = self._plant_counts_by_row(
+            observation, plant_type=1, facts=facts
+        )
         self._episode_threat_steps_by_row: Counter[int] = Counter()
         self._episode_undefended_threat_steps_by_row: Counter[int] = Counter()
         self._episode_undefended_threat_age_sum_by_row: Counter[int] = Counter()
@@ -1812,9 +1822,24 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         if not isinstance(diag, dict):
             diag = {}
 
-        self._replace_row_counts(self._episode_final_plants_by_row, diag.get("plants_by_row"), self._plant_counts_by_row(observation))
-        self._replace_row_counts(self._episode_final_peashooters_by_row, diag.get("peashooters_by_row"), self._plant_counts_by_row(observation, plant_type=0))
-        self._replace_row_counts(self._episode_final_sunflowers_by_row, diag.get("sunflowers_by_row"), self._plant_counts_by_row(observation, plant_type=1))
+        facts = self.base._step_facts_cache.get_known(observation, self.config.plant_types)
+        row_count_fields = (
+            (self._episode_final_plants_by_row, "plants_by_row", None),
+            (self._episode_final_peashooters_by_row, "peashooters_by_row", 0),
+            (self._episode_final_sunflowers_by_row, "sunflowers_by_row", 1),
+        )
+        for target, field_name, plant_type in row_count_fields:
+            values = diag.get(field_name)
+            fallback = (
+                Counter()
+                if isinstance(values, dict)
+                else self._plant_counts_by_row(
+                    observation,
+                    plant_type=plant_type,
+                    facts=facts,
+                )
+            )
+            self._replace_row_counts(target, values, fallback)
         self._add_row_counts(self._episode_threat_steps_by_row, diag.get("threat_steps_by_row"))
         self._add_row_counts(self._episode_undefended_threat_steps_by_row, diag.get("undefended_threat_steps_by_row"))
         self._add_row_counts(self._episode_undefended_threat_age_sum_by_row, diag.get("undefended_threat_age_sum_by_row"))
@@ -2047,20 +2072,33 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             default=0,
         )
 
-    def _plant_counts_by_row(self, observation: Dict[str, Any], plant_type: Optional[int] = None) -> Counter[int]:
+    def _plant_counts_by_row(
+        self,
+        observation: Dict[str, Any],
+        plant_type: Optional[int] = None,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Counter[int]:
         counts: Counter[int] = Counter()
         if not isinstance(observation, dict):
             return counts
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            row = self._safe_int_value(plant.get("row"), default=-1)
-            observed_type = self._safe_int_value(plant.get("type"), default=-999)
-            if row < 0:
-                continue
-            if plant_type is not None and observed_type != int(plant_type):
-                continue
-            counts[row] += 1
+        snapshot = facts or self.base._step_facts_cache.get(
+            observation,
+            self.config.plant_types,
+        )
+        if plant_type is None:
+            counts.update({
+                row: count
+                for row, count in snapshot.plant_count_by_lane.items()
+                if row >= 0
+            })
+        else:
+            resolved_type = int(plant_type)
+            counts.update({
+                row: count
+                for (candidate_type, row), count in snapshot.plant_count_by_type_and_lane.items()
+                if candidate_type == resolved_type and row >= 0
+            })
         return counts
 
     def _replace_row_counts(self, target: Counter[int], values: Any, fallback: Counter[int]) -> None:
@@ -2154,10 +2192,10 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._action_freezes_by_level: Counter[str] = Counter()
 
     @staticmethod
-    def _action_state_summary(observation: Dict[str, Any]) -> Dict[str, Any]:
+    def _action_state_summary(observation: Dict[str, Any], *, detailed: bool = True) -> Dict[str, Any]:
         slots = observation.get("seedSlots", []) if isinstance(observation.get("seedSlots"), list) else []
         plants = observation.get("plants", []) if isinstance(observation.get("plants"), list) else []
-        return {
+        summary = {
             "frame": observation.get("frameCount"),
             "level": observation.get("currentAdventureLevel") or observation.get("currentLevel"),
             "screen_state": observation.get("screenState"),
@@ -2169,7 +2207,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "max_wave": observation.get("maxWave"),
             "plant_count": observation.get("plantCount", len(plants)),
             "zombie_count": observation.get("zombieCount"),
-            "plants": sorted(
+            "plants": [],
+            "seed_slots": [],
+        }
+        if not detailed:
+            return summary
+        summary["plants"] = sorted(
                 (
                     int(plant.get("row", -1)),
                     int(plant.get("column", plant.get("col", -1))),
@@ -2178,8 +2221,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 )
                 for plant in plants
                 if isinstance(plant, dict)
-            ),
-            "seed_slots": [
+            )
+        summary["seed_slots"] = [
                 {
                     "slot": slot.get("slotIndex", index),
                     "plant_type": slot.get("plantType"),
@@ -2191,13 +2234,41 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 }
                 for index, slot in enumerate(slots)
                 if isinstance(slot, dict)
-            ],
-        }
+            ]
+        return summary
 
     @staticmethod
     def _action_state_hash(summary: Dict[str, Any]) -> str:
         encoded = json.dumps(summary, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _action_change_signatures(
+        observation: Dict[str, Any],
+    ) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
+        """Cheap exact board/cooldown signatures without JSON or state hashes."""
+
+        plants = observation.get("plants", [])
+        slots = observation.get("seedSlots", [])
+        plant_signature = tuple(sorted(
+            (
+                int(plant.get("row", -1)),
+                int(plant.get("column", plant.get("col", -1))),
+                int(plant.get("type", plant.get("plantType", -1))),
+                int(plant.get("instanceId", 0) or 0),
+            )
+            for plant in plants if isinstance(plants, list) and isinstance(plant, dict)
+        ))
+        cooldown_signature = tuple(
+            (
+                slot.get("slotIndex", index),
+                slot.get("currentCooldown"),
+                bool(slot.get("ready")),
+            )
+            for index, slot in enumerate(slots if isinstance(slots, list) else [])
+            if isinstance(slot, dict)
+        )
+        return plant_signature, cooldown_signature
 
     def _record_action_diagnostic(
         self,
@@ -2232,10 +2303,37 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         )
         source_name = str(fusion_candidate.get("source_plant_name") or fusion_candidate.get("sourcePlantName") or "")
         fusion_pair = f"{plant_name}+{source_name}" if fusion_attempted else ""
-        pre_summary = self._action_state_summary(pre_observation)
-        post_summary = self._action_state_summary(post_observation)
-        pre_cooldowns = [(slot.get("slot"), slot.get("cooldown"), slot.get("ready")) for slot in pre_summary["seed_slots"]]
-        post_cooldowns = [(slot.get("slot"), slot.get("cooldown"), slot.get("ready")) for slot in post_summary["seed_slots"]]
+        invalid = bool(action_result.get("illegalAction"))
+        safety_events = (
+            list(info.get("safety_events") or [])
+            if isinstance(info.get("safety_events"), list)
+            else []
+        )
+        done_reason = str(info.get("done_reason") or "")
+        terminal_reason = str(info.get("terminal_reason") or "")
+        environment_corruption = bool(
+            info.get("environment_corruption_detected")
+            or done_reason == "env_corruption"
+            or terminal_reason in {
+                "board_state_refreshed_during_gameplay",
+                "bridge_timeout",
+                "action_timeout",
+            }
+        )
+        safety_anomaly = bool(safety_events)
+        anomaly = bool(
+            timed_out
+            or invalid
+            or exception_text
+            or environment_corruption
+            or safety_anomaly
+        )
+        verbose = bool(getattr(self.config, "debug_performance", False))
+        detailed = bool(anomaly or verbose)
+        pre_summary = self._action_state_summary(pre_observation, detailed=detailed)
+        post_summary = self._action_state_summary(post_observation, detailed=detailed)
+        pre_plants, pre_cooldowns = self._action_change_signatures(pre_observation)
+        post_plants, post_cooldowns = self._action_change_signatures(post_observation)
         record = {
             "episode": int(self._episode_index),
             "step_index": int(self._step_count + 1),
@@ -2251,20 +2349,38 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "fusion_pair": fusion_pair,
             "pre_action_state": pre_summary,
             "post_action_state": post_summary,
-            "pre_action_state_hash": self._action_state_hash(pre_summary),
-            "post_action_state_hash": self._action_state_hash(post_summary),
+            "pre_action_state_hash": self._action_state_hash(pre_summary) if detailed else "",
+            "post_action_state_hash": self._action_state_hash(post_summary) if detailed else "",
             "action_start_timestamp": started_at,
             "action_end_timestamp": started_at + duration,
             "action_duration_seconds": duration,
-            "board_changed": pre_summary["plants"] != post_summary["plants"],
+            "board_changed": pre_plants != post_plants,
             "resources_changed": pre_summary.get("sun") != post_summary.get("sun"),
             "cooldowns_changed": pre_cooldowns != post_cooldowns,
-            "invalid": bool(action_result.get("illegalAction")),
+            "invalid": invalid,
             "invalid_reason": str(action_result.get("illegalReason") or ""),
             "timed_out": bool(timed_out),
-            "classification": "action_freeze" if timed_out else "normal_action",
+            "classification": (
+                "action_freeze"
+                if timed_out
+                else "environment_corruption"
+                if environment_corruption
+                else "safety_event"
+                if safety_anomaly
+                else "invalid_action"
+                if invalid
+                else "bridge_exception"
+                if exception_text
+                else "normal_action"
+            ),
             "exception": str(exception_text or ""),
             "screen_state": pre_summary.get("screen_state"),
+            "done_reason": done_reason,
+            "terminal_reason": terminal_reason,
+            "environment_corruption_detected": environment_corruption,
+            "safety_events": safety_events,
+            "detail_persisted": detailed,
+            "anomaly": anomaly,
         }
         self._action_durations.append(float(duration))
         if timed_out:
@@ -2275,7 +2391,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             self._action_freezes_by_grid[f"{row},{col}"] += 1
             self._action_freezes_by_screen_state[str(pre_summary.get("screen_state") or "unknown")] += 1
             self._action_freezes_by_level[str(pre_summary.get("level") or "unknown")] += 1
-        if self.config.enable_action_watchdog and self.config.action_diagnostics_path:
+        if self.config.enable_action_watchdog and self.config.action_diagnostics_path and detailed:
             path = Path(self.config.action_diagnostics_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
@@ -2310,7 +2426,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "freezes_by_level": dict(self._action_freezes_by_level),
         }
 
-    def _encode_observation(self, observation: Dict[str, Any]) -> np.ndarray:
+    def _encode_observation(
+        self,
+        observation: Dict[str, Any],
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> np.ndarray:
+        snapshot = facts or self.base._step_facts_cache.get(
+            observation,
+            self.config.plant_types,
+        )
         values: List[float] = []
         max_wave = max(1, int(observation.get("maxWave", 0) or 1))
         cells = max(1, self.cells)
@@ -2332,38 +2457,43 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             ]
         )
 
-        raw_slots = list(observation.get("seedSlots", []) or [])
-        sun = float(observation.get("sun", 0))
+        raw_slots = snapshot.seed_slots
+        sun = float(snapshot.sun)
         for slot_index in range(self.card_slot_count):
             plant_type = (
                 int(self.config.plant_types[slot_index])
                 if slot_index < len(self.config.plant_types)
                 else -1
             )
-            card = raw_slots[slot_index] if slot_index < len(raw_slots) else {}
-            full_cd = max(1e-6, float(card.get("fullCooldown", 0.0) or 0.0))
-            cost = float(card.get("seedCost", 0.0) or self._cost_for_type(plant_type))
+            card = raw_slots[slot_index] if slot_index < len(raw_slots) else None
+            full_cd = max(1e-6, float(card.full_cooldown if card is not None else 0.0))
+            cost = float(
+                (card.seed_cost if card is not None else 0.0)
+                or self._cost_for_type(plant_type)
+            )
             values.extend(
                 [
-                    1.0 if card.get("ready") else 0.0,
-                    self._clip(float(card.get("currentCooldown", 0.0) or 0.0) / full_cd),
-                    self._clip(float(card.get("rawCooldown", 0.0) or 0.0) / full_cd),
+                    1.0 if card is not None and card.ready else 0.0,
+                    self._clip(float(card.current_cooldown if card is not None else 0.0) / full_cd),
+                    self._clip(float(card.raw_cooldown if card is not None else 0.0) / full_cd),
                     self._clip(cost / 500.0),
                     1.0 if sun >= cost else 0.0,
                 ]
             )
 
-        plant_grid = {(int(p.get("row", -1)), int(p.get("column", -1))): p for p in observation.get("plants", [])}
+        plant_grid = snapshot.last_primary_plant_by_cell
         for row in range(self.rows):
             for col in range(self.cols):
                 plant = plant_grid.get((row, col))
                 if not plant:
                     values.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
                     continue
-                max_health = max(1.0, float(plant.get("maxHealth", 1) or 1))
-                plant_type = int(plant.get("type", -1))
+                max_health = max(1.0, float(plant.max_health or 1))
+                plant_type = int(plant.plant_type)
                 if self.config.enable_board_plant_identity:
-                    family_identity, tier_identity = board_plant_identity_features(plant)
+                    family_identity, tier_identity = board_plant_identity_features(
+                        {"type": plant_type, "typeName": plant.type_name}
+                    )
                 else:
                     family_identity = 1.0 if plant_type == 1 else 0.0
                     tier_identity = 1.0 if plant_type == 0 else 0.0
@@ -2372,16 +2502,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                         1.0,
                         family_identity,
                         tier_identity,
-                        self._clip(float(plant.get("health", 0)) / max_health),
-                        self._clip(float(plant.get("attackCooldown", 0.0) or 0.0) / 10.0),
-                        self._clip(float(plant.get("produceCooldown", 0.0) or 0.0) / 30.0),
+                        self._clip(float(plant.health) / max_health),
+                        self._clip(float(plant.attack_cooldown) / 10.0),
+                        self._clip(float(plant.produce_cooldown) / 30.0),
                     ]
                 )
 
-        lanes = {int(lane.get("row", -1)): lane for lane in observation.get("lanes", [])}
+        lanes = snapshot.lane_by_row
         for row in range(self.rows):
-            lane = lanes.get(row, {})
-            nearest_x = lane.get("nearestZombieX")
+            lane = lanes.get(row)
+            nearest_x = lane.nearest_zombie_x if lane is not None else None
             if nearest_x is None:
                 nearest_x_value = 1.0
                 danger = 0.0
@@ -2391,10 +2521,10 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 danger = self._clip(max(0.0, 1.0 - nearest_x_float / 10.0))
             values.extend(
                 [
-                    self._clip(float(lane.get("zombieCount", 0)) / 10.0),
+                    self._clip(float(lane.zombie_count if lane is not None else 0) / 10.0),
                     nearest_x_value,
-                    self._clip(float(lane.get("nearestZombieHealth", 0) or 0) / 1000.0),
-                    self._clip(float(lane.get("nearestZombieType", 0) or 0) / 100.0),
+                    self._clip(float(lane.nearest_zombie_health if lane is not None else 0) / 1000.0),
+                    self._clip(float(lane.nearest_zombie_type if lane is not None else 0) / 100.0),
                     danger,
                 ]
             )

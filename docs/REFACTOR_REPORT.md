@@ -189,7 +189,7 @@ Completed:
 - Reran the full gate: dependency check and compileall passed; pytest passed 26 tests plus 7 subtests; all nine legacy script runners passed; the bridge built with the three recorded baseline warnings; protected generalist and fixed control checkpoint loads retained `(701, (4297,), 370000)` and `(201, (357,), 350368)` respectively.
 - Completed an independent diff review. Its three portability/robustness findings were corrected, and the re-review found the Phase 0 boundary safe to commit.
 
-Rollback boundary: local commit subject `test: lock PvZRL refactor baseline`; its hash will be recorded in the final phase table.
+Rollback boundary: local commit `773c228` (`test: lock PvZRL refactor baseline`).
 
 ### Phase 1 - confirmed defects and lifecycle safety
 
@@ -229,7 +229,7 @@ Current gate results:
 
 Residual Phase 1 limitation: the deterministic C# harness exercises the request queue/state and active-client registry primitives but not a complete listener with a worker blocked in `ReadLine()`. The reviewed production path closes every socket that wins atomic registration, which is the operation that unblocks that read; a live bridge connection remains part of the final environment gate.
 
-Rollback boundary: local commit subject `fix: harden PvZRL lifecycle boundaries`; its hash will be recorded in the final phase table.
+Rollback boundary: local commit `55426dc` (`fix: harden PvZRL lifecycle boundaries`).
 
 ### Phase 2 - canonical metadata and resolved configuration
 
@@ -268,7 +268,7 @@ Rollback boundary: local commit `87aee4a` (`refactor: establish canonical PvZRL 
 
 ### Phase 3 - authoritative action and fusion pipeline
 
-Status: complete pending rollback commit.
+Status: complete.
 
 Implemented:
 
@@ -300,6 +300,42 @@ Measured deviation and residual boundary:
 
 Independent review found and drove fixes for mismatched cached intent/bridge identities, dynamic coach policy-versus-legacy indexing, implicit `plant`-to-fusion conversion, missing structured terminal/timeout results, caller-supplied recipe-result drift, runtime-only result invention, and missing failed-event copy replay. The final focused rerun is green. The review also confirmed the remaining fusion-diagnostics scan is a Phase 4 facts/index concern rather than a second execution authority.
 
-Rollback boundary: pending local Phase 3 commit after independent review.
+Rollback boundary: local commit `a147e93` (`refactor: unify PvZRL action and fusion pipelines`).
+
+### Phase 4 - per-observation facts, rewards, metrics, and hot-path I/O
+
+Status: complete.
+
+Implemented:
+
+- Added immutable `StepFacts` snapshots and an owner/content-verified one-entry cache. Plants, zombies, lanes, occupancy, seed slots, mower state, lifecycle signals, safety facts, and row/type counts are built once at the observation boundary and reused by action validation, masks, encoding, fusion, rewards, lane diagnostics, safety diagnostics, and episode metrics. Positional versus explicit seed-slot identities remain separate where the legacy contracts require them.
+- Replaced the environment's duplicated reward capture/apply state with one immutable `RewardCompositionState` and one pure reward compositor. The captured `a147e93` replay fixture locks every component and hidden-state transition at `1e-9`; terminal fusion reward is applied exactly once, including terminal restart returns.
+- Extracted lane diagnostics and environment-safety diagnostics into pure compositors. Six complete 94-field lane payloads retain their captured hashes and exact value types. Safety composition retains mower-loss ownership and was differential-tested across randomized lifecycle/cooldown transitions, malformed slots, duplicate explicit slot IDs, registry-name fallbacks, and board-refresh paths.
+- Kept execution, safety, and reward snapshot ownership explicit. A periodic forced seed probe may advance the pre-action execution frame, but reward and lane deltas remain paired with the stored previous observation, its facts, and its legal actions. Normal, timeout, and terminal/restart paths share that boundary and do not rebuild the prior frame.
+- Removed the old reward-state mirrors, lane/safety implementation bodies, temporary action/fusion adapters, duplicate environment analytics, and redundant readiness/accessor paths after call-site and schema coverage. Python wrappers that still form a documented compatibility boundary remain.
+- Centralized episode CSV/JSON coercion and writes, plus live-status throttling and atomic replacement. Ordinary status attempts use a lazy builder, failed replacement does not advance throttle state, forced terminal writes bypass suppression, and episode-significant keys remain part of the change signature.
+- Made watchdog normal-state timing records bounded and lightweight while preserving board/cooldown change booleans. Hashes, detailed differences, corruption evidence, timeout bundles, and safety context are persisted only when anomalous or explicitly verbose; safety and corruption classifications remain distinct.
+- Removed repeated raw seed-slot/model-fusion decoding, eager SB3 lane fallbacks, duplicate live-status mask calculation, and per-action diagnostic cloning. The hot path now projects from cached decisions and immutable facts without changing public masks or payloads.
+
+Compatibility and test evidence:
+
+- Full pytest gate: PASS, 197 tests plus 10 subtests. The final independent correctness audit reran 99 focused/adversarial tests plus 10 subtests and differential-fuzzed 2,000 valid/malformed cooldown snapshots and 2,000 watchdog board/cooldown signatures with exact legacy parity.
+- Component reward replay: PASS at `1e-9`; terminal fusion reward is exactly `0.62` once, and the forced-probe regression retains the stored-frame danger delta `-0.007` with distinct prior/current legal-action projections.
+- Lane diagnostics: PASS for all six captured 94-field payloads. Environment-safety composition: PASS for 500 randomized lifecycle transitions plus the larger independent malformed-slot projection audit.
+- All nine retained standalone regression entry points, dependency check, and `compileall`: PASS. The unchanged bridge lifecycle/build gate remains PASS at 7,051 deterministic checks and zero compiler warnings.
+- Protected June 27 generalist and fixed control loads remain PASS with `(701, (4297,), 370000)` and `(201, (357,), 350368)` respectively. No checkpoint, adjacent metadata, or progress artifact was modified.
+- External contracts remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI-default tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; live-status recursive keys/types `53e6489a...`.
+- The final bridge-free benchmark is `runs/benchmarks/phase4_python_final.json`, 50 samples by five rounds. Median/p95 changed as follows: fixed mask `0.77440/0.86370 -> 0.73295/0.78910 ms`; dense identity mask `1.50830/1.61350 -> 1.42240/1.49070`; reward composition with prebuilt shared facts `0.29335/0.57580 -> 0.16905/0.20250`; fusion scan `6.13360/7.05530 -> 3.00595/3.54450`; live-status build `3.28150/3.49770 -> 1.57945/1.77260`; serialization `0.17825/0.18920 -> 0.15785/0.17730`; unchanged GUI status parse `0.04605/0.06070 -> 0.03685/0.05590`. Identity encoding median is effectively flat (`0.60850 -> 0.61105 ms`). Atomic-write median is also flat (`4.98750 -> 4.92480 ms`).
+- Reward timing above is the incremental compositor with prebuilt facts, not a standalone end-to-end reward claim. Dense facts build is `1.21930/1.35960 ms`; content-verified reuse is `0.71490/0.83070 ms`, and the snapshot cost is amortized across masks, rewards, fusion, encoding, and diagnostics.
+- Of 500 ordinary live-status attempts, 49 built/wrote and 451 were suppressed; one forced final write also completed. Lazy suppressed attempts measure `0.00050 ms` median.
+- Independent correctness and performance audits both report PASS. They directly drove fixes for terminal fusion reward, tactical/fusion fact reuse, raw slot rescans, cache owner safety, localized names, structured terminal results, telemetry replacement ordering, watchdog truthfulness, forced-probe snapshot pairing, and exact cooldown projection semantics.
+
+Measured deviation and residual boundary:
+
+- The supplied Phase 4 estimate targeted a 900-1,500 runtime-line reduction. Relative to `a147e93`, existing runtime files are `+1,205/-2,604` (net `-1,399`), while the five new pure facts/reward/diagnostic/telemetry modules add 3,147 physical lines, for total runtime `+4,352/-2,604` (net `+1,748`). Test and fixture code is `+2,713/-16`; benchmark tooling is `+175/-5`. The runtime target is not met and is not being relabeled as met. The large environment deletion is real, but explicit immutable schemas, pure compositors, and adversarial compatibility boundaries dominate this phase's physical total.
+- The benchmark is bridge-free and excludes Unity step latency, PPO inference/rollout SPS, and complete Tk rendering. Current source was not installed into the game during this phase, so no live placement, fusion, reset, or training claim is added here.
+- Phase 5 begins with shadow lifecycle classification and explicit state records. Existing reset/progression behavior remains authoritative until recorded traces match; checkpoints, frontier, replay streaks, unlock state, and progress artifacts remain protected.
+
+Rollback boundary: local commit subject `refactor: consolidate PvZRL facts rewards and telemetry`; its hash is recorded after the commit because a commit cannot include its own hash.
 
 Later phase results, live verification, final independent reviews, code statistics, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.

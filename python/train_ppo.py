@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -46,7 +45,8 @@ from pvzrl_action_space import (
     build_action_space_spec,
     normalize_action_space_mode,
 )
-from pvzrl_env import REWARD_COMPONENT_FIELDS, REWARD_EPISODE_TOTAL_FIELDS, RewardConfig, parse_seed_list, resolve_seed_list
+from pvzrl_env import parse_seed_list, resolve_seed_list
+from pvzrl_rewards import REWARD_COMPONENT_FIELDS, REWARD_EPISODE_TOTAL_FIELDS, RewardConfig
 from pvzrl_env import (
     LEVEL3_SPECIALIST_PLANT_TYPES,
     LEVEL3_SPECIALIST_SEED_LIST,
@@ -74,6 +74,7 @@ from pvzrl_model_metadata import (
 )
 from pvzrl_model_router import ModelRouter, stage_config
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
+from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
 
 
 DEFAULT_CONFIG_PATH = Path("configs/ppo_sunflower_peashooter.json")
@@ -1954,6 +1955,35 @@ def write_progress_csv_rows(
     return header_written, writer_fieldnames
 
 
+class EpisodeMetricWriter:
+    """Own normalization and the paired CSV/JSONL episode event streams."""
+
+    def __init__(self, csv_path: Path, jsonl_path: Path) -> None:
+        self.csv_path = csv_path
+        self.jsonl_path = jsonl_path
+        self.rows: List[Dict[str, Any]] = []
+        self.csv_fieldnames = ensure_progress_csv_fieldnames(csv_path, EPISODE_METRIC_FIELDS)
+        self._header_written = csv_path.exists() and csv_path.stat().st_size > 0
+
+    def append_summaries(self, summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Preserve the callback's historical fallback: all summaries observed in
+        # one vectorized callback use the same pre-append episode index.
+        rows = [clean_episode_row(summary, len(self.rows)) for summary in summaries]
+        if not rows:
+            return []
+        self._header_written, self.csv_fieldnames = write_progress_csv_rows(
+            self.csv_path,
+            rows,
+            self.csv_fieldnames,
+            self._header_written,
+        )
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.jsonl_path.open("a", encoding="utf-8") as jsonl_handle:
+            jsonl_handle.write("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
+        self.rows.extend(rows)
+        return rows
+
+
 def sum_count_dicts_from_rows(rows: List[Dict[str, Any]], field_name: str) -> Dict[str, int]:
     totals: Counter[str] = Counter()
     for row in rows:
@@ -2336,27 +2366,6 @@ def write_eval_placeholder(config: Dict[str, Any], run_dir: Path, model_path: Pa
     (run_dir / "eval_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    for attempt in range(20):
-        try:
-            os.replace(tmp_path, path)
-            return
-        except PermissionError:
-            time.sleep(0.025 + attempt * 0.005)
-    try:
-        tmp_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    raise PermissionError(f"Could not replace live status file after retries: {path}")
-
-
 def resolved_live_status_path(path: Optional[Path]) -> Optional[Path]:
     if path is None:
         return None
@@ -2511,6 +2520,7 @@ def write_eval_live_status(
     status: str,
     mode: str = "fixed_eval",
     summary: Optional[Dict[str, Any]] = None,
+    status_writer: Optional[LiveStatusWriter] = None,
 ) -> None:
     if live_status_path is None:
         return
@@ -2574,11 +2584,11 @@ def write_eval_live_status(
         **fusion_fields,
         **coach_fields,
     }
-    write_json_atomic(live_status_path, payload)
+    writer = status_writer or LiveStatusWriter(live_status_path, min_interval_seconds=0.0)
+    writer.write(payload, force=status != "running" or status_writer is None)
 
 
-def write_runtime_live_status(
-    live_status_path: Optional[Path],
+def build_runtime_live_status_payload(
     *,
     config: Dict[str, Any],
     status: str,
@@ -2587,14 +2597,9 @@ def write_runtime_live_status(
     summary: Optional[Dict[str, Any]] = None,
     observation: Optional[Dict[str, Any]] = None,
     blocked_reason: str = "",
-) -> None:
-    if live_status_path is None:
-        return
+) -> Dict[str, Any]:
     summary = summary or {}
     observation = observation or {}
-    live_status_path = resolved_live_status_path(live_status_path)
-    if live_status_path is None:
-        return
     row_danger = {}
     for lane in observation.get("lanes", []) or []:
         if not isinstance(lane, dict):
@@ -2713,7 +2718,48 @@ def write_runtime_live_status(
         "eval": summary,
         **coach_fields,
     }
-    write_json_atomic(live_status_path, payload)
+    return payload
+
+
+def write_runtime_live_status(
+    live_status_path: Optional[Path],
+    *,
+    config: Dict[str, Any],
+    status: str,
+    mode: str,
+    model_path: Optional[Path] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    observation: Optional[Dict[str, Any]] = None,
+    blocked_reason: str = "",
+    status_writer: Optional[LiveStatusWriter] = None,
+    force: bool = False,
+) -> None:
+    if live_status_path is None:
+        return
+    resolved_path = resolved_live_status_path(live_status_path)
+    if resolved_path is None:
+        return
+    summary_values = summary or {}
+    observation_values = observation or {}
+    writer = status_writer or LiveStatusWriter(resolved_path, min_interval_seconds=0.0)
+    immediate = bool(force or status != "running" or status_writer is None)
+    writer.write_lazy(
+        lambda: build_runtime_live_status_payload(
+            config=config,
+            status=status,
+            mode=mode,
+            model_path=model_path,
+            summary=summary_values,
+            observation=observation_values,
+            blocked_reason=blocked_reason,
+        ),
+        significant_state=live_status_significant_state(
+            {"status": status, "blocked_reason": blocked_reason, "mode": mode},
+            summary_values,
+            observation_values,
+        ),
+        force=immediate,
+    )
 
 
 def verify_level3_specialist_start_state(config: Dict[str, Any], live_status_path: Optional[Path], model_path: Optional[Path] = None) -> None:
@@ -2753,6 +2799,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     BaseCallback, CallbackList, CheckpointCallback, DummyVecEnv, _ = require_sb3_callbacks()
 
     live_status_path = resolved_live_status_path(live_status_path)
+    runtime_status_writer = LiveStatusWriter(live_status_path)
     if live_status_path is not None:
         print(f"[train] live_status_path={live_status_path}")
     run_dir = Path(config["run_dir"])
@@ -2944,12 +2991,9 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     class ExperimentCallback(BaseCallback):
         def __init__(self, csv_path: Path, jsonl_path: Path):
             super().__init__()
-            self.csv_path = csv_path
-            self.jsonl_path = jsonl_path
-            self.rows: List[Dict[str, Any]] = []
+            self.metrics = EpisodeMetricWriter(csv_path, jsonl_path)
+            self.rows = self.metrics.rows
             self.performance = PerformanceAccumulator()
-            self.csv_fieldnames = ensure_progress_csv_fieldnames(csv_path, EPISODE_METRIC_FIELDS)
-            self._header_written = csv_path.exists() and csv_path.stat().st_size > 0
 
         def _on_step(self) -> bool:
             infos = self.locals.get("infos", [])
@@ -2974,23 +3018,16 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                             "total_timesteps": int(getattr(self, "num_timesteps", 0) or 0),
                             "callback_steps": int(getattr(self, "n_calls", 0) or 0),
                         },
+                        status_writer=runtime_status_writer,
                     )
-            rows = []
-            for info in infos:
-                summary = info.get("episode_summary")
-                if summary:
-                    rows.append(clean_episode_row(summary, len(self.rows)))
+            rows = self.metrics.append_summaries(
+                [
+                    info["episode_summary"]
+                    for info in infos
+                    if isinstance(info, dict) and isinstance(info.get("episode_summary"), dict)
+                ]
+            )
             if rows:
-                self._header_written, self.csv_fieldnames = write_progress_csv_rows(
-                    self.csv_path,
-                    rows,
-                    self.csv_fieldnames,
-                    self._header_written,
-                )
-                with self.jsonl_path.open("a", encoding="utf-8") as jsonl_handle:
-                    for row in rows:
-                        jsonl_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-                self.rows.extend(rows)
                 if rows and str(config.get("run_mode", "")) != ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
                     write_runtime_live_status(
                         live_status_path,
@@ -2999,6 +3036,8 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                         mode=str(config.get("run_mode", "fixed_train")),
                         model_path=Path(str(config.get("model_path") or run_dir / "model.zip")),
                         summary=rows[-1],
+                        status_writer=runtime_status_writer,
+                        force=True,
                     )
             return True
 
@@ -3093,6 +3132,8 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             "episode_reward": None,
             "total_timesteps": int(getattr(model, "num_timesteps", 0) or 0),
         },
+        status_writer=runtime_status_writer,
+        force=True,
     )
     if generalist_training and bool(config.get("adventure_generalist_strict_startup_validation", True)):
         pvz_env = unwrap_pvz_env(runtime_env)
@@ -3149,6 +3190,8 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         mode=str(config.get("run_mode", "fixed_train")),
         model_path=model_path,
         summary=summary,
+        status_writer=runtime_status_writer,
+        force=True,
     )
     print_validation_summary(summary)
     print(f"Saved final model to {model_path}")

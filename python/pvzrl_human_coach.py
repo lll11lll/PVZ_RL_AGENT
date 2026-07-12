@@ -44,6 +44,8 @@ from pvzrl_fusion import (
     validate_fusion_intent,
 )
 from pvzrl_file_tail import IncrementalLineTailReader
+from pvzrl_rewards import merge_reward_components
+from pvzrl_observation_facts import build_step_facts
 
 
 COACH_COMMANDS = {"plant", "fuse", "wait", "defend", "economy"}
@@ -1094,18 +1096,10 @@ class HumanCoachOverrideHook:
         decision.reward_delta = outcome_reward
         if isinstance(info, dict):
             breakdown = info.get("reward_breakdown")
-            if not isinstance(breakdown, dict):
-                breakdown = {}
-            for key, value in components.items():
-                try:
-                    breakdown[key] = float(breakdown.get(key) or 0.0) + float(value)
-                except (TypeError, ValueError):
-                    breakdown[key] = float(value)
-            try:
-                breakdown["reward_total"] = float(breakdown.get("reward_total") or 0.0) + float(outcome_reward)
-            except (TypeError, ValueError):
-                breakdown["reward_total"] = float(outcome_reward)
-            info["reward_breakdown"] = breakdown
+            info["reward_breakdown"] = merge_reward_components(
+                breakdown if isinstance(breakdown, dict) else {},
+                components,
+            )
             if decision.command is not None and decision.command.kind == "fuse":
                 info["human_coach_fusion_success"] = bool(
                     decision.reward_components.get(COACH_REWARD_FUSION_SUCCESS_COMPONENT, 0.0) > 0.0
@@ -1656,8 +1650,14 @@ def _fusion_compatibility_rejection(
     row = int(command.row if command.row is not None else -1)
     col = int(command.col if command.col is not None else -1)
     seed_index = int(command.seed_index if command.seed_index is not None else -1)
-    selected_type = seed_plant_type_for_slot(observation, seed_index, plant_types)
-    existing_type = plant_type_at_cell(observation, row, col)
+    facts = build_step_facts(observation, plant_types)
+    selected_type = seed_plant_type_for_slot(
+        observation,
+        seed_index,
+        plant_types,
+        facts=facts,
+    )
+    existing_type = plant_type_at_cell(observation, row, col, facts=facts)
     has_board = isinstance(observation.get("plants"), list) or isinstance(
         observation.get("visiblePlants"), list
     )
@@ -1695,6 +1695,7 @@ def _fusion_compatibility_rejection(
         fusion_bridge_available=True,
         plant_types=plant_types,
         check_seed_resources=False,
+        facts=facts,
     )
     if not decision.legal:
         if decision.rejection_reason != FUSION_ILLEGAL_INCOMPATIBLE:

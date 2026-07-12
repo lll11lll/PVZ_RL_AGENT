@@ -16,8 +16,6 @@ to the bridge for ordinary placement/wait commands.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -30,6 +28,12 @@ from pvzrl_action_space import (
     decode_policy_action,
     normalize_action_space_mode,
     policy_action_to_legacy_action,
+)
+from pvzrl_observation_facts import (
+    SeedSlotFact as SeedSlotFacts,
+    StepFacts,
+    build_step_facts,
+    stable_digest,
 )
 
 
@@ -44,48 +48,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return int(default)
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError, OverflowError):
-        return float(default)
-
-
-def _json_value(value: Any) -> Any:
-    """Return a deterministic JSON-compatible value without mutating input."""
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _json_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        normalized = [_json_value(item) for item in value]
-        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, default=str))
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    # Numpy scalar values and similar numeric wrappers normally provide item().
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _json_value(item())
-        except (TypeError, ValueError):
-            pass
-    return repr(value)
-
-
-def _stable_digest(value: Any) -> str:
-    encoded = json.dumps(
-        _json_value(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _freeze_value(value: Any) -> Any:
@@ -216,7 +178,7 @@ class ActionValidationConfig:
         object.__setattr__(
             self,
             "fingerprint",
-            _stable_digest(
+            stable_digest(
                 {
                     "action_space_mode": self.action_space_mode,
                     "plant_types": self.plant_types,
@@ -261,23 +223,11 @@ class ActionValidationConfig:
 
 
 @dataclass(frozen=True)
-class SeedSlotFacts:
-    position: int
-    slot_index: int
-    plant_type: int
-    usable: bool
-    disabled: bool
-    ready: bool
-    current_cooldown: float
-    full_cooldown: float
-    seed_cost: int
-
-
-@dataclass(frozen=True)
 class ActionValidationContext:
     """Immutable action-relevant facts for exactly one observation frame."""
 
     frame_identity: ObservationFrameIdentity
+    facts: StepFacts
     config: ActionValidationConfig
     config_fingerprint: str
     action_count: int
@@ -467,77 +417,20 @@ class ActionDecisionCache:
         return payload
 
 
-def seed_slots_for_validation(
-    observation: Mapping[str, Any],
-    fallback_plant_types: Sequence[int],
-) -> Tuple[SeedSlotFacts, ...]:
-    raw_slots = observation.get("seedSlots", [])
-    slots = list(raw_slots) if isinstance(raw_slots, list) else []
-    if not slots:
-        slots = [
-            {
-                "slotIndex": index,
-                "plantType": int(plant_type),
-                "seedCost": 0,
-                "ready": False,
-                "usable": False,
-            }
-            for index, plant_type in enumerate(fallback_plant_types)
-        ]
-    result = []
-    for position, raw_slot in enumerate(slots):
-        slot = raw_slot if isinstance(raw_slot, Mapping) else {}
-        result.append(
-            SeedSlotFacts(
-                position=position,
-                slot_index=_safe_int(slot.get("slotIndex"), position),
-                plant_type=_safe_int(slot.get("plantType"), -1),
-                usable=bool(slot.get("usable", False)),
-                disabled=bool(slot.get("disabled", False)),
-                ready=bool(slot.get("ready", False)),
-                current_cooldown=_safe_float(slot.get("currentCooldown"), 0.0),
-                full_cooldown=_safe_float(slot.get("fullCooldown"), 0.0),
-                seed_cost=max(0, _safe_int(slot.get("seedCost"), 0)),
-            )
-        )
-    return tuple(result)
-
-
-def occupancy_for_validation(observation: Mapping[str, Any]) -> Tuple[Tuple[int, int, int], ...]:
-    """Match the legacy plants-then-visiblePlants first-hit occupancy semantics."""
-
-    occupied: Dict[Tuple[int, int], int] = {}
-    for key in ("plants", "visiblePlants"):
-        raw_values = observation.get(key, [])
-        values = raw_values if isinstance(raw_values, list) else []
-        for raw_plant in values:
-            if not isinstance(raw_plant, Mapping):
-                continue
-            if key == "visiblePlants" and (
-                not bool(raw_plant.get("activeInHierarchy", True))
-                or not bool(raw_plant.get("inBoardBounds", True))
-            ):
-                continue
-            row = _safe_int(raw_plant.get("row"), -1)
-            column = _safe_int(raw_plant.get("column"), -1)
-            cell = (row, column)
-            if cell in occupied:
-                continue
-            occupied[cell] = _safe_int(raw_plant.get("type", raw_plant.get("plantType", -1)), -1)
-    return tuple((row, column, plant_type) for (row, column), plant_type in occupied.items())
-
-
 def compatible_pairs_for_observation(
     observation: Mapping[str, Any],
     fallback_plant_types: Sequence[int],
     compatibility: Any,
+    *,
+    facts: Optional[StepFacts] = None,
 ) -> FrozenSet[Tuple[int, int]]:
     """Freeze compatibility outcomes relevant to this frame into config input."""
 
     if not callable(compatibility):
         return frozenset()
-    existing_types = {plant_type for _row, _column, plant_type in occupancy_for_validation(observation)}
-    selected_types = {slot.plant_type for slot in seed_slots_for_validation(observation, fallback_plant_types)}
+    snapshot = facts or build_step_facts(observation, fallback_plant_types)
+    existing_types = snapshot.fusion_source_types
+    selected_types = set(snapshot.seed_slots_by_type)
     return frozenset(
         (int(existing), int(selected))
         for existing in existing_types
@@ -552,6 +445,7 @@ def observation_frame_identity(
     bridge_legal_actions: Iterable[int],
     restart_screen: bool = False,
     tactical_rejections: Optional[Mapping[int, str]] = None,
+    facts: Optional[StepFacts] = None,
 ) -> ObservationFrameIdentity:
     """Hash every observation value plus non-observation legality inputs.
 
@@ -560,15 +454,10 @@ def observation_frame_identity(
     action-relevant mutation can silently reuse an old decision.
     """
 
-    revision_value = observation.get("frameCount")
-    if revision_value is None:
-        revision_value = observation.get("frame")
-    if revision_value is None:
-        revision_value = observation.get("time")
-    revision = str(revision_value) if revision_value is not None else "unversioned"
-    state_digest = _stable_digest(
+    snapshot = facts or build_step_facts(observation)
+    state_digest = stable_digest(
         {
-            "observation": observation,
+            "observation_digest": snapshot.identity.content_digest,
             "bridge_legal_actions": sorted({int(action) for action in bridge_legal_actions}),
             "restart_screen": bool(restart_screen),
             # Direct callers may supply non-derived tactical decisions, so they
@@ -582,7 +471,7 @@ def observation_frame_identity(
             ),
         }
     )
-    return ObservationFrameIdentity(revision=revision, state_digest=state_digest)
+    return ObservationFrameIdentity(revision=snapshot.identity.revision, state_digest=state_digest)
 
 
 def build_action_validation_context(
@@ -592,17 +481,19 @@ def build_action_validation_context(
     bridge_legal_actions: Iterable[int],
     restart_screen: bool = False,
     tactical_rejections: Optional[Mapping[int, str]] = None,
+    facts: Optional[StepFacts] = None,
 ) -> ActionValidationContext:
     bridge_actions = frozenset(int(action) for action in bridge_legal_actions)
     tactical = tuple(
         sorted((int(action), str(reason)) for action, reason in (tactical_rejections or {}).items())
     )
-    rows = _safe_int(observation.get("rowCount"), 0)
-    cols = _safe_int(observation.get("columnCount"), 0)
-    slots = seed_slots_for_validation(observation, config.plant_types)
+    snapshot = facts or build_step_facts(observation, config.plant_types)
+    rows = snapshot.rows
+    cols = snapshot.columns
+    slots = snapshot.seed_slots
     default_count = config.spec.action_count
     action_count = max(0, _safe_int(observation.get("actionCount"), default_count))
-    occupancy = occupancy_for_validation(observation)
+    occupancy = snapshot.occupancy
     config_fingerprint = config.fingerprint
     return ActionValidationContext(
         frame_identity=observation_frame_identity(
@@ -610,21 +501,23 @@ def build_action_validation_context(
             bridge_legal_actions=bridge_actions,
             restart_screen=restart_screen,
             tactical_rejections=dict(tactical),
+            facts=snapshot,
         ),
+        facts=snapshot,
         config=config,
         config_fingerprint=config_fingerprint,
         action_count=action_count,
         rows=rows,
         cols=cols,
-        sun=_safe_int(observation.get("sun"), 0),
-        gameplay_ready=bool(observation.get("gameplayReady")),
-        board_found=bool(observation.get("boardFound")),
-        can_read_board=bool(observation.get("canReadBoard", True)),
-        seed_selection_active=bool(observation.get("seedSelectionActive")),
+        sun=snapshot.sun,
+        gameplay_ready=snapshot.lifecycle.gameplay_ready,
+        board_found=snapshot.lifecycle.board_found,
+        can_read_board=snapshot.lifecycle.can_read_board,
+        seed_selection_active=snapshot.lifecycle.seed_selection_active,
         restart_screen=bool(restart_screen),
         seed_slots=slots,
         occupancy=occupancy,
-        occupancy_by_cell={(row, column): plant_type for row, column, plant_type in occupancy},
+        occupancy_by_cell={cell: plant.plant_type for cell, plant in snapshot.occupant_by_cell.items()},
         bridge_legal_actions=bridge_actions,
         tactical_rejections=tactical,
         tactical_rejection_by_action=dict(tactical),
@@ -978,8 +871,6 @@ __all__ = [
     "build_action_validation_context",
     "compatible_pairs_for_observation",
     "observation_frame_identity",
-    "occupancy_for_validation",
-    "seed_slots_for_validation",
     "validate_action_intent",
     "validate_policy_action",
 ]

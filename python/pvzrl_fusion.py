@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, MutableSet, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+from pvzrl_observation_facts import SeedSlotFact, StepFacts, build_step_facts
 from pvzrl_registry import get_plant_registry, normalize_plant_name
 
 
@@ -686,77 +687,80 @@ def fusion_compatibility_table() -> Dict[str, List[str]]:
     return table
 
 
-def plant_type_at_cell(observation: Dict[str, Any], row: int, col: int) -> Optional[int]:
+def plant_type_at_cell(
+    observation: Dict[str, Any],
+    row: int,
+    col: int,
+    *,
+    facts: Optional[StepFacts] = None,
+) -> Optional[int]:
     """Return the plant type occupying (row, col), or None if the tile is empty."""
 
-    if not isinstance(observation, dict):
-        return None
-    for key in ("plants", "visiblePlants"):
-        values = observation.get(key) or []
-        if not isinstance(values, list):
-            continue
-        for plant in values:
-            if not isinstance(plant, dict):
-                continue
-            if key == "visiblePlants" and (
-                not bool(plant.get("activeInHierarchy", True))
-                or not bool(plant.get("inBoardBounds", True))
-            ):
-                continue
-            prow = _safe_int(plant.get("row"), default=-1)
-            pcol = _safe_int(plant.get("column"), plant.get("col"), default=-1)
-            if prow == int(row) and pcol == int(col):
-                plant_type = _safe_int(plant.get("type"), plant.get("plantType"), default=-1)
-                return plant_type if plant_type >= 0 else None
-    return None
+    snapshot = facts or build_step_facts(observation if isinstance(observation, dict) else {})
+    plant = snapshot.compat_occupant_by_cell.get((int(row), int(col)))
+    return plant.plant_type if plant is not None and plant.plant_type >= 0 else None
+
+
+def _seed_slot_payload(slot: SeedSlotFact) -> Dict[str, Any]:
+    return {
+        "slotIndex": slot.slot_index,
+        "plantType": slot.plant_type,
+        "plantTypeName": slot.plant_type_name,
+        "seedCost": slot.seed_cost,
+        "ready": slot.fusion_ready,
+        "disabled": slot.disabled,
+        "usable": slot.fusion_usable,
+        "currentCooldown": slot.current_cooldown,
+        "fullCooldown": slot.full_cooldown,
+        "rawCooldown": slot.raw_cooldown,
+        "cardInstanceId": slot.card_instance_id,
+    }
 
 
 def seed_slot_entry(
     observation: Dict[str, Any],
     seed_slot: int,
     plant_types: Optional[Iterable[int]] = None,
+    *,
+    facts: Optional[StepFacts] = None,
 ) -> Optional[Dict[str, Any]]:
     """Resolve a seed-slot index to its observation slot dict (by slotIndex)."""
 
-    slots = observation.get("seedSlots") if isinstance(observation, dict) else None
-    if isinstance(slots, list):
-        for slot in slots:
-            if isinstance(slot, dict) and _safe_int(slot.get("slotIndex"), default=-999) == int(seed_slot):
-                return slot
-        if 0 <= int(seed_slot) < len(slots) and isinstance(slots[int(seed_slot)], dict):
-            return slots[int(seed_slot)]
-    plant_type_list = list(plant_types or [])
-    if plant_type_list and 0 <= int(seed_slot) < len(plant_type_list):
-        return {"slotIndex": int(seed_slot), "plantType": int(plant_type_list[int(seed_slot)])}
-    return None
+    snapshot = facts or build_step_facts(
+        observation if isinstance(observation, dict) else {},
+        tuple(plant_types or ()),
+    )
+    slot = snapshot.seed_slot(int(seed_slot))
+    return _seed_slot_payload(slot) if slot is not None else None
 
 
 def seed_plant_type_for_slot(
     observation: Dict[str, Any],
     seed_slot: int,
     plant_types: Optional[Iterable[int]] = None,
+    *,
+    facts: Optional[StepFacts] = None,
 ) -> Optional[int]:
-    slot = seed_slot_entry(observation, seed_slot, plant_types)
+    slot = seed_slot_entry(
+        observation,
+        seed_slot,
+        plant_types,
+        facts=facts,
+    )
     if not isinstance(slot, dict):
         return None
     plant_type = _safe_int(slot.get("plantType"), slot.get("type"), default=-1)
     return plant_type if plant_type >= 0 else None
 
 
-def _seed_resource_reason(observation: Dict[str, Any], slot: Dict[str, Any]) -> str:
-    if not bool(slot.get("usable", True)):
+def _seed_fact_resource_reason(facts: StepFacts, slot: SeedSlotFact) -> str:
+    if not slot.fusion_usable or slot.disabled:
         return FUSION_ILLEGAL_SEED_UNAVAILABLE
-    if bool(slot.get("disabled", False)):
-        return FUSION_ILLEGAL_SEED_UNAVAILABLE
-    if not bool(slot.get("ready", True)):
+    if not slot.fusion_ready or (
+        slot.full_cooldown > 0.05 and slot.current_cooldown > 0.05
+    ):
         return FUSION_ILLEGAL_COOLDOWN
-    current_cooldown = _safe_float(slot.get("currentCooldown"), default=0.0)
-    full_cooldown = _safe_float(slot.get("fullCooldown"), default=0.0)
-    if full_cooldown > 0.05 and current_cooldown > 0.05:
-        return FUSION_ILLEGAL_COOLDOWN
-    sun = _safe_int(observation.get("sun"), default=0)
-    cost = max(0, _safe_int(slot.get("seedCost"), default=0))
-    if sun < cost:
+    if facts.sun < slot.seed_cost:
         return FUSION_ILLEGAL_INSUFFICIENT_SUN
     return FUSION_ILLEGAL_NONE
 
@@ -771,6 +775,7 @@ def get_fusion_illegal_reason(
     fusion_bridge_available: bool = True,
     plant_types: Optional[Iterable[int]] = None,
     check_seed_resources: bool = True,
+    facts: Optional[StepFacts] = None,
 ) -> str:
     """Return "" if fusion is legal, else a human-readable rejection reason.
 
@@ -781,6 +786,7 @@ def get_fusion_illegal_reason(
     """
 
     observation = observation if isinstance(observation, dict) else {}
+    snapshot = facts or build_step_facts(observation, tuple(plant_types or ()))
     if not fusion_enabled:
         return FUSION_ILLEGAL_DISABLED
     if not fusion_bridge_available:
@@ -791,19 +797,19 @@ def get_fusion_illegal_reason(
         return FUSION_ILLEGAL_INVALID_ROW
     if not (0 <= int(col) < cols):
         return FUSION_ILLEGAL_INVALID_COL
-    slot = seed_slot_entry(observation, seed_slot, plant_types)
+    slot = snapshot.seed_slot(int(seed_slot))
     if slot is None:
         return FUSION_ILLEGAL_INVALID_SEED_SLOT
-    seed_type = _safe_int(slot.get("plantType"), slot.get("type"), default=-1)
+    seed_type = slot.plant_type
     if seed_type < 0:
         return FUSION_ILLEGAL_INVALID_SEED_SLOT
-    existing_type = plant_type_at_cell(observation, int(row), int(col))
+    existing_type = plant_type_at_cell(observation, int(row), int(col), facts=snapshot)
     if existing_type is None:
         return FUSION_ILLEGAL_EMPTY_TILE
     if not are_fusion_compatible(existing_type, seed_type):
         return FUSION_ILLEGAL_INCOMPATIBLE
     if check_seed_resources:
-        resource_reason = _seed_resource_reason(observation, slot)
+        resource_reason = _seed_fact_resource_reason(snapshot, slot)
         if resource_reason:
             return resource_reason
     return FUSION_ILLEGAL_NONE
@@ -831,6 +837,7 @@ def validate_fusion_intent(
     check_seed_resources: bool = True,
     precondition_rejection: str = "",
     require_known_recipe: bool = False,
+    facts: Optional[StepFacts] = None,
 ) -> FusionDecision:
     """Pure, source-independent fusion legality decision.
 
@@ -842,6 +849,7 @@ def validate_fusion_intent(
 
     rejection = str(precondition_rejection or "")
     observation = observation if isinstance(observation, dict) else {}
+    snapshot = facts or build_step_facts(observation, tuple(plant_types or ()))
     if not rejection:
         rejection = get_fusion_illegal_reason(
             observation,
@@ -852,6 +860,7 @@ def validate_fusion_intent(
             fusion_bridge_available=bool(fusion_bridge_available),
             plant_types=plant_types,
             check_seed_resources=bool(check_seed_resources),
+            facts=snapshot,
         )
 
         # Preserve tile scoping and duplicate-slot identity.  A tile/slot that
@@ -866,17 +875,22 @@ def validate_fusion_intent(
             FUSION_ILLEGAL_EMPTY_TILE,
         }
         if rejection not in fundamental_rejections:
-            actual_source = plant_type_at_cell(observation, intent.source_row, intent.source_col)
+            actual_source = plant_type_at_cell(
+                observation,
+                intent.source_row,
+                intent.source_col,
+                facts=snapshot,
+            )
             if actual_source is None or int(actual_source) != int(intent.source_plant_type):
                 rejection = "source_not_found"
             else:
                 if intent.source_instance_id > 0:
                     matching_instances = {
-                        _safe_int(plant.get("instanceId"), plant.get("instanceID"), default=0)
-                        for plant in observation.get("plants", []) or []
-                        if isinstance(plant, dict)
-                        and _safe_int(plant.get("row"), default=-1) == intent.source_row
-                        and _safe_int(plant.get("column"), default=-1) == intent.source_col
+                        plant.instance_id
+                        for plant in snapshot.primary_plant_stacks_by_cell.get(
+                            (intent.source_row, intent.source_col),
+                            (),
+                        )
                     }
                     if matching_instances - {0} and intent.source_instance_id not in matching_instances:
                         rejection = "source_not_found"
@@ -884,6 +898,7 @@ def validate_fusion_intent(
                     observation,
                     intent.ingredient_seed_slot_index,
                     plant_types,
+                    facts=snapshot,
                 )
                 if not rejection and (
                     actual_ingredient is None or int(actual_ingredient) != int(intent.ingredient_plant_type)
@@ -1015,6 +1030,7 @@ def build_fusion_diagnostics(
     *,
     bridge_probe: Optional[Dict[str, Any]] = None,
     bridge_error: Optional[str] = None,
+    facts: Optional[StepFacts] = None,
 ) -> Dict[str, Any]:
     diag = default_fusion_diagnostics(policy)
     if diag["fusion_policy"] == FUSION_POLICY_NONE:
@@ -1023,7 +1039,7 @@ def build_fusion_diagnostics(
     if bridge_error:
         diag["fusion_bridge_error_count"] = 1
 
-    candidates = scan_fusion_candidates(observation, bridge_probe=bridge_probe)
+    candidates = scan_fusion_candidates(observation, bridge_probe=bridge_probe, facts=facts)
     diag["fusion_candidates"] = candidates
     diag["fusion_candidate_count"] = len(candidates)
     legal_candidates = [candidate for candidate in candidates if bool(candidate.get("fusion_legal"))]
@@ -1045,24 +1061,26 @@ def scan_fusion_candidates(
     observation: Dict[str, Any],
     *,
     bridge_probe: Optional[Dict[str, Any]] = None,
+    facts: Optional[StepFacts] = None,
 ) -> List[Dict[str, Any]]:
-    plants = [plant for plant in observation.get("plants", []) or [] if isinstance(plant, dict)]
-    slots = [slot for slot in observation.get("seedSlots", []) or [] if isinstance(slot, dict)]
+    snapshot = facts or build_step_facts(observation)
+    plants = snapshot.plants
+    slots = tuple(slot for slot in snapshot.seed_slots if slot.valid)
     rows = _safe_int(observation.get("rowCount"), default=5)
     cols = _safe_int(observation.get("columnCount"), default=10)
-    sun = _safe_int(observation.get("sun"), default=0)
+    sun = snapshot.sun
     probe_candidates = _probe_candidate_index(bridge_probe)
     candidates: List[Dict[str, Any]] = []
 
     for source in plants:
-        source_row = _safe_int(source.get("row"), default=-1)
-        source_col = _safe_int(source.get("column"), default=-1)
-        source_type = _safe_int(source.get("type"), default=-1)
+        source_row = source.row
+        source_col = source.column
+        source_type = source.plant_type
         if not (0 <= source_row < rows and 0 <= source_col < cols):
             continue
         for slot in slots:
-            ingredient_type = _safe_int(slot.get("plantType"), default=-1)
-            slot_index = _safe_int(slot.get("slotIndex"), default=-1)
+            ingredient_type = slot.plant_type
+            slot_index = slot.slot_index
             if slot_index < 0 or ingredient_type < 0:
                 continue
             rule = FUSION_RULES.get((source_type, ingredient_type))
@@ -1070,7 +1088,7 @@ def scan_fusion_candidates(
             fusion_legal = bool(rule)
             probe = _match_probe_candidate(
                 probe_candidates,
-                source,
+                source.instance_id,
                 source_row,
                 source_col,
                 source_type,
@@ -1098,15 +1116,15 @@ def scan_fusion_candidates(
                     blocked_reason = "incomplete_fusion_mapping"
                 else:
                     blocked_reason = ""
-            elif not _slot_available(slot, sun):
+            elif not slot.legacy_ready:
                 fusion_legal = False
                 blocked_reason = "target_not_available"
             elif rule:
                 fusion_legal = False
                 blocked_reason = "bridge_rejected"
 
-            lane = _lane_context(observation, source_row, source_col)
-            health_ratio = _source_health_ratio(source)
+            lane = _lane_context(observation, source_row, source_col, facts=snapshot)
+            health_ratio = source.fusion_health_ratio
             strategic_score, reason = _strategic_score(source_type, ingredient_type, rule, lane, health_ratio)
             if rule and not bool(rule.get("scripted_enabled")) and not blocked_reason:
                 fusion_legal = False
@@ -1114,15 +1132,15 @@ def scan_fusion_candidates(
 
             candidates.append(
                 {
-                    "source_plant_name": str(source.get("typeName") or plant_name(source_type)),
+                    "source_plant_name": source.type_name or plant_name(source_type),
                     "source_plant_type": source_type,
-                    "source_instance_id": _safe_int(source.get("instanceId"), source.get("instanceID"), default=0),
+                    "source_instance_id": source.instance_id,
                     "source_row": source_row,
                     "source_col": source_col,
-                    "target_or_ingredient_name": str(slot.get("plantTypeName") or plant_name(ingredient_type)),
+                    "target_or_ingredient_name": slot.plant_type_name or plant_name(ingredient_type),
                     "target_or_ingredient_type": ingredient_type,
                     "ingredient_seed_slot_index": slot_index,
-                    "ingredient_card_instance_id": _safe_int(slot.get("cardInstanceId"), default=0),
+                    "ingredient_card_instance_id": slot.card_instance_id,
                     "predicted_result_name": str((rule or {}).get("predicted_result_name") or "unknown"),
                     "predicted_result_type": _safe_int((rule or {}).get("predicted_result_type"), default=-1),
                     "fusion_legal": bool(fusion_legal and not blocked_reason),
@@ -1719,7 +1737,7 @@ def _probe_candidate_index(bridge_probe: Optional[Dict[str, Any]]) -> Dict[Tuple
 
 def _match_probe_candidate(
     index: Dict[Tuple[int, int, int, int, int], Dict[str, Any]],
-    source: Dict[str, Any],
+    source_instance: int,
     row: int,
     col: int,
     source_type: int,
@@ -1729,7 +1747,6 @@ def _match_probe_candidate(
     candidate = index.get((row, col, source_type, slot_index, ingredient_type))
     if candidate is not None:
         return candidate
-    source_instance = _safe_int(source.get("instanceId"), source.get("instanceID"), default=0)
     for probe in index.values():
         if source_instance <= 0:
             continue
@@ -1737,11 +1754,6 @@ def _match_probe_candidate(
         if probe_instance == source_instance and _safe_int(probe.get("ingredientSeedSlotIndex"), probe.get("seedSlotIndex"), default=-2) == slot_index:
             return probe
     return None
-
-
-def _slot_available(slot: Dict[str, Any], sun: int) -> bool:
-    cost = _safe_int(slot.get("seedCost"), default=0)
-    return bool(slot.get("usable", True)) and not bool(slot.get("disabled")) and bool(slot.get("ready")) and sun >= cost
 
 
 def _is_scripted_allowlisted(candidate: Dict[str, Any]) -> bool:
@@ -1752,7 +1764,13 @@ def _is_scripted_allowlisted(candidate: Dict[str, Any]) -> bool:
     return bool(FUSION_RULES.get(key, {}).get("scripted_enabled"))
 
 
-def _lane_context(observation: Dict[str, Any], source_row: int, source_col: int) -> Dict[str, Any]:
+def _lane_context(
+    observation: Dict[str, Any],
+    source_row: int,
+    source_col: int,
+    *,
+    facts: Optional[StepFacts] = None,
+) -> Dict[str, Any]:
     lane = {}
     for item in observation.get("lanes", []) or []:
         if isinstance(item, dict) and _safe_int(item.get("row"), default=-1) == source_row:
@@ -1762,21 +1780,17 @@ def _lane_context(observation: Dict[str, Any], source_row: int, source_col: int)
     nearest_x = _safe_float(lane.get("nearestZombieX"), default=99.0)
     if lane_danger < 0.0:
         lane_danger = max(0.0, 1.0 - nearest_x / 10.0) if nearest_x < 99.0 else 0.0
-    zombies = [
-        zombie for zombie in observation.get("zombies", []) or []
-        if isinstance(zombie, dict)
-        and _safe_int(zombie.get("row"), default=-1) == source_row
-        and bool(zombie.get("alive", True))
-    ]
+    snapshot = facts or build_step_facts(observation)
+    zombies = snapshot.zombies_by_lane.get(source_row, ())
     nearby = []
     for zombie in zombies:
-        zx = _safe_float(zombie.get("x"), default=nearest_x)
+        zx = zombie.x if zombie.has_position else nearest_x
         if zx >= float(source_col) - 0.5 and zx - float(source_col) <= 5.0:
             nearby.append(zombie)
     if not nearby and zombies:
         nearby = zombies
-    coneheads = sum(1 for zombie in nearby if is_conehead_zombie(zombie))
-    bucketheads = sum(1 for zombie in nearby if is_buckethead_zombie(zombie))
+    coneheads = sum(1 for zombie in nearby if _is_conehead_fact(zombie))
+    bucketheads = sum(1 for zombie in nearby if _is_buckethead_fact(zombie))
     return {
         "lane_danger_score": round(float(lane_danger), 4),
         "nearby_zombie_count": len(nearby),
@@ -1813,11 +1827,6 @@ def _strategic_score(
     return round(max(0.0, score), 4), str(rule.get("reason") or "known fusion mapping")
 
 
-def _source_health_ratio(source: Dict[str, Any]) -> float:
-    max_health = max(1.0, _safe_float(source.get("maxHealth"), default=1.0))
-    return round(max(0.0, min(1.0, _safe_float(source.get("health"), default=max_health) / max_health)), 4)
-
-
 def is_conehead_zombie(zombie: Dict[str, Any]) -> bool:
     zombie_type = _safe_int(zombie.get("type"), default=-1)
     name = str(zombie.get("typeName") or "").lower()
@@ -1839,32 +1848,52 @@ def is_tough_zombie(zombie: Dict[str, Any]) -> bool:
     )
 
 
-def count_tough_zombies_by_row(observation: Dict[str, Any]) -> Dict[int, Dict[str, int]]:
+def _is_conehead_fact(zombie: Any) -> bool:
+    name = str(zombie.type_name or "").lower()
+    return zombie.zombie_type in CONEHEAD_TYPES or "cone" in name or "roadblock" in name or "路障" in name
+
+
+def _is_buckethead_fact(zombie: Any) -> bool:
+    name = str(zombie.type_name or "").lower()
+    return zombie.zombie_type in BUCKETHEAD_TYPES or "bucket" in name or "铁桶" in name
+
+
+def _is_tough_fact(zombie: Any) -> bool:
+    return (
+        _is_conehead_fact(zombie)
+        or _is_buckethead_fact(zombie)
+        or zombie.health >= 600
+        or zombie.max_health >= 600
+    )
+
+
+def count_tough_zombies_by_row(
+    observation: Dict[str, Any],
+    *,
+    facts: Optional[StepFacts] = None,
+) -> Dict[int, Dict[str, int]]:
+    snapshot = facts or build_step_facts(observation)
     rows = _safe_int(observation.get("rowCount"), default=5)
     counts = {
         row: {"buckethead": 0, "conehead": 0, "tough": 0}
         for row in range(max(0, rows))
     }
-    for lane in observation.get("lanes", []) or []:
-        if not isinstance(lane, dict):
-            continue
-        row = _safe_int(lane.get("row"), default=-1)
+    for lane in snapshot.lanes:
+        row = lane.row
         if row not in counts:
             continue
-        counts[row]["buckethead"] = _safe_int(lane.get("bucketheadCount"), lane.get("buckethead_count"), default=counts[row]["buckethead"])
-        counts[row]["conehead"] = _safe_int(lane.get("coneheadCount"), lane.get("conehead_count"), default=counts[row]["conehead"])
-        counts[row]["tough"] = _safe_int(lane.get("toughZombieCount"), lane.get("tough_zombie_count"), default=counts[row]["tough"])
-    for zombie in observation.get("zombies", []) or []:
-        if not isinstance(zombie, dict) or not bool(zombie.get("alive", True)):
-            continue
-        row = _safe_int(zombie.get("row"), default=-1)
+        counts[row]["buckethead"] = lane.buckethead_count
+        counts[row]["conehead"] = lane.conehead_count
+        counts[row]["tough"] = lane.tough_zombie_count
+    for zombie in snapshot.alive_zombies:
+        row = zombie.row
         if row not in counts:
             continue
-        if is_buckethead_zombie(zombie):
+        if _is_buckethead_fact(zombie):
             counts[row]["buckethead"] += 1
-        if is_conehead_zombie(zombie):
+        if _is_conehead_fact(zombie):
             counts[row]["conehead"] += 1
-        if is_tough_zombie(zombie):
+        if _is_tough_fact(zombie):
             counts[row]["tough"] += 1
     return counts
 

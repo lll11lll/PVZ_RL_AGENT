@@ -31,6 +31,7 @@ from pvzrl_adventure import (
 from pvzrl_env import normalize_plant_name, parse_seed_list, plant_type_name, registry_entries, resolve_seed_list
 from pvzrl_fusion import FUSION_POLICY_SCRIPTED
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
+from pvzrl_telemetry import live_status_significant_state
 
 
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
@@ -1150,7 +1151,15 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "frontier_promoted_this_episode": bool(self.frontier_promoted_this_episode),
             }
         )
-        self.writer.write(build_live_status(self, self.context, last_info=info))
+        raw_observation = info.get("raw_observation") if isinstance(info, dict) else None
+        if hasattr(self.writer, "write_lazy"):
+            self.writer.write_lazy(
+                lambda: build_live_status(self, self.context, last_info=info),
+                significant_state=live_status_significant_state(self.context, raw_observation, info),
+                force=bool(terminated or truncated),
+            )
+        else:  # Compatibility for lightweight test/report writers.
+            self.writer.write(build_live_status(self, self.context, last_info=info))
         if terminated or truncated:
             self._finish_episode(info)
         return encoded, reward, terminated, truncated, info

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
+from pvzrl_rewards import PendingCherryEvent
 from test_refactor_support import make_wrapper, observation_for_wrapper
 
 
@@ -11,7 +13,22 @@ def _lane_diagnostics_for_cherry_event(event: dict, *, kill_delta: int) -> dict:
         previous = observation_for_wrapper(wrapper)
         current = copy.deepcopy(previous)
         current["killCount"] = int(previous.get("killCount", 0)) + int(kill_delta)
-        wrapper.base._pending_cherry_events = [dict(event)]
+        wrapper.base._reward_state = replace(
+            wrapper.base._reward_state,
+            pending_cherry_events=(
+                PendingCherryEvent(
+                    row=int(event.get("row", -1)),
+                    column=int(event.get("column", -1)),
+                    age=int(event.get("age", 0)),
+                    kills=int(event.get("kills", 0)),
+                    nearby_tough=int(event.get("nearby_tough", 0)),
+                    nearby_buckethead=int(event.get("nearby_buckethead", 0)),
+                    nearby_conehead=int(event.get("nearby_conehead", 0)),
+                    mower_risk=bool(event.get("mower_risk")),
+                    credited=bool(event.get("credited")),
+                ),
+            ),
+        )
         reward_events: dict = {}
         wrapper.base.compute_reward_breakdown(
             previous,

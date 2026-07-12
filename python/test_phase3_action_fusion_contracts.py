@@ -17,6 +17,7 @@ from itertools import product
 
 import numpy as np
 import pytest
+import pvzrl_env
 
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
@@ -1375,12 +1376,95 @@ def test_environment_fusion_adapter_is_tile_scoped_source_attributed_and_exactly
         assert diagnostics["fusion_failed_count"] == 0
         assert diagnostics["fusion_last_source"] == normalized_source
 
-        first_reward = env._compute_step_fusion_reward(observation, result)
-        second_reward = env._compute_step_fusion_reward(observation, result)
+        first_reward = env._compose_step_reward(
+            observation, observation, result, previous_legal_actions=[]
+        ).breakdown.component("fusion_reward")
+        second_reward = env._compose_step_reward(
+            observation, observation, result, previous_legal_actions=[]
+        ).breakdown.component("fusion_reward")
         assert first_reward > 0.0
         assert second_reward == 0.0
         assert result["fusionRewardApplied"] is True
         assert result["fusionRewardDuplicateSuppressed"] is True
+    finally:
+        env.close()
+
+
+def test_model_fusion_reuses_prebuilt_action_and_seed_slot_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FusionClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def request(self, command: str, **payload: object) -> dict:
+            assert command == "fusion_step"
+            self.calls.append(dict(payload))
+            return {
+                "fusionAttempted": True,
+                "fusionSucceeded": True,
+                "fusion_success": True,
+                "illegalAction": False,
+                "illegalReason": None,
+                "fusionRejectedReason": "",
+                "fusionExecutionMode": "runtime_checkmix",
+                "bridgeMethodUsed": "CheckMix",
+                "bridgeResultReason": "success",
+                "fusionScope": "source_tile",
+                "changedTileCount": 1,
+                "changedTiles": [{"row": 2, "column": 4}],
+                "nonSourceTilesChanged": False,
+                "globalFusionSideEffect": False,
+                "sourceTileOccupiedBefore": True,
+                "plantCountOnTileBefore": 1,
+                "plantCountOnTileAfter": 1,
+                "resultingPlantAfter": {
+                    "row": 2,
+                    "column": 4,
+                    "plantType": 1030,
+                    "plantTypeName": "Repeater",
+                },
+            }
+
+        def close(self) -> None:
+            return None
+
+    observation = _recipe_observation(0, 0)
+    action = 1 + 2 * 10 + 4
+    client = FusionClient()
+    env = PvZGymEnv(
+        PvZEnvConfig(
+            plant_types=[0],
+            step_seconds=0.0,
+            fusion_policy="observe",
+            fusion_action_mask_enabled=True,
+        )
+    )
+    env.client = client  # type: ignore[assignment]
+    env._step_facts_cache.get(observation, env.config.plant_types)
+    monkeypatch.setattr(
+        pvzrl_env,
+        "decode_action",
+        lambda *_args, **_kwargs: pytest.fail("model fusion raw-decoded the action"),
+    )
+    monkeypatch.setattr(
+        pvzrl_env,
+        "seed_slots_from_observation",
+        lambda *_args, **_kwargs: pytest.fail("model fusion rescanned raw seed slots"),
+    )
+    try:
+        result, diagnostics = env._maybe_execute_model_fusion(
+            observation,
+            default_fusion_diagnostics("observe"),
+            action,
+            action,
+        )
+        assert result is not None and result["fusionSucceeded"] is True
+        assert diagnostics["fusion_success_count"] == 1
+        assert len(client.calls) == 1
+        assert client.calls[0]["source_row"] == 2
+        assert client.calls[0]["source_col"] == 4
+        assert client.calls[0]["ingredient_seed_slot_index"] == 0
     finally:
         env.close()
 
@@ -1522,9 +1606,13 @@ def test_failed_environment_fusion_is_counted_and_rewarded_once_across_copied_re
         assert diagnostics["fusion_failed_count"] == 1
         assert diagnostics["fusion_rejected_count"] == 1
 
-        first_reward = env._compute_step_fusion_reward(observation, result)
+        first_reward = env._compose_step_reward(
+            observation, observation, result, previous_legal_actions=[]
+        ).breakdown.component("fusion_reward")
         copied_result = copy.deepcopy(result)
-        second_reward = env._compute_step_fusion_reward(observation, copied_result)
+        second_reward = env._compose_step_reward(
+            observation, observation, copied_result, previous_legal_actions=[]
+        ).breakdown.component("fusion_reward")
         assert first_reward < 0.0
         assert second_reward == 0.0
         assert result["fusionRewardApplied"] is True

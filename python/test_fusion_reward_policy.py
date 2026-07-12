@@ -22,6 +22,7 @@ from pvzrl_fusion import (
     fusion_live_fields,
     merge_episode_fusion_stats,
 )
+from pvzrl_rewards import fusion_source_from_result
 from train_ppo import (
     EPISODE_METRIC_FIELDS,
     PROGRESS_CSV_DIAGNOSTIC_FIELDS,
@@ -118,7 +119,12 @@ class FusionRewardPolicyTests(unittest.TestCase):
             result,
             rejected_reason=rejected_reason,
         )
-        delta = env._compute_step_fusion_reward(obs, result)
+        delta = env._compose_step_reward(
+            obs,
+            obs,
+            result,
+            previous_legal_actions=[],
+        ).breakdown.component("fusion_reward")
         diag.update(env._fusion_reward_live_fields())
         return {"delta": delta, "diagnostics": diag}
 
@@ -157,14 +163,14 @@ class FusionRewardPolicyTests(unittest.TestCase):
         env = self.make_env(reward)
         first = self.apply_event(env, action_result(success=True, col=4), observation())
         second = self.apply_event(env, action_result(success=True, col=5), observation())
-        self.assertAlmostEqual(env._fusion_reward_positive_total, 0.60, places=7)
-        self.assertAlmostEqual(env._fusion_reward_total, 0.60, places=7)
+        self.assertAlmostEqual(env._reward_state.fusion.positive_total, 0.60, places=7)
+        self.assertAlmostEqual(env._reward_state.fusion.reward_total, 0.60, places=7)
         self.assertTrue(second["diagnostics"]["fusion_reward_capped"])
 
         bad = action_result(success=False, reason="bridge_error", legal=True, col=6)
         penalty = self.apply_event(env, bad, observation(), rejected_reason="bridge_error")
         self.assertLess(penalty["delta"], 0.0)
-        self.assertLess(env._fusion_reward_total, 0.60)
+        self.assertLess(env._reward_state.fusion.reward_total, 0.60)
         totals = env._fusion_reward_live_fields()
         component_sum = sum(
             float(totals[field])
@@ -192,10 +198,10 @@ class FusionRewardPolicyTests(unittest.TestCase):
             rejected_reason="incompatible_pair",
         )
         env._reset_reward_episode_state()
-        self.assertEqual(env._fusion_reward_total, 0.0)
-        self.assertEqual(env._fusion_reward_positive_total, 0.0)
-        self.assertFalse(env._fusion_reward_capped)
-        self.assertEqual(len(env._recent_fusion_attempts), 0)
+        self.assertEqual(env._reward_state.fusion.reward_total, 0.0)
+        self.assertEqual(env._reward_state.fusion.positive_total, 0.0)
+        self.assertFalse(env._reward_state.fusion.capped)
+        self.assertEqual(len(env._reward_state.fusion.recent_attempts), 0)
 
     def test_live_and_episode_metrics_include_reward_fields(self) -> None:
         env = self.make_env()
@@ -307,7 +313,7 @@ class FusionRewardPolicyTests(unittest.TestCase):
         )
         for result, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(env._fusion_source_from_result(result), expected)
+                self.assertEqual(fusion_source_from_result(result), expected)
 
     def test_model_bridge_error_is_returned_to_shared_reward_path(self) -> None:
         class FailingClient:
@@ -334,7 +340,12 @@ class FusionRewardPolicyTests(unittest.TestCase):
         self.assertEqual(result["fusionRejectedReason"], "bridge_error")
         self.assertEqual(diagnostics["fusion_bridge_error_count"], 1)
         self.assertEqual(diagnostics["fusion_failed_count"], 1)
-        delta = env._compute_step_fusion_reward(observation(), result)
+        delta = env._compose_step_reward(
+            observation(),
+            observation(),
+            result,
+            previous_legal_actions=[],
+        ).breakdown.component("fusion_reward")
         self.assertLess(delta, 0.0)
         self.assertLess(env._fusion_reward_live_fields()["fusion_bridge_error_penalty_total"], 0.0)
 

@@ -17,7 +17,7 @@ import time
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pvzrl_actions import (
     ActionDecision,
@@ -32,7 +32,6 @@ from pvzrl_actions import (
     validate_action_intent,
 )
 from pvzrl_fusion import (
-    FUSION_ILLEGAL_INCOMPATIBLE,
     FUSION_POLICY_NONE,
     FUSION_POLICY_SCRIPTED,
     FUSION_SOURCE_MODEL,
@@ -51,10 +50,11 @@ from pvzrl_fusion import (
     fusion_live_fields,
     fusion_execution_from_result,
     fusion_intent_from_candidate,
-    fusion_tier,
     get_fusion_illegal_reason,
+    is_buckethead_zombie,
+    is_conehead_zombie,
+    is_tough_zombie,
     merge_episode_fusion_stats,
-    normalize_fusion_source,
     normalize_fusion_policy,
     plant_name as fusion_plant_name,
     validate_fusion_intent,
@@ -64,6 +64,30 @@ from pvzrl_registry import (
     DEFAULT_PLANT_REGISTRY_PATH,
     get_plant_registry,
     normalize_plant_name as normalize_registry_plant_name,
+)
+from pvzrl_observation_facts import StepFacts, StepFactsCache, build_step_facts
+from pvzrl_diagnostics import (
+    append_safety_event,
+    compose_environment_safety_diagnostics,
+)
+from pvzrl_lane_diagnostics import LaneDiagnosticsInput, compose_lane_diagnostics
+from pvzrl_rewards import (
+    REWARD_COMPONENT_FIELDS,
+    REWARD_EPISODE_TOTAL_FIELDS,
+    RewardComposition,
+    RewardCompositionState,
+    RewardConfig,
+    compose_environment_reward,
+    compose_step_reward,
+    fusion_reward_live_fields,
+    _active_threat_rows as active_threat_rows_from_facts,
+    _lane_danger_by_row as lane_danger_by_row_from_facts,
+    _mower_risk_rows as mower_risk_rows_from_facts,
+    _nearby_zombie_context as nearby_zombie_context_from_facts,
+    _nearest_zombie_x_by_row as nearest_zombie_x_by_row_from_facts,
+    _plant_counts_by_row as plant_counts_by_row_from_facts,
+    _valuable_plant_columns as valuable_plant_columns_from_facts,
+    _wallnut_blocker_count as wallnut_blocker_count_from_facts,
 )
 
 
@@ -100,165 +124,6 @@ LIFECYCLE_RESET_CLEANUP_ALLOWED = {
     LIFECYCLE_LOSS_PENDING,
     LIFECYCLE_RESETTING,
 }
-REWARD_COMPONENT_FIELDS = (
-    "kill_reward",
-    "wave_reward",
-    "win_loss_reward",
-    "illegal_penalty",
-    "mower_loss_penalty",
-    "danger_delta_reward",
-    "undefended_threat_penalty",
-    "lane_response_reward",
-    "plant_health_loss_penalty",
-    "threat_balanced_row_reward",
-    "overdefended_row_penalty",
-    "role_positioning_reward",
-    "first_peashooter_in_row_reward",
-    "first_defense_undefended_threatened_row_reward",
-    "all_rows_peashooter_coverage_reward",
-    "sunflower_overbuild_before_defense_penalty",
-    "defense_before_extra_economy_reward",
-    "sunflower_while_undefended_threat_penalty",
-    "plant_elsewhere_while_undefended_threat_penalty",
-    "late_undefended_threat_penalty",
-    "reduce_undefended_threat_reward",
-    "wait_while_actionable_threat_penalty",
-    "first_peashooter_threatened_row_reward",
-    "all_active_threatened_rows_have_peashooter_reward",
-    "sunflower_greed_while_defense_missing_penalty",
-    "early_sunflower_reward",
-    "safe_sunflower_position_reward",
-    "sunflower_overbuild_penalty",
-    "economy_collapse_penalty",
-    "first_defense_in_threatened_row_reward",
-    "threatened_lane_coverage_reward",
-    "row_balance_reward",
-    "useful_peashooter_position_reward",
-    "overdefense_penalty",
-    "wallnut_blocks_active_threat_reward",
-    "wallnut_low_value_placement_penalty",
-    "wallnut_threatened_lane_reward",
-    "wallnut_between_zombie_and_house_reward",
-    "wallnut_frontline_reward",
-    "wallnut_emergency_block_reward",
-    "wallnut_useless_penalty",
-    "cherrybomb_tactical_kill_reward",
-    "cherrybomb_wasted_penalty",
-    "cherrybomb_kill_reward",
-    "cherrybomb_heavy_zombie_bonus",
-    "cherrybomb_cluster_bonus",
-    "cherrybomb_emergency_reward",
-    "cherrybomb_zero_kill_penalty",
-    "cherrybomb_low_value_penalty",
-    "mower_risk_reduction_reward",
-    "tough_zombie_response_reward",
-    "row_danger_delta_reward",
-    "high_danger_unanswered_penalty",
-    "mower_exposure_penalty",
-    "minimum_viable_defense_reward",
-    "coach_match_reward",
-    "coach_legal_execution_reward",
-    "coach_override_penalty",
-    "coach_fusion_success_reward",
-    "coach_tactical_usefulness_reward",
-    # Net, per-episode-capped shaped reward for fusion events (model/coach/scripted).
-    # The per-component breakdown is tracked separately in fusion diagnostics.
-    "fusion_reward",
-)
-REWARD_EPISODE_TOTAL_FIELDS = tuple(f"{field}_total" for field in REWARD_COMPONENT_FIELDS)
-
-
-@dataclass
-class RewardConfig:
-    kill_reward: float = 1.0
-    wave_reward: float = 2.0
-    plant_health_loss_penalty: float = 0.002
-    illegal_action_penalty: float = 0.15
-    mower_loss_penalty: float = 1.25
-    danger_delta_scale: float = 0.01
-    lane_response_reward: float = 0.45
-    undefended_close_threat_penalty: float = 0.02
-    close_threat_threshold: float = 0.6
-    threat_balanced_row_reward: float = 0.5
-    threat_balanced_zero_defender_bonus: float = 0.25
-    overdefended_row_penalty: float = 0.2
-    role_positioning_reward: float = 0.25
-    first_peashooter_in_row_reward: float = 0.75
-    first_defense_undefended_threatened_row_reward: float = 1.25
-    all_rows_peashooter_coverage_reward: float = 3.0
-    sunflower_overbuild_before_defense_penalty: float = 0.2
-    defense_before_extra_economy_reward: float = 0.5
-    sunflower_while_undefended_threat_penalty: float = 0.45
-    plant_elsewhere_while_undefended_threat_penalty: float = 0.25
-    undefended_threat_grace_steps: float = 40.0
-    late_undefended_threat_penalty: float = 0.03
-    reduce_undefended_threat_reward: float = 1.0
-    wait_while_actionable_threat_penalty: float = 0.05
-    first_peashooter_threatened_row_reward: float = 0.35
-    all_active_threatened_rows_have_peashooter_reward: float = 0.15
-    sunflower_greed_while_defense_missing_penalty: float = 0.15
-    early_sunflower_reward: float = 0.0
-    safe_sunflower_position_reward: float = 0.0
-    sunflower_overbuild_penalty: float = 0.0
-    economy_collapse_penalty: float = 0.0
-    first_defense_in_threatened_row_reward: float = 0.0
-    threatened_lane_coverage_reward: float = 0.0
-    row_balance_reward: float = 0.0
-    useful_peashooter_position_reward: float = 0.0
-    overdefense_penalty: float = 0.0
-    wallnut_blocks_active_threat_reward: float = 0.25
-    wallnut_low_value_placement_penalty: float = 0.06
-    wallnut_threatened_lane_reward: float = 0.0
-    wallnut_between_zombie_and_house_reward: float = 0.0
-    wallnut_frontline_reward: float = 0.0
-    wallnut_emergency_block_reward: float = 0.0
-    wallnut_useless_penalty: float = 0.0
-    cherrybomb_tactical_kill_reward: float = 0.5
-    cherrybomb_tough_bonus_reward: float = 0.75
-    cherrybomb_mower_save_bonus_reward: float = 0.25
-    cherrybomb_wasted_penalty: float = 0.35
-    cherrybomb_kill_reward: float = 0.0
-    cherrybomb_heavy_zombie_bonus: float = 0.0
-    cherrybomb_cluster_bonus: float = 0.0
-    cherrybomb_emergency_reward: float = 0.0
-    cherrybomb_zero_kill_penalty: float = 0.0
-    cherrybomb_low_value_penalty: float = 0.0
-    mower_risk_reduction_reward: float = 0.15
-    tough_zombie_response_reward: float = 0.15
-    row_danger_delta_reward: float = 0.0
-    high_danger_unanswered_penalty: float = 0.0
-    mower_exposure_penalty: float = 0.0
-    minimum_viable_defense_reward: float = 0.0
-    coach_match_reward: float = 0.02
-    coach_legal_execution_reward: float = 0.01
-    coach_override_penalty: float = -0.01
-    coach_fusion_success_reward: float = 0.03
-    coach_tactical_usefulness_reward: float = 0.01
-    # Fusion reward policy. Applies to every confirmed fusion event regardless of
-    # source (model / human coach / stream coach / assist / scripted). Modest by
-    # design: fusion should help the policy, not dominate the reward function.
-    fusion_attempt_reward: float = 0.02
-    fusion_success_reward: float = 0.50
-    fusion_new_recipe_reward: float = 0.15
-    fusion_recursive_reward: float = 0.20
-    fusion_tier2_reward: float = 0.10
-    fusion_tier3_reward: float = 0.25
-    fusion_repeat_reward_multiplier: float = 0.25
-    fusion_threatened_row_bonus: float = 0.15
-    fusion_active_wave_bonus: float = 0.10
-    fusion_defensive_value_bonus: float = 0.10
-    fusion_incompatible_penalty: float = -0.10
-    fusion_empty_tile_penalty: float = -0.08
-    fusion_failed_penalty: float = -0.10
-    fusion_bridge_error_penalty: float = -0.25
-    fusion_spam_penalty: float = -0.05
-    max_fusion_reward_per_episode: float = 3.0
-    # Legacy config field kept for old configs; absolute proximity punishment is no longer applied.
-    proximity_penalty: float = 0.01
-    win_reward: float = 10.0
-    loss_penalty: float = 10.0
-
-
 @dataclass
 class PvZEnvConfig:
     host: str = "127.0.0.1"
@@ -963,6 +828,7 @@ class PvZGymEnv:
             ),
         )
         self.previous_observation: Optional[Dict[str, Any]] = None
+        self._step_facts_cache = StepFactsCache()
         self._action_decision_cache: Optional[ActionDecisionCache] = None
         self._action_decision_cache_hits = 0
         self._action_decision_cache_misses = 0
@@ -984,7 +850,6 @@ class PvZGymEnv:
         self._executed_coach_command_ids: set[int] = set()
         self._last_executed_coach_command_id: Optional[int] = None
         self._coach_fusion_fresh_after_timestamp = time.time()
-        self._fusion_recipes_seen_run: set[str] = set()
         self._reset_reward_episode_state()
 
     def _run_mode(self) -> str:
@@ -1087,16 +952,21 @@ class PvZGymEnv:
         self._possible_win_pending_steps = 0
         self._loss_pending_wait_steps = 0
         self._episode_lost_mower_rows: set[int] = set()
-        self._all_rows_peashooter_coverage_rewarded = False
-        self._all_active_threatened_rows_coverage_rewarded = False
-        self._pending_cherry_events: List[Dict[str, Any]] = []
         self._last_fusion_diagnostics: Dict[str, Any] = default_fusion_diagnostics(self.config.fusion_policy)
-        self._reset_fusion_reward_tracking()
         rows = max(0, int(self.config.row_count))
-        self.undefended_threat_age_by_row = [0 for _ in range(rows)]
-        self.max_undefended_threat_age_by_row = [0 for _ in range(rows)]
-        self.undefended_threat_age_sum_by_row = [0 for _ in range(rows)]
-        self.undefended_threat_age_count_by_row = [0 for _ in range(rows)]
+        previous_state = getattr(self, "_reward_state", None)
+        recipes_seen_run = (
+            previous_state.fusion.recipes_seen_run
+            if isinstance(previous_state, RewardCompositionState)
+            else ()
+        )
+        self._reward_state = RewardCompositionState.initial(
+            rows,
+            recipes_seen_run=recipes_seen_run,
+        )
+        self._fusion_pipeline_epoch = int(getattr(self, "_fusion_pipeline_epoch", 0)) + 1
+        self._fusion_pipeline_event_counter = 0
+        self._fusion_accounted_event_ids: set[str] = set()
 
     def clear_coach_runtime_state(
         self,
@@ -1153,39 +1023,6 @@ class PvZGymEnv:
                     f"mowerCount={baseline.get('logicalMowerCount')} "
                     f"nextStep={baseline.get('nextStep')}"
                 )
-
-    def _ensure_undefended_threat_age_rows(self, rows: int) -> None:
-        rows = max(0, int(rows))
-        for name in (
-            "undefended_threat_age_by_row",
-            "max_undefended_threat_age_by_row",
-            "undefended_threat_age_sum_by_row",
-            "undefended_threat_age_count_by_row",
-        ):
-            values = getattr(self, name, [])
-            if len(values) < rows:
-                values.extend([0 for _ in range(rows - len(values))])
-            setattr(self, name, values)
-
-    def _update_undefended_threat_age(
-        self,
-        rows: int,
-        threatened_rows: List[int],
-        peashooters_by_row: Dict[int, int],
-    ) -> None:
-        self._ensure_undefended_threat_age_rows(rows)
-        threatened = set(int(row) for row in threatened_rows)
-        for row in range(max(0, rows)):
-            if row in threatened and peashooters_by_row.get(row, 0) == 0:
-                self.undefended_threat_age_by_row[row] += 1
-                self.max_undefended_threat_age_by_row[row] = max(
-                    self.max_undefended_threat_age_by_row[row],
-                    self.undefended_threat_age_by_row[row],
-                )
-                self.undefended_threat_age_sum_by_row[row] += self.undefended_threat_age_by_row[row]
-                self.undefended_threat_age_count_by_row[row] += 1
-            else:
-                self.undefended_threat_age_by_row[row] = 0
 
     def _autodetect_game_exe(self) -> Optional[str]:
         candidates = [
@@ -4068,9 +3905,18 @@ class PvZGymEnv:
             return [0]
         return [int(action) for action in data.get("legalActions", [])]
 
-    def legal_actions(self, observation: Optional[Dict[str, Any]] = None) -> List[int]:
+    def legal_actions(
+        self,
+        observation: Optional[Dict[str, Any]] = None,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> List[int]:
         obs = observation or self.previous_observation or self.observe()
-        return [action for action, allowed in enumerate(self.action_mask(obs)) if allowed]
+        return [
+            action
+            for action, allowed in enumerate(self.action_mask(obs, facts=facts))
+            if allowed
+        ]
 
     def teacher_action(self, observation: Optional[Dict[str, Any]] = None) -> int:
         if observation is not None and is_restart_screen_observation(observation):
@@ -4121,11 +3967,13 @@ class PvZGymEnv:
             bridge_probe = self.client.request("fusion_probe", return_observation=False)
         except Exception as exc:
             bridge_error = str(exc)
+        facts = self._step_facts_cache.get_known(observation, self.config.plant_types)
         diagnostics = build_fusion_diagnostics(
             policy,
             observation,
             bridge_probe=bridge_probe,
             bridge_error=bridge_error,
+            facts=facts,
         )
         self._last_fusion_diagnostics = diagnostics
         return diagnostics
@@ -4157,6 +4005,7 @@ class PvZGymEnv:
         """
 
         event_id = self._next_fusion_pipeline_event_id(intent.source)
+        facts = self._step_facts_cache.get_known(pre_observation, self.config.plant_types)
         decision = validate_fusion_intent(
             intent,
             pre_observation,
@@ -4166,6 +4015,7 @@ class PvZGymEnv:
             check_seed_resources=True,
             precondition_rejection=precondition_rejection,
             require_known_recipe=require_known_recipe,
+            facts=facts,
         )
         if not decision.legal and isinstance(rejection_reason_aliases, dict):
             aliased_reason = str(rejection_reason_aliases.get(decision.rejection_reason) or decision.rejection_reason)
@@ -4384,31 +4234,54 @@ class PvZGymEnv:
             return None, diagnostics
         if int(executed_action) <= 0:
             return None, diagnostics
-        decoded = decode_action(int(executed_action), pre_observation, self.config.plant_types)
-        if int(decoded.get("kind", -1)) != 1:
+        facts = self._step_facts_cache.get_known(
+            pre_observation,
+            self.config.plant_types,
+        )
+        rows = int(facts.rows)
+        cols = int(facts.columns)
+        if rows <= 0 or cols <= 0:
             return None, diagnostics
-        row = int(decoded.get("row", -1))
-        col = int(decoded.get("column", -1))
-        seed_type = int(decoded.get("plant_type", -1))
-        slot_index = int(decoded.get("slot_index", -1))
-        occupied, existing_type = self._cell_occupancy(pre_observation, row, col)
-        if not occupied:
+        cells = rows * cols
+        encoded = int(executed_action) - 1
+        slot_index = encoded // cells
+        cell = encoded % cells
+        row, col = cell // cols, cell % cols
+        slot_fact = (
+            facts.seed_slots[slot_index]
+            if 0 <= slot_index < len(facts.seed_slots)
+            and facts.seed_slots[slot_index].valid
+            else None
+        )
+        seed_type = int(slot_fact.legacy_action_plant_type) if slot_fact else -1
+        occupant = facts.occupant_by_cell.get((row, col))
+        if occupant is None:
             return None, diagnostics  # empty tile -> normal placement, let bridge step handle it
-        source_plant = self._plant_at_cell(pre_observation, row, col)
-        slots = seed_slots_from_observation(pre_observation, self.config.plant_types)
-        slot = slots[slot_index] if 0 <= slot_index < len(slots) else {}
+        existing_type = int(occupant.plant_type)
+        primary_stack = facts.primary_plant_stacks_by_cell.get((row, col), ())
+        source_plant = primary_stack[0] if primary_stack else None
         candidate = {
             "source_plant_type": int(existing_type),
-            "source_plant_name": str((source_plant or {}).get("typeName") or fusion_plant_name(existing_type)),
-            "source_instance_id": self._safe_int(
-                (source_plant or {}).get("instanceId"), (source_plant or {}).get("instanceID"), default=0
+            "source_plant_name": str(
+                (source_plant.type_name if source_plant is not None else "")
+                or fusion_plant_name(existing_type)
+            ),
+            "source_instance_id": int(
+                source_plant.instance_id if source_plant is not None else 0
             ),
             "source_row": row,
             "source_col": col,
             "target_or_ingredient_type": int(seed_type),
-            "target_or_ingredient_name": str(slot.get("plantTypeName") or fusion_plant_name(seed_type)),
-            "ingredient_seed_slot_index": int(slot.get("slotIndex", slot_index)),
-            "ingredient_card_instance_id": self._safe_int(slot.get("cardInstanceId"), default=0),
+            "target_or_ingredient_name": str(
+                (slot_fact.plant_type_name if slot_fact is not None else "")
+                or fusion_plant_name(seed_type)
+            ),
+            "ingredient_seed_slot_index": int(
+                slot_fact.slot_index if slot_fact is not None else slot_index
+            ),
+            "ingredient_card_instance_id": int(
+                slot_fact.card_instance_id if slot_fact is not None else 0
+            ),
             "predicted_result_type": -1,
             "predicted_result_name": "",
             "fusion_legal": True,
@@ -4431,452 +4304,12 @@ class PvZGymEnv:
             return_rejection_result=True,
         )
 
-    def _plant_at_cell(self, observation: Dict[str, Any], row: int, column: int) -> Optional[Dict[str, Any]]:
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            if self._safe_int(plant.get("row"), default=-1) == int(row) and self._safe_int(
-                plant.get("column"), default=-1
-            ) == int(column):
-                return plant
-        return None
-
     # ------------------------------------------------------------------
-    # Fusion reward policy (shared by model / coach / scripted fusion paths)
+    # Fusion reward policy (pure compositor adapters)
     # ------------------------------------------------------------------
-
-    _FUSION_REWARD_COMPONENT_NAMES = (
-        "fusion_attempt_reward",
-        "fusion_success_reward",
-        "fusion_new_recipe_reward",
-        "fusion_recursive_reward",
-        "fusion_tier_reward",
-        "fusion_repeat_decay",
-        "fusion_threatened_row_bonus",
-        "fusion_active_wave_bonus",
-        "fusion_defensive_value_bonus",
-        "fusion_incompatible_penalty",
-        "fusion_empty_tile_penalty",
-        "fusion_failed_penalty",
-        "fusion_bridge_error_penalty",
-        "fusion_spam_penalty",
-    )
-
-    def _reset_fusion_reward_tracking(self) -> None:
-        """Reset fusion reward counters/accounting at episode (attempt) start."""
-        self._fusion_reward_total = 0.0
-        self._fusion_reward_positive_total = 0.0
-        self._fusion_reward_capped = False
-        self._fusion_reward_component_totals: Dict[str, float] = {
-            name: 0.0 for name in self._FUSION_REWARD_COMPONENT_NAMES
-        }
-        self._fusion_last_reward_delta = 0.0
-        self._fusion_last_reward_reason = ""
-        self._fusion_last_usefulness_bonus = 0.0
-        self._fusion_last_source = ""
-        self._recent_fusion_attempts: Deque[Tuple[int, int, int, str, int]] = deque(maxlen=20)
-        self._fusion_event_counter = 0
-        self._fusion_pipeline_epoch = int(getattr(self, "_fusion_pipeline_epoch", 0)) + 1
-        self._fusion_pipeline_event_counter = 0
-        self._fusion_accounted_event_ids: set[str] = set()
-        self._fusion_reward_accounted_event_ids: set[str] = set()
-        self._fusion_recipes_seen_episode: set[str] = set()
-        self._fusion_recipe_counts_episode: Counter[str] = Counter()
-
-    def _record_fusion_reward_component(self, name: str, value: float) -> None:
-        """Track a fusion reward component contribution for diagnostics/metrics."""
-        if not value:
-            return
-        totals = getattr(self, "_fusion_reward_component_totals", None)
-        if isinstance(totals, dict) and name in totals:
-            totals[name] = float(totals.get(name, 0.0)) + float(value)
-
-    def _apply_fusion_reward_cap(self, positive_delta: float) -> float:
-        """Cap cumulative positive fusion reward per episode; return the allowed amount."""
-        cap = float(getattr(self.config.reward, "max_fusion_reward_per_episode", 0.0) or 0.0)
-        if positive_delta <= 0.0:
-            return 0.0
-        if cap <= 0.0:
-            self._fusion_reward_positive_total += positive_delta
-            return positive_delta
-        remaining = max(0.0, cap - float(getattr(self, "_fusion_reward_positive_total", 0.0)))
-        allowed = min(positive_delta, remaining)
-        self._fusion_reward_positive_total = float(getattr(self, "_fusion_reward_positive_total", 0.0)) + allowed
-        if allowed < positive_delta - 1e-9 or self._fusion_reward_positive_total >= cap - 1e-9:
-            self._fusion_reward_capped = True
-        return allowed
-
-    def _is_fusion_spam(self, row: int, col: int, seed_slot: int, reason: str) -> bool:
-        """Detect repeated low-value/rejected fusion attempts in the recent window."""
-        recent = getattr(self, "_recent_fusion_attempts", None)
-        if not recent:
-            return False
-        key = (int(row), int(col), int(seed_slot), str(reason or "failed"))
-        same_rejection = sum(
-            1
-            for (r, c, s, prior_reason, _step) in recent
-            if (r, c, s, prior_reason) == key
-        )
-        recent_rejections = sum(1 for (_r, _c, _s, rs, _step) in recent if rs)
-        if same_rejection >= 1:
-            return True
-        if reason and recent_rejections >= 3:
-            return True
-        return False
-
-    def _fusion_usefulness_bonus(
-        self,
-        row: int,
-        col: int,
-        existing_plant: int,
-        selected_plant: int,
-        result: Dict[str, Any],
-        observation: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, float]:
-        """Estimate whether a successful fusion was strategically useful.
-
-        Returns a dict of {component_name: bonus_value}. Uses existing row
-        diagnostics (threat rows, shooter counts, lane danger); intentionally
-        simple to avoid over-fitting the reward.
-        """
-        del existing_plant, selected_plant, result
-        cfg = self.config.reward
-        obs = observation if isinstance(observation, dict) else {}
-        bonuses: Dict[str, float] = {}
-        if not (0 <= int(row) < max(1, self._row_count(obs))):
-            return bonuses
-        threat_rows = set(self._active_threat_rows(obs))
-        in_threatened_row = int(row) in threat_rows
-        if in_threatened_row:
-            bonuses["fusion_threatened_row_bonus"] = float(cfg.fusion_threatened_row_bonus)
-        zombies_active = self._row_has_active_zombies(obs, int(row)) or int(obs.get("zombieCount", 0) or 0) > 0
-        if zombies_active:
-            bonuses["fusion_active_wave_bonus"] = float(cfg.fusion_active_wave_bonus)
-        shooters = self._shooter_counts_by_row(obs).get(int(row), 0)
-        wallnuts = self._wallnut_blocker_count(obs, int(row))
-        weakly_defended = (shooters + wallnuts) <= 1
-        if in_threatened_row and weakly_defended:
-            bonuses["fusion_defensive_value_bonus"] = float(cfg.fusion_defensive_value_bonus)
-        return bonuses
-
-    def _row_has_active_zombies(self, observation: Dict[str, Any], row: int) -> bool:
-        for zombie in observation.get("zombies", []) or []:
-            if not isinstance(zombie, dict):
-                continue
-            if self._safe_int(zombie.get("row"), default=-1) == int(row) and bool(zombie.get("alive", True)):
-                return True
-        for lane in observation.get("lanes", []) or []:
-            if isinstance(lane, dict) and self._safe_int(lane.get("row"), default=-1) == int(row):
-                if self._safe_int(lane.get("zombieCount"), default=0) > 0:
-                    return True
-        return False
-
-    def _compute_fusion_reward(self, fusion_event: Dict[str, Any]) -> float:
-        """Compute shaped reward for a fusion event and update reward accounting.
-
-        Reward is only awarded for a confirmed, board-changing fusion. Illegal /
-        incompatible / empty / failed / bridge-error events receive (modest)
-        penalties only. Positive reward is capped per episode.
-        """
-        if not isinstance(fusion_event, dict):
-            return 0.0
-        cfg = self.config.reward
-        row = self._safe_int(fusion_event.get("row"), default=-1)
-        col = self._safe_int(fusion_event.get("col"), default=-1)
-        seed_slot = self._safe_int(fusion_event.get("seed_slot"), default=-1)
-        success = bool(fusion_event.get("success"))
-        legal = bool(fusion_event.get("legal", success))
-        attempted = bool(fusion_event.get("attempted", success))
-        board_changed = bool(fusion_event.get("board_changed", success))
-        reason = str(fusion_event.get("reason") or "")
-        source = str(fusion_event.get("source") or "model")
-        observation = fusion_event.get("observation") if isinstance(fusion_event.get("observation"), dict) else {}
-        self._fusion_last_source = source
-        self._fusion_last_usefulness_bonus = 0.0
-
-        confirmed_success = bool(success and legal and board_changed)
-        bad_reason = reason or ("no_board_change" if success and not board_changed else "failed")
-        spam_reasons = {
-            FUSION_ILLEGAL_INCOMPATIBLE,
-            "empty_tile",
-            "exception",
-            "bridge_error",
-            "fusion_bridge_unavailable",
-            "fusion_probe_failed",
-            "fusion_no_effect",
-            "no_board_change",
-            "failed",
-        }
-        spam = bool(not confirmed_success and bad_reason in spam_reasons and self._is_fusion_spam(
-            row, col, seed_slot, bad_reason
-        ))
-        self._recent_fusion_attempts.append(
-            (row, col, seed_slot, "" if confirmed_success else bad_reason, self._fusion_event_counter)
-        )
-        self._fusion_event_counter += 1
-
-        positive = 0.0
-        negative = 0.0
-        positive_components: List[Tuple[str, float]] = []
-        reasons: List[str] = []
-
-        if legal and attempted:
-            value = float(cfg.fusion_attempt_reward)
-            positive += value
-            positive_components.append(("fusion_attempt_reward", value))
-
-        if confirmed_success:
-            value = float(cfg.fusion_success_reward)
-            positive += value
-            positive_components.append(("fusion_success_reward", value))
-            existing_plant = self._safe_int(fusion_event.get("existing_plant"), default=-1)
-            selected_seed = self._safe_int(fusion_event.get("selected_seed"), default=-1)
-            recipe_key = f"{fusion_plant_name(selected_seed)} + {fusion_plant_name(existing_plant)}"
-            prior_recipe_count = int(self._fusion_recipe_counts_episode.get(recipe_key, 0))
-            new_recipe_episode = recipe_key not in self._fusion_recipes_seen_episode
-            new_recipe_run = recipe_key not in self._fusion_recipes_seen_run
-            self._fusion_recipe_counts_episode[recipe_key] += 1
-            self._fusion_recipes_seen_episode.add(recipe_key)
-            self._fusion_recipes_seen_run.add(recipe_key)
-            result_payload = fusion_event.get("result") if isinstance(fusion_event.get("result"), dict) else {}
-            resulting_plant = result_payload.get("resultingPlantAfter") if isinstance(result_payload.get("resultingPlantAfter"), dict) else {}
-            candidate = result_payload.get("fusionCandidate") if isinstance(result_payload.get("fusionCandidate"), dict) else {}
-            result_type = self._safe_int(
-                resulting_plant.get("plantType"),
-                resulting_plant.get("type"),
-                candidate.get("predicted_result_type"),
-                default=-1,
-            )
-            result_tier = fusion_tier(result_type)
-            recursive = fusion_tier(existing_plant) > 0
-
-            if self.config.enable_recipe_discovery_reward and new_recipe_episode:
-                value = float(cfg.fusion_new_recipe_reward)
-                positive += value
-                positive_components.append(("fusion_new_recipe_reward", value))
-                reasons.append("new_recipe_episode")
-                if new_recipe_run:
-                    reasons.append("new_recipe_run")
-            if self.config.enable_fusion_chain_rewards and recursive:
-                value = float(cfg.fusion_recursive_reward)
-                positive += value
-                positive_components.append(("fusion_recursive_reward", value))
-                reasons.append("recursive")
-            if self.config.enable_fusion_chain_rewards and result_tier >= 2:
-                value = float(cfg.fusion_tier3_reward if result_tier >= 3 else cfg.fusion_tier2_reward)
-                positive += value
-                positive_components.append(("fusion_tier_reward", value))
-                reasons.append(f"tier_{result_tier}")
-            bonuses = self._fusion_usefulness_bonus(
-                row,
-                col,
-                self._safe_int(fusion_event.get("existing_plant"), default=-1),
-                self._safe_int(fusion_event.get("selected_seed"), default=-1),
-                fusion_event.get("result") if isinstance(fusion_event.get("result"), dict) else {},
-                observation,
-            )
-            for name, value in bonuses.items():
-                positive += float(value)
-                positive_components.append((name, float(value)))
-            if self.config.enable_repeat_recipe_decay and prior_recipe_count >= 2 and positive > 0.0:
-                multiplier = max(0.0, min(1.0, float(cfg.fusion_repeat_reward_multiplier)))
-                reduced_positive = positive * multiplier
-                decay = reduced_positive - positive
-                positive_components = [(name, value * multiplier) for name, value in positive_components]
-                negative += decay
-                self._record_fusion_reward_component("fusion_repeat_decay", decay)
-                positive = reduced_positive
-                reasons.append("repeat_decay")
-            reasons.append("success")
-        else:
-            penalty_reason = reason or ("failed" if not success else "fusion_no_effect")
-            if penalty_reason == FUSION_ILLEGAL_INCOMPATIBLE:
-                negative += float(cfg.fusion_incompatible_penalty)
-                self._record_fusion_reward_component("fusion_incompatible_penalty", cfg.fusion_incompatible_penalty)
-            elif penalty_reason == "empty_tile":
-                negative += float(cfg.fusion_empty_tile_penalty)
-                self._record_fusion_reward_component("fusion_empty_tile_penalty", cfg.fusion_empty_tile_penalty)
-            elif penalty_reason in {"exception", "bridge_error", "fusion_bridge_unavailable", "fusion_probe_failed"}:
-                negative += float(cfg.fusion_bridge_error_penalty)
-                self._record_fusion_reward_component("fusion_bridge_error_penalty", cfg.fusion_bridge_error_penalty)
-            elif penalty_reason in {
-                "cooldown_not_ready",
-                "insufficient_sun",
-                "fusion_disabled",
-                "seed_unavailable",
-                "fusion_policy_none",
-                "fusion_not_available",
-                "target_not_available",
-                "gameplay_not_ready",
-                "not_gameplay",
-                "seed_selection_active",
-                "terminal_or_transition_state",
-                "reward_or_unlock_screen_active",
-                "startup_stale_command_blocked",
-                "coach_command_already_executed",
-            }:
-                # Pre-condition blocks are not the model's fault: no penalty, no reward.
-                penalty_reason = ""
-            else:
-                negative += float(cfg.fusion_failed_penalty)
-                self._record_fusion_reward_component("fusion_failed_penalty", cfg.fusion_failed_penalty)
-            if penalty_reason:
-                reasons.append(penalty_reason)
-
-        if spam:
-            negative += float(cfg.fusion_spam_penalty)
-            self._record_fusion_reward_component("fusion_spam_penalty", cfg.fusion_spam_penalty)
-            reasons.append("spam")
-
-        capped_positive = self._apply_fusion_reward_cap(positive)
-        remaining_positive = capped_positive
-        for name, raw_value in positive_components:
-            applied_value = min(max(0.0, raw_value), max(0.0, remaining_positive))
-            if applied_value > 0.0:
-                self._record_fusion_reward_component(name, applied_value)
-                if name in {
-                    "fusion_threatened_row_bonus",
-                    "fusion_active_wave_bonus",
-                    "fusion_defensive_value_bonus",
-                }:
-                    self._fusion_last_usefulness_bonus += applied_value
-                remaining_positive -= applied_value
-        net = capped_positive + negative
-        self._fusion_reward_total = float(getattr(self, "_fusion_reward_total", 0.0)) + net
-        self._fusion_last_reward_delta = net
-        self._fusion_last_reward_reason = ",".join(reasons)
-        return net
-
-    def _fusion_source_from_result(self, action_result: Dict[str, Any]) -> str:
-        intent_source = str(action_result.get("fusionIntentSource") or action_result.get("fusion_intent_source") or "")
-        if intent_source:
-            return normalize_fusion_source(intent_source)
-        source = str(action_result.get("fusionExecutionSource") or "")
-        if source == "model_action_mask":
-            return "model"
-        coach_payload = action_result.get("humanCoach") if isinstance(action_result.get("humanCoach"), dict) else {}
-        coach_source = str(
-            action_result.get("coach_command_source")
-            or action_result.get("coachCommandSource")
-            or coach_payload.get("source")
-            or ""
-        )
-        coach_mode = str(coach_payload.get("commandMode") or coach_payload.get("command_mode") or "")
-        if coach_mode == "assist":
-            return "assist"
-        if coach_source in {"human", "gui", "human_coach"}:
-            return "human_coach"
-        if coach_source in {"stream", "stream_coach"}:
-            return "stream_coach"
-        if action_result.get("coachFusionOverrideApplied") is not None or action_result.get("executed_from_fresh_coach_command"):
-            return "human_coach"
-        if isinstance(action_result.get("fusionCandidate"), dict) and "fusionOverrideApplied" in action_result:
-            return "scripted"
-        return source or "model"
-
-    def _fusion_event_from_action_result(
-        self,
-        action_result: Optional[Dict[str, Any]],
-        observation: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if not isinstance(action_result, dict):
-            return None
-        decoded = action_result.get("decoded") if isinstance(action_result.get("decoded"), dict) else {}
-        candidate = action_result.get("fusionCandidate") if isinstance(action_result.get("fusionCandidate"), dict) else {}
-        is_fusion = (
-            "fusionSucceeded" in action_result
-            or "fusionAttempted" in action_result
-            or "fusion_success" in action_result
-            or bool(action_result.get("fusionExecutionSource"))
-            or str(decoded.get("kind") or "") == "fusion"
-            or bool(candidate)
-            or bool(action_result.get("fusionRejectedReason"))
-        )
-        if not is_fusion:
-            return None
-        success = bool(action_result.get("fusionSucceeded") or action_result.get("fusion_success"))
-        legal = bool(candidate.get("fusion_legal", success))
-        bridge_method = str(action_result.get("bridgeMethodUsed") or action_result.get("bridge_method_used") or "")
-        attempted = bool(
-            success
-            or action_result.get("fusionAttempted")
-            or (bridge_method and bridge_method != "none")
-        )
-        changed = self._safe_int(action_result.get("changedTileCount"), action_result.get("changed_tile_count"), default=(1 if success else 0))
-        reason = "" if success else str(
-            action_result.get("fusionRejectedReason")
-            or action_result.get("illegalReason")
-            or action_result.get("bridgeResultReason")
-            or "failed"
-        )
-        if reason in {FUSION_ILLEGAL_INCOMPATIBLE, "empty_tile"}:
-            legal = False
-        return {
-            "source": self._fusion_source_from_result(action_result),
-            "success": success,
-            "legal": legal,
-            "attempted": attempted,
-            "board_changed": success and changed > 0,
-            "reason": reason,
-            "row": self._safe_int(decoded.get("row"), action_result.get("sourceRow"), candidate.get("source_row"), default=-1),
-            "col": self._safe_int(decoded.get("column"), action_result.get("sourceCol"), candidate.get("source_col"), default=-1),
-            "existing_plant": self._safe_int(decoded.get("sourcePlantType"), action_result.get("sourcePlantType"), candidate.get("source_plant_type"), default=-1),
-            "selected_seed": self._safe_int(decoded.get("ingredientPlantType"), action_result.get("ingredientPlantType"), candidate.get("target_or_ingredient_type"), default=-1),
-            "seed_slot": self._safe_int(candidate.get("ingredient_seed_slot_index"), action_result.get("ingredientSeedSlotIndex"), default=-1),
-            "result": action_result,
-            "observation": observation if isinstance(observation, dict) else {},
-        }
-
-    def _compute_step_fusion_reward(
-        self,
-        observation: Optional[Dict[str, Any]],
-        action_result: Optional[Dict[str, Any]],
-    ) -> float:
-        fusion_event = self._fusion_event_from_action_result(action_result, observation)
-        if fusion_event is None:
-            return 0.0
-        event_id = str((action_result or {}).get("fusionEventId") or (action_result or {}).get("fusion_event_id") or "")
-        if event_id:
-            accounted = getattr(self, "_fusion_reward_accounted_event_ids", None)
-            if not isinstance(accounted, set):
-                accounted = set()
-                self._fusion_reward_accounted_event_ids = accounted
-            if event_id in accounted:
-                if isinstance(action_result, dict):
-                    action_result["fusionRewardDuplicateSuppressed"] = True
-                return 0.0
-            accounted.add(event_id)
-        reward_delta = self._compute_fusion_reward(fusion_event)
-        if isinstance(action_result, dict) and event_id:
-            action_result["fusionRewardApplied"] = True
-            action_result["fusionRewardDelta"] = float(reward_delta)
-        return reward_delta
 
     def _fusion_reward_live_fields(self) -> Dict[str, Any]:
-        """Cumulative per-episode fusion reward accounting for diagnostics/metrics."""
-        totals = getattr(self, "_fusion_reward_component_totals", {}) or {}
-        return {
-            "fusion_reward_total": round(float(getattr(self, "_fusion_reward_total", 0.0)), 6),
-            "fusion_attempt_reward_total": round(float(totals.get("fusion_attempt_reward", 0.0)), 6),
-            "fusion_success_reward_total": round(float(totals.get("fusion_success_reward", 0.0)), 6),
-            "fusion_new_recipe_reward_total": round(float(totals.get("fusion_new_recipe_reward", 0.0)), 6),
-            "fusion_recursive_reward_total": round(float(totals.get("fusion_recursive_reward", 0.0)), 6),
-            "fusion_tier_reward_total": round(float(totals.get("fusion_tier_reward", 0.0)), 6),
-            "fusion_repeat_decay_total": round(float(totals.get("fusion_repeat_decay", 0.0)), 6),
-            "fusion_threatened_row_bonus_total": round(float(totals.get("fusion_threatened_row_bonus", 0.0)), 6),
-            "fusion_active_wave_bonus_total": round(float(totals.get("fusion_active_wave_bonus", 0.0)), 6),
-            "fusion_defensive_value_bonus_total": round(float(totals.get("fusion_defensive_value_bonus", 0.0)), 6),
-            "fusion_incompatible_penalty_total": round(float(totals.get("fusion_incompatible_penalty", 0.0)), 6),
-            "fusion_empty_tile_penalty_total": round(float(totals.get("fusion_empty_tile_penalty", 0.0)), 6),
-            "fusion_failed_penalty_total": round(float(totals.get("fusion_failed_penalty", 0.0)), 6),
-            "fusion_bridge_error_penalty_total": round(float(totals.get("fusion_bridge_error_penalty", 0.0)), 6),
-            "fusion_spam_penalty_total": round(float(totals.get("fusion_spam_penalty", 0.0)), 6),
-            "fusion_reward_capped": bool(getattr(self, "_fusion_reward_capped", False)),
-            "fusion_last_reward_delta": round(float(getattr(self, "_fusion_last_reward_delta", 0.0)), 6),
-            "fusion_last_reward_reason": str(getattr(self, "_fusion_last_reward_reason", "")),
-            "fusion_last_usefulness_bonus": round(float(getattr(self, "_fusion_last_usefulness_bonus", 0.0)), 6),
-            "fusion_last_source": str(getattr(self, "_fusion_last_source", "")),
-        }
+        return fusion_reward_live_fields(self._reward_state.fusion)
 
     def _coach_command_id_from_bridge_command(self, coach_bridge_command: Dict[str, Any]) -> Optional[int]:
         try:
@@ -5175,22 +4608,81 @@ class PvZGymEnv:
             terminal_reason: str = "game_over_restart_screen",
             done_reason: Optional[str] = None,
             adventure_state: Optional[Dict[str, Any]] = None,
+            *,
+            executed: bool = False,
+            decision: Optional[ActionDecision] = None,
+            previous_facts: Optional[StepFacts] = None,
+            current_facts: Optional[StepFacts] = None,
+            previous_legal_actions: Optional[List[int]] = None,
+            fusion_diagnostics: Optional[Dict[str, Any]] = None,
+            pre_step_mask_blocked_action: bool = False,
         ) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
             attach_structured_action_result(
                 observation,
                 action_result,
-                executed=False,
+                decision=decision,
+                executed=executed,
             )
-            reward_events: Dict[str, Any] = {}
-            reward_breakdown = self.compute_reward_breakdown(
-                self.previous_observation,
+            previous_observation = self.previous_observation
+            prior_snapshot = previous_facts or (
+                self._step_facts_cache.get(
+                    previous_observation,
+                    self.config.plant_types,
+                )
+                if isinstance(previous_observation, dict)
+                else None
+            )
+            next_snapshot = current_facts or (
+                prior_snapshot
+                if previous_observation is observation and prior_snapshot is not None
+                else self._step_facts_cache.get(observation, self.config.plant_types)
+            )
+            prior_legal = (
+                list(previous_legal_actions)
+                if previous_legal_actions is not None
+                else self.legal_actions(
+                    previous_observation,
+                    facts=prior_snapshot,
+                )
+                if isinstance(previous_observation, dict)
+                else []
+            )
+            reward_result = reward_action_result or action_result
+            classified_reason = classify_done_reason(observation)
+            terminal_reward_override: Optional[float] = None
+            if done_reason == "post_win_pending":
+                # This restart UI belongs to a win that was already accounted
+                # for by the Adventure progression owner.
+                terminal_reward_override = 0.0
+            elif done_reason == "win" or (not done_reason and classified_reason == "win"):
+                terminal_reward_override = float(self.config.reward.win_reward)
+            elif done_reason == "loss" or (not done_reason and classified_reason == "loss"):
+                terminal_reward_override = -float(self.config.reward.loss_penalty)
+            reward_composition = self._compose_step_reward(
+                previous_observation,
                 observation,
-                reward_action_result or action_result,
-                event_diagnostics=reward_events,
+                reward_result,
+                terminal_reward_override=terminal_reward_override,
+                previous_facts=prior_snapshot,
+                current_facts=next_snapshot,
+                previous_legal_actions=prior_legal,
             )
-            reward = reward_breakdown["reward_total"]
+            if reward_result is not action_result:
+                action_result.update(reward_composition.annotations_dict())
+            reward_events = reward_composition.diagnostics_dict()
+            reward_breakdown = reward_composition.breakdown.to_dict()
+            reward = float(reward_breakdown["reward_total"])
+            resolved_fusion_diagnostics = (
+                fusion_diagnostics
+                if isinstance(fusion_diagnostics, dict)
+                else action_result.get("fusionDiagnostics")
+                if isinstance(action_result.get("fusionDiagnostics"), dict)
+                else None
+            )
+            if resolved_fusion_diagnostics is not None:
+                resolved_fusion_diagnostics.update(self._fusion_reward_live_fields())
             legal_started = time.perf_counter()
-            legal = self.legal_actions(observation)
+            legal = self.legal_actions(observation, facts=next_snapshot)
             legal_ms = round((time.perf_counter() - legal_started) * 1000.0, 3)
             info: Dict[str, Any] = {
                 "action_result": action_result,
@@ -5200,19 +4692,32 @@ class PvZGymEnv:
                 "needs_reset": True,
                 "legal_actions": legal,
                 "bridge_legal_actions": self.bridge_legal_actions(observation),
-                "pre_step_mask_blocked_action": False,
+                "pre_step_mask_blocked_action": bool(pre_step_mask_blocked_action),
             }
+            if resolved_fusion_diagnostics is not None:
+                info["fusion_diagnostics"] = resolved_fusion_diagnostics
+                info.update(
+                    fusion_live_fields(
+                        resolved_fusion_diagnostics,
+                        self.config.fusion_policy,
+                    )
+                )
             if done_reason:
                 info["done_reason"] = done_reason
             if adventure_state is not None:
                 info["adventure_state"] = adventure_state
-            info["mask_diagnostics"] = self.mask_diagnostics(observation)
+            mask_diag = self.mask_diagnostics(observation, facts=next_snapshot)
+            info["mask_diagnostics"] = mask_diag
             info["lane_diagnostics"] = self.lane_diagnostics(
-                self.previous_observation,
+                previous_observation,
                 observation,
                 action_result,
                 legal,
                 cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
+                previous_facts=prior_snapshot,
+                current_facts=next_snapshot,
+                previous_legal_actions=prior_legal,
+                mask_diagnostics_snapshot=mask_diag,
             )
             if self.config.debug_performance:
                 info["performance"] = {
@@ -5233,6 +4738,8 @@ class PvZGymEnv:
             return observation, reward, True, False, info
 
         interval = max(0, int(self.config.seed_screen_check_interval))
+        reward_previous_observation = self.previous_observation
+        reward_previous_facts: Optional[StepFacts] = None
         pre_observation = self.previous_observation or self.observe()
         if is_restart_screen_observation(pre_observation):
             override_reason, adventure_state = self._adventure_terminal_override()
@@ -5271,6 +4778,14 @@ class PvZGymEnv:
             or (interval > 0 and self._steps_since_seed_screen_check >= interval)
         )
         if needs_seed_screen_check:
+            if isinstance(reward_previous_observation, dict):
+                # Capture the prior owner before the forced probe advances the
+                # execution frame.  On normal steps this is a zero-hash known-
+                # owner reuse; on externally injected state it builds once.
+                reward_previous_facts = self._step_facts_cache.get_known(
+                    reward_previous_observation,
+                    self.config.plant_types,
+                )
             pre_observation = self.observe(force_seed_probe=True)
             self._steps_since_seed_screen_check = 0
             if is_restart_screen_observation(pre_observation):
@@ -5291,6 +4806,7 @@ class PvZGymEnv:
                         terminal_reason=override_reason,
                         done_reason="post_win_pending",
                         adventure_state=adventure_state,
+                        previous_facts=reward_previous_facts,
                     )
                 action_result = {
                     "action": int(action),
@@ -5301,12 +4817,23 @@ class PvZGymEnv:
                     "cooldownStarted": False,
                     "observation": pre_observation,
                 }
-                return restart_terminal_return(pre_observation, action_result)
+                return restart_terminal_return(
+                    pre_observation,
+                    action_result,
+                    previous_facts=reward_previous_facts,
+                )
         requested_action = int(action)
         coach_bridge_payload = dict(coach_bridge_command) if isinstance(coach_bridge_command, dict) else None
         coach_context_payload = dict(coach_context) if isinstance(coach_context, dict) else None
         executed_action = requested_action
-        pre_step_mask = self.action_mask(pre_observation)
+        pre_step_facts = self._step_facts_cache.get(
+            pre_observation,
+            self.config.plant_types,
+        )
+        pre_step_mask = self.action_mask(pre_observation, facts=pre_step_facts)
+        pre_step_legal_actions = [
+            index for index, allowed in enumerate(pre_step_mask) if bool(allowed)
+        ]
         decision_source = str((coach_context_payload or {}).get("source") or action_source or "direct")
         decision_metadata = dict(action_source_metadata or {})
         if coach_context_payload:
@@ -5318,11 +4845,17 @@ class PvZGymEnv:
             source_metadata=decision_metadata,
             bridge_command=coach_bridge_payload,
             intent=action_intent,
+            facts=pre_step_facts,
         )
         pre_step_mask_blocked = bool(requested_action != 0 and not pre_step_decision.legal)
         pre_step_audit: Dict[str, Any] = {}
         if pre_step_mask_blocked:
-            pre_step_audit = self.action_legality_audit(requested_action, pre_observation, pre_step_mask)
+            pre_step_audit = self.action_legality_audit(
+                requested_action,
+                pre_observation,
+                pre_step_mask,
+                facts=pre_step_facts,
+            )
             executed_action = 0
 
         fusion_diagnostics = self._fusion_diagnostics_for_step(pre_observation)
@@ -5350,11 +4883,35 @@ class PvZGymEnv:
                 executed_action,
                 len(pre_step_mask),
             )
+        if isinstance(reward_previous_observation, dict):
+            if reward_previous_observation is pre_observation:
+                reward_previous_facts = pre_step_facts
+                reward_previous_legal_actions = pre_step_legal_actions
+            else:
+                # A forced seed probe may refresh execution state without
+                # advancing the reward owner.  Keep the stored observation,
+                # its facts, and its legal actions as one coherent snapshot.
+                if reward_previous_facts is None:
+                    reward_previous_facts = build_step_facts(
+                        reward_previous_observation,
+                        self.config.plant_types,
+                    )
+                reward_previous_legal_actions = self.legal_actions(
+                    reward_previous_observation,
+                    facts=reward_previous_facts,
+                )
+        else:
+            reward_previous_facts = None
+            reward_previous_legal_actions = []
         try:
             action_result = fusion_action_result or self.client.request("step", action=executed_action, return_observation=False)
         except BridgeTimeoutError as exc:
             observation = pre_observation if isinstance(pre_observation, dict) else {}
-            legal = self.legal_actions(observation) if observation else [0]
+            legal = (
+                list(pre_step_legal_actions)
+                if observation
+                else [0]
+            )
             bridge_event = {
                 "event": "bridge_timeout",
                 "command": exc.command,
@@ -5394,17 +4951,18 @@ class PvZGymEnv:
                 decision=pre_step_decision,
                 executed=True,
             )
-            reward_events: Dict[str, Any] = {}
-            reward_breakdown = self.compute_reward_breakdown(
-                self.previous_observation,
+            reward_composition = self._compose_step_reward(
+                reward_previous_observation,
                 observation,
                 action_result,
-                event_diagnostics=reward_events,
+                exceptional_adjustments={"env_corruption_penalty": -10.0},
+                previous_facts=reward_previous_facts,
+                current_facts=pre_step_facts,
+                previous_legal_actions=reward_previous_legal_actions,
             )
-            penalty = 10.0
-            reward = float(reward_breakdown.get("reward_total", 0.0)) - penalty
-            reward_breakdown["reward_total"] = reward
-            reward_breakdown["env_corruption_penalty"] = -penalty
+            reward_events = reward_composition.diagnostics_dict()
+            reward_breakdown = reward_composition.breakdown.to_dict()
+            reward = float(reward_breakdown["reward_total"])
             info = {
                 "action_result": action_result,
                 "reward_breakdown": reward_breakdown,
@@ -5422,13 +4980,22 @@ class PvZGymEnv:
                 "safety_events": [bridge_event],
                 "fusion_diagnostics": fusion_diagnostics,
             }
-            info["mask_diagnostics"] = self.mask_diagnostics(observation) if observation else {}
+            mask_diag = (
+                self.mask_diagnostics(observation, facts=pre_step_facts)
+                if observation
+                else {}
+            )
+            info["mask_diagnostics"] = mask_diag
             info["lane_diagnostics"] = self.lane_diagnostics(
-                self.previous_observation,
+                reward_previous_observation,
                 observation,
                 action_result,
                 legal,
                 cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
+                previous_facts=reward_previous_facts,
+                current_facts=pre_step_facts,
+                previous_legal_actions=reward_previous_legal_actions,
+                mask_diagnostics_snapshot=mask_diag,
             ) if observation else {}
             self.previous_observation = observation
             self._steps_since_seed_screen_check = self.config.seed_screen_check_interval
@@ -5456,6 +5023,10 @@ class PvZGymEnv:
         observation = action_result.get("observation") if isinstance(action_result, dict) else None
         if not isinstance(observation, dict):
             observation = self.observe()
+        current_step_facts = self._step_facts_cache.get(
+            observation,
+            self.config.plant_types,
+        )
         if isinstance(action_result, dict):
             audit_action = requested_action if pre_step_mask_blocked else executed_action
             if action_result.get("illegalAction") or pre_step_mask_blocked:
@@ -5465,6 +5036,7 @@ class PvZGymEnv:
                     pre_step_mask,
                     after=observation,
                     action_result=action_result,
+                    facts=pre_step_facts,
                 )
         self._steps_since_seed_screen_check += 1
         if is_restart_screen_observation(observation):
@@ -5479,8 +5051,25 @@ class PvZGymEnv:
                     terminal_reason=override_reason,
                     done_reason="post_win_pending",
                     adventure_state=adventure_state,
+                    executed=True,
+                    decision=pre_step_decision,
+                    previous_facts=reward_previous_facts,
+                    current_facts=current_step_facts,
+                    previous_legal_actions=reward_previous_legal_actions,
+                    fusion_diagnostics=fusion_diagnostics,
+                    pre_step_mask_blocked_action=pre_step_mask_blocked,
                 )
-            return restart_terminal_return(observation, action_result)
+            return restart_terminal_return(
+                observation,
+                action_result,
+                executed=True,
+                decision=pre_step_decision,
+                previous_facts=reward_previous_facts,
+                current_facts=current_step_facts,
+                previous_legal_actions=reward_previous_legal_actions,
+                fusion_diagnostics=fusion_diagnostics,
+                pre_step_mask_blocked_action=pre_step_mask_blocked,
+            )
         if observation.get("seedSelectionActive") or not observation.get("gameplayReady"):
             self._steps_since_seed_screen_check = interval
         safety_diagnostics = self._environment_safety_diagnostics(
@@ -5488,6 +5077,8 @@ class PvZGymEnv:
             observation,
             action_result,
             requested_action,
+            previous_facts=pre_step_facts,
+            current_facts=current_step_facts,
         )
         for event in safety_diagnostics.get("safety_events", []) or []:
             event_name = event.get("event")
@@ -5501,22 +5092,8 @@ class PvZGymEnv:
             ):
                 print(f"[corruption] {event_name}: {event}")
         reward_events: Dict[str, Any] = {}
-        reward_breakdown = self.compute_reward_breakdown(
-            self.previous_observation,
-            observation,
-            action_result,
-            event_diagnostics=reward_events,
-        )
-        # Shaped fusion reward is computed once here (not inside compute_reward_breakdown,
-        # which is side-effect free and may run on non-step paths). Covers every fusion
-        # source because model/coach/scripted fusions all surface as this step's action_result.
-        fusion_reward_delta = self._compute_step_fusion_reward(self.previous_observation, action_result)
-        if fusion_reward_delta:
-            reward_breakdown["fusion_reward"] = float(reward_breakdown.get("fusion_reward", 0.0)) + fusion_reward_delta
-            reward_breakdown["reward_total"] = float(reward_breakdown.get("reward_total", 0.0)) + fusion_reward_delta
-        if isinstance(fusion_diagnostics, dict):
-            fusion_diagnostics.update(self._fusion_reward_live_fields())
-        reward = reward_breakdown["reward_total"]
+        terminal_reward_override: Optional[float] = None
+        exceptional_reward_adjustments: Dict[str, float] = {}
         done = bool(observation.get("done", False))
         terminal_hint = str(observation.get("terminalHint") or "")
         done_reason_override: Optional[str] = None
@@ -5528,7 +5105,7 @@ class PvZGymEnv:
         ):
             if self._is_fixed_level_mode() and self._is_confirmed_possible_win(observation):
                 self._possible_win_pending_steps += 1
-                self._append_safety_event(
+                append_safety_event(
                     safety_diagnostics.setdefault("safety_events", []),
                     "fixed_level_possible_win_confirmation",
                     observation,
@@ -5543,12 +5120,14 @@ class PvZGymEnv:
                 done = False
                 done_reason_override = "none"
                 terminal_reason_override = ""
+                terminal_reward_override = 0.0
                 if self._possible_win_pending_steps in {1, 2, 5} or self._possible_win_pending_steps % 20 == 0:
                     print(self._format_safety_context("[terminal] fixed-level possible_win observed; waiting for explicit terminal UI", observation))
             else:
                 self._possible_win_pending_steps += 1
                 done = False
-                self._append_safety_event(
+                terminal_reward_override = 0.0
+                append_safety_event(
                     safety_diagnostics.setdefault("safety_events", []),
                     "suspicious_screen_state_transition",
                     observation,
@@ -5573,7 +5152,7 @@ class PvZGymEnv:
             done = False
             done_reason_override = "none"
             terminal_reason_override = ""
-            self._append_safety_event(
+            append_safety_event(
                 safety_diagnostics.setdefault("safety_events", []),
                 "loss_waiting_for_restart_screen",
                 observation,
@@ -5601,7 +5180,7 @@ class PvZGymEnv:
                 done = True
                 done_reason_override = "win"
                 terminal_reason_override = "fixed_level_win_transition"
-                self._append_safety_event(
+                append_safety_event(
                     safety_events,
                     "win_transition_board_refresh_detected",
                     observation,
@@ -5619,20 +5198,37 @@ class PvZGymEnv:
                 )
             else:
                 penalty = float(safety_diagnostics.get("environment_corruption_penalty") or 10.0)
-                reward -= penalty
-                reward_breakdown["reward_total"] = reward
-                reward_breakdown["env_corruption_penalty"] = -penalty
+                exceptional_reward_adjustments["env_corruption_penalty"] = -penalty
                 done = True
                 done_reason_override = "env_corruption"
                 terminal_reason_override = "board_state_refreshed_during_gameplay"
-        if done_reason_override == "win":
-            win_reward = float(self.config.reward.win_reward)
-            reward += win_reward
-            reward_breakdown["reward_total"] = reward
-            reward_breakdown["win_loss_reward"] = win_reward
+        reward_done_reason = (
+            str(done_reason_override)
+            if done_reason_override not in {None, "none", ""}
+            else classify_done_reason(observation)
+        )
+        if done and reward_done_reason == "win":
+            terminal_reward_override = float(self.config.reward.win_reward)
+        elif done and reward_done_reason == "loss":
+            terminal_reward_override = -float(self.config.reward.loss_penalty)
+        reward_composition = self._compose_step_reward(
+            reward_previous_observation,
+            observation,
+            action_result,
+            terminal_reward_override=terminal_reward_override,
+            exceptional_adjustments=exceptional_reward_adjustments,
+            previous_facts=reward_previous_facts,
+            current_facts=current_step_facts,
+            previous_legal_actions=reward_previous_legal_actions,
+        )
+        reward_events.update(reward_composition.diagnostics_dict())
+        reward_breakdown = reward_composition.breakdown.to_dict()
+        reward = float(reward_breakdown["reward_total"])
+        if isinstance(fusion_diagnostics, dict):
+            fusion_diagnostics.update(self._fusion_reward_live_fields())
         truncated = False
         legal_started = time.perf_counter()
-        legal = self.legal_actions(observation)
+        legal = self.legal_actions(observation, facts=current_step_facts)
         legal_ms = round((time.perf_counter() - legal_started) * 1000.0, 3)
         info = {
             "action_result": action_result,
@@ -5665,13 +5261,18 @@ class PvZGymEnv:
                     f"wave={observation.get('wave')}/{observation.get('maxWave')} "
                     f"run_mode={self._run_mode()}"
                 )
-        info["mask_diagnostics"] = self.mask_diagnostics(observation)
+        mask_diag = self.mask_diagnostics(observation, facts=current_step_facts)
+        info["mask_diagnostics"] = mask_diag
         info["lane_diagnostics"] = self.lane_diagnostics(
-            self.previous_observation,
+            reward_previous_observation,
             observation,
             action_result,
             legal,
             cherry_delayed_diagnostics=reward_events.get("cherry_delayed"),
+            previous_facts=reward_previous_facts,
+            current_facts=current_step_facts,
+            previous_legal_actions=reward_previous_legal_actions,
+            mask_diagnostics_snapshot=mask_diag,
         )
         if self.config.debug_performance:
             info["performance"] = {
@@ -5705,341 +5306,78 @@ class PvZGymEnv:
         action_result: Optional[Dict[str, Any]] = None,
         *,
         event_diagnostics: Optional[Dict[str, Any]] = None,
+        previous_facts: Optional[StepFacts] = None,
+        current_facts: Optional[StepFacts] = None,
+        previous_legal_actions: Optional[List[int]] = None,
     ) -> Dict[str, float]:
-        components = {field: 0.0 for field in REWARD_COMPONENT_FIELDS}
-        components["reward_total"] = 0.0
-        if previous is None:
-            return components
+        """Compatibility adapter over the pure per-observation compositor."""
 
-        cfg = self.config.reward
-        kill_delta = max(0, int(current.get("killCount", 0)) - int(previous.get("killCount", 0)))
-        components["kill_reward"] = kill_delta * cfg.kill_reward
-        cherry_delayed_reward, cherry_delayed_wasted_penalty, cherry_delayed_diag = self._update_pending_cherry_events(kill_delta)
+        state = self._reward_state
+        legal_actions = (
+            list(previous_legal_actions)
+            if previous_legal_actions is not None
+            else self.legal_actions(previous) if isinstance(previous, dict) else []
+        )
+        composition = compose_environment_reward(
+            previous,
+            current,
+            action_result,
+            config=self.config.reward,
+            state=state,
+            plant_types=self.config.plant_types,
+            fallback_rows=self.config.row_count,
+            fallback_columns=self.config.column_count,
+            previous_legal_actions=legal_actions,
+            previous_facts=previous_facts,
+            current_facts=current_facts,
+        )
+        self._reward_state = composition.state
         if event_diagnostics is not None:
-            event_diagnostics["cherry_delayed"] = dict(cherry_delayed_diag)
-        components["cherrybomb_tactical_kill_reward"] += cherry_delayed_reward
-        components["cherrybomb_wasted_penalty"] += cherry_delayed_wasted_penalty
-        components["cherrybomb_kill_reward"] += int(cherry_delayed_diag.get("kills", 0) or 0) * cfg.cherrybomb_kill_reward
-        heavy_delayed = int(cherry_delayed_diag.get("buckethead", 0) or 0) + int(cherry_delayed_diag.get("conehead", 0) or 0)
-        components["cherrybomb_heavy_zombie_bonus"] += heavy_delayed * cfg.cherrybomb_heavy_zombie_bonus
-        components["cherrybomb_zero_kill_penalty"] += -int(cherry_delayed_diag.get("zero_kill", 0) or 0) * cfg.cherrybomb_zero_kill_penalty
-        components["wave_reward"] = (
-            max(0, int(current.get("wave", 0)) - int(previous.get("wave", 0)))
-            * cfg.wave_reward
+            event_diagnostics.update(composition.diagnostics_dict())
+        return composition.breakdown.to_dict()
+
+    def _compose_step_reward(
+        self,
+        previous: Optional[Dict[str, Any]],
+        current: Dict[str, Any],
+        action_result: Optional[Dict[str, Any]],
+        *,
+        terminal_reward_override: Optional[float] = None,
+        exceptional_adjustments: Optional[Dict[str, float]] = None,
+        previous_facts: Optional[StepFacts] = None,
+        current_facts: Optional[StepFacts] = None,
+        previous_legal_actions: Optional[List[int]] = None,
+    ) -> RewardComposition:
+        state = self._reward_state
+        legal_actions = (
+            list(previous_legal_actions)
+            if previous_legal_actions is not None
+            else self.legal_actions(previous) if isinstance(previous, dict) else []
         )
-
-        previous_health = int(previous.get("totalPlantHealth", 0))
-        current_health = int(current.get("totalPlantHealth", 0))
-        components["plant_health_loss_penalty"] = (
-            -max(0, previous_health - current_health) * cfg.plant_health_loss_penalty
+        composition = compose_step_reward(
+            previous,
+            current,
+            action_result,
+            config=self.config.reward,
+            state=state,
+            plant_types=self.config.plant_types,
+            fallback_rows=self.config.row_count,
+            fallback_columns=self.config.column_count,
+            previous_legal_actions=legal_actions,
+            previous_facts=previous_facts,
+            current_facts=current_facts,
+            enable_recipe_discovery_reward=bool(
+                self.config.enable_recipe_discovery_reward
+            ),
+            enable_fusion_chain_rewards=bool(self.config.enable_fusion_chain_rewards),
+            enable_repeat_recipe_decay=bool(self.config.enable_repeat_recipe_decay),
+            terminal_reward_override=terminal_reward_override,
+            exceptional_adjustments=exceptional_adjustments,
         )
-
-        mowers_lost = max(0, self._mower_count(previous) - self._mower_count(current))
-        components["mower_loss_penalty"] = -mowers_lost * cfg.mower_loss_penalty
-
-        if action_result and action_result.get("illegalAction"):
-            components["illegal_penalty"] = -cfg.illegal_action_penalty
-
-        previous_total_danger = self._total_lane_danger(previous)
-        current_total_danger = self._total_lane_danger(current)
-        danger_delta = current_total_danger - previous_total_danger
-        if danger_delta > 0.0:
-            components["danger_delta_reward"] = -danger_delta * cfg.danger_delta_scale
-            components["row_danger_delta_reward"] = -danger_delta * cfg.row_danger_delta_reward
-        elif danger_delta < 0.0:
-            components["danger_delta_reward"] = abs(danger_delta) * cfg.danger_delta_scale
-            components["row_danger_delta_reward"] = abs(danger_delta) * cfg.row_danger_delta_reward
-
-        if self._is_lane_response_action(previous, action_result):
-            components["lane_response_reward"] = cfg.lane_response_reward
-
-        components["undefended_threat_penalty"] = (
-            -len(self._undefended_close_threat_rows(current))
-            * cfg.undefended_close_threat_penalty
-        )
-
-        action_info = self._action_info(action_result)
-        illegal_action = bool(action_result.get("illegalAction")) if isinstance(action_result, dict) else False
-        plant_placed = bool(action_info.get("plant_placed", False)) and not illegal_action
-        plant_type = int(action_info.get("plant_type", -1))
-        action_row = int(action_info.get("row", -1))
-        action_column = int(action_info.get("column", -1))
-        rows = max(self._row_count(previous), self._row_count(current))
-        previous_shooters = self._shooter_counts_by_row(previous)
-        current_shooters = self._shooter_counts_by_row(current)
-        previous_sunflowers = self._plant_counts_by_row(previous, plant_type=1)
-        current_sunflowers = self._plant_counts_by_row(current, plant_type=1)
-        previous_threat_rows = self._active_threat_rows(previous)
-        current_threat_rows = self._active_threat_rows(current)
-        previous_zero_defender_threat_rows = [
-            row for row in previous_threat_rows
-            if previous_shooters.get(row, 0) == 0
-        ]
-        current_zero_defender_threat_rows = [
-            row for row in current_threat_rows
-            if current_shooters.get(row, 0) == 0
-        ]
-        previous_emergency_peashooter_fix_rows: List[int] = []
-        if previous_zero_defender_threat_rows:
-            previous_legal_peashooters = self._legal_peashooter_actions_by_row(
-                previous,
-                self.legal_actions(previous),
-            )
-            previous_emergency_peashooter_fix_rows = [
-                row for row in previous_zero_defender_threat_rows
-                if previous_legal_peashooters.get(row, 0) > 0
-            ]
-        placed_correct_emergency_peashooter = bool(
-            plant_placed
-            and plant_type == 0
-            and action_row in previous_emergency_peashooter_fix_rows
-        )
-        action_kind = str(action_info.get("kind", "wait"))
-        ready_seed_types = self._affordable_ready_seed_types(previous)
-        actionable_threat_rows = self._actionable_threat_rows(previous)
-        tough_by_row = count_tough_zombies_by_row(previous)
-        mower_risk_rows = self._mower_risk_rows(previous)
-        cherry_delayed_kills = int(cherry_delayed_diag.get("kills", 0) or 0)
-
-        if (
-            action_kind == "wait"
-            and bool(previous.get("gameplayReady"))
-            and actionable_threat_rows
-        ):
-            components["wait_while_actionable_threat_penalty"] = -cfg.wait_while_actionable_threat_penalty
-
-        high_danger_unanswered_rows = [
-            row for row, danger in self._lane_danger_by_row(current).items()
-            if danger >= 0.65 and current_shooters.get(row, 0) == 0 and self._wallnut_blocker_count(current, row) <= 0
-        ]
-        if high_danger_unanswered_rows:
-            components["high_danger_unanswered_penalty"] = (
-                -len(high_danger_unanswered_rows) * cfg.high_danger_unanswered_penalty
-            )
-        mower_exposure_rows = [
-            row for row in self._mower_risk_rows(current)
-            if current_shooters.get(row, 0) == 0 and self._wallnut_blocker_count(current, row) <= 0
-        ]
-        if mower_exposure_rows:
-            components["mower_exposure_penalty"] = -len(mower_exposure_rows) * cfg.mower_exposure_penalty
-        if current_threat_rows and all(current_shooters.get(row, 0) > 0 for row in current_threat_rows):
-            components["minimum_viable_defense_reward"] = cfg.minimum_viable_defense_reward
-
-        if plant_placed and 0 <= action_row < rows:
-            components["role_positioning_reward"] = self._role_positioning_reward(
-                previous,
-                plant_type,
-                action_row,
-                action_column,
-            )
-
-            if plant_type == 0:
-                previous_row_shooters = previous_shooters.get(action_row, 0)
-                if previous_row_shooters == 0 and current_shooters.get(action_row, 0) > 0:
-                    components["first_peashooter_in_row_reward"] = cfg.first_peashooter_in_row_reward
-
-                if action_row in previous_zero_defender_threat_rows:
-                    components["first_defense_undefended_threatened_row_reward"] = (
-                        cfg.first_defense_undefended_threatened_row_reward
-                    )
-                    components["first_defense_in_threatened_row_reward"] = (
-                        cfg.first_defense_in_threatened_row_reward
-                    )
-                if action_row in previous_threat_rows and previous_row_shooters == 0:
-                    components["first_peashooter_threatened_row_reward"] = (
-                        cfg.first_peashooter_threatened_row_reward
-                    )
-                    components["threatened_lane_coverage_reward"] = cfg.threatened_lane_coverage_reward
-
-                if previous_threat_rows:
-                    threatened_counts = {
-                        row: previous_shooters.get(row, 0)
-                        for row in previous_threat_rows
-                    }
-                    min_threat_defenders = min(threatened_counts.values())
-                    if (
-                        action_row in threatened_counts
-                        and previous_row_shooters == min_threat_defenders
-                    ):
-                        components["threat_balanced_row_reward"] = cfg.threat_balanced_row_reward
-                        components["row_balance_reward"] = cfg.row_balance_reward
-                        if previous_row_shooters == 0:
-                            components["threat_balanced_row_reward"] += cfg.threat_balanced_zero_defender_bonus
-
-                if (
-                    previous_row_shooters >= 2
-                    and any(row != action_row for row in previous_zero_defender_threat_rows)
-                ):
-                    components["overdefended_row_penalty"] = -cfg.overdefended_row_penalty
-                    components["overdefense_penalty"] = -cfg.overdefense_penalty
-
-                useful_position = self._role_positioning_reward(previous, plant_type, action_row, action_column)
-                if useful_position > 0.0 and action_row in previous_threat_rows:
-                    components["useful_peashooter_position_reward"] = cfg.useful_peashooter_position_reward
-
-                if (
-                    sum(previous_sunflowers.values()) >= 4
-                    and previous_row_shooters == 0
-                    and bool(previous_threat_rows)
-                ):
-                    components["defense_before_extra_economy_reward"] = cfg.defense_before_extra_economy_reward
-
-                if (
-                    rows > 0
-                    and not self._all_rows_peashooter_coverage_rewarded
-                    and self._rows_with_peashooter_count(previous) < rows
-                    and self._rows_with_peashooter_count(current) >= rows
-                ):
-                    components["all_rows_peashooter_coverage_reward"] = cfg.all_rows_peashooter_coverage_reward
-                    self._all_rows_peashooter_coverage_rewarded = True
-
-            elif plant_type == 1:
-                total_previous_sunflowers = sum(previous_sunflowers.values())
-                total_current_sunflowers = sum(current_sunflowers.values())
-                row_danger = self._lane_danger_by_row(previous).get(action_row, 0.0)
-                if total_previous_sunflowers < 5 and action_column <= 2 and row_danger < cfg.close_threat_threshold:
-                    components["early_sunflower_reward"] = cfg.early_sunflower_reward
-                if action_column <= 2 and row_danger < 0.3:
-                    components["safe_sunflower_position_reward"] = cfg.safe_sunflower_position_reward
-                if (
-                    total_current_sunflowers >= 5
-                    and any(previous_shooters.get(row, 0) == 0 for row in range(rows))
-                    and bool(previous_threat_rows)
-                ):
-                    components["sunflower_overbuild_before_defense_penalty"] = (
-                        -cfg.sunflower_overbuild_before_defense_penalty
-                    )
-                    components["sunflower_overbuild_penalty"] = -cfg.sunflower_overbuild_penalty
-                if previous_zero_defender_threat_rows:
-                    components["sunflower_while_undefended_threat_penalty"] = (
-                        -cfg.sunflower_while_undefended_threat_penalty
-                    )
-                if (
-                    sum(previous_sunflowers.values()) >= 6
-                    and previous_zero_defender_threat_rows
-                    and 0 in ready_seed_types
-                ):
-                    components["sunflower_greed_while_defense_missing_penalty"] = (
-                        -cfg.sunflower_greed_while_defense_missing_penalty
-                    )
-
-            elif plant_type == 3:
-                nearest_x = self._nearest_zombie_x_by_row(previous).get(action_row)
-                valuable_behind = any(col < action_column for col in self._valuable_plant_columns(previous, action_row))
-                close_or_weak = (
-                    action_row in previous_threat_rows
-                    and (
-                        nearest_x is None
-                        or float(nearest_x) - float(action_column) <= 4.0
-                        or previous_shooters.get(action_row, 0) == 0
-                    )
-                )
-                if close_or_weak and valuable_behind:
-                    components["wallnut_blocks_active_threat_reward"] = cfg.wallnut_blocks_active_threat_reward
-                    components["wallnut_frontline_reward"] = cfg.wallnut_frontline_reward
-                if action_row in previous_threat_rows:
-                    components["wallnut_threatened_lane_reward"] = cfg.wallnut_threatened_lane_reward
-                if action_row in previous_threat_rows and nearest_x is not None and float(action_column) < float(nearest_x):
-                    components["wallnut_between_zombie_and_house_reward"] = cfg.wallnut_between_zombie_and_house_reward
-                if action_row in mower_risk_rows:
-                    components["wallnut_emergency_block_reward"] = cfg.wallnut_emergency_block_reward
-                elif action_row not in previous_threat_rows or (
-                    nearest_x is not None and float(nearest_x) < float(action_column) - 0.5
-                ):
-                    components["wallnut_low_value_placement_penalty"] = -cfg.wallnut_low_value_placement_penalty
-                    components["wallnut_useless_penalty"] = -cfg.wallnut_useless_penalty
-
-            elif plant_type == 2:
-                nearby = self._nearby_zombie_context(previous, action_row, action_column, radius=2.75)
-                under_threat = action_row in previous_threat_rows
-                mower_risk = action_row in mower_risk_rows
-                if nearby["zombies"] >= 2 or nearby["tough"] > 0 or mower_risk:
-                    components["cherrybomb_tactical_kill_reward"] += cfg.cherrybomb_tactical_kill_reward
-                    if nearby["zombies"] >= 2:
-                        components["cherrybomb_cluster_bonus"] += cfg.cherrybomb_cluster_bonus
-                    if nearby["tough"] > 0 or nearby["buckethead"] > 0 or nearby["conehead"] > 0:
-                        components["cherrybomb_tactical_kill_reward"] += cfg.cherrybomb_tough_bonus_reward
-                        components["cherrybomb_heavy_zombie_bonus"] += cfg.cherrybomb_heavy_zombie_bonus
-                    if mower_risk:
-                        components["cherrybomb_tactical_kill_reward"] += cfg.cherrybomb_mower_save_bonus_reward
-                        components["cherrybomb_emergency_reward"] += cfg.cherrybomb_emergency_reward
-                elif not under_threat:
-                    components["cherrybomb_wasted_penalty"] += -cfg.cherrybomb_wasted_penalty
-                    components["cherrybomb_low_value_penalty"] += -cfg.cherrybomb_low_value_penalty
-                if nearby["zombies"] <= 0:
-                    components["cherrybomb_zero_kill_penalty"] += -cfg.cherrybomb_zero_kill_penalty
-                self._pending_cherry_events.append(
-                    {
-                        "row": action_row,
-                        "column": action_column,
-                        "age": 0,
-                        "kills": 0,
-                        "nearby_tough": nearby["tough"],
-                        "nearby_buckethead": nearby["buckethead"],
-                        "nearby_conehead": nearby["conehead"],
-                        "mower_risk": mower_risk,
-                        "credited": False,
-                    }
-                )
-
-            if action_row in mower_risk_rows and (plant_type in {0, 2, 3} or action_kind == "fusion"):
-                components["mower_risk_reduction_reward"] = cfg.mower_risk_reduction_reward
-
-            if tough_by_row.get(action_row, {}).get("tough", 0) > 0 and (
-                plant_type in {0, 2, 3} or action_kind == "fusion"
-            ):
-                multiplier = 1.0
-                if plant_type == 0:
-                    multiplier = 0.5
-                elif plant_type == 2:
-                    multiplier = 1.5
-                components["tough_zombie_response_reward"] = cfg.tough_zombie_response_reward * multiplier
-
-            if previous_emergency_peashooter_fix_rows and not placed_correct_emergency_peashooter:
-                components["plant_elsewhere_while_undefended_threat_penalty"] = (
-                    -cfg.plant_elsewhere_while_undefended_threat_penalty
-                )
-                if plant_type in {2, 3} and self._safe_int(previous.get("sun"), default=0) < 150:
-                    components["economy_collapse_penalty"] = -cfg.economy_collapse_penalty
-
-        if (
-            previous_threat_rows
-            and not self._all_active_threatened_rows_coverage_rewarded
-            and any(previous_shooters.get(row, 0) == 0 for row in previous_threat_rows)
-            and all(current_shooters.get(row, 0) > 0 for row in current_threat_rows)
-            and current_threat_rows
-        ):
-            components["all_active_threatened_rows_have_peashooter_reward"] = (
-                cfg.all_active_threatened_rows_have_peashooter_reward
-            )
-            self._all_active_threatened_rows_coverage_rewarded = True
-
-        if len(current_zero_defender_threat_rows) < len(previous_zero_defender_threat_rows):
-            # This intentionally stacks with first-defense reward: one component credits
-            # the exact Peashooter response, the other credits reducing global exposure.
-            components["reduce_undefended_threat_reward"] = cfg.reduce_undefended_threat_reward
-
-        self._update_undefended_threat_age(rows, current_threat_rows, current_shooters)
-        grace_steps = int(max(0, cfg.undefended_threat_grace_steps))
-        late_penalty_count = sum(
-            1
-            for row in range(rows)
-            if self.undefended_threat_age_by_row[row] > grace_steps
-        )
-        if late_penalty_count > 0:
-            components["late_undefended_threat_penalty"] = (
-                -late_penalty_count * cfg.late_undefended_threat_penalty
-            )
-
-        if current.get("done"):
-            terminal_hint = str(current.get("terminalHint", ""))
-            if terminal_hint == "possible_win":
-                components["win_loss_reward"] = cfg.win_reward
-            elif terminal_hint == "game_over_or_loss" and is_restart_screen_observation(current):
-                components["win_loss_reward"] = -cfg.loss_penalty
-
-        components["reward_total"] = sum(components[field] for field in REWARD_COMPONENT_FIELDS)
-        return components
+        self._reward_state = composition.state
+        if isinstance(action_result, dict):
+            action_result.update(composition.annotations_dict())
+        return composition
 
     def lane_diagnostics(
         self,
@@ -6049,338 +5387,63 @@ class PvZGymEnv:
         legal_actions: Optional[List[int]] = None,
         *,
         cherry_delayed_diagnostics: Optional[Dict[str, Any]] = None,
+        previous_facts: Optional[StepFacts] = None,
+        current_facts: Optional[StepFacts] = None,
+        previous_legal_actions: Optional[List[int]] = None,
+        mask_diagnostics_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        action_info = self._action_info(action_result)
-        previous_obs = previous or current
-        current_threat_rows = [
-            row for row, count in self._lane_zombie_counts(current).items()
-            if count > 0
-        ]
-        previous_threat_rows = [
-            row for row, count in self._lane_zombie_counts(previous_obs).items()
-            if count > 0
-        ]
-        undefended_rows = self._undefended_close_threat_rows(current)
-        mower_losses_by_row = self._mower_losses_by_row(previous_obs, current)
-        legal_peashooters = self._legal_peashooter_actions_by_row(current, legal_actions or [])
-        previous_legal_actions = self.legal_actions(previous_obs)
-        previous_legal_peashooters = self._legal_peashooter_actions_by_row(previous_obs, previous_legal_actions)
-        response_applied = self._is_lane_response_action(previous_obs, action_result)
-        response_row = int(action_info.get("row", -1)) if response_applied else -1
-        row_defense_opportunities = [
-            row for row in self._undefended_close_threat_rows(previous_obs)
-            if previous_legal_peashooters.get(row, 0) > 0
-        ]
-        if response_row >= 0 and response_row not in row_defense_opportunities:
-            row_defense_opportunities.append(response_row)
-        row_defense_responses = {response_row: 1} if response_row >= 0 else {}
-        rows = self._row_count(current)
-        previous_shooters = self._shooter_counts_by_row(previous_obs)
-        current_shooters = self._shooter_counts_by_row(current)
-        current_sunflowers = self._plant_counts_by_row(current, plant_type=1)
-        ready_seed_types = self._affordable_ready_seed_types(previous_obs)
-        actionable_threat_rows = self._actionable_threat_rows(previous_obs)
-        tough_by_row = count_tough_zombies_by_row(current)
-        previous_tough_by_row = count_tough_zombies_by_row(previous_obs)
-        mower_risk_rows = self._mower_risk_rows(previous_obs)
-        plant_placed = bool(action_info.get("plant_placed", False)) and not bool(
-            action_result.get("illegalAction") if isinstance(action_result, dict) else False
+        previous_observation = previous or current
+        prior_snapshot = previous_facts or build_step_facts(
+            previous_observation,
+            self.config.plant_types,
         )
-        action_plant_type = int(action_info.get("plant_type", -1))
-        action_row = int(action_info.get("row", -1))
-        action_column = int(action_info.get("column", -1))
-        current_rows_with_peashooter = self._rows_with_peashooter_count(current)
-        current_coverage_rate = (
-            float(current_rows_with_peashooter) / float(rows)
-            if rows > 0
-            else 0.0
+        next_snapshot = current_facts or (
+            prior_snapshot
+            if previous_observation is current
+            else build_step_facts(current, self.config.plant_types)
         )
-        previous_zero_defender_threat_rows = [
-            row for row in previous_threat_rows
-            if previous_shooters.get(row, 0) == 0
-        ]
-        previous_defense_available_rows = [
-            row for row in previous_zero_defender_threat_rows
-            if previous_legal_peashooters.get(row, 0) > 0
-        ]
-        threatened_zero_defender_rows = [
-            row for row in current_threat_rows
-            if current_shooters.get(row, 0) == 0
-        ]
-        action_kind = str(action_info.get("kind", "wait"))
-        plant_in_threatened_row = bool(
-            plant_placed
-            and action_row in previous_threat_rows
+        prior_legal = (
+            list(previous_legal_actions)
+            if previous_legal_actions is not None
+            else self.legal_actions(previous_observation, facts=prior_snapshot)
         )
-        plant_in_unthreatened_row = bool(
-            plant_placed
-            and action_row >= 0
-            and action_row not in previous_threat_rows
-        )
-        first_peashooter_row = -1
-        first_defense_row = -1
-        overdefended_while_undefended = False
-        least_defended_threatened_row_plant = False
-        sunflower_overbuild_before_defense = False
-        sunflower_greed_while_defense_missing = False
-        wallnut_blocks_active_threat = False
-        wallnut_low_value_placement = False
-        wallnut_threatened_lane = False
-        wallnut_between_zombie_and_house = False
-        wallnut_frontline = False
-        wallnut_emergency_block = False
-        cherrybomb_used_under_threat = False
-        cherrybomb_used_low_value = False
-        cherrybomb_cluster_use = False
-        cherrybomb_emergency_use = False
-        tough_zombie_response = False
-        mower_save_estimated_row = -1
-        all_rows_peashooter_covered = False
-        peashooter_available_but_waited_rows: List[int] = []
-        peashooter_available_but_planted_elsewhere_rows: List[int] = []
-        sunflower_while_undefended_threat_rows: List[int] = []
-        if plant_placed and 0 <= action_row < rows:
-            if action_plant_type == 0:
-                previous_row_shooters = previous_shooters.get(action_row, 0)
-                if previous_row_shooters == 0 and current_shooters.get(action_row, 0) > 0:
-                    first_peashooter_row = action_row
-                    if action_row in previous_threat_rows:
-                        first_defense_row = action_row
-                if previous_threat_rows:
-                    threatened_counts = {
-                        row: previous_shooters.get(row, 0)
-                        for row in previous_threat_rows
-                    }
-                    min_threat_defenders = min(threatened_counts.values())
-                    least_defended_threatened_row_plant = (
-                        action_row in threatened_counts
-                        and previous_row_shooters == min_threat_defenders
-                    )
-                overdefended_while_undefended = (
-                    previous_row_shooters >= 2
-                    and any(row != action_row for row in previous_zero_defender_threat_rows)
-                )
-                all_rows_peashooter_covered = (
-                    rows > 0
-                    and self._rows_with_peashooter_count(previous_obs) < rows
-                    and current_rows_with_peashooter >= rows
-                )
-            elif action_plant_type == 1:
-                sunflower_overbuild_before_defense = (
-                    sum(current_sunflowers.values()) >= 5
-                    and any(previous_shooters.get(row, 0) == 0 for row in range(rows))
-                    and bool(previous_threat_rows)
-                )
-                sunflower_greed_while_defense_missing = (
-                    sum(self._plant_counts_by_row(previous_obs, plant_type=1).values()) >= 6
-                    and previous_zero_defender_threat_rows
-                    and 0 in ready_seed_types
-                )
-            elif action_plant_type == 3:
-                nearest_x = self._nearest_zombie_x_by_row(previous_obs).get(action_row)
-                valuable_behind = any(col < action_column for col in self._valuable_plant_columns(previous_obs, action_row))
-                wallnut_blocks_active_threat = bool(
-                    action_row in previous_threat_rows
-                    and valuable_behind
-                    and (
-                        nearest_x is None
-                        or float(nearest_x) - float(action_column) <= 4.0
-                        or previous_shooters.get(action_row, 0) == 0
-                    )
-                )
-                wallnut_threatened_lane = action_row in previous_threat_rows
-                wallnut_between_zombie_and_house = bool(
-                    action_row in previous_threat_rows
-                    and nearest_x is not None
-                    and float(action_column) < float(nearest_x)
-                )
-                wallnut_frontline = bool(wallnut_blocks_active_threat and valuable_behind)
-                wallnut_emergency_block = action_row in mower_risk_rows
-                wallnut_low_value_placement = bool(
-                    not wallnut_blocks_active_threat
-                    and (
-                        action_row not in previous_threat_rows
-                        or (nearest_x is not None and float(nearest_x) < float(action_column) - 0.5)
-                    )
-                )
-            elif action_plant_type == 2:
-                nearby = self._nearby_zombie_context(previous_obs, action_row, action_column, radius=2.75)
-                cherrybomb_used_under_threat = action_row in previous_threat_rows
-                cherrybomb_used_low_value = not cherrybomb_used_under_threat and nearby.get("zombies", 0) <= 0
-                cherrybomb_cluster_use = int(nearby.get("zombies", 0) or 0) >= 2
-                cherrybomb_emergency_use = action_row in mower_risk_rows
-            if action_row in mower_risk_rows and (action_plant_type in {0, 2, 3} or action_kind == "fusion"):
-                mower_save_estimated_row = action_row
-            if previous_tough_by_row.get(action_row, {}).get("tough", 0) > 0 and (
-                action_plant_type in {0, 2, 3} or action_kind == "fusion"
-            ):
-                tough_zombie_response = True
-        if action_kind == "wait":
-            peashooter_available_but_waited_rows = list(previous_defense_available_rows)
-        if plant_placed:
-            peashooter_available_but_planted_elsewhere_rows = [
-                row for row in previous_defense_available_rows
-                if row != action_row
-            ]
-        if plant_placed and action_plant_type == 1:
-            sunflower_while_undefended_threat_rows = list(previous_zero_defender_threat_rows)
-
-        age_sum_step_by_row = {
-            row: int(self.undefended_threat_age_by_row[row])
-            for row in threatened_zero_defender_rows
-            if row < len(self.undefended_threat_age_by_row)
-        }
-        age_count_step_by_row = {row: 1 for row in age_sum_step_by_row}
-        age_max_by_row = {
-            row: int(self.max_undefended_threat_age_by_row[row])
-            for row in range(rows)
-            if row < len(self.max_undefended_threat_age_by_row)
-        }
-        previous_total_danger = self._total_lane_danger(previous_obs)
-        current_total_danger = self._total_lane_danger(current)
-        current_danger_by_row = self._lane_danger_by_row(current)
-        high_danger_unanswered_rows = [
-            row for row, danger in current_danger_by_row.items()
-            if danger >= 0.65 and current_shooters.get(row, 0) == 0 and self._wallnut_blocker_count(current, row) <= 0
-        ]
-        mower_exposure_rows = [
-            row for row in self._mower_risk_rows(current)
-            if current_shooters.get(row, 0) == 0 and self._wallnut_blocker_count(current, row) <= 0
-        ]
-        mask_diag = self.mask_diagnostics(current, self.action_mask(current))
-        mask_block_counts = Counter(mask_diag.get("python_mask_block_reason_counts", {}) or {})
-        action_audit = action_result.get("actionAudit") if isinstance(action_result, dict) and isinstance(action_result.get("actionAudit"), dict) else {}
-        pre_step_audit = action_result.get("preStepMaskAudit") if isinstance(action_result, dict) and isinstance(action_result.get("preStepMaskAudit"), dict) else {}
-        if pre_step_audit:
-            mask_block_counts[str(pre_step_audit.get("pythonFilterReason") or "blocked")] += 1
-        illegal_reason = str(action_result.get("illegalReason") or "") if isinstance(action_result, dict) else ""
-        cooldown_exposed_by_mask = (
-            illegal_reason == "cooldown"
-            and bool(
-                action_audit.get("pythonMaskValueBefore")
-                or action_audit.get("bridgeLegalActionsValueBefore")
+        mask_diagnostics = (
+            mask_diagnostics_snapshot
+            if mask_diagnostics_snapshot is not None
+            else self.mask_diagnostics(
+                current,
+                self.action_mask(current, facts=next_snapshot),
+                facts=next_snapshot,
             )
         )
-        cherry_delayed_diag = cherry_delayed_diagnostics or {}
-        return {
-            "action_kind": action_info.get("kind", "wait"),
-            "action_plant_type": int(action_info.get("plant_type", -1)),
-            "action_row": int(action_info.get("row", -1)),
-            "action_column": int(action_info.get("column", -1)),
-            "plant_placed": bool(action_info.get("plant_placed", False)),
-            "lane_response_reward_applied": response_applied,
-            "previous_total_danger": previous_total_danger,
-            "current_total_danger": current_total_danger,
-            "danger_delta": current_total_danger - previous_total_danger,
-            "mowers_lost_this_step": max(0, self._mower_count(previous_obs) - self._mower_count(current)),
-            "mower_losses_by_row": self._row_int_dict(mower_losses_by_row, rows) if mower_losses_by_row is not None else {},
-            "plants_by_row": self._row_int_dict(self._plant_counts_by_row(current), rows),
-            "peashooters_by_row": self._row_int_dict(self._plant_counts_by_row(current, plant_type=0), rows),
-            "sunflowers_by_row": self._row_int_dict(self._plant_counts_by_row(current, plant_type=1), rows),
-            "threat_rows": current_threat_rows,
-            "undefended_threat_rows": undefended_rows,
-            "threat_steps_by_row": self._row_int_dict({row: 1 for row in current_threat_rows}, rows),
-            "undefended_threat_steps_by_row": self._row_int_dict({row: 1 for row in undefended_rows}, rows),
-            "undefended_threat_age_sum_by_row": self._row_int_dict(age_sum_step_by_row, rows),
-            "undefended_threat_age_count_by_row": self._row_int_dict(age_count_step_by_row, rows),
-            "undefended_threat_age_max_by_row": self._row_int_dict(age_max_by_row, rows),
-            "wait_under_threat": action_info.get("kind", "wait") == "wait" and bool(previous_threat_rows),
-            "wait_while_actionable_threat": action_info.get("kind", "wait") == "wait" and bool(actionable_threat_rows),
-            "wait_while_actionable_threat_by_row": self._row_int_dict({row: 1 for row in actionable_threat_rows}, rows),
-            "wait_while_peashooter_affordable_ready": action_info.get("kind", "wait") == "wait" and 0 in ready_seed_types and bool(actionable_threat_rows),
-            "wait_while_wallnut_affordable_ready": action_info.get("kind", "wait") == "wait" and 3 in ready_seed_types and bool(actionable_threat_rows),
-            "wait_while_cherrybomb_affordable_ready": action_info.get("kind", "wait") == "wait" and 2 in ready_seed_types and bool(actionable_threat_rows),
-            "close_zombie_undefended_count": len(undefended_rows),
-            "close_zombie_with_no_defense_count": len(self._actionable_threat_rows(current)),
-            "close_zombie_undefended_rows": undefended_rows,
-            "illegal_reason": illegal_reason,
-            "legal_peashooter_actions_by_row": self._row_int_dict(legal_peashooters, rows),
-            "pre_action_legal_peashooter_actions_by_row": self._row_int_dict(previous_legal_peashooters, rows),
-            "peashooter_available_but_waited_by_row": self._row_int_dict(
-                {row: 1 for row in peashooter_available_but_waited_rows},
-                rows,
-            ),
-            "peashooter_available_but_planted_elsewhere_by_row": self._row_int_dict(
-                {row: 1 for row in peashooter_available_but_planted_elsewhere_rows},
-                rows,
-            ),
-            "sunflower_while_undefended_threat_by_row": self._row_int_dict(
-                {row: 1 for row in sunflower_while_undefended_threat_rows},
-                rows,
-            ),
-            "row_defense_opportunities_by_row": self._row_int_dict({row: 1 for row in row_defense_opportunities}, rows),
-            "row_defense_responses_by_row": self._row_int_dict(row_defense_responses, rows),
-            "threatened_rows_with_zero_defender_steps_by_row": self._row_int_dict({row: 1 for row in threatened_zero_defender_rows}, rows),
-            "plant_in_threatened_row": plant_in_threatened_row,
-            "plant_in_unthreatened_row": plant_in_unthreatened_row,
-            "first_peashooter_row": first_peashooter_row,
-            "first_defense_row": first_defense_row,
-            "overdefended_while_undefended": overdefended_while_undefended,
-            "least_defended_threatened_row_plant": least_defended_threatened_row_plant,
-            "rows_with_peashooter_count": current_rows_with_peashooter,
-            "peashooter_coverage_rate": current_coverage_rate,
-            "all_rows_peashooter_covered": all_rows_peashooter_covered,
-            "sunflower_count_when_first_full_coverage": (
-                sum(current_sunflowers.values()) if all_rows_peashooter_covered else -1
-            ),
-            "sunflower_overbuild_before_defense": sunflower_overbuild_before_defense,
-            "sunflower_greed_while_defense_missing": sunflower_greed_while_defense_missing,
-            "active_threat_rows_without_peashooter_count": len(threatened_zero_defender_rows),
-            "wallnut_placement": plant_placed and action_plant_type == 3,
-            "wallnut_threatened_lane": wallnut_threatened_lane,
-            "wallnut_between_zombie_and_house": wallnut_between_zombie_and_house,
-            "wallnut_frontline": wallnut_frontline,
-            "wallnut_emergency_block": wallnut_emergency_block,
-            "wallnut_blocks_active_threat": wallnut_blocks_active_threat,
-            "wallnut_low_value_placement": wallnut_low_value_placement,
-            "wallnut_placements_by_row": self._row_int_dict({action_row: 1} if plant_placed and action_plant_type == 3 else {}, rows),
-            "wallnut_placements_by_col": {str(action_column): 1} if plant_placed and action_plant_type == 3 and action_column >= 0 else {},
-            "cherrybomb_used": plant_placed and action_plant_type == 2,
-            "cherrybomb_used_under_threat": cherrybomb_used_under_threat,
-            "cherrybomb_used_low_value": cherrybomb_used_low_value,
-            "cherrybomb_cluster_use": cherrybomb_cluster_use,
-            "cherrybomb_emergency_use": cherrybomb_emergency_use,
-            "cherrybomb_delayed_kills": int(cherry_delayed_diag.get("kills", 0) or 0),
-            "cherrybomb_delayed_zero_kill": int(cherry_delayed_diag.get("zero_kill", 0) or 0),
-            "cherrybomb_buckethead_kill_credit": int(cherry_delayed_diag.get("buckethead", 0) or 0),
-            "cherrybomb_conehead_kill_credit": int(cherry_delayed_diag.get("conehead", 0) or 0),
-            "mower_risk_steps_by_row": self._row_int_dict({row: 1 for row in self._mower_risk_rows(current)}, rows),
-            "high_danger_unanswered_steps": len(high_danger_unanswered_rows),
-            "mower_exposure_steps": len(mower_exposure_rows),
-            "max_row_danger": max(current_danger_by_row.values()) if current_danger_by_row else 0.0,
-            "avg_row_danger": (
-                sum(current_danger_by_row.values()) / max(1, len(current_danger_by_row))
-                if current_danger_by_row
-                else 0.0
-            ),
-            "mower_saves_estimated_by_row": self._row_int_dict({mower_save_estimated_row: 1} if mower_save_estimated_row >= 0 else {}, rows),
-            "buckethead_count_by_row": self._row_int_dict({row: values.get("buckethead", 0) for row, values in tough_by_row.items()}, rows),
-            "conehead_count_by_row": self._row_int_dict({row: values.get("conehead", 0) for row, values in tough_by_row.items()}, rows),
-            "tough_zombie_count_by_row": self._row_int_dict({row: values.get("tough", 0) for row, values in tough_by_row.items()}, rows),
-            "tough_zombie_response": tough_zombie_response,
-            "legal_actions_by_seed_slot": mask_diag.get("legal_actions_by_seed_slot", {}),
-            "bridge_legal_actions_by_seed_slot": mask_diag.get("bridge_legal_actions_by_seed_slot", {}),
-            "python_mask_block_reason_counts": dict(sorted(mask_block_counts.items())),
-            "tactical_mask_enabled": bool(mask_diag.get("tactical_mask_enabled")),
-            "wallnut_tactical_mask_enabled": bool(mask_diag.get("wallnut_tactical_mask_enabled")),
-            "cherrybomb_tactical_mask_enabled": bool(mask_diag.get("cherrybomb_tactical_mask_enabled")),
-            "wallnut_actions_masked": int(mask_diag.get("wallnut_actions_masked") or 0),
-            "cherrybomb_actions_masked": int(mask_diag.get("cherrybomb_actions_masked") or 0),
-            "wallnut_actions_available": int(mask_diag.get("wallnut_actions_available") or 0),
-            "cherrybomb_actions_available": int(mask_diag.get("cherrybomb_actions_available") or 0),
-            "mask_all_but_wait_count": int(mask_diag.get("mask_all_but_wait_count") or 0),
-            "pre_step_mask_blocked_action": bool(action_result.get("preStepMaskBlockedAction")) if isinstance(action_result, dict) else False,
-            "cooldown_illegal_exposed_by_mask": cooldown_exposed_by_mask,
-            "mask_bridge_disagreement": bool(
-                action_audit
-                and action_audit.get("pythonMaskValueBefore") != action_audit.get("bridgeLegalActionsValueBefore")
-            ),
-        }
-
-    def _action_validation_config(self, observation: Dict[str, Any]) -> ActionValidationConfig:
-        rows = int(observation.get("rowCount") or self.config.row_count)
-        cols = int(observation.get("columnCount") or self.config.column_count)
-        slots = seed_slots_from_observation(observation, self.config.plant_types)
+        return compose_lane_diagnostics(
+            LaneDiagnosticsInput(
+                previous_facts=prior_snapshot,
+                current_facts=next_snapshot,
+                post_reward_state=self._reward_state,
+                current_legal_actions=tuple(legal_actions or ()),
+                previous_legal_actions=tuple(prior_legal),
+                action_result=action_result or {},
+                mask_diagnostics=mask_diagnostics,
+                cherry_delayed_diagnostics=cherry_delayed_diagnostics or {},
+                fallback_rows=self.config.row_count,
+                fallback_columns=self.config.column_count,
+                close_threat_threshold=self.config.reward.close_threat_threshold,
+            )
+        )
+    def _action_validation_config(
+        self,
+        observation: Dict[str, Any],
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> ActionValidationConfig:
+        snapshot = facts or self._step_facts_cache.get(
+            observation,
+            self.config.plant_types,
+        )
+        rows = int(snapshot.rows or self.config.row_count)
+        cols = int(snapshot.columns or self.config.column_count)
+        slots = snapshot.seed_slots
         cells = max(1, rows * cols)
         default_action_count = 1 + len(slots) * cells
         action_count = max(0, int(observation.get("actionCount") or default_action_count))
@@ -6400,6 +5463,7 @@ class PvZGymEnv:
                 observation,
                 self.config.plant_types,
                 are_fusion_compatible,
+                facts=snapshot,
             ),
             compatibility_version="relevant_observation_pairs_v1",
         )
@@ -6408,26 +5472,47 @@ class PvZGymEnv:
         self,
         observation: Dict[str, Any],
         action_count: int,
+        *,
+        facts: Optional[StepFacts] = None,
     ) -> Dict[int, str]:
         if not self._tactical_masks_enabled():
             return {}
         tactical_enabled = bool(getattr(self.config, "tactical_masks", False))
         wallnut_enabled = tactical_enabled or bool(getattr(self.config, "wallnut_tactical_mask", False))
         cherry_enabled = tactical_enabled or bool(getattr(self.config, "cherrybomb_tactical_mask", False))
+        snapshot = self._facts_snapshot(observation, facts)
+        rows = int(observation.get("rowCount") or 0)
+        columns = int(observation.get("columnCount") or 0)
+        if rows <= 0 or columns <= 0:
+            return {}
+        cells = rows * columns
         rejections: Dict[int, str] = {}
         for action_id in range(1, max(0, int(action_count))):
-            decoded = decode_action(action_id, observation, self.config.plant_types)
-            if int(decoded.get("kind", 0)) != 1:
-                continue
-            plant_type = int(decoded.get("plant_type", -1))
-            row = int(decoded.get("row", -1))
-            column = int(decoded.get("column", -1))
+            encoded = action_id - 1
+            slot_index = encoded // cells
+            cell = encoded % cells
+            plant_type = (
+                int(snapshot.seed_slots[slot_index].plant_type)
+                if 0 <= slot_index < len(snapshot.seed_slots)
+                else -1
+            )
+            row, column = divmod(cell, columns)
             if plant_type == 3 and wallnut_enabled:
-                allowed, reason = self._wallnut_tactical_action_allowed(observation, row, column)
+                allowed, reason = self._wallnut_tactical_action_allowed(
+                    observation,
+                    row,
+                    column,
+                    facts=snapshot,
+                )
                 if not allowed:
                     rejections[action_id] = f"tactical_wallnut_{reason}"
             elif plant_type == 2 and cherry_enabled:
-                allowed, reason = self._cherrybomb_tactical_action_allowed(observation, row, column)
+                allowed, reason = self._cherrybomb_tactical_action_allowed(
+                    observation,
+                    row,
+                    column,
+                    facts=snapshot,
+                )
                 if not allowed:
                     rejections[action_id] = f"tactical_cherrybomb_{reason}"
         return rejections
@@ -6437,6 +5522,7 @@ class PvZGymEnv:
         observation: Dict[str, Any],
         *,
         bridge_actions: Optional[List[int]] = None,
+        facts: Optional[StepFacts] = None,
     ) -> ActionDecisionCache:
         resolved_bridge_actions = [
             int(action)
@@ -6444,7 +5530,11 @@ class PvZGymEnv:
                 bridge_actions if bridge_actions is not None else self.bridge_legal_actions(observation)
             )
         ]
-        validation_config = self._action_validation_config(observation)
+        snapshot = facts or self._step_facts_cache.get(
+            observation,
+            self.config.plant_types,
+        )
+        validation_config = self._action_validation_config(observation, facts=snapshot)
         action_count = max(
             0,
             int(observation.get("actionCount") or validation_config.spec.action_count),
@@ -6455,13 +5545,18 @@ class PvZGymEnv:
             config=validation_config,
             bridge_legal_actions=resolved_bridge_actions,
             restart_screen=restart_screen,
+            facts=snapshot,
         )
         cached = self._action_decision_cache
         if cached is not None and cached.key == context.cache_key:
             self._action_decision_cache_hits += 1
             self._action_decision_cache_last_hit = True
             return cached
-        tactical_rejections = self._tactical_action_rejections(observation, action_count)
+        tactical_rejections = self._tactical_action_rejections(
+            observation,
+            action_count,
+            facts=snapshot,
+        )
         if tactical_rejections:
             tactical = tuple(sorted((int(action), str(reason)) for action, reason in tactical_rejections.items()))
             context = replace(
@@ -6506,9 +5601,14 @@ class PvZGymEnv:
         bridge_command: Optional[Dict[str, Any]] = None,
         bridge_actions: Optional[List[int]] = None,
         intent: Optional[ActionIntent] = None,
+        facts: Optional[StepFacts] = None,
     ) -> ActionDecision:
         obs = observation or self.previous_observation or self.observe()
-        cache = self._action_cache_for(obs, bridge_actions=bridge_actions)
+        cache = self._action_cache_for(
+            obs,
+            bridge_actions=bridge_actions,
+            facts=facts,
+        )
         action_id = int(action)
         resolved_intent = intent
         if resolved_intent is None:
@@ -6547,26 +5647,42 @@ class PvZGymEnv:
             return cached_decision
         return validate_action_intent(resolved_intent, cache.context)
 
-    def action_mask(self, observation: Optional[Dict[str, Any]] = None) -> List[int]:
+    def action_mask(
+        self,
+        observation: Optional[Dict[str, Any]] = None,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> List[int]:
         obs = observation or self.previous_observation or self.observe()
-        cache = self._action_cache_for(obs)
+        cache = self._action_cache_for(obs, facts=facts)
         return [1 if allowed else 0 for allowed in cache.mask]
 
     def mask_diagnostics(
         self,
         observation: Optional[Dict[str, Any]] = None,
         mask: Optional[List[int]] = None,
+        *,
+        facts: Optional[StepFacts] = None,
     ) -> Dict[str, Any]:
         obs = observation or self.previous_observation or self.observe()
         bridge_actions = self.bridge_legal_actions(obs)
-        cache = self._action_cache_for(obs, bridge_actions=bridge_actions)
+        cache = self._action_cache_for(
+            obs,
+            bridge_actions=bridge_actions,
+            facts=facts,
+        )
+        snapshot = cache.context.facts
         current_mask = mask if mask is not None else [1 if allowed else 0 for allowed in cache.mask]
         blocked_counts: Counter[str] = Counter()
         for action in bridge_actions:
             action_id = int(action)
             if action_id <= 0:
                 continue
-            decision = cache.decision_for(action_id)
+            decision = (
+                cache.decisions[action_id]
+                if 0 <= action_id < len(cache.decisions)
+                else None
+            )
             if decision is not None and not decision.legal:
                 blocked_counts[decision.rejection_reason or "filtered"] += 1
         tactical_diag: Dict[str, Any] = {}
@@ -6583,7 +5699,11 @@ class PvZGymEnv:
                 action_id = int(action)
                 if action_id <= 0:
                     continue
-                decision = cache.decision_for(action_id)
+                decision = (
+                    cache.decisions[action_id]
+                    if 0 <= action_id < len(cache.decisions)
+                    else None
+                )
                 if decision is None:
                     continue
                 reason = str(decision.rejection_reason or "")
@@ -6609,14 +5729,25 @@ class PvZGymEnv:
                 "tactical_mask_block_reason_counts": dict(sorted(tactical_counts.items())),
             }
         return {
-            "legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(obs, current_mask),
-            "bridge_legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(obs, bridge_actions),
+            "legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(
+                obs,
+                current_mask,
+                facts=snapshot,
+            ),
+            "bridge_legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(
+                obs,
+                bridge_actions,
+                facts=snapshot,
+            ),
             "python_mask_block_reason_counts": dict(sorted(blocked_counts.items())),
             "python_legal_action_count": sum(1 for allowed in current_mask if allowed),
             "bridge_legal_action_count": len(bridge_actions),
-            "slot_readiness_by_seed_slot": self._slot_readiness_by_seed_slot(obs),
+            "slot_readiness_by_seed_slot": self._slot_readiness_by_seed_slot(
+                obs,
+                facts=snapshot,
+            ),
             "action_cache": self.action_cache_diagnostics(),
-            **self._fusion_mask_diagnostics(obs),
+            **self._fusion_mask_diagnostics(obs, facts=snapshot),
             **tactical_diag,
         }
 
@@ -6627,22 +5758,34 @@ class PvZGymEnv:
             or getattr(self.config, "cherrybomb_tactical_mask", False)
         )
 
-    def _wallnut_tactical_action_allowed(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, str]:
+    def _wallnut_tactical_action_allowed(
+        self,
+        observation: Dict[str, Any],
+        row: int,
+        column: int,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Tuple[bool, str]:
         if row < 0 or column < 0:
             return False, "invalid_cell"
-        threat_rows = set(self._active_threat_rows(observation))
+        snapshot = self._facts_snapshot(observation, facts)
+        rows = max(0, int(snapshot.rows or self.config.row_count))
+        threat_rows = set(active_threat_rows_from_facts(snapshot, rows))
         if row not in threat_rows:
             return False, "no_row_threat"
-        nearest_x = self._nearest_zombie_x_by_row(observation).get(row)
+        nearest_x = nearest_zombie_x_by_row_from_facts(snapshot, rows).get(row)
         if nearest_x is not None and float(nearest_x) < float(column) - 0.5:
             return False, "behind_zombie"
-        if self._wallnut_blocker_count(observation, row) > 0:
+        if wallnut_blocker_count_from_facts(snapshot, row) > 0:
             return False, "duplicate_blocker"
-        mower_risk = row in self._mower_risk_rows(observation)
+        mower_risk = row in mower_risk_rows_from_facts(snapshot, rows)
         if column <= 2 and not mower_risk:
             return False, "too_far_back"
-        valuable_behind = any(col < column for col in self._valuable_plant_columns(observation, row))
-        shooters = self._shooter_counts_by_row(observation).get(row, 0)
+        valuable_behind = any(
+            col < column
+            for col in valuable_plant_columns_from_facts(snapshot, row)
+        )
+        shooters = plant_counts_by_row_from_facts(snapshot, rows, 0).get(row, 0)
         if mower_risk:
             return True, "mower_risk"
         if valuable_behind and (nearest_x is None or float(nearest_x) - float(column) <= 5.0):
@@ -6651,32 +5794,34 @@ class PvZGymEnv:
             return True, "shooter_screen"
         return False, "non_blocking"
 
-    def _cherrybomb_tactical_action_allowed(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, str]:
+    def _cherrybomb_tactical_action_allowed(
+        self,
+        observation: Dict[str, Any],
+        row: int,
+        column: int,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Tuple[bool, str]:
         if row < 0 or column < 0:
             return False, "invalid_cell"
-        nearby = self._nearby_zombie_context(observation, row, column, radius=2.75)
+        snapshot = self._facts_snapshot(observation, facts)
+        rows = max(0, int(snapshot.rows or self.config.row_count))
+        nearby = nearby_zombie_context_from_facts(
+            snapshot,
+            row,
+            column,
+            radius=2.75,
+        )
         if int(nearby.get("zombies", 0)) >= 2:
             return True, "cluster"
         if int(nearby.get("tough", 0)) > 0 or int(nearby.get("buckethead", 0)) > 0 or int(nearby.get("conehead", 0)) > 0:
             return True, "heavy"
-        if row in self._mower_risk_rows(observation):
+        if row in mower_risk_rows_from_facts(snapshot, rows):
             return True, "mower_risk"
-        danger = self._lane_danger_by_row(observation).get(row, 0.0)
+        danger = lane_danger_by_row_from_facts(snapshot, rows).get(row, 0.0)
         if danger >= 0.65 and int(nearby.get("zombies", 0)) > 0:
             return True, "high_danger"
         return False, "low_value"
-
-    def _wallnut_blocker_count(self, observation: Dict[str, Any], row: int) -> int:
-        count = 0
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            if self._safe_int(plant.get("row"), default=-1) != row:
-                continue
-            if self._safe_int(plant.get("type"), default=-1) == 3:
-                count += 1
-        return count
-
     def action_legality_audit(
         self,
         action: int,
@@ -6684,10 +5829,16 @@ class PvZGymEnv:
         mask: Optional[List[int]] = None,
         after: Optional[Dict[str, Any]] = None,
         action_result: Optional[Dict[str, Any]] = None,
+        *,
+        facts: Optional[StepFacts] = None,
     ) -> Dict[str, Any]:
         action_id = int(action)
         bridge_actions = self.bridge_legal_actions(before)
-        cache = self._action_cache_for(before, bridge_actions=bridge_actions)
+        cache = self._action_cache_for(
+            before,
+            bridge_actions=bridge_actions,
+            facts=facts,
+        )
         current_mask = mask if mask is not None else [1 if allowed else 0 for allowed in cache.mask]
         decision = cache.decision_for(action_id)
         if decision is None:
@@ -6696,6 +5847,7 @@ class PvZGymEnv:
                 before,
                 source="diagnostic",
                 bridge_actions=bridge_actions,
+                facts=facts,
             )
         decoded = dict(decision.intent.decoded_action)
         slot_index = int(decoded.get("slot_index", -1))
@@ -6749,7 +5901,12 @@ class PvZGymEnv:
     def _fusion_action_mask_enabled(self) -> bool:
         return bool(getattr(self.config, "fusion_action_mask_enabled", False))
 
-    def _fusion_mask_diagnostics(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+    def _fusion_mask_diagnostics(
+        self,
+        observation: Dict[str, Any],
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Dict[str, Any]:
         """Classify occupied-tile/seed pairings into fusion mask diagnostics counts."""
 
         enabled = self._fusion_action_mask_enabled()
@@ -6768,19 +5925,17 @@ class PvZGymEnv:
         cols = int(observation.get("columnCount") or 0)
         if rows <= 0 or cols <= 0:
             return out
-        slots = seed_slots_from_observation(observation, self.config.plant_types)
-        occupied_cells: Dict[Tuple[int, int], int] = {}
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            prow = self._safe_int(plant.get("row"), default=-1)
-            pcol = self._safe_int(plant.get("column"), default=-1)
-            if 0 <= prow < rows and 0 <= pcol < cols:
-                occupied_cells[(prow, pcol)] = self._safe_int(plant.get("type"), plant.get("plantType"), default=-1)
+        snapshot = self._facts_snapshot(observation, facts)
+        slots = snapshot.seed_slots
+        occupied_cells = {
+            cell: plant.plant_type
+            for cell, plant in snapshot.last_primary_plant_by_cell.items()
+            if 0 <= cell[0] < rows and 0 <= cell[1] < cols
+        }
         available_tiles: set = set()
         for (prow, pcol), _existing in occupied_cells.items():
             for slot_index, slot in enumerate(slots):
-                seed_slot_index = int(slot.get("slotIndex", slot_index))
+                seed_slot_index = int(slot.slot_index if slot.slot_index >= 0 else slot_index)
                 # Always classify as if fusion were enabled so the disabled case
                 # can report how many compatible fusions are being suppressed.
                 reason = get_fusion_illegal_reason(
@@ -6790,6 +5945,7 @@ class PvZGymEnv:
                     seed_slot_index,
                     fusion_enabled=True,
                     plant_types=self.config.plant_types,
+                    facts=snapshot,
                 )
                 if reason == "incompatible_pair":
                     out["fusion_actions_masked_incompatible_count"] += 1
@@ -6805,32 +5961,15 @@ class PvZGymEnv:
                         out["fusion_actions_masked_disabled_count"] += 1
         out["fusion_candidate_tiles"] = sorted(available_tiles)
         return out
-
-    def _cell_occupancy(self, observation: Dict[str, Any], row: int, column: int) -> Tuple[bool, int]:
-        """Return (occupied, plant_type) for a cell; plant_type is -1 when empty."""
-
-        for key in ("plants", "visiblePlants"):
-            values = observation.get(key, []) or []
-            if not isinstance(values, list):
-                continue
-            for plant in values:
-                if not isinstance(plant, dict):
-                    continue
-                if key == "visiblePlants" and (
-                    not bool(plant.get("activeInHierarchy", True))
-                    or not bool(plant.get("inBoardBounds", True))
-                ):
-                    continue
-                try:
-                    if int(plant.get("row", -1)) == row and int(plant.get("column", -1)) == column:
-                        return True, self._safe_int(plant.get("type"), plant.get("plantType"), default=-1)
-                except (TypeError, ValueError):
-                    continue
-        return False, -1
-
-    def _legal_actions_by_seed_slot(self, observation: Dict[str, Any], actions_or_mask: Any) -> Dict[str, int]:
-        slots = seed_slots_from_observation(observation, self.config.plant_types)
-        counts = {str(index): 0 for index in range(len(slots))}
+    def _legal_actions_by_seed_slot(
+        self,
+        observation: Dict[str, Any],
+        actions_or_mask: Any,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Dict[str, int]:
+        snapshot = self._facts_snapshot(observation, facts)
+        counts = {str(index): 0 for index in range(len(snapshot.seed_slots))}
         if (
             isinstance(actions_or_mask, list)
             and len(actions_or_mask) == int(observation.get("actionCount") or len(actions_or_mask))
@@ -6841,50 +5980,35 @@ class PvZGymEnv:
             actions = [int(action) for action in actions_or_mask]
         else:
             actions = []
+        rows = int(observation.get("rowCount") or 0)
+        columns = int(observation.get("columnCount") or 0)
+        cells = rows * columns
+        if cells <= 0:
+            return counts
         for action in actions:
             if int(action) <= 0:
                 continue
-            try:
-                decoded = decode_action(int(action), observation, self.config.plant_types)
-            except Exception:
-                continue
-            slot_index = int(decoded.get("slot_index", -1))
+            slot_index = (int(action) - 1) // cells
             if str(slot_index) in counts:
                 counts[str(slot_index)] += 1
         return counts
 
-    def _slot_readiness_by_seed_slot(self, observation: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    def _slot_readiness_by_seed_slot(
+        self,
+        observation: Dict[str, Any],
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        snapshot = self._facts_snapshot(observation, facts)
         result: Dict[str, Dict[str, Any]] = {}
-        for index, slot in enumerate(seed_slots_from_observation(observation, self.config.plant_types)):
-            slot_index = int(slot.get("slotIndex", index))
-            result[str(slot_index)] = self._seed_slot_snapshot(observation, slot_index)
+        for index, slot in enumerate(snapshot.seed_slots):
+            slot_index = int(slot.slot_index if slot.slot_index >= 0 else index)
+            result[str(slot_index)] = self._seed_slot_snapshot(
+                observation,
+                slot_index,
+                facts=snapshot,
+            )
         return result
-
-    def _seed_slot_snapshot(self, observation: Dict[str, Any], slot_index: int) -> Dict[str, Any]:
-        if not isinstance(observation, dict) or slot_index < 0:
-            return {}
-        slots = seed_slots_from_observation(observation, self.config.plant_types)
-        if not (0 <= slot_index < len(slots)):
-            return {"slotIndex": slot_index, "present": False}
-        slot = slots[slot_index]
-        plant_type = self._safe_int(slot.get("plantType"), default=-1)
-        return {
-            "slotIndex": slot_index,
-            "present": True,
-            "plantType": plant_type,
-            "plantTypeName": str(slot.get("plantTypeName") or (plant_type_name(plant_type) if plant_type >= 0 else "unknown")),
-            "seedCost": self._safe_int(slot.get("seedCost"), default=0),
-            "usable": bool(slot.get("usable", False)),
-            "ready": bool(slot.get("ready", False)),
-            "disabled": bool(slot.get("disabled", False)),
-            "isAvailable": bool(slot.get("isAvailable", False)),
-            "rawCooldown": self._safe_float(slot.get("rawCooldown"), default=0.0),
-            "currentCooldown": self._safe_float(slot.get("currentCooldown"), default=0.0),
-            "fullCooldown": self._safe_float(slot.get("fullCooldown"), default=0.0),
-            "cardInstanceId": self._safe_int(slot.get("cardInstanceId"), default=0),
-            "source": str(slot.get("source") or ""),
-        }
-
     def rule_based_teacher_action(self, observation: Optional[Dict[str, Any]] = None) -> int:
         obs = observation or self.previous_observation or self.observe()
         legal = set(self.legal_actions(obs))
@@ -6952,688 +6076,79 @@ class PvZGymEnv:
             return 0
         return 1 + seed_slot_index * rows * cols + row * cols + column
 
-    def _row_count(self, observation: Dict[str, Any]) -> int:
-        return max(0, int(observation.get("rowCount") or self.config.row_count))
-
-    def _row_int_dict(self, values: Dict[int, int], rows: int) -> Dict[str, int]:
-        return {str(row): int(values.get(row, 0)) for row in range(max(0, rows))}
-
-    def _lane_zombie_counts(self, observation: Dict[str, Any]) -> Dict[int, int]:
-        counts: Dict[int, int] = {}
-        rows = self._row_count(observation)
-        for row in range(rows):
-            counts[row] = 0
-        for lane in observation.get("lanes", []):
-            try:
-                row = int(lane.get("row", -1))
-            except (TypeError, ValueError):
-                continue
-            if 0 <= row < rows:
-                counts[row] = max(0, int(lane.get("zombieCount", 0) or 0))
-        return counts
-
-    def _active_threat_rows(self, observation: Dict[str, Any]) -> List[int]:
-        return [
-            row for row, count in self._lane_zombie_counts(observation).items()
-            if count > 0
-        ]
-
-    def _lane_danger_by_row(self, observation: Dict[str, Any]) -> Dict[int, float]:
-        danger_by_row: Dict[int, float] = {}
-        rows = self._row_count(observation)
-        for row in range(rows):
-            danger_by_row[row] = 0.0
-        for lane in observation.get("lanes", []):
-            try:
-                row = int(lane.get("row", -1))
-            except (TypeError, ValueError):
-                continue
-            if not 0 <= row < rows:
-                continue
-            if int(lane.get("zombieCount", 0) or 0) <= 0:
-                danger_by_row[row] = 0.0
-                continue
-            raw_danger = lane.get("danger")
-            if raw_danger is not None:
-                try:
-                    danger_by_row[row] = max(0.0, float(raw_danger))
-                    continue
-                except (TypeError, ValueError):
-                    pass
-            nearest_x = lane.get("nearestZombieX")
-            if nearest_x is None:
-                danger_by_row[row] = 0.0
-                continue
-            try:
-                danger_by_row[row] = max(0.0, 1.0 - float(nearest_x) / 10.0)
-            except (TypeError, ValueError):
-                danger_by_row[row] = 0.0
-        return danger_by_row
-
-    def _total_lane_danger(self, observation: Dict[str, Any]) -> float:
-        return sum(self._lane_danger_by_row(observation).values())
-
-    def _nearest_zombie_x_by_row(self, observation: Dict[str, Any]) -> Dict[int, Optional[float]]:
-        nearest_by_row: Dict[int, Optional[float]] = {
-            row: None for row in range(self._row_count(observation))
-        }
-        for lane in observation.get("lanes", []):
-            try:
-                row = int(lane.get("row", -1))
-            except (TypeError, ValueError):
-                continue
-            if row not in nearest_by_row:
-                continue
-            nearest_x = lane.get("nearestZombieX")
-            if nearest_x is None:
-                continue
-            try:
-                nearest_by_row[row] = float(nearest_x)
-            except (TypeError, ValueError):
-                pass
-        return nearest_by_row
-
-    def _rows_with_peashooter_count(self, observation: Dict[str, Any]) -> int:
-        return sum(
-            1 for count in self._shooter_counts_by_row(observation).values()
-            if count > 0
-        )
-
-    def _role_positioning_reward(
-        self,
-        observation: Dict[str, Any],
-        plant_type: int,
-        row: int,
-        column: int,
-    ) -> float:
-        cfg = self.config.reward
-        max_reward = max(0.0, float(cfg.role_positioning_reward))
-        if max_reward <= 0.0 or row < 0 or column < 0:
-            return 0.0
-
-        rows = self._row_count(observation)
-        if not 0 <= row < rows:
-            return 0.0
-        cols = max(1, int(observation.get("columnCount") or self.config.column_count))
-        danger_by_row = self._lane_danger_by_row(observation)
-        zombie_counts = self._lane_zombie_counts(observation)
-
-        if int(plant_type) == 1:
-            row_danger = danger_by_row.get(row, 0.0)
-            row_has_zombie = zombie_counts.get(row, 0) > 0
-            if row_has_zombie or row_danger >= 0.3:
-                if column >= 3 and row_danger >= self.config.reward.close_threat_threshold:
-                    return -min(0.1, max_reward * 0.4)
-                return 0.0
-            if column <= 2:
-                return max_reward
-            if column <= 3:
-                return max_reward * 0.6
-            return 0.0
-
-        if int(plant_type) == 0:
-            if zombie_counts.get(row, 0) <= 0:
-                return 0.0
-            reward = max_reward * 0.55
-            nearest_x = self._nearest_zombie_x_by_row(observation).get(row)
-            if nearest_x is not None:
-                firing_distance = float(nearest_x) - float(column)
-                if firing_distance >= 3.0:
-                    reward += max_reward * 0.45
-                elif firing_distance >= 1.5:
-                    reward += max_reward * 0.25
-                elif firing_distance < 0.5:
-                    reward -= max_reward * 0.3
-            elif column <= max(0, cols - 4):
-                reward += max_reward * 0.25
-            if column >= max(0, cols - 2):
-                reward -= max_reward * 0.3
-            return max(-max_reward * 0.5, min(max_reward, reward))
-
-        return 0.0
-
-    def _plant_counts_by_row(self, observation: Dict[str, Any], plant_type: Optional[int] = None) -> Dict[int, int]:
-        counts: Dict[int, int] = {}
-        rows = self._row_count(observation)
-        for row in range(rows):
-            counts[row] = 0
-        for plant in observation.get("plants", []):
-            try:
-                row = int(plant.get("row", -1))
-                observed_type = int(plant.get("type", -999))
-            except (TypeError, ValueError):
-                continue
-            if not 0 <= row < rows:
-                continue
-            if plant_type is not None and observed_type != int(plant_type):
-                continue
-            counts[row] += 1
-        return counts
-
-    def _shooter_counts_by_row(self, observation: Dict[str, Any]) -> Dict[int, int]:
-        return self._plant_counts_by_row(observation, plant_type=0)
-
-    def _undefended_close_threat_rows(self, observation: Dict[str, Any]) -> List[int]:
-        zombie_counts = self._lane_zombie_counts(observation)
-        shooter_counts = self._shooter_counts_by_row(observation)
-        danger_by_row = self._lane_danger_by_row(observation)
-        threshold = float(self.config.reward.close_threat_threshold)
-        return [
-            row for row, count in zombie_counts.items()
-            if count > 0 and shooter_counts.get(row, 0) == 0 and danger_by_row.get(row, 0.0) >= threshold
-        ]
-
-    def _mower_count(self, observation: Dict[str, Any]) -> int:
-        for key in ("logicalMowerCount", "visibleMowerObjectCount"):
-            if key in observation:
-                try:
-                    return max(0, int(observation.get(key) or 0))
-                except (TypeError, ValueError):
-                    continue
-        return max(0, int(observation.get("rowCount") or self.config.row_count))
-
-    def _active_mower_rows(self, observation: Dict[str, Any]) -> Optional[set[int]]:
-        visible_mowers = observation.get("visibleMowers")
-        if not isinstance(visible_mowers, list):
-            return None
-        rows: set[int] = set()
-        for mower in visible_mowers:
-            if not isinstance(mower, dict):
-                continue
-            if not bool(mower.get("activeInHierarchy", True)):
-                continue
-            if not bool(mower.get("inBoardBounds", True)):
-                continue
-            if not bool(mower.get("inMowerArray", True)):
-                continue
-            try:
-                row = int(mower.get("row", -1))
-            except (TypeError, ValueError):
-                continue
-            if row >= 0:
-                rows.add(row)
-        return rows
-
-    def _mower_losses_by_row(
-        self,
-        previous: Dict[str, Any],
-        current: Dict[str, Any],
-    ) -> Optional[Dict[int, int]]:
-        previous_rows = self._active_mower_rows(previous)
-        current_rows = self._active_mower_rows(current)
-        if previous_rows is None or current_rows is None:
-            return None
-        rows = max(self._row_count(previous), self._row_count(current))
-        losses = {row: 0 for row in range(rows)}
-        for row in previous_rows - current_rows:
-            if 0 <= row < rows:
-                losses[row] += 1
-        return losses
-
-    def _cooldown_snapshots_by_slot(self, observation: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
-        snapshots: Dict[int, Dict[str, Any]] = {}
-        slots = observation.get("seedSlots", []) or []
-        if isinstance(slots, list) and slots:
-            source_items = slots
-        else:
-            source_items = observation.get("cardCooldowns", []) or []
-        if not isinstance(source_items, list):
-            return snapshots
-        for fallback_index, item in enumerate(source_items):
-            if not isinstance(item, dict):
-                continue
-            slot_index = self._safe_int(item.get("slotIndex"), default=fallback_index)
-            configured_type = self.config.plant_types[slot_index] if 0 <= slot_index < len(self.config.plant_types) else -1
-            snapshots[slot_index] = {
-                "slot": slot_index,
-                "plantType": self._safe_int(item.get("plantType"), default=configured_type),
-                "plantTypeName": str(item.get("plantTypeName") or ""),
-                "currentCooldown": self._safe_float(item.get("currentCooldown"), default=0.0),
-                "rawCooldown": self._safe_float(item.get("rawCooldown"), default=0.0),
-                "fullCooldown": self._safe_float(item.get("fullCooldown"), default=0.0),
-                "ready": bool(item.get("ready")),
-                "cardInstanceId": self._safe_int(item.get("cardInstanceId"), default=0),
-            }
-        return snapshots
-
-    def _append_safety_event(
-        self,
-        events: List[Dict[str, Any]],
-        event: str,
-        observation: Dict[str, Any],
-        **fields: Any,
-    ) -> None:
-        events.append(
-            {
-                "event": event,
-                "step": observation.get("frameCount"),
-                "wave": observation.get("wave"),
-                "maxWave": observation.get("maxWave"),
-                "zombieCount": observation.get("zombieCount"),
-                "plantCount": observation.get("plantCount"),
-                "gameplayReady": observation.get("gameplayReady"),
-                "screenState": observation.get("screenState"),
-                "nextStep": observation.get("nextStep"),
-                "done": observation.get("done"),
-                "over": observation.get("over"),
-                "terminalHint": observation.get("terminalHint"),
-                **fields,
-            }
-        )
-
     def _environment_safety_diagnostics(
         self,
         previous: Optional[Dict[str, Any]],
         current: Dict[str, Any],
         action_result: Optional[Dict[str, Any]],
         requested_action: int,
+        *,
+        previous_facts: Optional[StepFacts] = None,
+        current_facts: Optional[StepFacts] = None,
     ) -> Dict[str, Any]:
-        events: List[Dict[str, Any]] = []
-        live_board_progress = self._has_live_board_progress(current)
-        post_win_signal = self._post_win_signal_present(current)
-        if live_board_progress and post_win_signal:
-            self._append_safety_event(
-                events,
-                "false_reward_unlock_during_gameplay",
-                current,
-                last_action=requested_action,
-            )
-            self._append_safety_event(
-                events,
-                "post_win_veto_live_board",
-                current,
-                last_action=requested_action,
-            )
-        if live_board_progress and (
-            current.get("nextStep") == "cleanup_reward_ui" or self._cleanup_signal_active(current)
-        ):
-            self._append_safety_event(
-                events,
-                "false_cleanup_reward_ui_during_gameplay",
-                current,
-                last_action=requested_action,
-            )
-        if self._suspicious_cleanup_signal_during_gameplay(current):
-            self._append_safety_event(
-                events,
-                "suspicious_cleanup_reward_ui_during_gameplay",
-                current,
-                last_action=requested_action,
-            )
-
-        active_runtime_context = bool(
-            previous
-            and not self._is_confirmed_post_game_ui(previous)
-            and not self._is_confirmed_post_game_ui(current)
-            and not bool(current.get("seedSelectionActive"))
-            and not bool(current.get("over"))
+        del action_result
+        result = compose_environment_safety_diagnostics(
+            previous,
+            current,
+            requested_action=int(requested_action),
+            fallback_plant_types=self.config.plant_types,
+            fallback_row_count=self.config.row_count,
+            lost_mower_rows=self._episode_lost_mower_rows,
+            live_board_progress=self._has_live_board_progress(current),
+            post_win_signal_present=self._post_win_signal_present(current),
+            cleanup_signal_active=bool(
+                current.get("nextStep") == "cleanup_reward_ui"
+                or self._cleanup_signal_active(current)
+            ),
+            suspicious_cleanup_signal_during_gameplay=(
+                self._suspicious_cleanup_signal_during_gameplay(current)
+            ),
+            previous_confirmed_postgame=bool(
+                previous and self._is_confirmed_post_game_ui(previous)
+            ),
+            current_confirmed_postgame=self._is_confirmed_post_game_ui(current),
+            previous_facts=previous_facts,
+            current_facts=current_facts,
         )
-        if previous and active_runtime_context:
-            previous_rows = self._active_mower_rows(previous)
-            current_rows = self._active_mower_rows(current)
-            if previous_rows is not None and current_rows is not None:
-                rows = max(self._row_count(previous), self._row_count(current))
-                for row in range(rows):
-                    if row in previous_rows and row not in current_rows:
-                        self._episode_lost_mower_rows.add(row)
-                respawn_rows = sorted(
-                    row for row in current_rows
-                    if 0 <= row < rows and (row not in previous_rows or row in self._episode_lost_mower_rows)
-                )
-                if respawn_rows:
-                    self._append_safety_event(
-                        events,
-                        "mower_respawn_detected",
-                        current,
-                        rows=respawn_rows,
-                        mowers_before=[row in previous_rows for row in range(rows)],
-                        mowers_after=[row in current_rows for row in range(rows)],
-                        last_action=requested_action,
-                    )
-            else:
-                previous_count = self._mower_count(previous)
-                current_count = self._mower_count(current)
-                if current_count > previous_count:
-                    self._append_safety_event(
-                        events,
-                        "mower_respawn_detected",
-                        current,
-                        rows=[],
-                        mowerCountBefore=previous_count,
-                        mowerCountAfter=current_count,
-                        last_action=requested_action,
-                    )
-
-            previous_plant_count = self._safe_int(previous.get("plantCount"), default=0)
-            current_plant_count = self._safe_int(current.get("plantCount"), default=0)
-            previous_visible_plants = self._safe_int(previous.get("visiblePlantObjectCount"), default=0)
-            current_visible_plants = self._safe_int(current.get("visiblePlantObjectCount"), default=0)
-            previous_wave = self._safe_int(previous.get("wave"), default=0)
-            current_wave = self._safe_int(current.get("wave"), default=0)
-            previous_time = self._safe_float(previous.get("time"), default=0.0)
-            current_time = self._safe_float(current.get("time"), default=0.0)
-            plant_count_refreshed = (
-                previous_plant_count >= 8
-                and current_plant_count <= max(1, int(previous_plant_count * 0.25))
-                and current_visible_plants <= max(1, int(previous_visible_plants * 0.25))
-            )
-            wave_rolled_back = previous_wave > 0 and current_wave < previous_wave
-            time_rolled_back = previous_time > 5.0 and current_time + 1.0 < previous_time
-            mower_count_refreshed = (
-                self._mower_count(previous) < max(1, self._row_count(previous))
-                and self._mower_count(current) >= max(1, self._row_count(current))
-            )
-            if plant_count_refreshed or wave_rolled_back or time_rolled_back or mower_count_refreshed:
-                self._append_safety_event(
-                    events,
-                    "board_refresh_detected",
-                    current,
-                    plant_count_before=previous_plant_count,
-                    plant_count_after=current_plant_count,
-                    visible_plant_count_before=previous_visible_plants,
-                    visible_plant_count_after=current_visible_plants,
-                    wave_before=previous_wave,
-                    wave_after=current_wave,
-                    time_before=previous_time,
-                    time_after=current_time,
-                    mower_count_before=self._mower_count(previous),
-                    mower_count_after=self._mower_count(current),
-                    last_action=requested_action,
-                )
-
-            previous_cooldowns = self._cooldown_snapshots_by_slot(previous)
-            current_cooldowns = self._cooldown_snapshots_by_slot(current)
-            cooldown_reset_candidates: List[Dict[str, Any]] = []
-            for slot, before in previous_cooldowns.items():
-                after = current_cooldowns.get(slot)
-                if not after:
-                    continue
-                before_cd = float(before.get("currentCooldown") or 0.0)
-                after_cd = float(after.get("currentCooldown") or 0.0)
-                full_cd = max(float(before.get("fullCooldown") or 0.0), float(after.get("fullCooldown") or 0.0))
-                drop_amount = max(0.0, before_cd - after_cd)
-                elapsed_game_time = max(0.0, current_time - previous_time)
-                elapsed_explains_drop = elapsed_game_time >= max(0.0, drop_amount - 0.75)
-                suspicious_drop = (
-                    before_cd > max(1.0, full_cd * 0.35)
-                    and after_cd <= 0.05
-                    and not elapsed_explains_drop
-                )
-                if suspicious_drop:
-                    cooldown_reset_candidates.append(
-                        {
-                            "slot": slot,
-                            "plant": after.get("plantTypeName") or plant_type_name(int(after.get("plantType", -1))),
-                            "cooldown_before": before_cd,
-                            "cooldown_after": after_cd,
-                            "full_cooldown": full_cd,
-                            "drop_amount": drop_amount,
-                            "elapsed_game_time": elapsed_game_time,
-                            "last_action": requested_action,
-                        }
-                    )
-                before_id = int(before.get("cardInstanceId") or 0)
-                after_id = int(after.get("cardInstanceId") or 0)
-                if before_id and after_id and before_id != after_id:
-                    self._append_safety_event(
-                        events,
-                        "seed_slot_object_id_changed_during_gameplay",
-                        current,
-                        slot=slot,
-                        plant=after.get("plantTypeName") or plant_type_name(int(after.get("plantType", -1))),
-                        card_id_before=before_id,
-                        card_id_after=after_id,
-                        last_action=requested_action,
-                    )
-            if len(cooldown_reset_candidates) >= 2:
-                for candidate in cooldown_reset_candidates:
-                    self._append_safety_event(events, "cooldown_reset_detected", current, **candidate)
-            elif cooldown_reset_candidates:
-                self._append_safety_event(
-                    events,
-                    "cooldown_drop_observed",
-                    current,
-                    **cooldown_reset_candidates[0],
-                    reason="single_slot_drop_not_global_reset",
-                )
-
-        corruption_events = [
-            event for event in events
-            if event.get("event") in {
-                "mower_respawn_detected",
-                "cooldown_reset_detected",
-                "seed_slot_object_id_changed_during_gameplay",
-                "board_refresh_detected",
-            }
-        ]
-        return {
-            "environment_corruption_detected": bool(corruption_events),
-            "environment_corruption_penalty": 10.0 if corruption_events else 0.0,
-            "env_corruption_count": len(corruption_events),
-            "mower_respawn_detected_count": sum(1 for event in events if event.get("event") == "mower_respawn_detected"),
-            "cooldown_reset_detected_count": sum(1 for event in events if event.get("event") == "cooldown_reset_detected"),
-            "board_refresh_detected_count": sum(1 for event in events if event.get("event") == "board_refresh_detected"),
-            "false_reward_unlock_during_gameplay_count": sum(
-                1 for event in events
-                if event.get("event") == "false_reward_unlock_during_gameplay"
-            ),
-            "false_cleanup_reward_ui_during_gameplay_count": sum(
-                1 for event in events
-                if event.get("event") == "false_cleanup_reward_ui_during_gameplay"
-            ),
-            "post_win_veto_live_board_count": sum(
-                1 for event in events
-                if event.get("event") == "post_win_veto_live_board"
-            ),
-            "blocked_cleanup_during_gameplay_count": sum(
-                1 for event in events
-                if event.get("event") == "suspicious_cleanup_reward_ui_during_gameplay"
-            ),
-            "suspicious_cleanup_reward_ui_count": sum(
-                1 for event in events
-                if event.get("event") == "suspicious_cleanup_reward_ui_during_gameplay"
-            ),
-            "reset_reward_ui_cleanup_count": 0,
-            "reset_reward_ui_cleanup_blocked_count": 0,
-            "safety_events": events,
-        }
-
-    def _action_info(self, action_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not isinstance(action_result, dict):
-            return {"kind": "wait", "plant_type": -1, "row": -1, "column": -1, "plant_placed": False}
-        decoded = action_result.get("decoded") if isinstance(action_result.get("decoded"), dict) else {}
-        placement = action_result.get("placement") if isinstance(action_result.get("placement"), dict) else {}
-        kind = str(decoded.get("kind") or ("plant" if placement else "wait"))
-        if kind == "fusion":
-            return {
-                "kind": "fusion",
-                "plant_type": self._safe_int(
-                    decoded.get("resultPlantType"),
-                    action_result.get("predictedResultType"),
-                    placement.get("plantType"),
-                    default=-1,
-                ),
-                "source_plant_type": self._safe_int(decoded.get("sourcePlantType"), default=-1),
-                "ingredient_plant_type": self._safe_int(decoded.get("ingredientPlantType"), default=-1),
-                "row": self._safe_int(decoded.get("row"), action_result.get("sourceRow"), default=-1),
-                "column": self._safe_int(decoded.get("column"), action_result.get("sourceCol"), default=-1),
-                "plant_placed": bool(action_result.get("fusionSucceeded") or placement.get("success")),
-            }
-        return {
-            "kind": kind,
-            "plant_type": self._safe_int(decoded.get("plantType"), placement.get("plantType"), default=-1),
-            "row": self._safe_int(decoded.get("row"), placement.get("row"), default=-1),
-            "column": self._safe_int(decoded.get("column"), placement.get("column"), default=-1),
-            "plant_placed": bool(
-                placement.get("success")
-                or action_result.get("plantPlaced")
-                or placement.get("plantPlaced")
-            ),
-        }
-
-    def _is_lane_response_action(
-        self,
-        previous: Optional[Dict[str, Any]],
-        action_result: Optional[Dict[str, Any]],
-    ) -> bool:
-        if previous is None or not isinstance(action_result, dict):
-            return False
-        if action_result.get("illegalAction"):
-            return False
-        action_info = self._action_info(action_result)
-        if int(action_info.get("plant_type", -1)) != 0 or not bool(action_info.get("plant_placed", False)):
-            return False
-        row = int(action_info.get("row", -1))
-        return (
-            row >= 0
-            and self._lane_zombie_counts(previous).get(row, 0) > 0
-            and self._shooter_counts_by_row(previous).get(row, 0) == 0
-        )
-
-    def _affordable_ready_seed_types(self, observation: Dict[str, Any]) -> set[int]:
-        ready: set[int] = set()
-        sun = self._safe_int(observation.get("sun"), default=0)
-        for slot in observation.get("seedSlots", []) or []:
-            if not isinstance(slot, dict):
-                continue
-            plant_type = self._safe_int(slot.get("plantType"), default=-1)
-            cost = self._safe_int(slot.get("seedCost"), default=0)
-            if (
-                plant_type >= 0
-                and bool(slot.get("ready"))
-                and bool(slot.get("usable", True))
-                and not bool(slot.get("disabled"))
-                and sun >= cost
-            ):
-                ready.add(plant_type)
-        return ready
-
-    def _meaningful_defender_counts_by_row(self, observation: Dict[str, Any]) -> Dict[int, int]:
-        counts = {row: 0 for row in range(self._row_count(observation))}
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            row = self._safe_int(plant.get("row"), default=-1)
-            plant_type = self._safe_int(plant.get("type"), default=-1)
-            name = str(plant.get("typeName") or "").lower()
-            if row not in counts:
-                continue
-            if plant_type in {0, 3, 1030, 1032} or any(token in name for token in ("pea", "shoot", "gatling", "repeater", "nut")):
-                counts[row] += 1
-        return counts
-
-    def _actionable_threat_rows(self, observation: Dict[str, Any]) -> List[int]:
-        defenders = self._meaningful_defender_counts_by_row(observation)
-        ready = self._affordable_ready_seed_types(observation)
-        tough_by_row = count_tough_zombies_by_row(observation)
-        rows: List[int] = []
-        for row in self._active_threat_rows(observation):
-            if defenders.get(row, 0) > 0:
-                continue
-            useful_ready = 0 in ready or 3 in ready
-            if 2 in ready and (
-                self._lane_zombie_counts(observation).get(row, 0) >= 2
-                or tough_by_row.get(row, {}).get("tough", 0) > 0
-            ):
-                useful_ready = True
-            if useful_ready and bool(observation.get("gameplayReady")):
-                rows.append(row)
-        return rows
-
-    def _mower_risk_rows(self, observation: Dict[str, Any]) -> List[int]:
-        active_mowers = self._active_mower_rows(observation)
-        if active_mowers is None:
-            active_mowers = set(range(self._row_count(observation)))
-        danger = self._lane_danger_by_row(observation)
-        nearest = self._nearest_zombie_x_by_row(observation)
-        defenders = self._meaningful_defender_counts_by_row(observation)
-        rows: List[int] = []
-        for row in active_mowers:
-            if self._lane_zombie_counts(observation).get(row, 0) <= 0:
-                continue
-            close = nearest.get(row)
-            if danger.get(row, 0.0) >= 0.65 or (close is not None and close <= 2.0) or defenders.get(row, 0) == 0:
-                rows.append(row)
-        return rows
-
-    def _valuable_plant_columns(self, observation: Dict[str, Any], row: int) -> List[int]:
-        columns: List[int] = []
-        for plant in observation.get("plants", []) or []:
-            if not isinstance(plant, dict):
-                continue
-            if self._safe_int(plant.get("row"), default=-1) != row:
-                continue
-            if self._safe_int(plant.get("type"), default=-1) in {0, 1, 1030, 1032, 1033}:
-                columns.append(self._safe_int(plant.get("column"), default=-1))
-        return [column for column in columns if column >= 0]
-
-    def _nearby_zombie_context(self, observation: Dict[str, Any], row: int, column: int, radius: float = 2.5) -> Dict[str, int]:
-        context = {"zombies": 0, "buckethead": 0, "conehead": 0, "tough": 0}
-        for zombie in observation.get("zombies", []) or []:
-            if not isinstance(zombie, dict) or not bool(zombie.get("alive", True)):
-                continue
-            zombie_row = self._safe_int(zombie.get("row"), default=-99)
-            if abs(zombie_row - row) > 1:
-                continue
-            zx = self._safe_float(zombie.get("x"), zombie.get("column"), default=float(column))
-            if abs(zx - float(column)) > radius and zombie_row != row:
-                continue
-            if zombie_row == row and zx - float(column) > 5.0:
-                continue
-            context["zombies"] += 1
-            tough_counts = count_tough_zombies_by_row({"rowCount": self._row_count(observation), "zombies": [zombie]})
-            row_counts = tough_counts.get(zombie_row, {})
-            context["buckethead"] += int(row_counts.get("buckethead", 0))
-            context["conehead"] += int(row_counts.get("conehead", 0))
-            context["tough"] += int(row_counts.get("tough", 0))
-        return context
-
-    def _update_pending_cherry_events(self, kill_delta: int) -> Tuple[float, float, Dict[str, int]]:
-        cfg = self.config.reward
-        reward = 0.0
-        wasted_penalty = 0.0
-        diagnostics = {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0}
-        active_events: List[Dict[str, Any]] = []
-        for event in self._pending_cherry_events:
-            event["age"] = int(event.get("age", 0)) + 1
-            if kill_delta > 0 and not bool(event.get("credited")):
-                event["kills"] = int(event.get("kills", 0)) + kill_delta
-                diagnostics["kills"] += kill_delta
-                base = float(cfg.cherrybomb_tactical_kill_reward)
-                if int(event.get("nearby_tough", 0)) > 0 or int(event.get("nearby_buckethead", 0)) > 0 or int(event.get("nearby_conehead", 0)) > 0:
-                    base += float(cfg.cherrybomb_tough_bonus_reward)
-                    diagnostics["buckethead"] += int(event.get("nearby_buckethead", 0) > 0)
-                    diagnostics["conehead"] += int(event.get("nearby_conehead", 0) > 0)
-                if bool(event.get("mower_risk")):
-                    base += float(cfg.cherrybomb_mower_save_bonus_reward)
-                if int(event.get("kills", 0)) >= 2 or base > float(cfg.cherrybomb_tactical_kill_reward):
-                    reward += base
-                    event["credited"] = True
-            if int(event.get("age", 0)) > 80:
-                if int(event.get("kills", 0)) <= 0:
-                    wasted_penalty -= float(cfg.cherrybomb_wasted_penalty)
-                    diagnostics["zero_kill"] += 1
-                continue
-            active_events.append(event)
-        self._pending_cherry_events = active_events
-        return reward, wasted_penalty, diagnostics
-
-    def _legal_peashooter_actions_by_row(
+        self._episode_lost_mower_rows = set(result.next_lost_mower_rows)
+        return result.diagnostics
+    def _facts_snapshot(
         self,
         observation: Dict[str, Any],
-        legal_actions: List[int],
-    ) -> Dict[int, int]:
-        counts = {row: 0 for row in range(self._row_count(observation))}
-        for action in legal_actions:
-            try:
-                decoded = decode_action(int(action), observation, self.config.plant_types)
-            except Exception:
-                continue
-            if decoded.get("kind") == 1 and int(decoded.get("plant_type", -1)) == 0:
-                row = int(decoded.get("row", -1))
-                if row in counts:
-                    counts[row] += 1
-        return counts
+        facts: Optional[StepFacts] = None,
+    ) -> StepFacts:
+        return facts or self._step_facts_cache.get(observation, self.config.plant_types)
+
+    def _seed_slot_snapshot(
+        self,
+        observation: Dict[str, Any],
+        slot_index: int,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> Dict[str, Any]:
+        if slot_index < 0:
+            return {}
+        slot = self._facts_snapshot(observation, facts).seed_slot(slot_index)
+        if slot is None:
+            return {"slotIndex": int(slot_index), "present": False}
+        return {
+            "slotIndex": int(slot_index),
+            "present": True,
+            "plantType": slot.plant_type,
+            "plantTypeName": slot.plant_type_name or (
+                plant_type_name(slot.plant_type) if slot.plant_type >= 0 else "unknown"
+            ),
+            "seedCost": slot.seed_cost,
+            "usable": slot.usable,
+            "ready": slot.ready,
+            "disabled": slot.disabled,
+            "isAvailable": slot.is_available,
+            "rawCooldown": slot.raw_cooldown,
+            "currentCooldown": slot.current_cooldown,
+            "fullCooldown": slot.full_cooldown,
+            "cardInstanceId": slot.card_instance_id,
+            "source": slot.source,
+        }
 
     @staticmethod
     def _safe_int(*values: Any, default: int = 0) -> int:

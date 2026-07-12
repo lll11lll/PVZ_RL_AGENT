@@ -1,0 +1,595 @@
+{
+  "schema_version": 1,
+  "captured_from_commit": "a147e93",
+  "base_observation_fixture": "synthetic_observation.json",
+  "tolerance": 1e-09,
+  "component_fields": [
+    "kill_reward",
+    "wave_reward",
+    "win_loss_reward",
+    "illegal_penalty",
+    "mower_loss_penalty",
+    "danger_delta_reward",
+    "undefended_threat_penalty",
+    "lane_response_reward",
+    "plant_health_loss_penalty",
+    "threat_balanced_row_reward",
+    "overdefended_row_penalty",
+    "role_positioning_reward",
+    "first_peashooter_in_row_reward",
+    "first_defense_undefended_threatened_row_reward",
+    "all_rows_peashooter_coverage_reward",
+    "sunflower_overbuild_before_defense_penalty",
+    "defense_before_extra_economy_reward",
+    "sunflower_while_undefended_threat_penalty",
+    "plant_elsewhere_while_undefended_threat_penalty",
+    "late_undefended_threat_penalty",
+    "reduce_undefended_threat_reward",
+    "wait_while_actionable_threat_penalty",
+    "first_peashooter_threatened_row_reward",
+    "all_active_threatened_rows_have_peashooter_reward",
+    "sunflower_greed_while_defense_missing_penalty",
+    "early_sunflower_reward",
+    "safe_sunflower_position_reward",
+    "sunflower_overbuild_penalty",
+    "economy_collapse_penalty",
+    "first_defense_in_threatened_row_reward",
+    "threatened_lane_coverage_reward",
+    "row_balance_reward",
+    "useful_peashooter_position_reward",
+    "overdefense_penalty",
+    "wallnut_blocks_active_threat_reward",
+    "wallnut_low_value_placement_penalty",
+    "wallnut_threatened_lane_reward",
+    "wallnut_between_zombie_and_house_reward",
+    "wallnut_frontline_reward",
+    "wallnut_emergency_block_reward",
+    "wallnut_useless_penalty",
+    "cherrybomb_tactical_kill_reward",
+    "cherrybomb_wasted_penalty",
+    "cherrybomb_kill_reward",
+    "cherrybomb_heavy_zombie_bonus",
+    "cherrybomb_cluster_bonus",
+    "cherrybomb_emergency_reward",
+    "cherrybomb_zero_kill_penalty",
+    "cherrybomb_low_value_penalty",
+    "mower_risk_reduction_reward",
+    "tough_zombie_response_reward",
+    "row_danger_delta_reward",
+    "high_danger_unanswered_penalty",
+    "mower_exposure_penalty",
+    "minimum_viable_defense_reward",
+    "coach_match_reward",
+    "coach_legal_execution_reward",
+    "coach_override_penalty",
+    "coach_fusion_success_reward",
+    "coach_tactical_usefulness_reward",
+    "fusion_reward"
+  ],
+  "environment_cases": [
+    {
+      "name": "kill_wave_wait",
+      "reward_overrides": {},
+      "previous": {},
+      "current": {
+        "scalar_deltas": {"killCount": 1, "wave": 1, "time": 0.5}
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": false,
+        "decoded": {"kind": "wait"}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "kill_reward": 1.0,
+        "wave_reward": 2.0,
+        "undefended_threat_penalty": -0.02,
+        "wait_while_actionable_threat_penalty": -0.05,
+        "reward_total": 2.93
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "illegal_damage_danger_mower",
+      "reward_overrides": {},
+      "previous": {},
+      "current": {
+        "scalar_deltas": {"totalPlantHealth": -100},
+        "scalar_set": {"logicalMowerCount": 4},
+        "lane_updates": {"4": {"danger": 0.8, "nearestZombieX": 2.0}}
+      },
+      "action_result": {
+        "ok": false,
+        "illegalAction": true,
+        "plantPlaced": false,
+        "decoded": {"kind": "wait"}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "illegal_penalty": -0.15,
+        "mower_loss_penalty": -1.25,
+        "danger_delta_reward": -0.002000000000000001,
+        "undefended_threat_penalty": -0.02,
+        "plant_health_loss_penalty": -0.2,
+        "wait_while_actionable_threat_penalty": -0.05,
+        "reward_total": -1.672
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "emergency_peashooter",
+      "reward_overrides": {
+        "first_defense_in_threatened_row_reward": 0.35,
+        "threatened_lane_coverage_reward": 0.18,
+        "row_balance_reward": 0.12,
+        "useful_peashooter_position_reward": 0.08,
+        "row_danger_delta_reward": 0.01,
+        "minimum_viable_defense_reward": 0.06
+      },
+      "previous": {"legal_actions_add": [113]},
+      "current": {
+        "plants_add": [
+          {"row": 1, "column": 2, "type": 0, "typeName": "Peashooter", "instanceId": 9003, "health": 300, "maxHealth": 300}
+        ]
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": true,
+        "decoded": {"kind": "plant", "plantType": 0, "row": 1, "column": 2},
+        "placement": {"success": true, "plantType": 0, "row": 1, "column": 2}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "undefended_threat_penalty": -0.02,
+        "lane_response_reward": 0.45,
+        "threat_balanced_row_reward": 0.75,
+        "role_positioning_reward": 0.25,
+        "first_peashooter_in_row_reward": 0.75,
+        "first_defense_undefended_threatened_row_reward": 1.25,
+        "reduce_undefended_threat_reward": 1.0,
+        "first_peashooter_threatened_row_reward": 0.35,
+        "first_defense_in_threatened_row_reward": 0.35,
+        "threatened_lane_coverage_reward": 0.18,
+        "row_balance_reward": 0.12,
+        "useful_peashooter_position_reward": 0.08,
+        "mower_risk_reduction_reward": 0.15,
+        "tough_zombie_response_reward": 0.075,
+        "reward_total": 5.735
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 0, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 0, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 0, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 0, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "sunflower_greed",
+      "reward_overrides": {
+        "early_sunflower_reward": 0.18,
+        "safe_sunflower_position_reward": 0.08,
+        "sunflower_overbuild_penalty": 0.22,
+        "economy_collapse_penalty": 0.25
+      },
+      "previous": {
+        "plants_add": [
+          {"row": 0, "column": 1, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300},
+          {"row": 0, "column": 2, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300},
+          {"row": 1, "column": 0, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300},
+          {"row": 2, "column": 0, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300},
+          {"row": 3, "column": 0, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300},
+          {"row": 4, "column": 0, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300}
+        ]
+      },
+      "current": {
+        "plants_add": [
+          {"row": 0, "column": 3, "type": 1, "typeName": "SunFlower", "health": 300, "maxHealth": 300}
+        ]
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": true,
+        "decoded": {"kind": "plant", "plantType": 1, "row": 0, "column": 3},
+        "placement": {"success": true, "plantType": 1, "row": 0, "column": 3}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "undefended_threat_penalty": -0.02,
+        "role_positioning_reward": 0.15,
+        "sunflower_overbuild_before_defense_penalty": -0.2,
+        "sunflower_while_undefended_threat_penalty": -0.45,
+        "plant_elsewhere_while_undefended_threat_penalty": -0.25,
+        "sunflower_greed_while_defense_missing_penalty": -0.15,
+        "sunflower_overbuild_penalty": -0.22,
+        "reward_total": -1.1400000000000001
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "wallnut_tactical",
+      "reward_overrides": {
+        "wallnut_threatened_lane_reward": 0.16,
+        "wallnut_between_zombie_and_house_reward": 0.18,
+        "wallnut_frontline_reward": 0.12,
+        "wallnut_emergency_block_reward": 0.28,
+        "wallnut_useless_penalty": 0.08,
+        "row_danger_delta_reward": 0.01
+      },
+      "previous": {"lane_updates": {"1": {"nearestZombieX": 3.0, "danger": 0.7}}},
+      "current": {
+        "plants_add": [
+          {"row": 1, "column": 2, "type": 3, "typeName": "WallNut", "instanceId": 9003, "health": 400, "maxHealth": 400}
+        ]
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": true,
+        "decoded": {"kind": "plant", "plantType": 3, "row": 1, "column": 2},
+        "placement": {"success": true, "plantType": 3, "row": 1, "column": 2}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "undefended_threat_penalty": -0.04,
+        "plant_elsewhere_while_undefended_threat_penalty": -0.25,
+        "wallnut_threatened_lane_reward": 0.16,
+        "wallnut_between_zombie_and_house_reward": 0.18,
+        "wallnut_emergency_block_reward": 0.28,
+        "mower_risk_reduction_reward": 0.15,
+        "tough_zombie_response_reward": 0.15,
+        "reward_total": 0.63
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "cherry_placement",
+      "reward_overrides": {
+        "cherrybomb_kill_reward": 0.16,
+        "cherrybomb_heavy_zombie_bonus": 0.12,
+        "cherrybomb_cluster_bonus": 0.1,
+        "cherrybomb_emergency_reward": 0.22,
+        "cherrybomb_zero_kill_penalty": 0.18,
+        "cherrybomb_low_value_penalty": 0.1,
+        "row_danger_delta_reward": 0.01
+      },
+      "previous": {
+        "zombies_replace": [
+          {"row": 1, "type": 4, "typeName": "Buckethead", "x": 3.0, "health": 500, "maxHealth": 900},
+          {"row": 1, "type": 2, "x": 3.5, "health": 270, "maxHealth": 270}
+        ],
+        "lane_updates": {"1": {"zombieCount": 2, "nearestZombieX": 3.0, "nearestZombieType": 4, "danger": 0.7}}
+      },
+      "current": {
+        "plants_add": [
+          {"row": 1, "column": 2, "type": 2, "typeName": "CherryBomb", "instanceId": 9003, "health": 300, "maxHealth": 300}
+        ]
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": true,
+        "decoded": {"kind": "plant", "plantType": 2, "row": 1, "column": 2},
+        "placement": {"success": true, "plantType": 2, "row": 1, "column": 2}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "undefended_threat_penalty": -0.04,
+        "plant_elsewhere_while_undefended_threat_penalty": -0.25,
+        "cherrybomb_tactical_kill_reward": 1.5,
+        "cherrybomb_heavy_zombie_bonus": 0.12,
+        "cherrybomb_cluster_bonus": 0.1,
+        "cherrybomb_emergency_reward": 0.22,
+        "mower_risk_reduction_reward": 0.15,
+        "tough_zombie_response_reward": 0.22499999999999998,
+        "reward_total": 2.025
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [
+          {"row": 1, "column": 2, "age": 0, "kills": 0, "nearby_tough": 2, "nearby_buckethead": 1, "nearby_conehead": 1, "mower_risk": true, "credited": false}
+        ],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "cherry_delayed_kills",
+      "reward_overrides": {
+        "cherrybomb_kill_reward": 0.16,
+        "cherrybomb_heavy_zombie_bonus": 0.12,
+        "cherrybomb_cluster_bonus": 0.1,
+        "cherrybomb_emergency_reward": 0.22,
+        "cherrybomb_zero_kill_penalty": 0.18,
+        "cherrybomb_low_value_penalty": 0.1,
+        "row_danger_delta_reward": 0.01
+      },
+      "previous": {
+        "zombies_replace": [
+          {"row": 1, "type": 4, "typeName": "Buckethead", "x": 3.0, "health": 500, "maxHealth": 900},
+          {"row": 1, "type": 2, "x": 3.5, "health": 270, "maxHealth": 270}
+        ],
+        "lane_updates": {"1": {"zombieCount": 2, "nearestZombieX": 3.0, "nearestZombieType": 4, "danger": 0.7}},
+        "plants_add": [
+          {"row": 1, "column": 2, "type": 2, "typeName": "CherryBomb", "instanceId": 9003, "health": 300, "maxHealth": 300}
+        ]
+      },
+      "current": {
+        "scalar_deltas": {"killCount": 2},
+        "zombies_replace": [],
+        "lane_updates": {"1": {"zombieCount": 0, "nearestZombieX": null, "danger": 0.0}}
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": false,
+        "decoded": {"kind": "wait"}
+      },
+      "state_before": {
+        "pending_cherry_events": [
+          {"row": 1, "column": 2, "age": 0, "kills": 0, "nearby_tough": 1, "nearby_buckethead": 1, "nearby_conehead": 0, "mower_risk": true, "credited": false}
+        ]
+      },
+      "expected_nonzero": {
+        "kill_reward": 2.0,
+        "danger_delta_reward": 0.006999999999999998,
+        "undefended_threat_penalty": -0.02,
+        "reduce_undefended_threat_reward": 1.0,
+        "wait_while_actionable_threat_penalty": -0.05,
+        "cherrybomb_tactical_kill_reward": 1.5,
+        "cherrybomb_kill_reward": 0.32,
+        "cherrybomb_heavy_zombie_bonus": 0.12,
+        "row_danger_delta_reward": 0.006999999999999998,
+        "reward_total": 4.884
+      },
+      "expected_cherry_diagnostics": {"kills": 2, "zero_kill": 0, "buckethead": 1, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 0, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 0, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 0, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 0, 0, 0, 1],
+        "pending_cherry_events": [
+          {"row": 1, "column": 2, "age": 1, "kills": 2, "nearby_tough": 1, "nearby_buckethead": 1, "nearby_conehead": 0, "mower_risk": true, "credited": true}
+        ],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "terminal_win",
+      "reward_overrides": {},
+      "previous": {},
+      "current": {"scalar_set": {"done": true, "terminalHint": "possible_win"}},
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": false,
+        "decoded": {"kind": "wait"}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "win_loss_reward": 10.0,
+        "undefended_threat_penalty": -0.02,
+        "wait_while_actionable_threat_penalty": -0.05,
+        "reward_total": 9.93
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    },
+    {
+      "name": "terminal_loss",
+      "reward_overrides": {},
+      "previous": {},
+      "current": {
+        "scalar_set": {
+          "done": true,
+          "over": true,
+          "terminalHint": "game_over_or_loss",
+          "onGameOverScreen": true,
+          "gameplayReady": false
+        }
+      },
+      "action_result": {
+        "ok": true,
+        "illegalAction": false,
+        "plantPlaced": false,
+        "decoded": {"kind": "wait"}
+      },
+      "state_before": {},
+      "expected_nonzero": {
+        "win_loss_reward": -10.0,
+        "undefended_threat_penalty": -0.02,
+        "wait_while_actionable_threat_penalty": -0.05,
+        "reward_total": -10.07
+      },
+      "expected_cherry_diagnostics": {"kills": 0, "zero_kill": 0, "buckethead": 0, "conehead": 0},
+      "expected_state_after": {
+        "undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "max_undefended_threat_age_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_sum_by_row": [0, 1, 0, 0, 1],
+        "undefended_threat_age_count_by_row": [0, 1, 0, 0, 1],
+        "pending_cherry_events": [],
+        "all_rows_peashooter_coverage_rewarded": false,
+        "all_active_threatened_rows_coverage_rewarded": false
+      }
+    }
+  ],
+  "fusion_sequences": [
+    {
+      "name": "success_context",
+      "max_positive_reward": 3.0,
+      "steps": [{"threatened": true, "success": true, "reason": "", "legal": true, "column": 4}],
+      "expected_deltas": [0.87],
+      "expected_live": {
+        "fusion_reward_total": 0.87,
+        "fusion_attempt_reward_total": 0.02,
+        "fusion_success_reward_total": 0.5,
+        "fusion_new_recipe_reward_total": 0.0,
+        "fusion_recursive_reward_total": 0.0,
+        "fusion_tier_reward_total": 0.0,
+        "fusion_repeat_decay_total": 0.0,
+        "fusion_threatened_row_bonus_total": 0.15,
+        "fusion_active_wave_bonus_total": 0.1,
+        "fusion_defensive_value_bonus_total": 0.1,
+        "fusion_incompatible_penalty_total": 0.0,
+        "fusion_empty_tile_penalty_total": 0.0,
+        "fusion_failed_penalty_total": 0.0,
+        "fusion_bridge_error_penalty_total": 0.0,
+        "fusion_spam_penalty_total": 0.0,
+        "fusion_reward_capped": false,
+        "fusion_last_reward_delta": 0.87,
+        "fusion_last_reward_reason": "success",
+        "fusion_last_usefulness_bonus": 0.35,
+        "fusion_last_source": "model"
+      }
+    },
+    {
+      "name": "incompatible_repeat",
+      "max_positive_reward": 3.0,
+      "steps": [
+        {"threatened": false, "success": false, "reason": "incompatible_pair", "legal": false, "column": 4},
+        {"threatened": false, "success": false, "reason": "incompatible_pair", "legal": false, "column": 4}
+      ],
+      "expected_deltas": [-0.1, -0.15000000000000002],
+      "expected_live": {
+        "fusion_reward_total": -0.25,
+        "fusion_attempt_reward_total": 0.0,
+        "fusion_success_reward_total": 0.0,
+        "fusion_new_recipe_reward_total": 0.0,
+        "fusion_recursive_reward_total": 0.0,
+        "fusion_tier_reward_total": 0.0,
+        "fusion_repeat_decay_total": 0.0,
+        "fusion_threatened_row_bonus_total": 0.0,
+        "fusion_active_wave_bonus_total": 0.0,
+        "fusion_defensive_value_bonus_total": 0.0,
+        "fusion_incompatible_penalty_total": -0.2,
+        "fusion_empty_tile_penalty_total": 0.0,
+        "fusion_failed_penalty_total": 0.0,
+        "fusion_bridge_error_penalty_total": 0.0,
+        "fusion_spam_penalty_total": -0.05,
+        "fusion_reward_capped": false,
+        "fusion_last_reward_delta": -0.15,
+        "fusion_last_reward_reason": "incompatible_pair,spam",
+        "fusion_last_usefulness_bonus": 0.0,
+        "fusion_last_source": "model"
+      }
+    },
+    {
+      "name": "cap_then_penalty",
+      "max_positive_reward": 0.6,
+      "steps": [
+        {"threatened": false, "success": true, "reason": "", "legal": true, "column": 4},
+        {"threatened": false, "success": true, "reason": "", "legal": true, "column": 5},
+        {"threatened": false, "success": false, "reason": "bridge_error", "legal": true, "column": 6}
+      ],
+      "expected_deltas": [0.52, 0.07999999999999996, -0.25],
+      "expected_live": {
+        "fusion_reward_total": 0.35,
+        "fusion_attempt_reward_total": 0.04,
+        "fusion_success_reward_total": 0.56,
+        "fusion_new_recipe_reward_total": 0.0,
+        "fusion_recursive_reward_total": 0.0,
+        "fusion_tier_reward_total": 0.0,
+        "fusion_repeat_decay_total": 0.0,
+        "fusion_threatened_row_bonus_total": 0.0,
+        "fusion_active_wave_bonus_total": 0.0,
+        "fusion_defensive_value_bonus_total": 0.0,
+        "fusion_incompatible_penalty_total": 0.0,
+        "fusion_empty_tile_penalty_total": 0.0,
+        "fusion_failed_penalty_total": 0.0,
+        "fusion_bridge_error_penalty_total": -0.25,
+        "fusion_spam_penalty_total": 0.0,
+        "fusion_reward_capped": true,
+        "fusion_last_reward_delta": -0.25,
+        "fusion_last_reward_reason": "bridge_error",
+        "fusion_last_usefulness_bonus": 0.0,
+        "fusion_last_source": "model"
+      }
+    },
+    {
+      "name": "duplicate_event",
+      "max_positive_reward": 3.0,
+      "steps": [
+        {"threatened": false, "success": true, "reason": "", "legal": true, "column": 4, "event_id": "same"},
+        {"threatened": false, "success": true, "reason": "", "legal": true, "column": 4, "event_id": "same"}
+      ],
+      "expected_deltas": [0.52, 0.0],
+      "expected_live": {
+        "fusion_reward_total": 0.52,
+        "fusion_attempt_reward_total": 0.02,
+        "fusion_success_reward_total": 0.5,
+        "fusion_new_recipe_reward_total": 0.0,
+        "fusion_recursive_reward_total": 0.0,
+        "fusion_tier_reward_total": 0.0,
+        "fusion_repeat_decay_total": 0.0,
+        "fusion_threatened_row_bonus_total": 0.0,
+        "fusion_active_wave_bonus_total": 0.0,
+        "fusion_defensive_value_bonus_total": 0.0,
+        "fusion_incompatible_penalty_total": 0.0,
+        "fusion_empty_tile_penalty_total": 0.0,
+        "fusion_failed_penalty_total": 0.0,
+        "fusion_bridge_error_penalty_total": 0.0,
+        "fusion_spam_penalty_total": 0.0,
+        "fusion_reward_capped": false,
+        "fusion_last_reward_delta": 0.52,
+        "fusion_last_reward_reason": "success",
+        "fusion_last_usefulness_bonus": 0.0,
+        "fusion_last_source": "model"
+      }
+    }
+  ]
+}

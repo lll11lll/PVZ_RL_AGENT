@@ -8,7 +8,6 @@ outside the live game loop so failures are clear and early.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -18,7 +17,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pvzrl_env import (
-    REWARD_EPISODE_TOTAL_FIELDS,
     classify_done_reason,
     decode_action,
     is_restart_screen_observation,
@@ -26,11 +24,13 @@ from pvzrl_env import (
     plant_type_name,
     registry_entries,
 )
+from pvzrl_rewards import REWARD_EPISODE_TOTAL_FIELDS
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields
 from pvzrl_human_coach import human_coach_live_status_from_hook
 from pvzrl_model_router import ModelRouter
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_seed_inventory import inventory_from_runtime_sources
+from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
 
 
 ADVENTURE_SEED_PRIORITY = [
@@ -167,44 +167,6 @@ class AdventureLevelLog:
     avg_mowers_lost: float = 0.0
     row_defense_response_rate: float = 0.0
     undefended_threat_ratio_by_row: Dict[str, float] = field(default_factory=dict)
-
-
-class LiveStatusWriter:
-    def __init__(self, path: Optional[Path]):
-        self.path = path
-        self.last_payload: Dict[str, Any] = {}
-        self._write_index = 0
-        self._last_warning_at = 0.0
-
-    def write(self, payload: Dict[str, Any]) -> None:
-        self.last_payload = payload
-        if self.path is None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_index += 1
-        tmp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.{id(self)}.{self._write_index}.tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        for attempt in range(20):
-            try:
-                os.replace(tmp_path, self.path)
-                return
-            except PermissionError:
-                time.sleep(0.025 + attempt * 0.005)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        now = time.monotonic()
-        if now - self._last_warning_at > 5.0:
-            self._last_warning_at = now
-            print(
-                f"[adventure] warning: live status file is locked; skipped one write to {self.path}",
-                flush=True,
-            )
 
 
 def launch_gui(live_status_path: Path) -> Optional[subprocess.Popen[Any]]:
@@ -1984,7 +1946,15 @@ def run_policy_attempt(
         if log.soft_timeout_reached:
             log.steps_after_soft_timeout = max(0, log.episode_length - log.soft_timeout_step)
         update_timeout_context(context, log)
-        writer.write(build_live_status(env, context, last_info=info))
+        raw_observation = info.get("raw_observation") if isinstance(info, dict) else None
+        if hasattr(writer, "write_lazy"):
+            writer.write_lazy(
+                lambda: build_live_status(env, context, last_info=info),
+                significant_state=live_status_significant_state(context, raw_observation, info),
+                force=bool(terminated or truncated),
+            )
+        else:  # Compatibility for lightweight test/report writers.
+            writer.write(build_live_status(env, context, last_info=info))
 
         if terminated or truncated:
             _finalize_policy_attempt(env, log, info)
@@ -2057,7 +2027,13 @@ def build_rows_payload(observation: Dict[str, Any], diagnostics: Dict[str, Any])
     return rows
 
 
-def build_agent_payload(env: PvZMaskedPPOEnv, context: Dict[str, Any], last_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_agent_payload(
+    env: PvZMaskedPPOEnv,
+    context: Dict[str, Any],
+    last_info: Optional[Dict[str, Any]] = None,
+    *,
+    legal_action_count: Optional[int] = None,
+) -> Dict[str, Any]:
     observation = env._last_observation or {}
     action_id = int(context.get("last_action_id", 0) or 0)
     if hasattr(env, "decode_policy_action"):
@@ -2065,12 +2041,14 @@ def build_agent_payload(env: PvZMaskedPPOEnv, context: Dict[str, Any], last_info
     else:
         decoded = decode_action(action_id, observation, env.config.plant_types)
     plant_type = int(decoded.get("plant_type", -1))
-    legal_count = 0
-    try:
-        legal_count = int(env.action_masks().sum())
-    except Exception:
-        legal = observation.get("legalActions", []) if isinstance(observation, dict) else []
-        legal_count = len(legal) if isinstance(legal, list) else 0
+    if legal_action_count is None:
+        try:
+            legal_count = int(env.action_masks().sum())
+        except Exception:
+            legal = observation.get("legalActions", []) if isinstance(observation, dict) else []
+            legal_count = len(legal) if isinstance(legal, list) else 0
+    else:
+        legal_count = int(legal_action_count)
     action_type = "wait" if int(decoded.get("kind", 0)) == 0 else "plant" if int(decoded.get("kind", 0)) == 1 else "invalid"
     return {
         "last_action": action_id,
@@ -2618,7 +2596,12 @@ def build_live_status(
         "human_coach": dict(coach_fields),
         "stream_coach": dict(coach_fields),
         "fusion": dict(fusion_fields),
-        "agent": build_agent_payload(env, context, last_info),
+        "agent": build_agent_payload(
+            env,
+            context,
+            last_info,
+            legal_action_count=legal_action_count,
+        ),
         "rows": build_rows_payload(observation, lane_diagnostics),
         "reward": {
             "episode_reward": float(getattr(env, "_episode_reward", 0.0) or 0.0),

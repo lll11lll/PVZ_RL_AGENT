@@ -26,6 +26,7 @@ import numpy as np
 from pvzrl_adventure import LiveStatusWriter, build_live_status
 from pvzrl_fusion import build_fusion_diagnostics
 from pvzrl_gui import PvZDashboard
+from pvzrl_observation_facts import StepFactsCache, build_step_facts
 from test_refactor_support import (
     array_sha256,
     cooldown_variant,
@@ -84,10 +85,51 @@ def measure(
     }
 
 
+def recursive_json_keys_types(value: Any) -> Dict[str, Any]:
+    """Return a value-independent, canonical description of JSON structure."""
+
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "properties": {
+                str(key): recursive_json_keys_types(value[key])
+                for key in sorted(value, key=lambda item: str(item))
+            },
+        }
+    if isinstance(value, (list, tuple)):
+        variants: Dict[str, Dict[str, Any]] = {}
+        for item in value:
+            item_schema = recursive_json_keys_types(item)
+            canonical = json.dumps(item_schema, sort_keys=True, separators=(",", ":"))
+            variants.setdefault(canonical, item_schema)
+        return {
+            "type": "array",
+            "items": [variants[key] for key in sorted(variants)],
+        }
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    return {"type": type(value).__name__}
+
+
 def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     fixed = make_wrapper(identity=False, fusion_enabled=True)
     identity = make_wrapper(identity=True, fusion_enabled=True)
     identity_no_fusion = make_wrapper(identity=True, fusion_enabled=False)
+    gui_default_generalist = make_wrapper(
+        identity=True,
+        fusion_enabled=True,
+        tactical_masks=True,
+        wallnut_tactical_mask=True,
+        cherrybomb_tactical_mask=True,
+    )
     fixed_dense = dense_observation(slot_count=4)
     identity_dense = dense_observation(slot_count=14)
     identity_low_sun = low_sun_variant(identity_dense)
@@ -95,6 +137,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     fixed._last_observation = fixed_dense
     identity._last_observation = identity_dense
     identity_no_fusion._last_observation = identity_dense
+    gui_default_generalist._last_observation = identity_dense
 
     sparse_fixed = observation_for_wrapper(fixed)
     sparse_identity = observation_for_wrapper(identity)
@@ -103,6 +146,17 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     reward_current["killCount"] = int(reward_previous.get("killCount", 0)) + 1
     reward_current["wave"] = int(reward_previous.get("wave", 0)) + 1
     reward_action = {"ok": True, "plantPlaced": False, "kind": "wait"}
+    slot_types = tuple(
+        int(slot.get("plantType", -1))
+        for slot in identity_dense.get("seedSlots", [])
+        if isinstance(slot, dict)
+    )
+    sparse_fixed_facts = build_step_facts(sparse_fixed, fixed.config.plant_types)
+    sparse_identity_facts = build_step_facts(sparse_identity, identity.config.plant_types)
+    reward_previous_facts = build_step_facts(reward_previous, identity.config.plant_types)
+    reward_current_facts = build_step_facts(reward_current, identity.config.plant_types)
+    reward_previous_legal = identity.base.legal_actions(reward_previous)
+    fusion_dense_facts = build_step_facts(identity_dense, slot_types)
 
     results: Dict[str, Any] = {}
     try:
@@ -130,23 +184,65 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
             samples=samples,
             rounds=rounds,
         )
+
+        def gui_default_generalist_cold_mask() -> np.ndarray:
+            # Force the same work a previously unseen bridge frame requires:
+            # observation facts, tactical decisions, and the full mask cache.
+            gui_default_generalist.base._step_facts_cache.clear()
+            gui_default_generalist.base._action_decision_cache = None
+            return gui_default_generalist.action_masks()
+
+        results["action_mask_gui_default_generalist_tactical_cold_dense"] = measure(
+            gui_default_generalist_cold_mask,
+            samples=samples,
+            rounds=rounds,
+        )
+        gui_default_generalist.action_masks()
+        results["mask_diagnostics_gui_default_generalist_dense"] = measure(
+            lambda: gui_default_generalist.base.mask_diagnostics(identity_dense),
+            samples=samples,
+            rounds=rounds,
+        )
         results["observation_encode_fixed_sparse"] = measure(
-            lambda: fixed._encode_observation(sparse_fixed),
+            lambda: fixed._encode_observation(sparse_fixed, facts=sparse_fixed_facts),
             samples=samples,
             rounds=rounds,
         )
         results["observation_encode_identity_sparse"] = measure(
-            lambda: identity._encode_observation(sparse_identity),
+            lambda: identity._encode_observation(sparse_identity, facts=sparse_identity_facts),
             samples=samples,
             rounds=rounds,
         )
         results["reward_breakdown_dense"] = measure(
-            lambda: identity.base.compute_reward_breakdown(reward_previous, reward_current, reward_action),
+            lambda: identity.base.compute_reward_breakdown(
+                reward_previous,
+                reward_current,
+                reward_action,
+                previous_facts=reward_previous_facts,
+                current_facts=reward_current_facts,
+                previous_legal_actions=reward_previous_legal,
+            ),
+            samples=samples,
+            rounds=rounds,
+        )
+        results["step_facts_build_dense"] = measure(
+            lambda: build_step_facts(identity_dense, slot_types),
+            samples=samples,
+            rounds=rounds,
+        )
+        facts_cache = StepFactsCache()
+        facts_cache.get(identity_dense)
+        results["step_facts_content_verified_reuse_dense"] = measure(
+            lambda: facts_cache.get(identity_dense),
             samples=samples,
             rounds=rounds,
         )
         results["fusion_candidate_scan_dense"] = measure(
-            lambda: build_fusion_diagnostics("observe", identity_dense),
+            lambda: build_fusion_diagnostics(
+                "observe",
+                identity_dense,
+                facts=fusion_dense_facts,
+            ),
             samples=samples,
             rounds=rounds,
         )
@@ -161,6 +257,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
             rounds=rounds,
         )
         live_payload = build_live_status(identity, live_context, live_state, {})
+        live_status_schema = recursive_json_keys_types(live_payload)
         results["live_status_json_serialize"] = measure(
             lambda: json.dumps(live_payload, indent=2),
             samples=samples,
@@ -171,11 +268,44 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
             live_path = temp_path / "live_status.json"
             writer = LiveStatusWriter(live_path)
             results["live_status_atomic_write"] = measure(
-                lambda: writer.write(live_payload),
+                lambda: writer.write(live_payload, force=True),
                 samples=samples,
                 rounds=rounds,
                 warmups=1,
             )
+            throttled_writer = LiveStatusWriter(live_path, min_interval_seconds=3600.0)
+            steady_token = ("running", "TRAINING_STEP")
+            throttled_writer.write(live_payload, force=True, significant_state=steady_token)
+            results["live_status_throttled_ordinary_attempt"] = measure(
+                lambda: throttled_writer.write(live_payload, significant_state=steady_token),
+                samples=samples,
+                rounds=rounds,
+            )
+            results["live_status_lazy_builder_suppressed"] = measure(
+                lambda: throttled_writer.write_lazy(
+                    lambda: build_live_status(identity, live_context, live_state, {}),
+                    significant_state=steady_token,
+                ),
+                samples=samples,
+                rounds=rounds,
+            )
+
+            clock_value = [0.0]
+            frequency_writer = LiveStatusWriter(
+                live_path,
+                min_interval_seconds=0.5,
+                monotonic=lambda: clock_value[0],
+            )
+            for _ in range(500):
+                frequency_writer.write_lazy(lambda: live_payload, significant_state=steady_token)
+                clock_value[0] += 0.05
+            ordinary_frequency = frequency_writer.stats
+            frequency_writer.write_lazy(
+                lambda: {**live_payload, "status": "complete"},
+                significant_state=("complete", "EPISODE_COMPLETE"),
+                force=True,
+            )
+            final_frequency = frequency_writer.stats
             live_path.write_text(json.dumps(live_payload, indent=2) + "\n", encoding="utf-8")
             dashboard = PvZDashboard.__new__(PvZDashboard)
             dashboard.live_status_path = live_path
@@ -197,6 +327,18 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
 
         dense_mask = identity.action_masks()
         dense_vector = identity._encode_observation(identity_dense)
+        gui_default_generalist.base._step_facts_cache.clear()
+        gui_default_generalist.base._action_decision_cache = None
+        tactical_mask = gui_default_generalist.action_masks()
+        tactical_mask_diagnostics = gui_default_generalist.base.mask_diagnostics(
+            identity_dense,
+            [1 if allowed else 0 for allowed in tactical_mask],
+        )
+        tactical_mask_diagnostics_contract = {
+            key: value
+            for key, value in tactical_mask_diagnostics.items()
+            if key != "action_cache"
+        }
         return {
             "schema_version": 1,
             "environment": {
@@ -218,6 +360,17 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
                     "no full Tk widget rendering",
                     "filesystem results depend on Windows cache and device state",
                 ],
+                "gui_default_generalist_configuration": {
+                    "action_space_mode": "adventure_14_identity",
+                    "fusion_action_mask_enabled": True,
+                    "tactical_masks": True,
+                    "wallnut_tactical_mask": True,
+                    "cherrybomb_tactical_mask": True,
+                },
+                "live_status_contract": (
+                    "recursive keys/types SHA-256 is deterministic; payload byte count is a "
+                    "nondeterministic diagnostic because values include runtime metadata"
+                ),
             },
             "contracts": {
                 "dense_observation_sha256": json_sha256(identity_dense),
@@ -225,7 +378,23 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
                 "identity_vector_sha256": array_sha256(dense_vector),
                 "identity_mask_true_count": int(dense_mask.sum()),
                 "identity_vector_size": int(dense_vector.size),
+                "gui_default_tactical_mask_sha256": mask_sha256(tactical_mask),
+                "gui_default_tactical_mask_true_count": int(tactical_mask.sum()),
+                "gui_default_tactical_mask_diagnostics_sha256": json_sha256(
+                    tactical_mask_diagnostics_contract
+                ),
                 "live_payload_bytes": len(json.dumps(live_payload).encode("utf-8")),
+                "live_payload_bytes_nondeterministic_diagnostic": len(
+                    json.dumps(live_payload).encode("utf-8")
+                ),
+                "live_status_recursive_keys_types_sha256": json_sha256(live_status_schema),
+                "live_status_write_frequency": {
+                    "ordinary_attempts": ordinary_frequency.attempts,
+                    "ordinary_payload_builds": ordinary_frequency.payload_builds,
+                    "ordinary_writes": ordinary_frequency.writes,
+                    "ordinary_skipped": ordinary_frequency.skipped,
+                    "forced_final_writes": final_frequency.writes - ordinary_frequency.writes,
+                },
             },
             "results": results,
         }
@@ -233,6 +402,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         fixed.close()
         identity.close()
         identity_no_fusion.close()
+        gui_default_generalist.close()
 
 
 def parse_args() -> argparse.Namespace:
