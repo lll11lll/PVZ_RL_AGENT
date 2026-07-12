@@ -17,7 +17,7 @@ import time
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pvzrl_actions import (
     ActionDecision,
@@ -125,6 +125,41 @@ LIFECYCLE_RESET_CLEANUP_ALLOWED = {
     LIFECYCLE_LOSS_PENDING,
     LIFECYCLE_RESETTING,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _DeadlinePollResult:
+    matched: bool
+    last_value: Dict[str, Any]
+
+
+def _poll_dict_until(
+    *,
+    deadline: float,
+    probe: Callable[[], Dict[str, Any]],
+    accept: Callable[[Dict[str, Any]], bool],
+    poll_seconds: float,
+    retry_exceptions: Tuple[type, ...] = (),
+    after_reject: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> _DeadlinePollResult:
+    """Poll a dictionary probe without owning caller-specific transition policy."""
+
+    last_value: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            value = probe()
+        except retry_exceptions:
+            time.sleep(poll_seconds)
+            continue
+        last_value = value
+        if accept(value):
+            return _DeadlinePollResult(True, value)
+        if after_reject is not None:
+            after_reject(value)
+        time.sleep(poll_seconds)
+    return _DeadlinePollResult(False, last_value)
+
+
 @dataclass
 class PvZEnvConfig:
     host: str = "127.0.0.1"
@@ -3507,13 +3542,16 @@ class PvZGymEnv:
     def wait_for_startup_popup_dismissed(self, timeout: float = 5.0, poll_seconds: Optional[float] = None) -> Dict[str, Any]:
         poll = self.config.reset_poll_seconds if poll_seconds is None else float(poll_seconds)
         deadline = time.monotonic() + max(0.1, timeout)
-        last_state: Dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            last_state = self.adventure_screen_state()
-            if not (last_state.get("startupPopupVisible") or last_state.get("startupOkButtonVisible")):
-                return last_state
-            time.sleep(max(0.05, poll))
-        return last_state
+        result = _poll_dict_until(
+            deadline=deadline,
+            probe=self.adventure_screen_state,
+            accept=lambda state: not (
+                state.get("startupPopupVisible")
+                or state.get("startupOkButtonVisible")
+            ),
+            poll_seconds=max(0.05, poll),
+        )
+        return result.last_value
 
     def click_reward_continue_once(self) -> Dict[str, Any]:
         return self._request_reconnect_once("click_reward_continue_once")
@@ -3530,28 +3568,27 @@ class PvZGymEnv:
     def wait_for_board(self, timeout: float = 180.0, poll_seconds: float = 0.2, quiet: bool = False) -> Dict[str, Any]:
         started = time.monotonic()
         deadline = time.monotonic() + timeout
-        last_observation: Dict[str, Any] = {}
         if not quiet:
             print(
                 "Waiting for board. In the game: click the green OK on the "
                 "startup popup, click Adventure, select plants, then enter/start the board."
             )
-        while time.monotonic() < deadline:
-            try:
-                observation = self.observe()
-                last_observation = observation
-                if observation.get("boardFound"):
-                    if not quiet:
-                        elapsed = time.monotonic() - started
-                        print(f"Board detected after {elapsed:.2f} seconds.")
-                    return observation
-            except (ConnectionError, OSError, RuntimeError):
-                pass
-            time.sleep(poll_seconds)
+        result = _poll_dict_until(
+            deadline=deadline,
+            probe=self.observe,
+            accept=lambda observation: bool(observation.get("boardFound")),
+            poll_seconds=poll_seconds,
+            retry_exceptions=(ConnectionError, OSError, RuntimeError),
+        )
+        if result.matched:
+            if not quiet:
+                elapsed = time.monotonic() - started
+                print(f"Board detected after {elapsed:.2f} seconds.")
+            return result.last_value
         raise TimeoutError(
             "Timed out waiting for boardFound=true. Manual path: click the green OK on the "
             "startup popup, click Adventure, select plants, then enter/start the board. "
-            f"Last observation: {last_observation}"
+            f"Last observation: {result.last_value}"
         )
 
     def wait_for_gameplay_ready(
@@ -3563,24 +3600,10 @@ class PvZGymEnv:
     ) -> Dict[str, Any]:
         started = time.monotonic()
         deadline = time.monotonic() + timeout
-        last_observation: Dict[str, Any] = {}
         if not quiet:
             print("Waiting for gameplayReady=true with selected seed packets available.")
-        while time.monotonic() < deadline:
-            try:
-                observation = self.observe()
-                last_observation = observation
-            except (ConnectionError, OSError, RuntimeError):
-                time.sleep(poll_seconds)
-                continue
 
-            if observation.get("gameplayReady") and not observation.get("seedSelectionActive"):
-                if not quiet:
-                    elapsed = time.monotonic() - started
-                    print(f"gameplayReady detected after {elapsed:.2f} seconds.")
-                self.previous_observation = observation
-                return observation
-
+        def reject_terminal(observation: Dict[str, Any]) -> None:
             if fail_on_terminal and observation.get("boardFound") and observation.get("done"):
                 hint = observation.get("terminalHint", "unknown")
                 wave = observation.get("wave", "?")
@@ -3590,8 +3613,26 @@ class PvZGymEnv:
                     f"(terminalHint={hint}, wave={wave}/{max_wave}). Start or reset a playable episode before waiting for gameplayReady."
                 )
 
-            time.sleep(poll_seconds)
-        raise TimeoutError(f"Timed out waiting for gameplayReady=true. Last observation: {last_observation}")
+        result = _poll_dict_until(
+            deadline=deadline,
+            probe=self.observe,
+            accept=lambda observation: bool(
+                observation.get("gameplayReady")
+                and not observation.get("seedSelectionActive")
+            ),
+            poll_seconds=poll_seconds,
+            retry_exceptions=(ConnectionError, OSError, RuntimeError),
+            after_reject=reject_terminal,
+        )
+        if result.matched:
+            if not quiet:
+                elapsed = time.monotonic() - started
+                print(f"gameplayReady detected after {elapsed:.2f} seconds.")
+            self.previous_observation = result.last_value
+            return result.last_value
+        raise TimeoutError(
+            f"Timed out waiting for gameplayReady=true. Last observation: {result.last_value}"
+        )
 
     def ensure_seeds_then_gameplay_ready(
         self,
