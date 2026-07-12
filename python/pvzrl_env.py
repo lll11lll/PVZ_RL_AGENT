@@ -71,6 +71,7 @@ from pvzrl_diagnostics import (
     compose_environment_safety_diagnostics,
 )
 from pvzrl_lane_diagnostics import LaneDiagnosticsInput, compose_lane_diagnostics
+from pvzrl_runtime_state import ResetRuntimeState
 from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
@@ -1385,25 +1386,38 @@ class PvZGymEnv:
         playable_reset_attempts = 0
         seed_selection_failures = 0
         last_observation: Dict[str, Any] = {}
-        reset_phase = "idle"
-        require_seed_selection_this_reset = bool(
+        requires_seed_selection = bool(
             reset_reason in {"win", "post_win_pending"}
             or reset_result.get("timeoutRequiresSeedFlow")
             or reset_result.get("fixedTrainTerminalReset")
             or reset_result.get("fixedTrainTerminalHardReset")
             or (self._is_level3_specialist_mode() and reset_reason == "level3_start")
         )
-        saw_seed_selection_this_reset = False
-        reset_started_from_loss = False
-        reset_started_from_win = bool(require_seed_selection_this_reset)
-        win_reset_invariant_armed = bool(require_seed_selection_this_reset)
-        unsafe_gameplay_ready_before_seed_count = 0
-        clicked_lets_rock_this_reset = False
-        fixed_train_post_win_reset = bool(reset_reason in {"win", "post_win_pending"} and self._is_fixed_level_mode())
-        fixed_train_terminal_reset = bool(
-            reset_result.get("fixedTrainTerminalReset")
-            or (self._is_fixed_level_mode() and reset_reason in {"win", "loss", "post_win_pending", "timeout", "level3_start"})
+        reset_state = ResetRuntimeState(
+            generation_id=int(self._reset_generation_id),
+            reason=str(reset_reason or ""),
+            requires_seed_selection=requires_seed_selection,
+            started_from_win=requires_seed_selection,
+            fixed_post_win_replay=bool(
+                reset_reason in {"win", "post_win_pending"}
+                and self._is_fixed_level_mode()
+            ),
+            fixed_terminal_reset=bool(
+                reset_result.get("fixedTrainTerminalReset")
+                or (
+                    self._is_fixed_level_mode()
+                    and reset_reason
+                    in {
+                        "win",
+                        "loss",
+                        "post_win_pending",
+                        "timeout",
+                        "level3_start",
+                    }
+                )
+            ),
         )
+        win_reset_invariant_armed = bool(reset_state.requires_seed_selection)
         fixed_train_in_game_attempts = 0
         last_fixed_train_in_game_attempt_at = 0.0
 
@@ -1411,31 +1425,22 @@ class PvZGymEnv:
             stages.append({"stage": name, "elapsed": round(time.monotonic() - started, 3), **fields})
 
         def set_phase(phase: str) -> None:
-            nonlocal reset_phase
-            reset_phase = phase
-            reset_result["resetPhase"] = reset_phase
+            reset_state.set_phase(phase)
+            reset_result["resetPhase"] = reset_state.phase
 
         def sync_invariant_fields() -> None:
-            self._reset_requires_seed_flow = bool(require_seed_selection_this_reset)
-            self._saw_seed_selection_this_reset = bool(saw_seed_selection_this_reset)
-            self._clicked_lets_rock_this_reset = bool(clicked_lets_rock_this_reset)
+            self._reset_requires_seed_flow = bool(reset_state.requires_seed_selection)
+            self._saw_seed_selection_this_reset = bool(reset_state.saw_seed_selection)
+            self._clicked_lets_rock_this_reset = bool(reset_state.clicked_lets_rock)
             self._reset_reason = str(reset_reason or "")
-            reset_result["requireSeedSelectionThisReset"] = bool(require_seed_selection_this_reset)
-            reset_result["sawSeedSelectionThisReset"] = bool(saw_seed_selection_this_reset)
-            reset_result["clickedLetsRockThisReset"] = bool(clicked_lets_rock_this_reset)
-            reset_result["resetStartedFromLoss"] = bool(reset_started_from_loss)
-            reset_result["resetStartedFromWin"] = bool(reset_started_from_win)
-            reset_result["fixedTrainPostWinReplayReset"] = bool(fixed_train_post_win_reset)
-            reset_result["fixedTrainTerminalReset"] = bool(fixed_train_terminal_reset)
-            reset_result["resetPhaseFinal"] = reset_phase
-            reset_result["unsafeGameplayReadyBeforeSeedCount"] = int(unsafe_gameplay_ready_before_seed_count)
+            reset_result.update(reset_state.compatibility_fields())
 
         def log_reset_state(observation: Dict[str, Any], note: str = "") -> None:
             line = self._format_reset_state_line(
                 observation,
-                phase=reset_phase,
-                require_seed_selection_this_reset=require_seed_selection_this_reset,
-                saw_seed_selection_this_reset=saw_seed_selection_this_reset,
+                phase=reset_state.phase,
+                require_seed_selection_this_reset=reset_state.requires_seed_selection,
+                saw_seed_selection_this_reset=reset_state.saw_seed_selection,
             )
             if note:
                 line += f" note={note}"
@@ -1474,24 +1479,25 @@ class PvZGymEnv:
             return False
 
         def enforce_loss_reset_invariant(observation: Dict[str, Any], note: str) -> None:
-            nonlocal unsafe_gameplay_ready_before_seed_count
-            if not reset_started_from_loss:
+            if not reset_state.started_from_loss:
                 return
             self._enforce_loss_reset_seed_selection_invariant(
                 observation,
-                require_seed_selection_this_reset=require_seed_selection_this_reset,
-                saw_seed_selection_this_reset=saw_seed_selection_this_reset,
-                reset_phase=reset_phase,
+                require_seed_selection_this_reset=reset_state.requires_seed_selection,
+                saw_seed_selection_this_reset=reset_state.saw_seed_selection,
+                reset_phase=reset_state.phase,
                 reset_result=reset_result,
                 stage_callback=stage,
                 state_logger=log_reset_state,
                 note=note,
             )
-            unsafe_gameplay_ready_before_seed_count = int(reset_result.get("unsafeGameplayReadyBeforeSeedCount", 0) or 0)
+            reset_state.unsafe_gameplay_ready_before_seed_count = int(
+                reset_result.get("unsafeGameplayReadyBeforeSeedCount", 0) or 0
+            )
 
         set_phase("idle")
         sync_invariant_fields()
-        if require_seed_selection_this_reset:
+        if reset_state.requires_seed_selection:
             set_phase("terminal_detected")
             sync_invariant_fields()
             stage(
@@ -1499,9 +1505,9 @@ class PvZGymEnv:
                 resetReason=reset_reason,
                 requireSeedSelectionThisReset=True,
                 sawSeedSelectionThisReset=False,
-                fixedTrainPostWinReplayReset=bool(fixed_train_post_win_reset),
+                fixedTrainPostWinReplayReset=bool(reset_state.fixed_post_win_replay),
             )
-            if fixed_train_post_win_reset:
+            if reset_state.fixed_post_win_replay:
                 stage(
                     "fixed_train_post_win_replay_reset_started",
                     resetReason=reset_reason,
@@ -1523,11 +1529,11 @@ class PvZGymEnv:
             if (
                 reset_reason == "timeout"
                 and possible_win_reset_context
-                and not require_seed_selection_this_reset
+                and not reset_state.requires_seed_selection
             ):
-                require_seed_selection_this_reset = True
-                saw_seed_selection_this_reset = False
-                reset_started_from_win = True
+                reset_state.requires_seed_selection = True
+                reset_state.saw_seed_selection = False
+                reset_state.started_from_win = True
                 set_phase("terminal_detected")
                 sync_invariant_fields()
                 if not win_reset_invariant_armed:
@@ -1566,8 +1572,8 @@ class PvZGymEnv:
             enforce_loss_reset_invariant(observation, note="loop_head")
 
             post_win_replay_context = bool(
-                fixed_train_post_win_reset
-                and not saw_seed_selection_this_reset
+                reset_state.fixed_post_win_replay
+                and not reset_state.saw_seed_selection
                 and not self._seed_selection_visible(observation)
                 and (
                     lifecycle_state == LIFECYCLE_POST_WIN_PENDING
@@ -1674,9 +1680,9 @@ class PvZGymEnv:
                 continue
 
             fixed_train_in_game_reset_context = bool(
-                fixed_train_terminal_reset
+                reset_state.fixed_terminal_reset
                 and reset_reason in {"timeout", "level3_start"}
-                and not saw_seed_selection_this_reset
+                and not reset_state.saw_seed_selection
                 and not self._seed_selection_visible(observation)
                 and (
                     lifecycle_state in {LIFECYCLE_ACTIVE_GAMEPLAY, LIFECYCLE_READY}
@@ -1748,10 +1754,10 @@ class PvZGymEnv:
                 continue
 
             if lifecycle_state == LIFECYCLE_LOSS_PENDING:
-                if not reset_started_from_loss:
-                    require_seed_selection_this_reset = True
-                    saw_seed_selection_this_reset = False
-                    reset_started_from_loss = True
+                if not reset_state.started_from_loss:
+                    reset_state.requires_seed_selection = True
+                    reset_state.saw_seed_selection = False
+                    reset_state.started_from_loss = True
                     set_phase("terminal_detected")
                     sync_invariant_fields()
                     stage(
@@ -1788,7 +1794,9 @@ class PvZGymEnv:
                     start_sun=self.config.start_sun,
                     allow_active_gameplay_reset=allow_active_gameplay_reset,
                     reset_reason=reset_reason,
-                    require_loss_seed_selection_path=bool(require_seed_selection_this_reset),
+                    require_loss_seed_selection_path=bool(
+                        reset_state.requires_seed_selection
+                    ),
                 )
                 restart_attempts += 1
                 last_restart_attempt_at = now
@@ -1836,7 +1844,7 @@ class PvZGymEnv:
                     LIFECYCLE_UNKNOWN,
                 }:
                     if cleanup_attempts >= 3 and lifecycle_state == LIFECYCLE_POST_WIN_PENDING:
-                        if require_seed_selection_this_reset:
+                        if reset_state.requires_seed_selection:
                             stage(
                                 "post_win_soft_reset_blocked",
                                 lifecycleState=lifecycle_state,
@@ -1891,7 +1899,7 @@ class PvZGymEnv:
 
             if self._reward_or_trophy_ui_active(observation):
                 if cleanup_attempts >= 3:
-                    if require_seed_selection_this_reset:
+                    if reset_state.requires_seed_selection:
                         stage(
                             "post_win_soft_reset_blocked",
                             lifecycleState=lifecycle_state,
@@ -1940,24 +1948,24 @@ class PvZGymEnv:
                 continue
 
             if lifecycle_state == LIFECYCLE_RESETTING and self._seed_selection_visible(observation):
-                saw_seed_selection_this_reset = True
+                reset_state.saw_seed_selection = True
                 set_phase("seed_selection")
                 sync_invariant_fields()
                 log_reset_state(observation, note="seed_selection_detected")
                 reset_result.setdefault("seedScreenAtSeconds", round(time.monotonic() - started, 3))
                 print(f"[reset] seed_screen_at={reset_result['seedScreenAtSeconds']:.2f}s")
-                if fixed_train_terminal_reset:
+                if reset_state.fixed_terminal_reset:
                     print("[reset] seed_selection_detected=True")
                 if reset_reason == "timeout":
                     print("[reset] seed screen observed after timeout reset")
-                if fixed_train_post_win_reset:
+                if reset_state.fixed_post_win_replay:
                     print("[reset] seed selection observed after post-win reset")
                 stage(
                     "seed_screen_detected",
                     lifecycleState=lifecycle_state,
                     selectedBankVisibleCount=observation.get("selectedBankVisibleCount"),
-                    requireSeedSelectionThisReset=require_seed_selection_this_reset,
-                    sawSeedSelectionThisReset=saw_seed_selection_this_reset,
+                    requireSeedSelectionThisReset=reset_state.requires_seed_selection,
+                    sawSeedSelectionThisReset=reset_state.saw_seed_selection,
                 )
                 if not self.config.auto_select_seeds:
                     raise RuntimeError("reset reached seed selection but auto_select_seeds is disabled")
@@ -1977,14 +1985,14 @@ class PvZGymEnv:
                 set_phase("selecting_seeds")
                 sync_invariant_fields()
                 stage("auto_select_started", seedList=list(self.config.seed_list))
-                if fixed_train_terminal_reset:
+                if reset_state.fixed_terminal_reset:
                     print(f"[reset] selected_seeds={','.join(str(seed) for seed in self.config.seed_list)}")
-                elif fixed_train_post_win_reset:
+                elif reset_state.fixed_post_win_replay:
                     print(f"[reset] auto-selecting seeds after post-win reset: {list(self.config.seed_list)}")
                 selection = self.auto_select_seeds(seed_list=self.config.seed_list, start_level=True)
                 reset_result["autoSelectSeeds"] = selection
                 reset_result["letsRockAtSeconds"] = round(time.monotonic() - started, 3)
-                clicked_lets_rock_this_reset = bool(
+                reset_state.clicked_lets_rock = bool(
                     selection.get("startInvoked")
                     or (isinstance(selection.get("startLog"), dict) and selection.get("startLog", {}).get("startInvoked"))
                     or (isinstance(selection.get("startLog"), dict) and selection.get("startLog", {}).get("startClicked"))
@@ -1995,13 +2003,13 @@ class PvZGymEnv:
                     "lets_rock_clicked",
                     ok=selection.get("ok"),
                     startInvoked=selection.get("startInvoked"),
-                    clickedLetsRockThisReset=bool(clicked_lets_rock_this_reset),
+                    clickedLetsRockThisReset=bool(reset_state.clicked_lets_rock),
                     startLog=selection.get("startLog", {}),
                 )
                 print(f"[reset] lets_rock_at={reset_result['letsRockAtSeconds']:.2f}s")
-                if fixed_train_terminal_reset:
-                    print(f"[reset] lets_rock_clicked={bool(clicked_lets_rock_this_reset)}")
-                if fixed_train_post_win_reset and clicked_lets_rock_this_reset:
+                if reset_state.fixed_terminal_reset:
+                    print(f"[reset] lets_rock_clicked={bool(reset_state.clicked_lets_rock)}")
+                if reset_state.fixed_post_win_replay and reset_state.clicked_lets_rock:
                     print("[reset] Let's Rock clicked after post-win reset")
                 if not selection.get("ok", False):
                     seed_selection_failures += 1
@@ -2046,11 +2054,11 @@ class PvZGymEnv:
                 )
                 reset_result["gameplayReadyAtSeconds"] = round(time.monotonic() - started, 3)
                 print(f"[reset] gameplay_ready_at={reset_result['gameplayReadyAtSeconds']:.2f}s")
-                if fixed_train_terminal_reset:
+                if reset_state.fixed_terminal_reset:
                     print(f"[reset] gameplay_ready={bool(observation.get('gameplayReady'))}")
-                if require_seed_selection_this_reset and saw_seed_selection_this_reset:
+                if reset_state.requires_seed_selection and reset_state.saw_seed_selection:
                     seed_slot_count = self._safe_int(observation.get("seedSlotCount"), default=0)
-                    if fixed_train_post_win_reset:
+                    if reset_state.fixed_post_win_replay:
                         print(
                             "[reset] accepted board after post-win seed flow: "
                             f"wave={observation.get('wave', 0)} "
@@ -2072,16 +2080,18 @@ class PvZGymEnv:
 
             if lifecycle_state in {LIFECYCLE_ACTIVE_GAMEPLAY, LIFECYCLE_READY}:
                 enforce_loss_reset_invariant(observation, note="active_or_ready_branch")
-                if require_seed_selection_this_reset and not saw_seed_selection_this_reset:
+                if reset_state.requires_seed_selection and not reset_state.saw_seed_selection:
                     set_phase("waiting_seed_selection")
                     sync_invariant_fields()
-                    unsafe_gameplay_ready_before_seed_count += 1
-                    reset_result["unsafeGameplayReadyBeforeSeedCount"] = int(unsafe_gameplay_ready_before_seed_count)
-                    if fixed_train_post_win_reset:
+                    reset_state.unsafe_gameplay_ready_before_seed_count += 1
+                    reset_result["unsafeGameplayReadyBeforeSeedCount"] = int(
+                        reset_state.unsafe_gameplay_ready_before_seed_count
+                    )
+                    if reset_state.fixed_post_win_replay:
                         print(
                             "[reset] rejecting gameplay board: post-win fixed_train reset requires seed selection "
-                            f"sawSeed={bool(saw_seed_selection_this_reset)} "
-                            f"clickedLetsRock={bool(clicked_lets_rock_this_reset)} "
+                            f"sawSeed={bool(reset_state.saw_seed_selection)} "
+                            f"clickedLetsRock={bool(reset_state.clicked_lets_rock)} "
                             f"seedSelectionActive={observation.get('seedSelectionActive')} "
                             f"screenState={observation.get('screenState')} "
                             f"gameplayReady={observation.get('gameplayReady')}"
@@ -2090,7 +2100,7 @@ class PvZGymEnv:
                         print(
                             "[reset] rejecting playable board: "
                             f"{reset_reason} reset requires seed selection but "
-                            f"sawSeed={bool(saw_seed_selection_this_reset)} "
+                            f"sawSeed={bool(reset_state.saw_seed_selection)} "
                             f"seedSelectionActive={observation.get('seedSelectionActive')} "
                             f"screenState={observation.get('screenState')} "
                             f"gameplayReady={observation.get('gameplayReady')}"
@@ -2104,26 +2114,28 @@ class PvZGymEnv:
                         seedSelectionActive=observation.get("seedSelectionActive"),
                         requireSeedSelectionThisReset=True,
                         sawSeedSelectionThisReset=False,
-                        unsafeGameplayReadyBeforeSeedCount=int(unsafe_gameplay_ready_before_seed_count),
+                        unsafeGameplayReadyBeforeSeedCount=int(
+                            reset_state.unsafe_gameplay_ready_before_seed_count
+                        ),
                     )
-                    if unsafe_gameplay_ready_before_seed_count >= 3:
+                    if reset_state.unsafe_gameplay_ready_before_seed_count >= 3:
                         reset_result["seedSelectionImpossibleState"] = True
                         reset_result["seedSelectionImpossibleReason"] = (
                             "gameplay_ready_observed_repeatedly_before_seed_selection"
                         )
                         raise RuntimeError(
                             "seed-selection-required reset reached gameplay before seed selection repeatedly. "
-                            f"reason={reset_reason} phase={reset_phase} "
+                            f"reason={reset_reason} phase={reset_state.phase} "
                             f"screenState={observation.get('screenState')} "
                             f"nextStep={next_step} gameplayReady={observation.get('gameplayReady')} "
                             f"seedSelectionActive={observation.get('seedSelectionActive')} "
                             f"terminalHint={terminal_hint} "
-                            f"requireSeed={bool(require_seed_selection_this_reset)} "
-                            f"sawSeed={bool(saw_seed_selection_this_reset)}"
+                            f"requireSeed={bool(reset_state.requires_seed_selection)} "
+                            f"sawSeed={bool(reset_state.saw_seed_selection)}"
                         )
                     time.sleep(max(0.25, self.config.reset_poll_seconds))
                     continue
-                if require_seed_selection_this_reset and not clicked_lets_rock_this_reset:
+                if reset_state.requires_seed_selection and not reset_state.clicked_lets_rock:
                     set_phase("waiting_gameplay_ready")
                     sync_invariant_fields()
                     stage(
@@ -2133,12 +2145,12 @@ class PvZGymEnv:
                         gameplayReady=observation.get("gameplayReady"),
                         seedSelectionActive=observation.get("seedSelectionActive"),
                         requireSeedSelectionThisReset=True,
-                        sawSeedSelectionThisReset=bool(saw_seed_selection_this_reset),
+                        sawSeedSelectionThisReset=bool(reset_state.saw_seed_selection),
                         clickedLetsRockThisReset=False,
                     )
                     print(
                         "[reset] rejecting gameplay board: seed-selection-required reset has not clicked Let's Rock "
-                        f"sawSeed={bool(saw_seed_selection_this_reset)} "
+                        f"sawSeed={bool(reset_state.saw_seed_selection)} "
                         f"screenState={observation.get('screenState')} "
                         f"gameplayReady={observation.get('gameplayReady')}"
                     )
@@ -2255,18 +2267,23 @@ class PvZGymEnv:
                 f"lastLifecycleState={reset_result['lastLifecycleState']} Last observation: {last_observation}"
             )
 
-        if require_seed_selection_this_reset and (not saw_seed_selection_this_reset or not clicked_lets_rock_this_reset):
+        if reset_state.requires_seed_selection and (
+            not reset_state.saw_seed_selection
+            or not reset_state.clicked_lets_rock
+        ):
             sync_invariant_fields()
             stage(
                 "seed_flow_reset_invariant_unmet",
                 requireSeedSelectionThisReset=True,
-                sawSeedSelectionThisReset=bool(saw_seed_selection_this_reset),
-                clickedLetsRockThisReset=bool(clicked_lets_rock_this_reset),
+                sawSeedSelectionThisReset=bool(reset_state.saw_seed_selection),
+                clickedLetsRockThisReset=bool(reset_state.clicked_lets_rock),
                 message="seed-selection-required reset did not observe seed selection and Let's Rock before completion",
             )
             raise RuntimeError("Reset invariant failed: seed selection and Let's Rock were not observed before reset completion.")
 
-        cleanup_allow_active_gameplay_reset = bool(allow_active_gameplay_reset or fixed_train_terminal_reset)
+        cleanup_allow_active_gameplay_reset = bool(
+            allow_active_gameplay_reset or reset_state.fixed_terminal_reset
+        )
         cleanup = self.reset_cleanup(
             reset_card_cooldowns=True,
             allow_active_gameplay_reset=cleanup_allow_active_gameplay_reset,
@@ -2283,10 +2300,10 @@ class PvZGymEnv:
         stage("cleanup_complete", cleanupSuccess=cleanup_ok, message=cleanup_message)
         mower_count_warning_only = bool(
             not cleanup_ok
-            and fixed_train_terminal_reset
-            and require_seed_selection_this_reset
-            and saw_seed_selection_this_reset
-            and clicked_lets_rock_this_reset
+            and reset_state.fixed_terminal_reset
+            and reset_state.requires_seed_selection
+            and reset_state.saw_seed_selection
+            and reset_state.clicked_lets_rock
             and self._is_mower_count_only_cleanup_warning(cleanup_message)
         )
         if not cleanup_ok:
@@ -2304,9 +2321,9 @@ class PvZGymEnv:
         observation, playable_ok, playable_message = self._wait_for_post_reset_playable(
             allow_active_gameplay_reset=cleanup_allow_active_gameplay_reset,
             reset_reason=reset_reason,
-            require_seed_selection_this_reset=require_seed_selection_this_reset,
-            saw_seed_selection_this_reset=saw_seed_selection_this_reset,
-            clicked_lets_rock_this_reset=clicked_lets_rock_this_reset,
+            require_seed_selection_this_reset=reset_state.requires_seed_selection,
+            saw_seed_selection_this_reset=reset_state.saw_seed_selection,
+            clicked_lets_rock_this_reset=reset_state.clicked_lets_rock,
             require_mowers=not mower_count_warning_only,
         )
         reset_result["postResetPlayableValidation"] = playable_message
@@ -2321,8 +2338,8 @@ class PvZGymEnv:
         if "restartDetectedAtSeconds" in reset_result:
             print(f"[reset] total_reset_seconds={reset_result['timeToPlayableSeconds']:.2f}")
         reset_result["postResetSeedSelectionActive"] = bool(observation.get("seedSelectionActive"))
-        invariant_ok = (not require_seed_selection_this_reset) or (
-            saw_seed_selection_this_reset and clicked_lets_rock_this_reset
+        invariant_ok = (not reset_state.requires_seed_selection) or (
+            reset_state.saw_seed_selection and reset_state.clicked_lets_rock
         )
         reset_result["resetSuccess"] = (
             bool(observation.get("gameplayReady"))
