@@ -30,6 +30,14 @@ from pvzrl_assisted_coach import (
     queue_rows,
 )
 from pvzrl_action_space import ACTION_SPACE_ADVENTURE_14_IDENTITY
+from pvzrl_gui_status import (
+    LIVE_MAX_AGE_SECONDS,
+    STALE_MAX_AGE_SECONDS,
+    DiagnosticsRenderKey,
+    LiveStatusReader,
+    classify_live_health,
+    diagnostics_render_key,
+)
 from pvzrl_registry import get_plant_registry
 
 
@@ -54,8 +62,6 @@ DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
 DEFAULT_HUMAN_COACH_LOG_PATH = Path("runs") / "human_coach.jsonl"
 DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
 DEFAULT_INTERVENTION_LOG_PATH = Path("logs") / "interventions" / "dashboard_interventions.jsonl"
-LIVE_MAX_AGE_SECONDS = 5.0
-STALE_MAX_AGE_SECONDS = 30.0
 MISSING = object()
 _PLANT_REGISTRY = get_plant_registry()
 _FOUR_SLOT_CURRENT = _PLANT_REGISTRY.require_gui_preset("four_slot_current")
@@ -396,10 +402,8 @@ class PvZDashboard:
         self.last_live_parse_error = ""
         self.last_live_health = ""
         self.last_live_warning_key = ""
-        self._live_status_signature: Optional[Tuple[int, int, int, int, int]] = None
-        self._live_status_cached_payload: Optional[Dict[str, Any]] = None
-        self._live_status_cached_state = "MISSING"
-        self._live_status_cached_parse_error = ""
+        self._live_status_reader = LiveStatusReader(self.live_status_path)
+        self._diagnostics_render_key: Optional[DiagnosticsRenderKey] = None
 
         self._build()
         self._append_log(f"Project root: {self.project_root}\n")
@@ -3474,132 +3478,23 @@ class PvZDashboard:
                 f"Live diagnostics GUI error: {exc}\n",
             )
 
+    def _status_reader(self) -> LiveStatusReader:
+        reader = getattr(self, "_live_status_reader", None)
+        if reader is None:
+            reader = LiveStatusReader(self.live_status_path)
+            self._live_status_reader = reader
+        elif reader.path != self.live_status_path:
+            reader.set_path(self.live_status_path)
+        return reader
+
     def _read_live_status_file(self) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        path = self.live_status_path
-        info: Dict[str, Any] = {
-            "path": path,
-            "exists": False,
-            "size": None,
-            "mtime": None,
-            "age": None,
-            "health": "MISSING",
-            "parse_error": "",
-        }
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            self._reset_live_status_cache()
-            return None, info
-        except OSError as exc:
-            info["health"] = "MALFORMED"
-            info["parse_error"] = f"OSError while stat() reading live status: {exc}"
-            return None, info
-
-        age = max(0.0, time.time() - stat.st_mtime)
-        info.update({"exists": True, "size": int(stat.st_size), "mtime": stat.st_mtime, "age": age})
-        signature = (
-            int(getattr(stat, "st_dev", 0) or 0),
-            int(getattr(stat, "st_ino", 0) or 0),
-            int(stat.st_size),
-            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
-            int(getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000))),
-        )
-        if stat.st_size == 0:
-            self._live_status_signature = signature
-            self._live_status_cached_payload = None
-            self._live_status_cached_state = "EMPTY"
-            self._live_status_cached_parse_error = ""
-            info["health"] = "EMPTY"
-            return None, info
-
-        if signature == getattr(self, "_live_status_signature", None):
-            info["unchanged"] = True
-            cached_error = str(getattr(self, "_live_status_cached_parse_error", "") or "")
-            cached_payload = getattr(self, "_live_status_cached_payload", None)
-            info["parse_error"] = cached_error
-            if cached_payload is not None:
-                info["health"] = self._live_health(age, cached_payload)
-                return cached_payload, info
-            info["health"] = str(getattr(self, "_live_status_cached_state", "MALFORMED"))
-            return None, info
-
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                content = handle.read()
-        except FileNotFoundError:
-            self._reset_live_status_cache()
-            info.update({"exists": False, "size": None, "mtime": None, "age": None, "health": "MISSING"})
-            return None, info
-        except OSError as exc:
-            info["health"] = "MALFORMED"
-            info["parse_error"] = f"OSError while reading live status: {exc}"
-            return None, info
-
-        if not content.strip():
-            self._live_status_signature = signature
-            self._live_status_cached_payload = None
-            self._live_status_cached_state = "EMPTY"
-            self._live_status_cached_parse_error = ""
-            info["health"] = "EMPTY"
-            return None, info
-
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            info["health"] = "MALFORMED"
-            info["parse_error"] = f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
-            self._cache_live_status_failure(signature, info["parse_error"])
-            return None, info
-
-        if not isinstance(payload, dict):
-            info["health"] = "MALFORMED"
-            info["parse_error"] = f"Expected JSON object, got {type(payload).__name__}"
-            self._cache_live_status_failure(signature, info["parse_error"])
-            return None, info
-
-        info["health"] = self._live_health(age, payload)
-        self._live_status_signature = signature
-        self._live_status_cached_payload = payload
-        self._live_status_cached_state = str(info["health"])
-        self._live_status_cached_parse_error = ""
-        return payload, info
-
-    def _cache_live_status_failure(self, signature: Tuple[int, int, int, int, int], error: str) -> None:
-        self._live_status_signature = signature
-        self._live_status_cached_payload = None
-        self._live_status_cached_state = "MALFORMED"
-        self._live_status_cached_parse_error = str(error or "")
+        return self._status_reader().read()
 
     def _reset_live_status_cache(self) -> None:
-        self._live_status_signature = None
-        self._live_status_cached_payload = None
-        self._live_status_cached_state = "MISSING"
-        self._live_status_cached_parse_error = ""
+        self._status_reader().reset()
 
     def _live_health(self, age: float, payload: Optional[Dict[str, Any]] = None) -> str:
-        payload = payload if isinstance(payload, dict) else {}
-        if age > STALE_MAX_AGE_SECONDS:
-            return "DEAD"
-        if age >= LIVE_MAX_AGE_SECONDS:
-            return "STALE"
-        blocked_reason = str(
-            self._first_value(
-                payload,
-                ["blocked_reason", "adventure.blocked_reason", "post_win_blocked_reason", "adventure.post_win_blocked_reason"],
-                default="",
-            )
-            or ""
-        )
-        if blocked_reason.startswith("post_win_") or blocked_reason in {
-            "trophy_visible_but_click_failed",
-            "reward_or_unlock_click_failed_after_win",
-        }:
-            return "BLOCKED_POST_WIN"
-        if "seed_selection" in blocked_reason:
-            return "BLOCKED_SEED_SELECTION"
-        if "gameplay_ready" in blocked_reason or "gameplay" in blocked_reason:
-            return "BLOCKED_GAMEPLAY_READY"
-        return "LIVE"
+        return classify_live_health(age, payload)
 
     def _set_live_status(self, info: Dict[str, Any]) -> None:
         path = info.get("path", self.live_status_path)
@@ -3719,11 +3614,21 @@ class PvZDashboard:
                 self._set_panel(title, message)
 
     def _render_diagnostics_payload(self, payload: Optional[Dict[str, Any]], health: str, using_last_good: bool) -> None:
+        previous_key = getattr(self, "_diagnostics_render_key", None)
+        render_key = diagnostics_render_key(
+            payload,
+            health,
+            using_last_good,
+            previous=previous_key,
+        )
+        if render_key == previous_key:
+            return
         try:
             if payload is None:
                 self._render_no_status(health)
             else:
                 self._render(payload, health=health, using_last_good=using_last_good)
+            self._diagnostics_render_key = render_key
         except Exception as exc:
             self._render_no_status(f"{health}; render error")
             self._log_live_warning(

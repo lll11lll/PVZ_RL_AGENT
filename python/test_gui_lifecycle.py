@@ -113,10 +113,6 @@ def _bare_dashboard() -> PvZDashboard:
 def _status_dashboard(path: Path) -> PvZDashboard:
     dashboard = PvZDashboard.__new__(PvZDashboard)
     dashboard.live_status_path = path
-    dashboard._live_status_signature = None
-    dashboard._live_status_cached_payload = None
-    dashboard._live_status_cached_state = "MISSING"
-    dashboard._live_status_cached_parse_error = ""
     return dashboard
 
 
@@ -217,6 +213,19 @@ def test_status_age_overrides_old_blocked_payload(tmp_path: Path) -> None:
     assert dashboard._live_health(LIVE_MAX_AGE_SECONDS + 0.01, {"blocked_reason": "post_win_timeout"}) == "STALE"
 
 
+def test_health_aliases_preserve_case_insensitive_empty_fallbacks(tmp_path: Path) -> None:
+    dashboard = _status_dashboard(tmp_path / "unused.json")
+
+    assert dashboard._live_health(
+        0.0,
+        {"blocked_reason": "", "adventure": {"blocked_reason": "post_win_next_screen_timeout"}},
+    ) == "BLOCKED_POST_WIN"
+    assert dashboard._live_health(
+        0.0,
+        {"Blocked_Reason": "post_win_next_screen_timeout"},
+    ) == "BLOCKED_POST_WIN"
+
+
 def test_malformed_cache_recovers_after_rotation(tmp_path: Path) -> None:
     path = tmp_path / "live_status.json"
     path.write_text("{bad", encoding="utf-8")
@@ -235,3 +244,49 @@ def test_malformed_cache_recovers_after_rotation(tmp_path: Path) -> None:
     assert recovered == {"status": "recovered"}
     assert info["health"] == "LIVE"
     assert not info.get("unchanged", False)
+
+
+def test_non_object_live_status_is_cached_as_malformed(tmp_path: Path) -> None:
+    path = tmp_path / "live_status.json"
+    path.write_text("[]", encoding="utf-8")
+    dashboard = _status_dashboard(path)
+
+    payload, malformed = dashboard._read_live_status_file()
+    cached, unchanged = dashboard._read_live_status_file()
+
+    assert payload is cached is None
+    assert malformed["health"] == unchanged["health"] == "MALFORMED"
+    assert malformed["parse_error"] == "Expected JSON object, got list"
+    assert unchanged["unchanged"] is True
+
+
+def test_unchanged_payload_skips_full_render_until_view_state_changes() -> None:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    render_calls: list[tuple[object, str, bool]] = []
+    empty_calls: list[str] = []
+    dashboard._render = lambda payload, health, using_last_good: render_calls.append(
+        (payload, health, using_last_good)
+    )
+    dashboard._render_no_status = lambda health: empty_calls.append(health)
+    payload = {"status": "running"}
+
+    dashboard._render_diagnostics_payload(payload, "LIVE", False)
+    dashboard._render_diagnostics_payload(payload, "LIVE", False)
+    dashboard._render_diagnostics_payload(payload, "STALE", False)
+    dashboard._render_diagnostics_payload(dict(payload), "STALE", False)
+    dashboard._render_diagnostics_payload({**payload, "updated_at": 10.0}, "STALE", False)
+    dashboard._render_diagnostics_payload({**payload, "updated_at": 11.0}, "STALE", False)
+    coach_payload = {**payload, "updated_at": 11.0, "coach": {"stream_coach_last_poll_age_seconds": 1.0}}
+    dashboard._render_diagnostics_payload(coach_payload, "STALE", False)
+    dashboard._render_diagnostics_payload(
+        {**coach_payload, "coach": {"stream_coach_last_poll_age_seconds": 2.0}},
+        "STALE",
+        False,
+    )
+    dashboard._render_diagnostics_payload({"status": "changed"}, "STALE", False)
+    dashboard._render_diagnostics_payload(None, "MISSING", False)
+    dashboard._render_diagnostics_payload(None, "MISSING", False)
+
+    assert len(render_calls) == 5
+    assert [call[1] for call in render_calls] == ["LIVE", "STALE", "STALE", "STALE", "STALE"]
+    assert empty_calls == ["MISSING"]
