@@ -162,7 +162,10 @@ class GuiStatusViewMixin:
         size_text = self._fmt_size(info.get("size"))
         age_text = self._fmt_age(info.get("age"))
         health = info.get("health", "MISSING")
-        self.live_status_var.set(f"Live: {path} | exists={exists_text} | size={size_text} | age={age_text} | health={health}")
+        self._set_live_variable(
+            self.live_status_var,
+            f"Live: {path} | exists={exists_text} | size={size_text} | age={age_text} | health={health}",
+        )
 
     def _set_diagnostics_status(self, info: Dict[str, Any], using_last_good: bool) -> None:
         health = str(info.get("health", "MISSING"))
@@ -178,9 +181,10 @@ class GuiStatusViewMixin:
         parse_text = parse_error if parse_error else "-"
         if len(parse_text) > 180:
             parse_text = parse_text[:177] + "..."
-        self.diagnostics_status_var.set(
+        self._set_live_variable(
+            self.diagnostics_status_var,
             f"{prefix} | modified={self._fmt_time(info.get('mtime'))} | "
-            f"last_success={self._fmt_time(self.last_good_read_time)} | parse_error={parse_text}"
+            f"last_success={self._fmt_time(self.last_good_read_time)} | parse_error={parse_text}",
         )
 
     def _log_live_warning(self, key: str, message: str) -> None:

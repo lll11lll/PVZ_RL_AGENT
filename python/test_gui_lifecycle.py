@@ -346,6 +346,51 @@ def test_oversized_incoming_log_batch_inserts_only_retained_suffix() -> None:
     assert dashboard.log_text.insert_calls[-1] == ("end", retained)
 
 
+def test_partial_line_rollover_rebuilds_from_bounded_history() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.log_text = FakeText()
+    dashboard.log_filter_var = FakeVar()
+    dashboard.log_severity_var = FakeVar()
+    dashboard.log_severity_var.value = "All"
+    dashboard.log_pause_autoscroll_var = FakeVar()
+    dashboard.log_history = ["partial"] + [f"line {index}\n" for index in range(LOG_HISTORY_MAX_LINES - 1)]
+    dashboard.log_history_chars = sum(len(line) for line in dashboard.log_history)
+
+    dashboard._append_log("new line\n")
+
+    expected = dashboard._log_drop_notice() + "".join(dashboard.log_history)
+    assert ("1.0", "end") in dashboard.log_text.delete_calls
+    assert dashboard.log_text.insert_calls[-1] == ("1.0", expected)
+    assert dashboard.log_history[0] == "line 0\n"
+
+
+def test_identical_live_and_diagnostics_labels_skip_tcl_writes(tmp_path: Path) -> None:
+    dashboard = PvZDashboard.__new__(PvZDashboard)
+    dashboard.live_status_path = tmp_path / "live_status.json"
+    dashboard.live_status_var = CountingVar()
+    dashboard.diagnostics_status_var = CountingVar()
+    dashboard.last_live_parse_error = ""
+    dashboard.last_good_status = {"status": "running"}
+    dashboard.last_good_read_time = 100.0
+    info = {
+        "path": dashboard.live_status_path,
+        "exists": True,
+        "size": 20,
+        "mtime": 100.0,
+        "age": 1.0,
+        "health": "LIVE",
+        "parse_error": "",
+    }
+
+    dashboard._set_live_status(info)
+    dashboard._set_diagnostics_status(info, using_last_good=False)
+    dashboard._set_live_status(dict(info))
+    dashboard._set_diagnostics_status(dict(info), using_last_good=False)
+
+    assert dashboard.live_status_var.set_count == 1
+    assert dashboard.diagnostics_status_var.set_count == 1
+
+
 def test_filtered_log_bursts_schedule_only_one_full_refresh() -> None:
     dashboard = _bare_dashboard()
     dashboard.log_text = FakeText()

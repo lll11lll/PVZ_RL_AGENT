@@ -2761,6 +2761,10 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         while drop_count < len(self.log_history) and retained_chars > LOG_HISTORY_MAX_CHARS:
             retained_chars -= len(self.log_history[drop_count])
             drop_count += 1
+        requires_full_log_refresh = bool(
+            drop_count
+            and any(not entry.endswith("\n") for entry in self.log_history[:drop_count])
+        )
         if drop_count:
             del self.log_history[:drop_count]
             self.log_history_chars = max(0, retained_chars)
@@ -2777,6 +2781,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         )
         if filtering:
             self._request_log_view_refresh()
+            return
+        if requires_full_log_refresh:
+            self._refresh_log_view()
             return
         self._append_unfiltered_log_view(retained_text, drop_count)
 
@@ -2820,8 +2827,11 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._cancel_after("_log_view_after_id")
         if self.log_text is None:
             return
-        search = self.log_filter_var.get().strip().lower()
-        severity = self.log_severity_var.get()
+        filter_var = getattr(self, "log_filter_var", None)
+        severity_var = getattr(self, "log_severity_var", None)
+        pause_var = getattr(self, "log_pause_autoscroll_var", None)
+        search = "" if filter_var is None else filter_var.get().strip().lower()
+        severity = "All" if severity_var is None else severity_var.get()
         lines = "".join(self.log_history).splitlines(keepends=True)
 
         def matches(line: str) -> bool:
@@ -2842,7 +2852,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.insert("1.0", filtered)
-        if not self.log_pause_autoscroll_var.get():
+        if pause_var is None or not pause_var.get():
             self.log_text.see("end")
         self.log_text.configure(state="disabled")
         self._last_log_view_refresh_at = time.monotonic()
