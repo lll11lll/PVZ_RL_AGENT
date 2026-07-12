@@ -6,7 +6,7 @@ import json
 import random
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -30,6 +30,15 @@ from pvzrl_adventure import (
 )
 from pvzrl_env import normalize_plant_name, parse_seed_list, plant_type_name, registry_entries, resolve_seed_list
 from pvzrl_fusion import FUSION_POLICY_SCRIPTED
+from pvzrl_generalist_progression import (
+    GeneralistEpisodeOutcome,
+    GeneralistProgressionConfig,
+    GeneralistProgressionState,
+    GeneralistProgressionTransition,
+    begin_generalist_attempt,
+    fresh_generalist_progression,
+    reduce_generalist_episode,
+)
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_telemetry import live_status_significant_state
 
@@ -496,6 +505,162 @@ class AdventureSeedCurriculum:
 class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
     """MaskablePPO environment that advances Adventure progression between episodes."""
 
+    def _progression_state_value(self) -> GeneralistProgressionState:
+        state = self.__dict__.get("_progression_state")
+        if isinstance(state, GeneralistProgressionState):
+            return state
+        start_level = max(1, int(self.__dict__.get("adventure_start_level", 1)))
+        state = GeneralistProgressionState(current_level=start_level)
+        self.__dict__["_progression_state"] = state
+        return state
+
+    def _progression_config_value(self) -> GeneralistProgressionConfig:
+        return GeneralistProgressionConfig.normalized(
+            adventure_start_level=self.__dict__.get("adventure_start_level", 1),
+            max_adventure_levels=self.__dict__.get("max_adventure_levels", 1),
+            max_attempts_per_level=self.__dict__.get("max_attempts_per_level", 1),
+            frontier_win_streak_required=self.__dict__.get(
+                "frontier_win_streak_required", 1
+            ),
+        )
+
+    def _set_progression_fields(self, **changes: Any) -> None:
+        self.__dict__["_progression_state"] = replace(
+            self._progression_state_value(),
+            **changes,
+        )
+
+    def _set_progression_latches(self, **changes: Any) -> None:
+        state = self._progression_state_value()
+        self.__dict__["_progression_state"] = replace(
+            state,
+            last_episode=replace(state.last_episode, **changes),
+        )
+
+    def _apply_progression_transition(
+        self,
+        transition: GeneralistProgressionTransition,
+    ) -> None:
+        self._apply_progression_state(transition.state)
+
+    def _apply_progression_state(self, state: GeneralistProgressionState) -> None:
+        self.__dict__["_progression_state"] = state
+        self._assert_progression_projection()
+
+    @staticmethod
+    def _pre_effect_progression_state(
+        state: GeneralistProgressionState,
+        transition: GeneralistProgressionTransition,
+    ) -> GeneralistProgressionState:
+        """Project the exact mutable state legacy hooks observed after a win."""
+
+        if not transition.is_win_like:
+            return state
+        provisional_streak = int(state.frontier_win_streak)
+        if transition.is_frontier_mastery_attempt:
+            provisional_streak += 1
+        return replace(
+            state,
+            current_attempt=0,
+            frontier_win_streak=provisional_streak,
+            cleared_levels=transition.state.cleared_levels,
+        )
+
+    def _assert_progression_projection(self) -> None:
+        state = self._progression_state_value()
+        assert self.current_level == state.current_level
+        assert self.current_attempt == state.current_attempt
+        assert self.frontier_win_streak == state.frontier_win_streak
+        assert tuple(self.cleared_levels) == state.cleared_levels
+        assert tuple(self.frontier_mastered_levels) == state.frontier_mastered_levels
+        assert self.frontier_replay_supported == state.frontier_replay_supported
+        assert self.frontier_replay_blocked_reason == state.frontier_replay_blocked_reason
+        assert self.frontier_mastery_ready == state.last_episode.mastery_ready
+        assert self.frontier_promoted_this_episode == state.last_episode.promoted
+        assert self.frontier_mastery_reset_reason == state.last_episode.reset_reason
+
+    @property
+    def current_level(self) -> int:
+        return int(self._progression_state_value().current_level)
+
+    @current_level.setter
+    def current_level(self, value: int) -> None:
+        self._set_progression_fields(current_level=int(value))
+
+    @property
+    def current_attempt(self) -> int:
+        return int(self._progression_state_value().current_attempt)
+
+    @current_attempt.setter
+    def current_attempt(self, value: int) -> None:
+        self._set_progression_fields(current_attempt=int(value))
+
+    @property
+    def frontier_win_streak(self) -> int:
+        return int(self._progression_state_value().frontier_win_streak)
+
+    @frontier_win_streak.setter
+    def frontier_win_streak(self, value: int) -> None:
+        self._set_progression_fields(frontier_win_streak=int(value))
+
+    @property
+    def cleared_levels(self) -> List[int]:
+        return list(self._progression_state_value().cleared_levels)
+
+    @cleared_levels.setter
+    def cleared_levels(self, value: Iterable[int]) -> None:
+        self._set_progression_fields(cleared_levels=tuple(int(level) for level in value))
+
+    @property
+    def frontier_mastered_levels(self) -> List[int]:
+        return list(self._progression_state_value().frontier_mastered_levels)
+
+    @frontier_mastered_levels.setter
+    def frontier_mastered_levels(self, value: Iterable[int]) -> None:
+        self._set_progression_fields(
+            frontier_mastered_levels=tuple(int(level) for level in value)
+        )
+
+    @property
+    def frontier_replay_supported(self) -> bool:
+        return bool(self._progression_state_value().frontier_replay_supported)
+
+    @frontier_replay_supported.setter
+    def frontier_replay_supported(self, value: bool) -> None:
+        self._set_progression_fields(frontier_replay_supported=bool(value))
+
+    @property
+    def frontier_replay_blocked_reason(self) -> str:
+        return str(self._progression_state_value().frontier_replay_blocked_reason)
+
+    @frontier_replay_blocked_reason.setter
+    def frontier_replay_blocked_reason(self, value: str) -> None:
+        self._set_progression_fields(frontier_replay_blocked_reason=str(value or ""))
+
+    @property
+    def frontier_mastery_ready(self) -> bool:
+        return bool(self._progression_state_value().last_episode.mastery_ready)
+
+    @frontier_mastery_ready.setter
+    def frontier_mastery_ready(self, value: bool) -> None:
+        self._set_progression_latches(mastery_ready=bool(value))
+
+    @property
+    def frontier_promoted_this_episode(self) -> bool:
+        return bool(self._progression_state_value().last_episode.promoted)
+
+    @frontier_promoted_this_episode.setter
+    def frontier_promoted_this_episode(self, value: bool) -> None:
+        self._set_progression_latches(promoted=bool(value))
+
+    @property
+    def frontier_mastery_reset_reason(self) -> str:
+        return str(self._progression_state_value().last_episode.reset_reason)
+
+    @frontier_mastery_reset_reason.setter
+    def frontier_mastery_reset_reason(self, value: str) -> None:
+        self._set_progression_latches(reset_reason=str(value or ""))
+
     def __init__(
         self,
         config: PvZSB3Config,
@@ -543,13 +708,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.max_attempts_per_level = max(1, int(max_attempts_per_level))
         self.adventure_start_level = max(1, int(adventure_start_level))
         self.frontier_win_streak_required = max(1, int(frontier_win_streak_required))
-        self.frontier_win_streak = 0
-        self.frontier_mastered_levels: List[int] = []
-        self.frontier_replay_supported = True
-        self.frontier_replay_blocked_reason = ""
-        self.frontier_mastery_reset_reason = ""
-        self.frontier_promoted_this_episode = False
-        self.frontier_mastery_ready = False
+        self.__dict__["_progression_state"] = fresh_generalist_progression(
+            self._progression_config_value(),
+            ppo_resume=False,
+        )
         self._hard_blocked_reason = ""
         self.strict_startup_validation = bool(strict_startup_validation)
         self._startup_validation_completed = False
@@ -559,10 +721,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "recent_cleared": float(recent_cleared_sample_prob),
             "maintenance": float(maintenance_sample_prob),
         }
-        self.current_level = self.adventure_start_level
-        self.current_attempt = 0
         self.episode_index = 0
-        self.cleared_levels: List[int] = []
         self.current_sample_source = "frontier"
         self.configured_seed_list = list(self.curriculum.initial_loadout)
         self.seed_order_source = _normalize_seed_order_source(seed_order_source)
@@ -1057,16 +1216,17 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             self.strict_startup_validation
             and (
                 not getattr(self, "_startup_validation_completed", False)
-                or self.context.get("frontier_replay_recovery_required")
+                or self._progression_state_value().frontier_replay_recovery_required
             )
         )
         if needs_startup_validation:
             validation_phase = (
                 "same_level_replay_recovery"
-                if self.context.get("frontier_replay_recovery_required")
+                if self._progression_state_value().frontier_replay_recovery_required
                 else "first_reset"
             )
             self.validate_startup_state(phase=validation_phase, raise_on_failure=True)
+            self._set_progression_fields(frontier_replay_recovery_required=False)
             self.context["frontier_replay_recovery_required"] = False
         self.curriculum.episode_index = self.episode_index
         adventure_state = self._safe_adventure_state()
@@ -1075,7 +1235,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.config.fusion_policy = FUSION_POLICY_SCRIPTED if fusion_assisted else self._base_fusion_policy
         self.base.config.fusion_policy = self.config.fusion_policy
         self.current_sample_source = self._sample_source()
-        self.current_attempt += 1
+        self.__dict__["_progression_state"] = begin_generalist_attempt(
+            self._progression_state_value()
+        )
+        self._assert_progression_projection()
         self.context.update(
             {
                 "status": "running",
@@ -1167,18 +1330,20 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
     def _finish_episode(self, info: Dict[str, Any]) -> None:
         summary = info.get("episode_summary", {}) if isinstance(info, dict) else {}
         result = str(summary.get("done_reason") or info.get("done_reason") or "unknown")
-        episode_level = self.current_level
-        episode_attempt = self.current_attempt
+        progression_before = self._progression_state_value()
+        episode_level = int(progression_before.current_level)
+        episode_attempt = int(progression_before.current_attempt)
         newly_unlocked: List[str] = []
         post_win_blocked_reason = ""
         post_win_transition: Dict[str, Any] = {}
         post_win_last_state: Dict[str, Any] = {}
         unknown_unlock_objects: List[Dict[str, Any]] = []
-        frontier_level_before = int(self.current_level)
         frontier_promoted_this_episode = False
         frontier_mastery_ready = False
         frontier_mastery_reset_reason = ""
-        frontier_replay_blocked_reason = str(self.frontier_replay_blocked_reason or "")
+        frontier_replay_blocked_reason = str(
+            progression_before.frontier_replay_blocked_reason or ""
+        )
         mastery_sample_source = str(self.current_sample_source or "frontier")
 
         def collect_allowed_post_win_transition() -> None:
@@ -1240,37 +1405,48 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 if result == "win":
                     result = "post_win_pending"
 
-        is_win_like = result in {"win", "post_win_pending"}
-        is_frontier_mastery_attempt = (
-            mastery_sample_source in {"frontier", "frontier_mastery_replay"}
-            and int(episode_level) == int(frontier_level_before)
+        progression_config = self._progression_config_value()
+        replay_succeeded: Optional[bool] = None
+        replay_reason = ""
+        preview_transition = reduce_generalist_episode(
+            progression_before,
+            GeneralistEpisodeOutcome(
+                result=result,
+                episode_level=episode_level,
+                sample_source=mastery_sample_source,
+            ),
+            progression_config,
         )
 
-        if is_win_like and episode_level not in self.cleared_levels:
-            self.cleared_levels.append(episode_level)
-
-        if is_win_like:
-            self.current_attempt = 0
-            if is_frontier_mastery_attempt:
-                self.frontier_win_streak = int(self.frontier_win_streak) + 1
-                frontier_mastery_ready = self.frontier_win_streak >= self.frontier_win_streak_required
-                threshold_met = bool(frontier_mastery_ready)
-                post_win_decision = "advance_next_level" if threshold_met else "replay_same_level"
+        if preview_transition.is_win_like:
+            pre_effect_state = self._pre_effect_progression_state(
+                progression_before,
+                preview_transition,
+            )
+            self._apply_progression_state(pre_effect_state)
+            if preview_transition.is_frontier_mastery_attempt:
+                preview_streak = int(pre_effect_state.frontier_win_streak)
+                threshold_met = bool(
+                    preview_transition.state.last_episode.mastery_ready
+                )
+                post_win_decision = preview_transition.post_win_decision
                 self.context.update(
                     {
-                        "wins_on_current_level": int(self.frontier_win_streak),
+                        "wins_on_current_level": preview_streak,
                         "wins_before_advance": int(self.frontier_win_streak_required),
-                        "frontier_win_streak": int(self.frontier_win_streak),
+                        "frontier_win_streak": preview_streak,
                         "frontier_win_streak_required": int(self.frontier_win_streak_required),
-                        "frontier_mastery_ready": bool(frontier_mastery_ready),
+                        "frontier_mastery_ready": threshold_met,
                         "post_win_decision": post_win_decision,
-                        "post_win_transition_allowed": bool(threshold_met),
+                        "post_win_transition_allowed": bool(
+                            preview_transition.post_win_transition_allowed
+                        ),
                     }
                 )
                 print(
                     "[adventure-generalist] "
                     f"win detected level={episode_level} "
-                    f"wins_on_level={int(self.frontier_win_streak)}/{int(self.frontier_win_streak_required)}"
+                    f"wins_on_level={preview_streak}/{int(self.frontier_win_streak_required)}"
                 )
                 print(
                     "[adventure-generalist] "
@@ -1278,21 +1454,12 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 )
                 print(
                     "[adventure-generalist] "
-                    f"post_win_transition_allowed={'true' if threshold_met else 'false'}"
+                    "post_win_transition_allowed="
+                    f"{'true' if preview_transition.post_win_transition_allowed else 'false'}"
                 )
-                if frontier_mastery_ready:
+                if preview_transition.collect_post_win_transition:
                     collect_allowed_post_win_transition()
-                    frontier_promoted_this_episode = True
-                    if episode_level not in self.frontier_mastered_levels:
-                        self.frontier_mastered_levels.append(int(episode_level))
-                    self.current_level = min(
-                        self.adventure_start_level + self.max_adventure_levels - 1,
-                        episode_level + 1,
-                    )
-                    self.frontier_win_streak = 0
-                    frontier_mastery_reset_reason = "promoted"
                 else:
-                    self.current_level = int(episode_level)
                     post_win_transition = {
                         "win_detected": True,
                         "post_win_decision": "replay_same_level",
@@ -1303,7 +1470,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                         "trophy_click_count": 0,
                         "reward_continue_click_count": 0,
                     }
-                    if self.frontier_win_streak_required > 1:
+                    if preview_transition.same_level_replay_requested:
                         replay_ok, replay_reason = replay_current_level_after_validation_win(
                             self,
                             self.writer,
@@ -1312,25 +1479,36 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                             expected_level=int(episode_level),
                             seed_selection_callback=self._on_seed_selection_screen,
                         )
+                        replay_succeeded = bool(replay_ok)
                         replay_state = self._safe_adventure_state()
-                        replay_level = int(replay_state.get("currentAdventureLevel", episode_level) or episode_level)
+                        replay_level = int(
+                            replay_state.get("currentAdventureLevel", episode_level)
+                            or episode_level
+                        )
                         self.context["frontier_replay_level_after_win"] = replay_level
-                        self.context["frontier_replay_last_state"] = _snapshot_post_win_state(replay_state)
-                        if replay_ok and replay_level != int(episode_level) and _replay_level_check_authoritative(replay_state):
-                            replay_ok = False
+                        self.context["frontier_replay_last_state"] = _snapshot_post_win_state(
+                            replay_state
+                        )
+                        if (
+                            replay_succeeded
+                            and replay_level != int(episode_level)
+                            and _replay_level_check_authoritative(replay_state)
+                        ):
+                            replay_succeeded = False
                             replay_reason = (
-                                f"same_level_replay_advanced_to_unexpected_level:{replay_level}!={int(episode_level)}"
+                                "same_level_replay_advanced_to_unexpected_level:"
+                                f"{replay_level}!={int(episode_level)}"
                             )
-                        if not replay_ok:
-                            frontier_replay_blocked_reason = str(replay_reason or BLOCKED_FRONTIER_REPLAY_REQUIRED)
+                        if not replay_succeeded:
+                            frontier_replay_blocked_reason = str(
+                                replay_reason or BLOCKED_FRONTIER_REPLAY_REQUIRED
+                            )
                             post_win_blocked_reason = frontier_replay_blocked_reason
                             print(
                                 "[adventure-generalist] "
-                                f"same_level_replay_recovery_required reason={frontier_replay_blocked_reason}"
+                                "same_level_replay_recovery_required "
+                                f"reason={frontier_replay_blocked_reason}"
                             )
-                            self.frontier_replay_supported = False
-                            self.frontier_replay_blocked_reason = frontier_replay_blocked_reason
-                            frontier_mastery_reset_reason = "same_level_replay_recovery_required"
                             self.context.update(
                                 {
                                     "frontier_replay_supported": False,
@@ -1341,41 +1519,47 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                                 }
                             )
                         else:
-                            self.frontier_replay_supported = True
                             frontier_replay_blocked_reason = ""
                             self.context["frontier_replay_recovery_required"] = False
                             print(
                                 "[adventure-generalist] "
                                 f"same_level_replay_ready level={int(episode_level)} "
-                                f"wins_on_level={int(self.frontier_win_streak)}/{int(self.frontier_win_streak_required)}"
+                                f"wins_on_level={preview_streak}/{int(self.frontier_win_streak_required)}"
                             )
             else:
                 self.context.update(
                     {
                         "post_win_decision": "hold_frontier",
                         "post_win_transition_allowed": False,
-                        "wins_on_current_level": int(self.frontier_win_streak),
+                        "wins_on_current_level": int(progression_before.frontier_win_streak),
                         "wins_before_advance": int(self.frontier_win_streak_required),
                     }
                 )
-                self.current_level = int(frontier_level_before)
-        else:
-            if is_frontier_mastery_attempt and self.frontier_win_streak > 0:
-                if result == "loss":
-                    frontier_mastery_reset_reason = "loss"
-                elif result == "timeout":
-                    frontier_mastery_reset_reason = "timeout"
-                elif result == "env_corruption":
-                    frontier_mastery_reset_reason = "env_corruption"
-                else:
-                    frontier_mastery_reset_reason = str(result or "failure")
-                self.frontier_win_streak = 0
-            if result in {"loss", "timeout"} and self.current_attempt >= self.max_attempts_per_level:
-                self.current_attempt = 0
 
-        self.frontier_promoted_this_episode = bool(frontier_promoted_this_episode)
-        self.frontier_mastery_ready = bool(frontier_mastery_ready)
-        self.frontier_mastery_reset_reason = str(frontier_mastery_reset_reason or "")
+        progression_transition = reduce_generalist_episode(
+            progression_before,
+            GeneralistEpisodeOutcome(
+                result=result,
+                episode_level=episode_level,
+                sample_source=mastery_sample_source,
+                same_level_replay_succeeded=replay_succeeded,
+                same_level_replay_reason=replay_reason,
+            ),
+            progression_config,
+        )
+        self._apply_progression_transition(progression_transition)
+        frontier_promoted_this_episode = bool(
+            progression_transition.state.last_episode.promoted
+        )
+        frontier_mastery_ready = bool(
+            progression_transition.state.last_episode.mastery_ready
+        )
+        frontier_mastery_reset_reason = str(
+            progression_transition.state.last_episode.reset_reason or ""
+        )
+        frontier_replay_blocked_reason = str(
+            progression_transition.state.frontier_replay_blocked_reason or ""
+        )
 
         selected_loadout_count = len(self.current_loadout)
         unlocked_now = set(self.curriculum.unlocked_seeds())

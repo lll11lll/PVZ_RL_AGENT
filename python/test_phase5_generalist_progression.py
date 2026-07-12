@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
+import pvzrl_adventure_generalist as generalist_module
+from pvzrl_adventure_generalist import AdventureGeneralistTrainingEnv
 from pvzrl_generalist_progression import (
     GeneralistEpisodeOutcome,
     GeneralistProgressionConfig,
@@ -14,6 +17,7 @@ from pvzrl_generalist_progression import (
     fresh_generalist_progression,
     reduce_generalist_episode,
 )
+from test_adventure_generalist_14slot_identity import fake_generalist_env
 
 
 def _config(*, required: int = 1, attempts: int = 3, levels: int = 4):
@@ -291,3 +295,206 @@ def test_failed_replay_uses_stable_default_reason() -> None:
     assert transition.post_win_blocked_reason == (
         "frontier_win_streak_requires_same_level_replay_support"
     )
+
+
+def test_wrapper_compatibility_fields_project_from_one_canonical_record() -> None:
+    env = AdventureGeneralistTrainingEnv.__new__(AdventureGeneralistTrainingEnv)
+    env.adventure_start_level = 4
+    env.max_adventure_levels = 3
+    env.max_attempts_per_level = 2
+    env.frontier_win_streak_required = 3
+    env.current_level = 5
+    env.current_attempt = 2
+    env.frontier_win_streak = 1
+    env.cleared_levels = [2, 4]
+    env.frontier_mastered_levels = [2]
+    env.frontier_replay_supported = False
+    env.frontier_replay_blocked_reason = "earlier_failure"
+    env.frontier_mastery_ready = True
+    env.frontier_promoted_this_episode = True
+    env.frontier_mastery_reset_reason = "promoted"
+
+    state = env._progression_state_value()
+    assert state.current_level == 5
+    assert state.current_attempt == 2
+    assert state.frontier_win_streak == 1
+    assert state.cleared_levels == (2, 4)
+    assert state.frontier_mastered_levels == (2,)
+    assert state.frontier_replay_supported is False
+    assert state.frontier_replay_blocked_reason == "earlier_failure"
+    assert state.last_episode.mastery_ready is True
+    assert state.last_episode.promoted is True
+    assert state.last_episode.reset_reason == "promoted"
+
+    projected_cleared = env.cleared_levels
+    projected_mastered = env.frontier_mastered_levels
+    projected_cleared.append(9)
+    projected_mastered.append(9)
+    assert env.cleared_levels == [2, 4]
+    assert env.frontier_mastered_levels == [2]
+    env._assert_progression_projection()
+
+
+def test_replay_hook_observes_legacy_pre_effect_progression_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    env = fake_generalist_env(tmp_path)
+    env.current_level = 4
+    env.current_attempt = 2
+    env.frontier_win_streak_required = 3
+    env.frontier_win_streak = 1
+    env.frontier_mastery_reset_reason = "prior_timeout"
+    env.current_sample_source = "frontier_mastery_replay"
+    env._safe_adventure_state = lambda: {"currentAdventureLevel": 4}
+    seen = {}
+
+    def replay_hook(*_args, **_kwargs):
+        seen.update(
+            current_level=env.current_level,
+            current_attempt=env.current_attempt,
+            frontier_win_streak=env.frontier_win_streak,
+            cleared_levels=env.cleared_levels,
+            frontier_mastered_levels=env.frontier_mastered_levels,
+            reset_reason=env.frontier_mastery_reset_reason,
+            context_streak=env.context.get("frontier_win_streak"),
+        )
+        return True, ""
+
+    monkeypatch.setattr(generalist_module, "replay_current_level_after_validation_win", replay_hook)
+    monkeypatch.setattr(generalist_module, "build_live_status", lambda *_args, **_kwargs: {})
+    env._finish_episode({"episode_summary": {"done_reason": "win"}})
+
+    assert seen == {
+        "current_level": 4,
+        "current_attempt": 0,
+        "frontier_win_streak": 2,
+        "cleared_levels": [4],
+        "frontier_mastered_levels": [],
+        "reset_reason": "prior_timeout",
+        "context_streak": 2,
+    }
+    assert env.current_level == 4
+    assert env.current_attempt == 0
+    assert env.frontier_win_streak == 2
+    assert env.frontier_mastery_reset_reason == ""
+
+
+def test_promotion_collect_hook_observes_threshold_streak_before_final_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    env = fake_generalist_env(tmp_path)
+    env.current_level = 4
+    env.current_attempt = 2
+    env.frontier_win_streak_required = 3
+    env.frontier_win_streak = 2
+    env.cleared_levels = [2]
+    env.frontier_mastered_levels = [2]
+    env.frontier_mastery_reset_reason = "prior_loss"
+    env.current_sample_source = "frontier_mastery_replay"
+    seen = {}
+
+    def collect_hook(*_args, **_kwargs):
+        seen.update(
+            current_level=env.current_level,
+            current_attempt=env.current_attempt,
+            frontier_win_streak=env.frontier_win_streak,
+            cleared_levels=env.cleared_levels,
+            frontier_mastered_levels=env.frontier_mastered_levels,
+            reset_reason=env.frontier_mastery_reset_reason,
+            context_streak=env.context.get("frontier_win_streak"),
+            context_ready=env.context.get("frontier_mastery_ready"),
+        )
+        return (
+            {"screenState": "seed_selection"},
+            True,
+            {},
+            [],
+            [],
+            "",
+            {"post_win_transition_completed": True},
+        )
+
+    monkeypatch.setattr(generalist_module, "collect_post_win_unlocks", collect_hook)
+    monkeypatch.setattr(generalist_module, "build_live_status", lambda *_args, **_kwargs: {})
+    env._finish_episode({"episode_summary": {"done_reason": "win"}})
+
+    assert seen == {
+        "current_level": 4,
+        "current_attempt": 0,
+        "frontier_win_streak": 3,
+        "cleared_levels": [2, 4],
+        "frontier_mastered_levels": [2],
+        "reset_reason": "prior_loss",
+        "context_streak": 3,
+        "context_ready": True,
+    }
+    assert env.current_level == 5
+    assert env.current_attempt == 0
+    assert env.frontier_win_streak == 0
+    assert env.frontier_mastered_levels == [2, 4]
+    assert env.frontier_mastery_ready is True
+    assert env.frontier_promoted_this_episode is True
+
+
+def test_replay_hook_exception_leaves_legacy_pre_effect_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    env = fake_generalist_env(tmp_path)
+    env.current_level = 4
+    env.current_attempt = 2
+    env.frontier_win_streak_required = 3
+    env.frontier_win_streak = 1
+    env.current_sample_source = "frontier"
+
+    def replay_hook(*_args, **_kwargs):
+        raise RuntimeError("simulated_replay_failure")
+
+    monkeypatch.setattr(generalist_module, "replay_current_level_after_validation_win", replay_hook)
+    with pytest.raises(RuntimeError, match="simulated_replay_failure"):
+        env._finish_episode({"episode_summary": {"done_reason": "win"}})
+
+    assert env.current_level == 4
+    assert env.current_attempt == 0
+    assert env.frontier_win_streak == 2
+    assert env.cleared_levels == [4]
+    assert env.frontier_mastered_levels == []
+    assert env.frontier_mastery_ready is False
+    assert env.frontier_promoted_this_episode is False
+
+
+def test_reset_clears_replay_recovery_latch_before_starting_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    env = fake_generalist_env(tmp_path)
+    env.current_attempt = 0
+    env.strict_startup_validation = True
+    env._startup_validation_completed = True
+    env._set_progression_fields(frontier_replay_recovery_required=True)
+    env.context["frontier_replay_recovery_required"] = True
+    env._base_fusion_policy = "none"
+    env.config.fusion_policy = "none"
+    env.base = SimpleNamespace(config=SimpleNamespace(fusion_policy="none"))
+    env._sample_curriculum_mode = lambda: "frontier"
+    env._sample_source = lambda: "frontier"
+    validation_phases = []
+    env.validate_startup_state = lambda *, phase, raise_on_failure: validation_phases.append(phase) or {"ok": True}
+    env.start_episode_from_observation = lambda observation, reset_info: (observation, reset_info)
+    monkeypatch.setattr(generalist_module, "build_live_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        generalist_module,
+        "prepare_adventure_gameplay",
+        lambda *_args, **_kwargs: ({"frame": 1}, {"reset": True}, ""),
+    )
+
+    observation, reset_info = env.reset()
+
+    assert validation_phases == ["same_level_replay_recovery"]
+    assert env._progression_state_value().frontier_replay_recovery_required is False
+    assert env.context["frontier_replay_recovery_required"] is False
+    assert env.current_attempt == 1
+    assert observation == {"frame": 1}
+    assert reset_info == {"reset": True}
