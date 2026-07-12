@@ -438,6 +438,7 @@ class FileCoachCommandSource:
         for line in self._tail.read_lines():
             stripped = line.strip()
             payload: Optional[Dict[str, Any]] = None
+            text = ""
             if stripped.startswith("{"):
                 try:
                     decoded = json.loads(stripped)
@@ -446,7 +447,9 @@ class FileCoachCommandSource:
                     self._tail.note_malformed_record("json_decode_error")
                     self._last_error = "json_decode_error"
                     continue
-            text = _command_text_from_line(line)
+                text = _command_text_from_payload(payload) if payload is not None else ""
+            else:
+                text = _command_text_from_line(line)
             if text:
                 source = str((payload or {}).get("source") or "")
                 if source:
@@ -2645,12 +2648,17 @@ def _command_text_from_line(line: str) -> str:
             # Ignore malformed JSONL records (including partial writes).
             return ""
         if isinstance(payload, dict):
-            for key in ("parser_command", "raw_text", "text", "command"):
-                value = payload.get(key)
-                if value:
-                    return str(value).strip()
+            return _command_text_from_payload(payload)
         return ""
     return text
+
+
+def _command_text_from_payload(payload: Dict[str, Any]) -> str:
+    for key in ("parser_command", "raw_text", "text", "command"):
+        value = payload.get(key)
+        if value:
+            return str(value).strip()
+    return ""
 
 
 def _jsonable(value: Any) -> Any:

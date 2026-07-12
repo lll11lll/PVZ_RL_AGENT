@@ -17,6 +17,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Sequenc
 from pvzrl_action_space import build_action_space_spec, normalize_action_space_mode
 from pvzrl_file_tail import IncrementalLineTailReader
 from pvzrl_human_coach import (
+    COACH_COMMANDS,
     COACH_PENDING_RETRY_REASONS,
     COACH_REJECTION_PENDING_COMMAND,
     parse_coach_command,
@@ -28,7 +29,7 @@ from pvzrl_human_coach import (
 # Existing lightweight interfaces (kept unchanged)
 # ---------------------------------------------------------------------------
 
-VALID_COACH_COMMANDS = {"plant", "fuse", "defend", "economy", "wait"}
+VALID_COACH_COMMANDS = COACH_COMMANDS
 
 
 def _safe_int(value: Any, default: int = -1) -> int:
