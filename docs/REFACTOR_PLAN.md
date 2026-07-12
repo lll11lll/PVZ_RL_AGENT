@@ -97,8 +97,8 @@ Unless a separately documented defect correction has focused regression coverage
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Complete | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
 | 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete (automated; live game unavailable) | Recorded lifecycle equivalence, state/schema parity, all automated gates, and exact final-live omissions recorded |
 | 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete (automated; live game unavailable) | Build after every split, DTO snapshots, zero warnings, live placement/fusion/reset/seed checks |
-| 7 | GUI/process/status/coach separation and polling/log-drain optimization | In progress | Command snapshots, malformed/stale/unchanged status, bounded logs, callback/process lifecycle, interactive smoke |
-| 8 | Full validation, independent reviews, final benchmarks/statistics/report | Pending | Every automated gate green; environment-specific omissions documented with exact commands |
+| 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete (automated and local Tk; live game unavailable) | Command snapshots, malformed/stale/unchanged status, bounded logs, callback/process lifecycle, interactive smoke |
+| 8 | Full validation, independent reviews, final benchmarks/statistics/report | In progress | Every automated gate green; environment-specific omissions documented with exact commands |
 
 ## Risk controls and rollback boundaries
 
