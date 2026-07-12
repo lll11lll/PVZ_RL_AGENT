@@ -17,10 +17,6 @@ using MelonLoader;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
-[assembly: MelonInfo(typeof(PvZRLBridge.BridgeMod), "PvZRLBridge", "0.1.0", "Codex")]
-[assembly: MelonGame("LanPiaoPiao", "PlantsVsZombiesRH")]
-[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("PvZRLBridgeLifecycleHarness")]
-
 namespace PvZRLBridge;
 
 
