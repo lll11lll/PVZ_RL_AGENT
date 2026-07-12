@@ -5,11 +5,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$bridgeSource = Join-Path $root "src\PvZRLBridge\BridgeMod.cs"
 $generatedRegistrySource = Join-Path $root "src\PvZRLBridge\GeneratedPlantRegistry.cs"
 $registryGenerator = Join-Path $PSScriptRoot "generate_bridge_registry.py"
 $plantRegistry = Join-Path $root "configs\plant_registry.json"
-$sources = @($bridgeSource, $generatedRegistrySource)
+$sourceDir = Join-Path $root "src\PvZRLBridge"
 $outDir = Join-Path $root "src\PvZRLBridge\bin\Release\net6.0"
 $dll = Join-Path $outDir "PvZRLBridge.dll"
 $csc = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\Roslyn\csc.exe"
@@ -22,6 +21,15 @@ $python = (Get-Command python -ErrorAction Stop).Source
 & $python $registryGenerator --registry $plantRegistry --output $generatedRegistrySource
 if ($LASTEXITCODE -ne 0) {
     throw "Bridge registry generation failed."
+}
+
+$sources = @(
+    Get-ChildItem -LiteralPath $sourceDir -Filter *.cs -File |
+        Sort-Object -Property Name |
+        ForEach-Object { $_.FullName }
+)
+if ($sources.Count -eq 0) {
+    throw "No bridge C# sources were found under $sourceDir"
 }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
