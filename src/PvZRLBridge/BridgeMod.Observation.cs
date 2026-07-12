@@ -27,11 +27,12 @@ public sealed partial class BridgeMod
         var seedProbeMs = 0.0;
         var uiScanMs = 0.0;
         var board = FindBoard();
+        var createPlant = FindCreatePlant();
         var restartInfo = DetectRestartScreenInfo(forceRestartProbe || board == null);
         var obs = new ObservationDto
         {
             BoardFound = board != null,
-            CreatePlantFound = FindCreatePlant() != null,
+            CreatePlantFound = createPlant != null,
             GameSpeed = TryReadGameSpeed(),
             RequestedGameSpeed = _config.GameSpeed,
             GameSpeedMode = _config.GameSpeedMode,
@@ -142,7 +143,8 @@ public sealed partial class BridgeMod
             obs.SeedSlots.AddRange(seedState.SeedSlots);
             obs.SeedSlotCount = obs.SeedSlots.Count;
             obs.SlotPlantTypes = obs.SeedSlots.Select(slot => slot.PlantType).ToArray();
-            RefreshCompatibilityFieldsFromSeedSlots(obs);
+            var orderedSeedSlots = obs.SeedSlots.OrderBy(slot => slot.SlotIndex).ToList();
+            RefreshCompatibilityFieldsFromSeedSlots(obs, orderedSeedSlots);
             obs.ActualGameplayReady = rawGameplayReady &&
                                       !obs.SeedSelectionActive &&
                                       !obs.BlockingRewardUiActive &&
@@ -173,7 +175,7 @@ public sealed partial class BridgeMod
             ApplyAdventureObservationFields(obs);
             obs.DebugMessage = $"terminalHint={obs.TerminalHint}, seedSelectionActive={obs.SeedSelectionActive}, gameplayReady={obs.GameplayReady}, seedSlots={obs.SeedSlotCount}";
 
-            AddLegalActions(obs);
+            AddLegalActions(obs, orderedSeedSlots, createPlant);
             obs.LegalActionCount = obs.LegalActions.Count;
             obs.ActionCount = GetActionCount(obs.RowCount, obs.ColumnCount, obs.SeedSlots.Count);
         }
@@ -290,27 +292,57 @@ public sealed partial class BridgeMod
         }
     }
 
-    private void RefreshCompatibilityFieldsFromSeedSlots(ObservationDto obs)
+    private void RefreshCompatibilityFieldsFromSeedSlots(
+        ObservationDto obs,
+        IReadOnlyList<SeedSlotDto> orderedSeedSlots)
     {
-        if (obs.SeedSlots.Count == 0)
+        if (orderedSeedSlots.Count == 0)
         {
             return;
         }
 
-        obs.PlantCosts.Clear();
-        obs.CardCooldowns.Clear();
-        foreach (var slot in obs.SeedSlots.OrderBy(s => s.SlotIndex))
+        for (var index = 0; index < orderedSeedSlots.Count; index++)
         {
-            obs.PlantCosts.Add(new PlantCostDto
+            var slot = orderedSeedSlots[index];
+            var plantCost = new PlantCostDto
             {
                 PlantType = slot.PlantType,
                 PlantTypeName = slot.PlantTypeName,
                 Cost = slot.SeedCost,
                 Source = $"seed_slot[{slot.SlotIndex}]/{slot.Source}"
-            });
+            };
+            if (index < obs.PlantCosts.Count)
+            {
+                obs.PlantCosts[index] = plantCost;
+            }
+            else
+            {
+                obs.PlantCosts.Add(plantCost);
+            }
+
             var cooldown = SlotCooldownFromDto(slot);
             cooldown.Source = $"seed_slot[{slot.SlotIndex}]/{slot.Source}";
-            obs.CardCooldowns.Add(cooldown);
+            if (index < obs.CardCooldowns.Count)
+            {
+                obs.CardCooldowns[index] = cooldown;
+            }
+            else
+            {
+                obs.CardCooldowns.Add(cooldown);
+            }
+        }
+
+        if (obs.PlantCosts.Count > orderedSeedSlots.Count)
+        {
+            obs.PlantCosts.RemoveRange(
+                orderedSeedSlots.Count,
+                obs.PlantCosts.Count - orderedSeedSlots.Count);
+        }
+        if (obs.CardCooldowns.Count > orderedSeedSlots.Count)
+        {
+            obs.CardCooldowns.RemoveRange(
+                orderedSeedSlots.Count,
+                obs.CardCooldowns.Count - orderedSeedSlots.Count);
         }
     }
 
@@ -436,52 +468,14 @@ public sealed partial class BridgeMod
 
     private void AddLaneSummaries(ObservationDto obs)
     {
-        for (var row = 0; row < obs.RowCount; row++)
-        {
-            var laneZombies = obs.Zombies.Where(z => z.Row == row && z.Alive).ToList();
-            if (laneZombies.Count == 0)
-            {
-                obs.Lanes.Add(new LaneDto { Row = row, ZombieCount = 0 });
-                continue;
-            }
-
-            var nearest = laneZombies.OrderBy(z => z.X).First();
-            var coneheads = laneZombies.Count(IsConeheadZombie);
-            var bucketheads = laneZombies.Count(IsBucketheadZombie);
-            var toughZombies = laneZombies.Where(IsToughZombie).ToList();
-            var nearestTough = toughZombies.OrderBy(z => z.X).FirstOrDefault();
-            obs.Lanes.Add(new LaneDto
-            {
-                Row = row,
-                ZombieCount = laneZombies.Count,
-                NearestZombieX = nearest.X,
-                NearestZombieHealth = nearest.Health,
-                NearestZombieType = nearest.Type,
-                ConeheadCount = coneheads,
-                BucketheadCount = bucketheads,
-                ToughZombieCount = toughZombies.Count,
-                ToughZombieNearestX = nearestTough?.X,
-                ToughZombiePressureScore = toughZombies.Sum(z => Math.Max(0f, 1f - z.X / 10f))
-            });
-        }
+        obs.Lanes.AddRange(
+            BridgeObservationHelpers.BuildLaneSummaries(obs.Zombies, obs.RowCount));
     }
 
-    private static bool IsConeheadZombie(ZombieDto zombie)
-    {
-        var name = (zombie.TypeName ?? "").ToLowerInvariant();
-        return zombie.Type is 2 or 12 || name.Contains("cone") || name.Contains("roadblock") || name.Contains("路障");
-    }
-
-    private static bool IsBucketheadZombie(ZombieDto zombie)
-    {
-        var name = (zombie.TypeName ?? "").ToLowerInvariant();
-        return zombie.Type is 4 or 13 || name.Contains("bucket") || name.Contains("铁桶");
-    }
-
-    private static bool IsToughZombie(ZombieDto zombie) =>
-        IsConeheadZombie(zombie) || IsBucketheadZombie(zombie) || zombie.Health >= 600 || zombie.MaxHealth >= 600;
-
-    private void AddLegalActions(ObservationDto obs)
+    private void AddLegalActions(
+        ObservationDto obs,
+        IReadOnlyList<SeedSlotDto> orderedSeedSlots,
+        CreatePlant? createPlant)
     {
         obs.LegalActions.Add(0);
         if (!obs.GameplayReady)
@@ -500,14 +494,17 @@ public sealed partial class BridgeMod
             return;
         }
 
-        var createPlant = FindCreatePlant();
         if (createPlant == null)
         {
             return;
         }
 
         var size = obs.RowCount * obs.ColumnCount;
-        foreach (var slot in obs.SeedSlots.OrderBy(slot => slot.SlotIndex))
+        var occupiedCellKeys = BridgeObservationHelpers.BuildOccupiedCellKeys(
+            obs,
+            obs.RowCount,
+            obs.ColumnCount);
+        foreach (var slot in orderedSeedSlots)
         {
             if (!slot.Usable || obs.Sun < slot.SeedCost || !slot.Ready || slot.Disabled)
             {
@@ -520,7 +517,11 @@ public sealed partial class BridgeMod
             {
                 for (var column = 0; column < obs.ColumnCount; column++)
                 {
-                    if (IsCellOccupied(obs, row, column))
+                    if (occupiedCellKeys.Contains(
+                            BridgeObservationHelpers.CellKey(
+                                row,
+                                column,
+                                obs.ColumnCount)))
                     {
                         continue;
                     }
@@ -544,7 +545,11 @@ public sealed partial class BridgeMod
 
     private static bool IsCellOccupied(ObservationDto obs, int row, int column) =>
         obs.Plants.Any(p => p.Row == row && p.Column == column) ||
-        obs.VisiblePlants.Any(p => p.ActiveInHierarchy && p.InBoardBounds && p.Row == row && p.Column == column);
+        obs.VisiblePlants.Any(p =>
+            p.ActiveInHierarchy &&
+            p.InBoardBounds &&
+            p.Row == row &&
+            p.Column == column);
 
     private PlantCostInfo GetPlantCost(int plantTypeId)
     {

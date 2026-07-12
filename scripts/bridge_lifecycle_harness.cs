@@ -1,5 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using PvZRLBridge;
@@ -23,6 +29,9 @@ internal static class BridgeLifecycleHarness
             DispatchCancelRaceHasOneOwner();
             DispatchStopRaceHasOneOwner();
             ClientRegistryStopsAndDrainsBoundedly();
+            ObservationSchemaIsStable();
+            OccupancyIndexMatchesLegacyScans();
+            LaneSummariesMatchLegacyProjection();
             Console.WriteLine($"Bridge lifecycle harness passed: {_checks} checks.");
             return 0;
         }
@@ -209,6 +218,181 @@ internal static class BridgeLifecycleHarness
         registry.Unregister(secondId);
         Check(registry.WaitForDrain(TimeSpan.FromSeconds(1)), "registry must signal after the final worker exits");
         Check(registry.ActiveCount == 0, "client registry must be empty after worker exit");
+    }
+
+    private static void ObservationSchemaIsStable()
+    {
+        const string expectedHash = "ad898bdc96741cf97875926327aae9b10d3ae4aab84a6cbc68f6ab3d33f0f5db";
+        var properties = typeof(ObservationDto).GetProperties(
+            BindingFlags.Public | BindingFlags.Instance);
+        Check(properties.Length == 122, "ObservationDto property count changed");
+        var signature = string.Join(
+            "\n",
+            properties
+                .Select(property =>
+                    JsonNamingPolicy.CamelCase.ConvertName(property.Name) +
+                    ":" + JsonShape(property.PropertyType))
+                .OrderBy(value => value, StringComparer.Ordinal));
+        var actualHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(signature))).ToLowerInvariant();
+        Check(
+            actualHash == expectedHash,
+            $"ObservationDto recursive key/type surface changed: {actualHash}");
+    }
+
+    private static string JsonShape(Type type)
+    {
+        var nullable = Nullable.GetUnderlyingType(type);
+        if (nullable != null)
+        {
+            return JsonShape(nullable) + "?";
+        }
+        if (type.IsArray)
+        {
+            return "array<" + JsonShape(type.GetElementType()!) + ">";
+        }
+        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+        {
+            return "array<" + JsonShape(type.GetGenericArguments()[0]) + ">";
+        }
+        if (type == typeof(bool)) return "boolean";
+        if (type == typeof(byte) || type == typeof(short) || type == typeof(int) || type == typeof(long)) return "integer";
+        if (type == typeof(float) || type == typeof(double) || type == typeof(decimal)) return "number";
+        if (type == typeof(string)) return "string";
+        return "object";
+    }
+
+    private static void OccupancyIndexMatchesLegacyScans()
+    {
+        var random = new Random(404);
+        for (var iteration = 0; iteration < 500; iteration++)
+        {
+            var observation = new ObservationDto { RowCount = 5, ColumnCount = 10 };
+            var plantCount = random.Next(0, 40);
+            for (var index = 0; index < plantCount; index++)
+            {
+                observation.Plants.Add(new PlantDto
+                {
+                    Row = random.Next(-1, 7),
+                    Column = random.Next(-1, 12)
+                });
+            }
+            var visibleCount = random.Next(0, 40);
+            for (var index = 0; index < visibleCount; index++)
+            {
+                observation.VisiblePlants.Add(new VisiblePlantDto
+                {
+                    Row = random.Next(-1, 7),
+                    Column = random.Next(-1, 12),
+                    ActiveInHierarchy = random.Next(0, 2) == 1,
+                    InBoardBounds = random.Next(0, 2) == 1
+                });
+            }
+
+            var occupied = BridgeObservationHelpers.BuildOccupiedCellKeys(
+                observation,
+                observation.RowCount,
+                observation.ColumnCount);
+            for (var row = 0; row < observation.RowCount; row++)
+            {
+                for (var column = 0; column < observation.ColumnCount; column++)
+                {
+                    var legacy = observation.Plants.Any(
+                        plant => plant.Row == row && plant.Column == column) ||
+                        observation.VisiblePlants.Any(
+                            plant => plant.ActiveInHierarchy &&
+                                     plant.InBoardBounds &&
+                                     plant.Row == row &&
+                                     plant.Column == column);
+                    var indexed = occupied.Contains(
+                        BridgeObservationHelpers.CellKey(
+                            row,
+                            column,
+                            observation.ColumnCount));
+                    Check(legacy == indexed, "occupancy index diverged from legacy scan");
+                }
+            }
+        }
+    }
+
+    private static void LaneSummariesMatchLegacyProjection()
+    {
+        var random = new Random(405);
+        for (var iteration = 0; iteration < 500; iteration++)
+        {
+            var zombies = new List<ZombieDto>();
+            var count = random.Next(0, 80);
+            for (var index = 0; index < count; index++)
+            {
+                var typeChoice = random.Next(0, 6);
+                zombies.Add(new ZombieDto
+                {
+                    Index = index,
+                    Type = typeChoice == 0 ? 2 : typeChoice == 1 ? 4 : 99,
+                    TypeName = typeChoice == 2 ? "ConeZombie" : typeChoice == 3 ? "BucketZombie" : "NormalZombie",
+                    Row = random.Next(-1, 7),
+                    Health = random.Next(0, 1000),
+                    MaxHealth = random.Next(0, 1000),
+                    Alive = random.Next(0, 4) != 0,
+                    X = (float)(random.NextDouble() * 14.0 - 2.0)
+                });
+            }
+
+            var actual = BridgeObservationHelpers.BuildLaneSummaries(zombies, 5);
+            var legacy = LegacyLaneSummaries(zombies, 5);
+            Check(actual.Count == legacy.Count, "lane count changed");
+            for (var row = 0; row < actual.Count; row++)
+            {
+                var left = actual[row];
+                var right = legacy[row];
+                Check(left.Row == right.Row, "lane row changed");
+                Check(left.ZombieCount == right.ZombieCount, "lane zombie count changed");
+                Check(left.NearestZombieX == right.NearestZombieX, "lane nearest X changed");
+                Check(left.NearestZombieHealth == right.NearestZombieHealth, "lane nearest health changed");
+                Check(left.NearestZombieType == right.NearestZombieType, "lane nearest type changed");
+                Check(left.ConeheadCount == right.ConeheadCount, "lane conehead count changed");
+                Check(left.BucketheadCount == right.BucketheadCount, "lane buckethead count changed");
+                Check(left.ToughZombieCount == right.ToughZombieCount, "lane tough count changed");
+                Check(left.ToughZombieNearestX == right.ToughZombieNearestX, "lane tough nearest X changed");
+                Check(
+                    left.ToughZombiePressureScore == right.ToughZombiePressureScore,
+                    $"lane tough pressure changed: {left.ToughZombiePressureScore:R} != {right.ToughZombiePressureScore:R}");
+            }
+        }
+    }
+
+    private static List<LaneDto> LegacyLaneSummaries(
+        IReadOnlyList<ZombieDto> zombies,
+        int rowCount)
+    {
+        var lanes = new List<LaneDto>();
+        for (var row = 0; row < rowCount; row++)
+        {
+            var laneZombies = zombies.Where(zombie => zombie.Row == row && zombie.Alive).ToList();
+            if (laneZombies.Count == 0)
+            {
+                lanes.Add(new LaneDto { Row = row, ZombieCount = 0 });
+                continue;
+            }
+
+            var nearest = laneZombies.OrderBy(zombie => zombie.X).First();
+            var tough = laneZombies.Where(BridgeObservationHelpers.IsToughZombie).ToList();
+            var nearestTough = tough.OrderBy(zombie => zombie.X).FirstOrDefault();
+            lanes.Add(new LaneDto
+            {
+                Row = row,
+                ZombieCount = laneZombies.Count,
+                NearestZombieX = nearest.X,
+                NearestZombieHealth = nearest.Health,
+                NearestZombieType = nearest.Type,
+                ConeheadCount = laneZombies.Count(BridgeObservationHelpers.IsConeheadZombie),
+                BucketheadCount = laneZombies.Count(BridgeObservationHelpers.IsBucketheadZombie),
+                ToughZombieCount = tough.Count,
+                ToughZombieNearestX = nearestTough?.X,
+                ToughZombiePressureScore = tough.Sum(zombie => Math.Max(0f, 1f - zombie.X / 10f))
+            });
+        }
+        return lanes;
     }
 
     private static PendingRequest NewRequest(long requestId, int timeoutMilliseconds = 1000) =>
