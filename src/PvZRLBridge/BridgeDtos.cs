@@ -590,6 +590,7 @@ internal sealed class SeedRuntimeCache
     public Dictionary<int, int> CachedPlantCosts { get; } = new();
     public Dictionary<int, CardUI> CachedGameplayCards { get; } = new();
     public List<SeedSlotCacheEntry> CachedSeedSlots { get; } = new();
+    public Dictionary<int, SeedSlotCacheEntry> CachedSeedSlotsByIndex { get; } = new();
     public List<SeedSlotDto> CachedSeedSlotDtos { get; } = new();
 
     public SeedRuntimeSnapshot ToSnapshot(bool rawGameplayReady)

@@ -313,7 +313,11 @@ public sealed partial class BridgeMod
     private void UpdateSeedRuntimeCache(SeedProbeDto probe)
     {
         var sortedSlotCards = SortSeedSlotCards(probe.ActiveGameplayCardBankCards);
-        var activeGameplayCounts = BuildTypeCounts(sortedSlotCards.Select(card => card.PlantType));
+        var activeGameplayCounts = new Dictionary<int, int>();
+        BridgeObservationHelpers.PopulateSeedCompatibilityCollections(
+            sortedSlotCards,
+            activeGameplayCounts,
+            _seedRuntimeCache.CachedPlantCosts);
         var requiredGameplayCounts = BuildTypeCounts(_config.PlantTypes);
         _seedRuntimeCache.Valid = true;
         _seedRuntimeCache.SeedSelectionActive = probe.SeedSelectionActive;
@@ -330,12 +334,6 @@ public sealed partial class BridgeMod
         foreach (var pair in activeGameplayCounts)
         {
             _seedRuntimeCache.ActiveGameplayTypeCounts[pair.Key] = pair.Value;
-        }
-
-        _seedRuntimeCache.CachedPlantCosts.Clear();
-        foreach (var group in sortedSlotCards.Where(card => card.SeedCost > 0).GroupBy(card => card.PlantType))
-        {
-            _seedRuntimeCache.CachedPlantCosts[group.Key] = group.Min(card => card.SeedCost);
         }
 
         _seedRuntimeCache.CachedSeedSlotDtos.Clear();
@@ -356,6 +354,7 @@ public sealed partial class BridgeMod
         _seedRuntimeCache.CachedPlantCosts.Clear();
         _seedRuntimeCache.CachedGameplayCards.Clear();
         _seedRuntimeCache.CachedSeedSlots.Clear();
+        _seedRuntimeCache.CachedSeedSlotsByIndex.Clear();
         _seedRuntimeCache.CachedSeedSlotDtos.Clear();
         _observationsSinceSeedProbe = Math.Max(_observationsSinceSeedProbe, _config.SeedScreenCheckInterval);
     }
@@ -364,6 +363,7 @@ public sealed partial class BridgeMod
     {
         _seedRuntimeCache.CachedGameplayCards.Clear();
         _seedRuntimeCache.CachedSeedSlots.Clear();
+        _seedRuntimeCache.CachedSeedSlotsByIndex.Clear();
         var activeGameplayCardIds = new HashSet<int>(sortedSlotCards.Select(card => card.InstanceId));
         if (activeGameplayCardIds.Count == 0)
         {
@@ -407,12 +407,14 @@ public sealed partial class BridgeMod
                 continue;
             }
 
-            _seedRuntimeCache.CachedSeedSlots.Add(new SeedSlotCacheEntry
+            var entry = new SeedSlotCacheEntry
             {
                 SlotIndex = i,
                 CardInstanceId = sortedSlotCards[i].InstanceId,
                 Card = card
-            });
+            };
+            _seedRuntimeCache.CachedSeedSlots.Add(entry);
+            _seedRuntimeCache.CachedSeedSlotsByIndex[i] = entry;
         }
     }
 
@@ -425,8 +427,8 @@ public sealed partial class BridgeMod
             return;
         }
 
-        var refreshed = new List<SeedSlotDto>();
-        foreach (var entry in _seedRuntimeCache.CachedSeedSlots.OrderBy(slot => slot.SlotIndex))
+        var refreshedCount = 0;
+        foreach (var entry in _seedRuntimeCache.CachedSeedSlots)
         {
             try
             {
@@ -440,7 +442,20 @@ public sealed partial class BridgeMod
                     return;
                 }
 
-                refreshed.Add(BuildSeedSlotDto(card, entry.SlotIndex, "cached_active_gameplay_card_live", includeHierarchyPath: false));
+                var refreshed = BuildSeedSlotDto(
+                    card,
+                    entry.SlotIndex,
+                    "cached_active_gameplay_card_live",
+                    includeHierarchyPath: false);
+                if (refreshedCount < _seedRuntimeCache.CachedSeedSlotDtos.Count)
+                {
+                    _seedRuntimeCache.CachedSeedSlotDtos[refreshedCount] = refreshed;
+                }
+                else
+                {
+                    _seedRuntimeCache.CachedSeedSlotDtos.Add(refreshed);
+                }
+                refreshedCount++;
             }
             catch
             {
@@ -449,15 +464,16 @@ public sealed partial class BridgeMod
             }
         }
 
-        if (refreshed.Count == 0)
+        if (refreshedCount == 0)
         {
             return;
         }
 
-        _seedRuntimeCache.CachedSeedSlotDtos.Clear();
-        foreach (var slot in refreshed)
+        if (_seedRuntimeCache.CachedSeedSlotDtos.Count > refreshedCount)
         {
-            _seedRuntimeCache.CachedSeedSlotDtos.Add(slot);
+            _seedRuntimeCache.CachedSeedSlotDtos.RemoveRange(
+                refreshedCount,
+                _seedRuntimeCache.CachedSeedSlotDtos.Count - refreshedCount);
         }
     }
 

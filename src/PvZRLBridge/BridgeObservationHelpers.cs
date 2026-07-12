@@ -5,6 +5,28 @@ namespace PvZRLBridge;
 
 internal static class BridgeObservationHelpers
 {
+    public static void PopulateSeedCompatibilityCollections(
+        IReadOnlyList<SeedCardDto> sortedSlotCards,
+        Dictionary<int, int> activeGameplayCounts,
+        Dictionary<int, int> minimumPositiveCosts)
+    {
+        activeGameplayCounts.Clear();
+        minimumPositiveCosts.Clear();
+        foreach (var card in sortedSlotCards)
+        {
+            activeGameplayCounts.TryGetValue(card.PlantType, out var count);
+            activeGameplayCounts[card.PlantType] = count + 1;
+            if (card.SeedCost > 0 &&
+                (!minimumPositiveCosts.TryGetValue(
+                     card.PlantType,
+                     out var currentCost) ||
+                 card.SeedCost < currentCost))
+            {
+                minimumPositiveCosts[card.PlantType] = card.SeedCost;
+            }
+        }
+    }
+
     public static int CellKey(int row, int column, int columnCount) =>
         row * columnCount + column;
 

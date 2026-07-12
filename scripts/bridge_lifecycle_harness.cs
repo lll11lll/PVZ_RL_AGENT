@@ -32,6 +32,7 @@ internal static class BridgeLifecycleHarness
             ObservationSchemaIsStable();
             OccupancyIndexMatchesLegacyScans();
             LaneSummariesMatchLegacyProjection();
+            SeedCompatibilityCollectionsMatchLegacyProjection();
             Console.WriteLine($"Bridge lifecycle harness passed: {_checks} checks.");
             return 0;
         }
@@ -393,6 +394,48 @@ internal static class BridgeLifecycleHarness
             });
         }
         return lanes;
+    }
+
+    private static void SeedCompatibilityCollectionsMatchLegacyProjection()
+    {
+        var random = new Random(406);
+        for (var iteration = 0; iteration < 500; iteration++)
+        {
+            var cards = new List<SeedCardDto>();
+            var cardCount = random.Next(0, 40);
+            for (var index = 0; index < cardCount; index++)
+            {
+                cards.Add(new SeedCardDto
+                {
+                    InstanceId = index + 1,
+                    PlantType = random.Next(-1, 16),
+                    SeedCost = random.Next(-25, 500)
+                });
+            }
+
+            var actualCounts = new Dictionary<int, int> { [999] = 1 };
+            var actualCosts = new Dictionary<int, int> { [999] = 1 };
+            BridgeObservationHelpers.PopulateSeedCompatibilityCollections(
+                cards,
+                actualCounts,
+                actualCosts);
+
+            var expectedCounts = cards
+                .GroupBy(card => card.PlantType)
+                .ToDictionary(group => group.Key, group => group.Count());
+            var expectedCosts = cards
+                .Where(card => card.SeedCost > 0)
+                .GroupBy(card => card.PlantType)
+                .ToDictionary(group => group.Key, group => group.Min(card => card.SeedCost));
+            Check(
+                actualCounts.OrderBy(pair => pair.Key).SequenceEqual(
+                    expectedCounts.OrderBy(pair => pair.Key)),
+                "seed compatibility counts changed");
+            Check(
+                actualCosts.OrderBy(pair => pair.Key).SequenceEqual(
+                    expectedCosts.OrderBy(pair => pair.Key)),
+                "seed compatibility minimum costs changed");
+        }
     }
 
     private static PendingRequest NewRequest(long requestId, int timeoutMilliseconds = 1000) =>

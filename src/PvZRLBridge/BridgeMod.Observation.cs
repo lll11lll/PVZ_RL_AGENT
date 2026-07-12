@@ -752,8 +752,9 @@ public sealed partial class BridgeMod
     {
         slot = new SeedSlotDto { SlotIndex = seedSlotIndex, PlantType = -1, PlantTypeName = "unknown" };
         card = null;
-        var entry = _seedRuntimeCache.CachedSeedSlots.FirstOrDefault(candidate => candidate.SlotIndex == seedSlotIndex);
-        if (entry == null || entry.SlotIndex != seedSlotIndex)
+        if (!_seedRuntimeCache.CachedSeedSlotsByIndex.TryGetValue(
+                seedSlotIndex,
+                out var entry))
         {
             return false;
         }
