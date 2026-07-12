@@ -1255,10 +1255,6 @@ class PvZGymEnv:
             "coach_command_queue_cleared_on_reset": True,
             "startup_command_blocked": False,
         }
-        if level3_start_state:
-            reset_result["level3SpecialistStartState"] = level3_start_state
-            reset_result["targetLevel"] = int(level3_start_state.get("targetLevel") or LEVEL3_SPECIALIST_TARGET_LEVEL)
-            reset_result["runMode"] = self._run_mode()
         if fixed_train_terminal_reset:
             print("[reset-mode] level3_specialist" if self._is_level3_specialist_mode() else "[reset-mode] fixed_train")
             print(f"[reset] reason={reset_reason}")

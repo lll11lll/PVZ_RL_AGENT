@@ -1325,7 +1325,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info["performance"] = perf
             self._record_performance(perf)
         if terminated or truncated:
-            next_reset_reason = done_reason
+            # ``action_freeze`` remains the episode-facing diagnostic result,
+            # while the base reset state machine accepts the corresponding
+            # corruption recovery reason.
+            next_reset_reason = (
+                "env_corruption" if done_reason == "action_freeze" else done_reason
+            )
             allow_active_gameplay_reset_next = False
             terminal_hint = str(observation.get("terminalHint") or "")
             timeout_near_terminal_win = bool(
@@ -1337,7 +1342,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                     or bool(observation.get("over"))
                 )
             )
-            if done_reason == "env_corruption":
+            if done_reason in {"env_corruption", "action_freeze"}:
                 allow_active_gameplay_reset_next = terminal_reason != "bridge_timeout"
             elif done_reason in ("win", "post_win_pending") and self.config.run_mode in {RUN_MODE_FIXED_TRAIN, RUN_MODE_LEVEL3_SPECIALIST}:
                 allow_active_gameplay_reset_next = False
