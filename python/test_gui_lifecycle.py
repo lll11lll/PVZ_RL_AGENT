@@ -154,6 +154,48 @@ def test_stop_escalates_only_after_grace_timeout() -> None:
     assert process.poll() == -9
 
 
+def test_begin_stop_is_idempotent_for_same_process() -> None:
+    dashboard = _bare_dashboard()
+    process = ImmediateExitProcess()
+    dashboard.active_process = process
+    dashboard.active_process_name = "training"
+
+    dashboard._begin_process_stop("training", process)
+    dashboard._begin_process_stop("training", process)
+    assert dashboard._stopper_thread is not None
+    dashboard._stopper_thread.join(timeout=1.0)
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+
+
+def test_stale_exit_event_does_not_clear_newer_process() -> None:
+    dashboard = _bare_dashboard()
+    current = ImmediateExitProcess()
+    stale = ImmediateExitProcess()
+    dashboard.active_process = current
+    dashboard.active_process_name = "current"
+
+    dashboard._handle_process_exit("stale", stale, 0)
+
+    assert dashboard.active_process is current
+    assert dashboard.active_process_name == "current"
+    assert dashboard.process_status_var.value == ""
+
+
+def test_second_launch_is_rejected_without_starting_subprocess() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.active_process = ImmediateExitProcess()
+    dashboard.active_process_name = "current"
+    messages: list[str] = []
+    dashboard._append_log = messages.append
+
+    dashboard.launch_process("replacement", ["python", "replacement.py"])
+
+    assert dashboard.active_process_name == "current"
+    assert messages == ["ERROR: Cannot launch replacement; current is still running.\n"]
+
+
 def test_poll_and_log_callbacks_are_tracked_and_bounded() -> None:
     dashboard = _bare_dashboard()
     dashboard._poll_after_id = None
