@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "description": "Ordered, sanitized Phase 5 lifecycle evidence. Observations contain only classifier-relevant bridge fields; current legacy branch actions are declarative expectations and are not executed by this fixture.",
+  "classification_fields": [
+    "phase",
+    "legacy_state",
+    "done_reason",
+    "next_directive",
+    "screen_state",
+    "seed_selection_visible",
+    "gameplay_ready",
+    "adventure_seed_selection_visible",
+    "adventure_gameplay_ready",
+    "adventure_startup_visible",
+    "adventure_loss_visible",
+    "adventure_menu_visible",
+    "live_board_progress",
+    "post_win_evidence",
+    "loss_evidence",
+    "transitional",
+    "expected_level",
+    "observed_level",
+    "identity_reliable",
+    "level_mismatch_authoritative",
+    "reasons"
+  ],
+  "delta_fields": [
+    "reset_requests",
+    "reset_successes",
+    "same_level_replays",
+    "env_corruption_resets",
+    "progression_advances",
+    "level_delta",
+    "blocked_transitions"
+  ],
+  "defaults": {
+    "frameCount": 0,
+    "rowCount": 5,
+    "columnCount": 10,
+    "boardFound": false,
+    "gameplayReady": false,
+    "actualGameplayReady": false,
+    "seedSelectionActive": false,
+    "seedSelectionPanelActive": false,
+    "screenState": "",
+    "nextStep": "",
+    "terminalHint": "running",
+    "done": false,
+    "over": false,
+    "wave": 0,
+    "maxWave": 10,
+    "moreZombiesComing": true,
+    "killCount": 0,
+    "plantCount": 0,
+    "visiblePlantObjectCount": 0,
+    "zombieCount": 0,
+    "bulletCount": 0,
+    "sun": 500,
+    "logicalMowerCount": 5,
+    "visibleMowerObjectCount": 5,
+    "duplicateMowerRowCount": 0,
+    "seedSlots": [],
+    "activeGameplayCardBankCount": 0,
+    "legalActions": [],
+    "legalActionCount": 0
+  },
+  "observation_templates": {
+    "startup": {
+      "screenState": "loading_or_menu",
+      "startupPopupVisible": true
+    },
+    "loading": {
+      "screenState": "loading_or_menu"
+    },
+    "seed": {
+      "boardFound": true,
+      "screenState": "seed_selection",
+      "seedSelectionActive": true,
+      "seedSelectionPanelActive": true
+    },
+    "ready": {
+      "boardFound": true,
+      "gameplayReady": true,
+      "actualGameplayReady": true,
+      "screenState": "gameplay",
+      "nextStep": "play",
+      "seedSlots": [{"slotIndex": 0, "plantType": 0}],
+      "seedSlotCount": 1,
+      "activeGameplayCardBankCount": 1,
+      "legalActions": [0],
+      "legalActionCount": 1
+    },
+    "possible_win": {
+      "boardFound": true,
+      "gameplayReady": true,
+      "actualGameplayReady": true,
+      "screenState": "gameplay",
+      "nextStep": "play",
+      "terminalHint": "possible_win",
+      "wave": 10,
+      "maxWave": 10,
+      "moreZombiesComing": false,
+      "seedSlots": [{"slotIndex": 0, "plantType": 0}],
+      "seedSlotCount": 1,
+      "activeGameplayCardBankCount": 1,
+      "legalActions": [0],
+      "legalActionCount": 1
+    },
+    "trophy": {
+      "boardFound": true,
+      "screenState": "level_complete_trophy",
+      "terminalHint": "reward_unlock",
+      "done": true,
+      "trophyVisible": true,
+      "levelCompleteTrophyVisible": true,
+      "postWinClickRequired": true
+    },
+    "reward": {
+      "boardFound": true,
+      "screenState": "reward_unlock",
+      "terminalHint": "reward_unlock",
+      "rewardScreenVisible": true,
+      "unlockScreenVisible": true
+    },
+    "loss": {
+      "boardFound": true,
+      "screenState": "game_over_restart_screen",
+      "terminalHint": "game_over_or_loss",
+      "done": true,
+      "over": true,
+      "onGameOverScreen": true,
+      "onRestartScreen": true,
+      "gameOverTextVisible": true
+    },
+    "active_timeout": {
+      "boardFound": true,
+      "gameplayReady": true,
+      "actualGameplayReady": true,
+      "screenState": "gameplay",
+      "nextStep": "play",
+      "wave": 4,
+      "plantCount": 5,
+      "zombieCount": 3
+    },
+    "active_corruption": {
+      "boardFound": true,
+      "gameplayReady": true,
+      "actualGameplayReady": true,
+      "screenState": "gameplay",
+      "nextStep": "play",
+      "wave": 3,
+      "plantCount": 8,
+      "zombieCount": 2
+    },
+    "wrong_level_active": {
+      "boardFound": true,
+      "gameplayReady": true,
+      "actualGameplayReady": true,
+      "screenState": "gameplay",
+      "nextStep": "play",
+      "wave": 1,
+      "currentAdventureLevel": 7,
+      "profileAdventureLevel": 7
+    }
+  },
+  "classification_contracts": {
+    "startup": ["startup", "unknown", "none", "dismiss_startup_popup", "loading_or_menu", false, false, false, false, true, false, false, false, false, false, true, 0, 0, false, false, ["startup_popup_visible"]],
+    "loading": ["loading", "unknown", "none", "wait_or_enter_adventure", "loading_or_menu", false, false, false, false, false, false, false, false, false, false, true, 0, 0, false, false, ["loading_or_menu"]],
+    "seed": ["seed_selection", "resetting", "none", "select_seeds_or_start", "seed_selection", true, false, true, false, false, false, false, false, false, false, true, 0, 0, false, false, ["seed_selection_visible"]],
+    "ready": ["ready", "ready", "none", "play", "gameplay", false, true, false, true, false, false, false, false, false, false, false, 0, 0, false, false, ["fresh_playable_board"]],
+    "possible_win": ["win_pending_confirmation", "active_gameplay", "none", "wait_terminal_confirmation", "gameplay", false, true, false, true, false, false, false, false, false, false, true, 0, 0, false, false, ["possible_win_without_confirmed_ui"]],
+    "trophy": ["win", "post_win_pending", "win", "continue_post_win", "level_complete_trophy", false, false, false, false, false, false, false, false, true, false, true, 0, 0, false, false, ["confirmed_post_win_ui"]],
+    "reward": ["reward_unlock", "post_win_pending", "win", "collect_or_continue_reward", "reward_unlock", false, false, false, false, false, false, false, false, true, false, true, 0, 0, false, false, ["confirmed_post_win_ui"]],
+    "same_level_seed": ["same_level_replay", "resetting", "none", "continue_same_level_replay", "seed_selection", true, false, true, false, false, false, false, false, false, false, true, 3, 3, true, false, ["same_level_replay_requested"]],
+    "ready_level3": ["ready", "ready", "none", "play", "gameplay", false, true, false, true, false, false, false, false, false, false, false, 3, 3, true, false, ["fresh_playable_board"]],
+    "loss": ["loss", "loss_pending", "loss", "click_restart", "game_over_restart_screen", false, false, false, false, false, true, false, false, false, true, true, 0, 0, false, false, ["confirmed_loss_ui"]],
+    "timeout": ["timeout", "active_gameplay", "none", "reset_timeout", "gameplay", false, true, false, true, false, false, false, true, false, false, true, 0, 0, false, false, ["action_or_episode_timeout"]],
+    "corruption_seed": ["corruption", "resetting", "none", "reset_corruption", "seed_selection", true, false, true, false, false, false, false, false, false, false, true, 0, 0, false, false, ["environment_corruption"]],
+    "corruption_active": ["corruption", "active_gameplay", "none", "reset_corruption", "gameplay", false, true, false, true, false, false, false, true, false, false, true, 0, 0, false, false, ["environment_corruption"]],
+    "reward_level3": ["reward_unlock", "post_win_pending", "win", "collect_or_continue_reward", "reward_unlock", false, false, false, false, false, false, false, false, true, false, true, 3, 3, true, false, ["confirmed_post_win_ui"]],
+    "progression_seed": ["adventure_progression", "resetting", "none", "continue_adventure_progression", "seed_selection", true, false, true, false, false, false, false, false, false, false, true, 4, 4, true, false, ["adventure_progression_requested"]],
+    "ready_level4": ["ready", "ready", "none", "play", "gameplay", false, true, false, true, false, false, false, false, false, false, false, 4, 4, true, false, ["fresh_playable_board"]],
+    "wrong_level_probe": ["same_level_replay", "active_gameplay", "none", "continue_same_level_replay", "gameplay", false, true, false, true, false, false, false, true, false, false, true, 6, 7, false, false, ["same_level_replay_requested"]],
+    "wrong_level_block": ["same_level_replay", "active_gameplay", "none", "block_level_identity_mismatch", "gameplay", false, true, false, true, false, false, false, true, false, false, true, 6, 7, true, true, ["same_level_replay_requested", "authoritative_level_identity_mismatch"]]
+  },
+  "provenance": {
+    "classifier_contract": {
+      "kind": "source_contract",
+      "source": "python/pvzrl_lifecycle.py",
+      "line_range": [442, 596],
+      "note": "Pure lifecycle classifier and complete immutable projection."
+    },
+    "reset_state_machine": {
+      "kind": "source_contract",
+      "source": "python/pvzrl_env.py",
+      "line_range": [1148, 2325],
+      "note": "Current reset reason, seed-selection invariant, and ready-board branches."
+    },
+    "action_freeze_handoff": {
+      "kind": "source_contract",
+      "source": "python/pvzrl_sb3.py",
+      "line_range": [1328, 1355],
+      "note": "Episode label action_freeze maps to base reset reason env_corruption."
+    },
+    "same_level_replay_branch": {
+      "kind": "source_contract",
+      "source": "python/pvzrl_adventure.py",
+      "line_range": [1033, 1430],
+      "note": "Same-level replay request, identity guard, seed selection, and gameplay-ready branches."
+    },
+    "adventure_progression_branch": {
+      "kind": "source_contract",
+      "source": "python/pvzrl_adventure_generalist.py",
+      "line_range": [1250, 1369],
+      "note": "Post-win replay-versus-advance decision and progression mutation."
+    },
+    "live_reward_unlock": {
+      "kind": "sanitized_live",
+      "source": "runs/live_status.json",
+      "line_range": [317, 344],
+      "source_excerpt_sha256": "facc6d49c8f5bf5b048589112fea45c3a106319ab80e59035009927fadc3c4bd",
+      "sanitization": [
+        "omitted absolute model and run paths",
+        "omitted stale gameplay counters from the mixed status snapshot",
+        "retained only reward and unlock screen signals"
+      ],
+      "note": "Live status supplies the reward_unlock and visible reward UI evidence."
+    },
+    "live_loss_episode": {
+      "kind": "sanitized_live",
+      "source": "runs/ppo_adventure_generalist_14slot_identity_v1_20260518_010240/adventure_training_progress.jsonl",
+      "line_range": [10, 10],
+      "source_excerpt_sha256": "64e391addf1e497bc778ffe46bcc2b6d44791d5d4019d52373318b5fddec5a2d",
+      "sanitization": [
+        "omitted reward and episode-length values",
+        "omitted loadout and checkpoint metadata",
+        "expanded terminal_reason into classifier-relevant loss UI flags"
+      ],
+      "note": "Recorded loss terminal_reason game_over_restart_screen anchors the loss frame."
+    },
+    "live_same_level_win": {
+      "kind": "sanitized_live",
+      "source": "runs/ppo_adventure_generalist_14slot_identity_v1_20260518_010240/adventure_training_progress.jsonl",
+      "line_range": [7, 9],
+      "source_excerpt_sha256": "5c567b5b1a73c04e9320265aad057649f2e108c3edafe0c6c3529649765be868",
+      "sanitization": [
+        "omitted reward, episode-length, loadout, and checkpoint metadata",
+        "retained win and replay_same_level transition intent",
+        "represented UI frames with the bridge vocabulary consumed by the classifier"
+      ],
+      "note": "Recorded wins and post-win pending state anchor same-level replay intent."
+    }
+  },
+  "sequences": [
+    {
+      "name": "startup_loading_seed_gameplay",
+      "expected_phase_order": ["startup", "loading", "seed_selection", "ready"],
+      "expected_legacy_actions": ["dismiss_startup_popup", "wait_or_press_adventure", "select_seeds_and_lets_rock", "accept_fresh_playable_board"],
+      "final_delta": {"reset_requests": 0, "reset_successes": 0, "same_level_replays": 0, "env_corruption_resets": 0, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "startup_popup", "template": "startup", "context": {}, "contract": "startup", "legacy_action": "dismiss_startup_popup", "provenance": "classifier_contract", "delta": {}},
+        {"name": "loading_or_menu", "template": "loading", "context": {}, "contract": "loading", "legacy_action": "wait_or_press_adventure", "provenance": "reset_state_machine", "delta": {}},
+        {"name": "seed_selection", "template": "seed", "context": {}, "contract": "seed", "legacy_action": "select_seeds_and_lets_rock", "provenance": "reset_state_machine", "delta": {}},
+        {"name": "fresh_gameplay", "template": "ready", "context": {}, "contract": "ready", "legacy_action": "accept_fresh_playable_board", "provenance": "reset_state_machine", "delta": {}}
+      ]
+    },
+    {
+      "name": "possible_win_trophy_reward",
+      "expected_phase_order": ["win_pending_confirmation", "win", "reward_unlock"],
+      "expected_legacy_actions": ["wait_terminal_confirmation", "click_trophy_once", "click_reward_continue_once"],
+      "final_delta": {"reset_requests": 0, "reset_successes": 0, "same_level_replays": 0, "env_corruption_resets": 0, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "possible_win", "template": "possible_win", "context": {}, "contract": "possible_win", "legacy_action": "wait_terminal_confirmation", "provenance": "classifier_contract", "delta": {}},
+        {"name": "level_complete_trophy", "template": "trophy", "context": {}, "contract": "trophy", "legacy_action": "click_trophy_once", "provenance": "live_same_level_win", "delta": {}},
+        {"name": "reward_unlock", "template": "reward", "context": {}, "contract": "reward", "legacy_action": "click_reward_continue_once", "provenance": "live_reward_unlock", "delta": {}}
+      ]
+    },
+    {
+      "name": "post_win_same_level_seed_fresh",
+      "expected_phase_order": ["win", "same_level_replay", "ready"],
+      "expected_legacy_actions": ["request_same_level_validation_replay", "select_same_level_seeds_and_lets_rock", "begin_new_same_level_attempt"],
+      "final_delta": {"reset_requests": 1, "reset_successes": 1, "same_level_replays": 1, "env_corruption_resets": 0, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "post_win_pending", "template": "trophy", "context": {}, "contract": "trophy", "legacy_action": "request_same_level_validation_replay", "provenance": "live_same_level_win", "delta": {"reset_requests": 1}},
+        {"name": "same_level_seed_selection", "template": "seed", "context": {"transition_target": "same_level_replay", "expected_level": 3, "observed_level": 3, "identity_reliable": true}, "contract": "same_level_seed", "legacy_action": "select_same_level_seeds_and_lets_rock", "provenance": "same_level_replay_branch", "delta": {}},
+        {"name": "same_level_fresh_board", "template": "ready", "context": {"expected_level": 3, "observed_level": 3, "identity_reliable": true}, "contract": "ready_level3", "legacy_action": "begin_new_same_level_attempt", "provenance": "same_level_replay_branch", "delta": {"reset_successes": 1, "same_level_replays": 1}}
+      ]
+    },
+    {
+      "name": "loss_restart_seed_ready",
+      "expected_phase_order": ["loss", "loading", "seed_selection", "ready"],
+      "expected_legacy_actions": ["classify_loss_and_request_reset", "click_restart_once", "select_seeds_and_lets_rock", "begin_new_attempt"],
+      "final_delta": {"reset_requests": 1, "reset_successes": 1, "same_level_replays": 0, "env_corruption_resets": 0, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "loss_terminal", "template": "loss", "context": {}, "contract": "loss", "legacy_action": "classify_loss_and_request_reset", "provenance": "live_loss_episode", "delta": {"reset_requests": 1}},
+        {"name": "restart_loading", "template": "loading", "context": {}, "contract": "loading", "legacy_action": "click_restart_once", "provenance": "reset_state_machine", "delta": {}},
+        {"name": "restart_seed_selection", "template": "seed", "context": {}, "contract": "seed", "legacy_action": "select_seeds_and_lets_rock", "provenance": "reset_state_machine", "delta": {}},
+        {"name": "loss_reset_ready", "template": "ready", "context": {}, "contract": "ready", "legacy_action": "begin_new_attempt", "provenance": "reset_state_machine", "delta": {"reset_successes": 1}}
+      ]
+    },
+    {
+      "name": "action_freeze_env_corruption_reset_ready",
+      "expected_phase_order": ["timeout", "corruption", "ready"],
+      "expected_legacy_actions": ["label_action_freeze_and_set_env_corruption_reset", "reset_env_corruption_to_seed_selection", "begin_new_attempt"],
+      "final_delta": {"reset_requests": 1, "reset_successes": 1, "same_level_replays": 0, "env_corruption_resets": 1, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "action_freeze_timeout", "template": "active_timeout", "context": {"timeout": true}, "contract": "timeout", "legacy_action": "label_action_freeze_and_set_env_corruption_reset", "provenance": "action_freeze_handoff", "delta": {"reset_requests": 1, "env_corruption_resets": 1}},
+        {"name": "env_corruption_reset_seed", "template": "seed", "context": {"corruption": true}, "contract": "corruption_seed", "legacy_action": "reset_env_corruption_to_seed_selection", "provenance": "action_freeze_handoff", "delta": {}},
+        {"name": "action_freeze_reset_ready", "template": "ready", "context": {}, "contract": "ready", "legacy_action": "begin_new_attempt", "provenance": "reset_state_machine", "delta": {"reset_successes": 1}}
+      ]
+    },
+    {
+      "name": "corruption_reset_ready",
+      "expected_phase_order": ["corruption", "seed_selection", "ready"],
+      "expected_legacy_actions": ["classify_env_corruption_and_request_reset", "reset_corruption_to_seed_selection", "begin_new_attempt"],
+      "final_delta": {"reset_requests": 1, "reset_successes": 1, "same_level_replays": 0, "env_corruption_resets": 1, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 0},
+      "frames": [
+        {"name": "environment_corruption", "template": "active_corruption", "context": {"corruption": true}, "contract": "corruption_active", "legacy_action": "classify_env_corruption_and_request_reset", "provenance": "classifier_contract", "delta": {"reset_requests": 1, "env_corruption_resets": 1}},
+        {"name": "corruption_reset_seed", "template": "seed", "context": {}, "contract": "seed", "legacy_action": "reset_corruption_to_seed_selection", "provenance": "reset_state_machine", "delta": {}},
+        {"name": "corruption_reset_ready", "template": "ready", "context": {}, "contract": "ready", "legacy_action": "begin_new_attempt", "provenance": "reset_state_machine", "delta": {"reset_successes": 1}}
+      ]
+    },
+    {
+      "name": "post_win_unlock_adventure_advancement",
+      "expected_phase_order": ["reward_unlock", "adventure_progression", "ready"],
+      "expected_legacy_actions": ["collect_unlock_and_advance_next_level", "select_advanced_level_seeds_and_lets_rock", "begin_advanced_level_attempt"],
+      "final_delta": {"reset_requests": 0, "reset_successes": 0, "same_level_replays": 0, "env_corruption_resets": 0, "progression_advances": 1, "level_delta": 1, "blocked_transitions": 0},
+      "frames": [
+        {"name": "post_win_unlock", "template": "reward", "context": {"expected_level": 3, "observed_level": 3, "identity_reliable": true}, "contract": "reward_level3", "legacy_action": "collect_unlock_and_advance_next_level", "provenance": "live_reward_unlock", "delta": {"progression_advances": 1, "level_delta": 1}},
+        {"name": "advanced_level_seed_selection", "template": "seed", "observation": {"currentAdventureLevel": 4, "profileAdventureLevel": 4}, "context": {"transition_target": "adventure_progression", "expected_level": 4, "observed_level": 4, "identity_reliable": true}, "contract": "progression_seed", "legacy_action": "select_advanced_level_seeds_and_lets_rock", "provenance": "adventure_progression_branch", "delta": {}},
+        {"name": "advanced_level_fresh_board", "template": "ready", "observation": {"currentAdventureLevel": 4, "profileAdventureLevel": 4}, "context": {"expected_level": 4, "observed_level": 4, "identity_reliable": true}, "contract": "ready_level4", "legacy_action": "begin_advanced_level_attempt", "provenance": "adventure_progression_branch", "delta": {}}
+      ]
+    },
+    {
+      "name": "stable_wrong_level_block",
+      "expected_phase_order": ["same_level_replay", "same_level_replay", "same_level_replay"],
+      "expected_legacy_actions": ["wait_for_stable_level_identity", "block_same_level_replay_advanced_to_unexpected_level", "keep_wrong_level_transition_blocked"],
+      "final_delta": {"reset_requests": 0, "reset_successes": 0, "same_level_replays": 0, "env_corruption_resets": 0, "progression_advances": 0, "level_delta": 0, "blocked_transitions": 1},
+      "frames": [
+        {"name": "wrong_level_unreliable_probe", "template": "wrong_level_active", "context": {"transition_target": "same_level_replay", "expected_level": 6, "observed_level": 7, "identity_reliable": false, "level_mismatch_authoritative": false}, "contract": "wrong_level_probe", "legacy_action": "wait_for_stable_level_identity", "provenance": "same_level_replay_branch", "delta": {}},
+        {"name": "wrong_level_stable_block", "template": "wrong_level_active", "observation": {"frameCount": 2}, "context": {"transition_target": "same_level_replay", "expected_level": 6, "observed_level": 7, "identity_reliable": true, "level_mismatch_authoritative": true}, "contract": "wrong_level_block", "legacy_action": "block_same_level_replay_advanced_to_unexpected_level", "provenance": "same_level_replay_branch", "delta": {"blocked_transitions": 1}},
+        {"name": "wrong_level_block_persists", "template": "wrong_level_active", "observation": {"frameCount": 3}, "context": {"transition_target": "same_level_replay", "expected_level": 6, "observed_level": 7, "identity_reliable": true, "level_mismatch_authoritative": true}, "contract": "wrong_level_block", "legacy_action": "keep_wrong_level_transition_blocked", "provenance": "same_level_replay_branch", "delta": {}}
+      ]
+    }
+  ]
+}
