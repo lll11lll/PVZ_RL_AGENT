@@ -26,7 +26,8 @@ public sealed partial class BridgeMod
         var seedProbeWatch = Stopwatch.StartNew();
         var board = FindBoard();
         var initBoard = FindInitBoard();
-        var cards = ScanSeedCards();
+        var cardReferences = new List<CardUI>();
+        var cards = ScanSeedCards(cardReferences);
         var gameplayReady = ComputeRawGameplayReady(board);
 
         var boardStartMove = false;
@@ -151,7 +152,7 @@ public sealed partial class BridgeMod
         probe.StalePreselectedCards.AddRange(stalePreselectedCards);
         probe.seed_probe_ms = Math.Round(seedProbeWatch.Elapsed.TotalMilliseconds, 3);
         probe.ui_scan_ms = Math.Round(uiWatch.Elapsed.TotalMilliseconds, 3);
-        UpdateSeedRuntimeCache(probe);
+        UpdateSeedRuntimeCache(probe, cardReferences);
         return probe;
     }
 
@@ -310,7 +311,9 @@ public sealed partial class BridgeMod
         return _seedRuntimeCache.ToSnapshot(rawGameplayReady);
     }
 
-    private void UpdateSeedRuntimeCache(SeedProbeDto probe)
+    private void UpdateSeedRuntimeCache(
+        SeedProbeDto probe,
+        IReadOnlyList<CardUI> cardReferences)
     {
         var sortedSlotCards = SortSeedSlotCards(probe.ActiveGameplayCardBankCards);
         var activeGameplayCounts = new Dictionary<int, int>();
@@ -342,7 +345,7 @@ public sealed partial class BridgeMod
             _seedRuntimeCache.CachedSeedSlotDtos.Add(BuildSeedSlotDto(sortedSlotCards[i], i, "active_gameplay_card_bank"));
         }
 
-        RefreshCachedGameplayCardRefs(sortedSlotCards);
+        RefreshCachedGameplayCardRefs(sortedSlotCards, cardReferences);
         _observationsSinceSeedProbe = 0;
     }
 
@@ -359,7 +362,9 @@ public sealed partial class BridgeMod
         _observationsSinceSeedProbe = Math.Max(_observationsSinceSeedProbe, _config.SeedScreenCheckInterval);
     }
 
-    private void RefreshCachedGameplayCardRefs(List<SeedCardDto> sortedSlotCards)
+    private void RefreshCachedGameplayCardRefs(
+        List<SeedCardDto> sortedSlotCards,
+        IReadOnlyList<CardUI> cardReferences)
     {
         _seedRuntimeCache.CachedGameplayCards.Clear();
         _seedRuntimeCache.CachedSeedSlots.Clear();
@@ -371,33 +376,26 @@ public sealed partial class BridgeMod
         }
 
         var cardsById = new Dictionary<int, CardUI>();
-        try
+        foreach (var card in cardReferences)
         {
-            foreach (var card in Object.FindObjectsOfType<CardUI>())
+            try
             {
-                try
+                if (card == null || !activeGameplayCardIds.Contains(card.GetInstanceID()))
                 {
-                    if (card == null || !activeGameplayCardIds.Contains(card.GetInstanceID()))
-                    {
-                        continue;
-                    }
-
-                    cardsById[card.GetInstanceID()] = card;
-                    var plantType = (int)card.thePlantType;
-                    if (!_seedRuntimeCache.CachedGameplayCards.ContainsKey(plantType))
-                    {
-                        _seedRuntimeCache.CachedGameplayCards[plantType] = card;
-                    }
+                    continue;
                 }
-                catch
+
+                cardsById[card.GetInstanceID()] = card;
+                var plantType = (int)card.thePlantType;
+                if (!_seedRuntimeCache.CachedGameplayCards.ContainsKey(plantType))
                 {
-                    // Ignore stale CardUI wrappers while refreshing the cache.
+                    _seedRuntimeCache.CachedGameplayCards[plantType] = card;
                 }
             }
-        }
-        catch
-        {
-            // Card UI is not available in every scene.
+            catch
+            {
+                // Ignore stale CardUI wrappers while refreshing the cache.
+            }
         }
 
         for (var i = 0; i < sortedSlotCards.Count; i++)
@@ -1186,7 +1184,8 @@ public sealed partial class BridgeMod
         };
     }
 
-    private List<SeedCardDto> ScanSeedCards()
+    private List<SeedCardDto> ScanSeedCards(
+        List<CardUI>? cardReferences = null)
     {
         var cards = new List<SeedCardDto>();
         try
@@ -1201,6 +1200,7 @@ public sealed partial class BridgeMod
                     }
 
                     cards.Add(BuildSeedCardDto(card));
+                    cardReferences?.Add(card);
                 }
                 catch
                 {
