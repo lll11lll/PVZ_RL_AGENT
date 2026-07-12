@@ -122,6 +122,8 @@ def recursive_json_keys_types(value: Any) -> Dict[str, Any]:
 def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     fixed = make_wrapper(identity=False, fusion_enabled=True)
     identity = make_wrapper(identity=True, fusion_enabled=True)
+    identity_low_sun_wrapper = make_wrapper(identity=True, fusion_enabled=True)
+    identity_cooldown_wrapper = make_wrapper(identity=True, fusion_enabled=True)
     identity_no_fusion = make_wrapper(identity=True, fusion_enabled=False)
     gui_default_generalist = make_wrapper(
         identity=True,
@@ -134,10 +136,24 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     identity_dense = dense_observation(slot_count=14)
     identity_low_sun = low_sun_variant(identity_dense)
     identity_cooldown = cooldown_variant(identity_dense)
-    fixed._last_observation = fixed_dense
-    identity._last_observation = identity_dense
-    identity_no_fusion._last_observation = identity_dense
-    gui_default_generalist._last_observation = identity_dense
+    fixed._adopt_observation(fixed_dense, source="benchmark_fixed_dense")
+    identity._adopt_observation(identity_dense, source="benchmark_identity_dense")
+    identity_low_sun_wrapper._adopt_observation(
+        identity_low_sun,
+        source="benchmark_identity_low_sun",
+    )
+    identity_cooldown_wrapper._adopt_observation(
+        identity_cooldown,
+        source="benchmark_identity_cooldown",
+    )
+    identity_no_fusion._adopt_observation(
+        identity_dense,
+        source="benchmark_identity_no_fusion",
+    )
+    gui_default_generalist._adopt_observation(
+        identity_dense,
+        source="benchmark_gui_default_generalist",
+    )
 
     sparse_fixed = observation_for_wrapper(fixed)
     sparse_identity = observation_for_wrapper(identity)
@@ -163,22 +179,16 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         results["action_mask_fixed_dense"] = measure(fixed.action_masks, samples=samples, rounds=rounds)
         results["action_mask_identity_dense"] = measure(identity.action_masks, samples=samples, rounds=rounds)
 
-        def identity_low_sun_mask() -> np.ndarray:
-            identity._last_observation = identity_low_sun
-            try:
-                return identity.action_masks()
-            finally:
-                identity._last_observation = identity_dense
-
-        def identity_cooldown_mask() -> np.ndarray:
-            identity._last_observation = identity_cooldown
-            try:
-                return identity.action_masks()
-            finally:
-                identity._last_observation = identity_dense
-
-        results["action_mask_identity_low_sun"] = measure(identity_low_sun_mask, samples=samples, rounds=rounds)
-        results["action_mask_identity_cooldown"] = measure(identity_cooldown_mask, samples=samples, rounds=rounds)
+        results["action_mask_identity_low_sun"] = measure(
+            identity_low_sun_wrapper.action_masks,
+            samples=samples,
+            rounds=rounds,
+        )
+        results["action_mask_identity_cooldown"] = measure(
+            identity_cooldown_wrapper.action_masks,
+            samples=samples,
+            rounds=rounds,
+        )
         results["action_mask_identity_no_fusion"] = measure(
             identity_no_fusion.action_masks,
             samples=samples,
@@ -401,6 +411,8 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
     finally:
         fixed.close()
         identity.close()
+        identity_low_sun_wrapper.close()
+        identity_cooldown_wrapper.close()
         identity_no_fusion.close()
         gui_default_generalist.close()
 
