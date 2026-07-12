@@ -336,6 +336,48 @@ Measured deviation and residual boundary:
 - The benchmark is bridge-free and excludes Unity step latency, PPO inference/rollout SPS, and complete Tk rendering. Current source was not installed into the game during this phase, so no live placement, fusion, reset, or training claim is added here.
 - Phase 5 begins with shadow lifecycle classification and explicit state records. Existing reset/progression behavior remains authoritative until recorded traces match; checkpoints, frontier, replay streaks, unlock state, and progress artifacts remain protected.
 
-Rollback boundary: local commit subject `refactor: consolidate PvZRL facts rewards and telemetry`; its hash is recorded after the commit because a commit cannot include its own hash.
+Rollback boundary: local commit `30b8910` (`refactor: consolidate PvZRL facts rewards and telemetry`).
+
+### Phase 5 - environment, reset, wrapper, and Adventure state
+
+Status: complete for source and automated compatibility gates. Live game execution is deferred to the final environment gate because no game process or bridge listener was available and the installed May DLL remains intentionally untouched.
+
+Implemented:
+
+- Added the pure `LifecycleClassification` shadow model with separate base and Adventure vocabulary, exact legacy done projections, reset context, timeout/corruption interpretation, transition identity, and authoritative-versus-transient level mismatch fields. Randomized comparisons locked legacy base and Adventure classification before any lifecycle owner changed.
+- Added ordered trace fixtures for startup/loading/seed/gameplay, possible win/trophy/reward, same-level replay, loss/restart, action-freeze-to-corruption recovery, corruption reset, post-win Adventure advancement, and stable wrong-level blocking. Twenty-six frames lock every lifecycle field, legacy action order, reset/progression deltas, and sanitized source provenance.
+- Corrected two demonstrated lifecycle defects with focused rollback commits: base reset no longer evaluates an undefined orphan `level3_start_state`, while Level-3 preflight remains at the trainer boundary; an episode-facing `action_freeze` now hands the base reset machine the supported `env_corruption` recovery reason.
+- Added explicit `ResetRuntimeState`, `EpisodeRuntimeState`, `WatchdogRuntimeState`, and immutable Generalist progression records. Phase 3's immutable `FusionIntent`, `FusionDecision`, and `FusionExecution` remain the one fusion record family. Core wrapper episode counters and reset/Adventure initialization now have one owner; specialized lane, fusion, reward, coach, and curriculum counters stay separate where their schemas differ.
+- Established wrapper/base observation ownership with content/revision identity. Reset, Adventure start, step return, and mask fallback all adopt one observation; divergent copies fail before policy masking or bridge execution. Adventure terminal effects set `transition_pending`, so masks and steps remain unavailable until a fresh board is adopted.
+- Promoted the differential-tested Generalist reducer from shadow to canonical progression ownership without changing the serialized `AdventureGeneralistProgress`, attempt, or level log schemas. Replay/collection hooks receive the legacy-equivalent provisional win state before external effects, then the final immutable state commits after the effect result. This preserves frontier, streak, attempt, cleared/mastered levels, unlock ordering, replay recovery, max-level clamping, maintenance isolation, and checkpoint warm-start behavior.
+- Consolidated only the proven-equivalent polling leaf used by popup dismissal, board discovery, and gameplay readiness. The reset dispatcher, post-win unlock collector, same-level replay, Adventure preparation, and Generalist startup recovery retain explicit strategy order because simultaneous-signal priorities differ materially.
+- Updated the bridge-free benchmark to establish observations through the production ownership boundary. Direct `_last_observation` injection remains a test-only compatibility path and is no longer mismeasured as the production mask hot path.
+
+Compatibility and test evidence:
+
+- Full pytest gate: PASS, 264 tests plus 10 subtests. The seven Phase 5 files pass 67 focused tests. The retained corruption, fusion-chain, Generalist identity, timeout, fusion compatibility, fusion reward, human coach, metadata, and stream coach entry points all exit zero.
+- Independent focused reviews differential-tested reset payloads across eight fixed/Adventure terminal paths, progression across 48,384 shadow cases and hook-visible live-wrapper states, episode initialization across 10,000 randomized states, watchdog summaries through 1,000 actions, and observation ownership across reset/terminal/test-only paths. Review found and drove the reset handoff fixes, shallow progression immutability fix, and provisional pre-effect progression boundary.
+- Dependency readiness and `compileall`: PASS. Bridge build: PASS with zero warnings. Lifecycle harness: PASS, 7,051 checks.
+- Protected metadata dry-runs and actual CPU loads remain PASS: Generalist `(701, (4297,), 370000)` and fixed control `(201, (357,), 350368)`. The June 21 control also remains inventoried. All six checkpoint/model and adjacent metadata mtimes predate this refactor; current SHA-256 values are recorded by the gate and no protected artifact or progress file was written.
+
+| Protected artifact | Bytes | UTC mtime | SHA-256 |
+| --- | ---: | --- | --- |
+| Fixed `model.zip` | 1,081,313 | 2026-05-07T23:53:03.4743374Z | `8a4de3fcb8b3691119fbd3203bc30d25526b82ba1f3814b840447cb20de521eb` |
+| Fixed `model_metadata.json` | 715 | 2026-05-07T23:53:03.4873399Z | `ce77348031b44f733f48cd5117fb155e1eec4b892d3367e729532e1c452cd3fa` |
+| June 21 370k checkpoint | 7,795,814 | 2026-06-21T14:34:29.0185485Z | `a8f42c7cb88c2e334be39bc0cc114c624efd5f5d50f1d97f48a52b8a27e5abc6` |
+| June 21 metadata | 2,282 | 2026-06-21T14:15:03.4839261Z | `677fb7c771a5c54e177d5c8ce87b5421e185e163fd781b2cf7c62e492c9be3db` |
+| June 27 protected 370k checkpoint | 7,869,579 | 2026-06-28T14:07:08.3413716Z | `dfd2b800d5b4bb24772be868e4cd31a320e07aec14c2d67d2ca509eab49c0b5b` |
+| June 27 metadata | 2,028 | 2026-06-27T21:27:30.0912885Z | `378ce2b592570ae7a5efe96f7e85aaab5eaa5e563b26155308e659e54484ad8f` |
+- External hashes remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; live-status recursive keys/types `53e6489a...`. Live-status throttling remains 49 builds/writes and 451 suppressions across 500 ordinary attempts, plus one forced final write.
+- Final bridge-free benchmark: `runs/benchmarks/phase5_python_final.json`, 50 samples by five rounds. Phase 4 to Phase 5 median/p95 is fixed mask `0.73295/0.78910 -> 0.72625/0.77500 ms`; dense identity mask `1.42240/1.49070 -> 1.40665/1.47730`; reward with prebuilt facts `0.16905/0.20250 -> 0.13475/0.15580`; fusion scan `3.00595/3.54450 -> 2.57805/3.13220`; live-status build `1.57945/1.77260 -> 1.49960/1.82680`; facts build `1.21930/1.35960 -> 0.99900/1.16100`; verified facts reuse `0.71490/0.83070 -> 0.70670/0.79640`. No deterministic contract changed and no unexplained median regression remains.
+
+Measured deviation and residual boundary:
+
+- The supplied Phase 5 estimate targeted an 800-1,400 runtime-line reduction. Relative to `30b8910`, the three changed target runtime files are `+734/-390` (net `+344`); the three new lifecycle/progression/state modules add 1,074 lines, for total runtime `+1,808/-390` (net `+1,418`). Phase 5 tests add 1,669 lines, fixtures add 777, and benchmark tooling is net `+12`. The target is not met and is not being relabeled as met. Explicit state schemas, trace fixtures, compatibility projections, and adversarial boundary tests outweigh the removed scalar/initialization duplication.
+- `action_durations` remains an unbounded per-episode list exactly as before, cleared on fixed reset and Adventure start. Five wrapper terminal-to-reset handoff latches remain outside the state records. They are parity-tested but remain a future consolidation candidate only if a trace-backed change materially improves ownership.
+- Large high-level loops remain intentionally separate: reset, unlock collection, same-level replay, Adventure preparation, and Generalist recovery use different action priorities when signals conflict. The nominal ordered traces do not justify collapsing them into one generic dispatcher.
+- No `PlantsVsZombiesRH`/MelonLoader process was running and port 32323 was closed. The newly built DLL is `f0216d69...`; the installed recovery DLL remains `5643ec37...`. Source was not copied into `Game Files/Mods`, so live startup, win/loss/timeout, post-win unlock, same-level replay, Adventure advancement, short train/resume, and evaluation are not claimed here. The final live gate will first preserve the installed DLL, run `scripts\build_bridge.ps1 -CopyToMods`, launch `Game Files\PlantsVsZombiesRH.exe`, and execute observation/legal-action, placement/fusion, reset/terminal, seed-selection, short train/resume, and fixed/Adventure evaluation commands before restoring or accepting the new install.
+
+Rollback boundaries, in order: `e36b4cd` shadow classifier; `fd31df6` reset handoff defects; `d58b0bd` progression shadow; `2220228` ordered traces; `ca76308` observation ownership; `f793aca` reset state; `084fcab` polling leaf; `0632401` episode/watchdog state; `bee529c` canonical progression; `b259bec` benchmark ownership.
 
 Later phase results, live verification, final independent reviews, code statistics, deferred work, remaining duplication/risks, and exact rollback commits will be appended rather than inferred in advance.

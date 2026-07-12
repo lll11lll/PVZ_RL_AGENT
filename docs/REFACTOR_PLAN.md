@@ -95,7 +95,7 @@ Unless a separately documented defect correction has focused regression coverage
 | 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
 | 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Complete | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Complete | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
-| 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Pending | Recorded lifecycle trace equivalence and live startup/win/loss/timeout/replay/Adventure checks |
+| 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete (automated; live game unavailable) | Recorded lifecycle equivalence, state/schema parity, all automated gates, and exact final-live omissions recorded |
 | 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Pending | Build after every split, DTO snapshots, zero warnings, live placement/fusion/reset/seed checks |
 | 7 | GUI/process/status/coach separation and polling/log-drain optimization | Pending | Command snapshots, malformed/stale/unchanged status, bounded logs, callback/process lifecycle, interactive smoke |
 | 8 | Full validation, independent reviews, final benchmarks/statistics/report | Pending | Every automated gate green; environment-specific omissions documented with exact commands |
