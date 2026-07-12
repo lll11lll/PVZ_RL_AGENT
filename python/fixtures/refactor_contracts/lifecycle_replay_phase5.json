@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "description": "Sanitized Phase 5 lifecycle traces captured from current bridge buckets and existing Adventure/reset regression scenarios.",
+  "defaults": {
+    "frameCount": 0,
+    "rowCount": 5,
+    "columnCount": 10,
+    "boardFound": false,
+    "gameplayReady": false,
+    "actualGameplayReady": false,
+    "seedSelectionActive": false,
+    "seedSelectionPanelActive": false,
+    "screenState": "",
+    "nextStep": "",
+    "terminalHint": "running",
+    "done": false,
+    "over": false,
+    "wave": 0,
+    "maxWave": 10,
+    "killCount": 0,
+    "plantCount": 0,
+    "visiblePlantObjectCount": 0,
+    "zombieCount": 0,
+    "bulletCount": 0,
+    "sun": 500,
+    "logicalMowerCount": 5,
+    "visibleMowerObjectCount": 5,
+    "duplicateMowerRowCount": 0,
+    "seedSlots": [],
+    "activeGameplayCardBankCount": 0,
+    "legalActions": [],
+    "legalActionCount": 0
+  },
+  "traces": [
+    {
+      "name": "startup_popup",
+      "provenance": "sanitized_live_20260627_startup_recovery",
+      "observation": {
+        "frameCount": 1,
+        "screenState": "loading_or_menu",
+        "startupPopupVisible": true
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "unknown",
+        "done_reason": "none",
+        "phase": "startup",
+        "next_directive": "dismiss_startup_popup",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "loading_or_menu",
+      "provenance": "sanitized_live_20260627_startup_recovery",
+      "observation": {
+        "frameCount": 2,
+        "screenState": "loading_or_menu"
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "unknown",
+        "done_reason": "none",
+        "phase": "loading",
+        "next_directive": "wait_or_enter_adventure",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "seed_selection",
+      "provenance": "sanitized_live_20260627_same_level_replay",
+      "observation": {
+        "frameCount": 3,
+        "boardFound": true,
+        "screenState": "seed_selection",
+        "seedSelectionActive": true,
+        "seedSelectionPanelActive": true
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "resetting",
+        "done_reason": "none",
+        "phase": "seed_selection",
+        "next_directive": "select_seeds_or_start",
+        "seed_selection_visible": true,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "fresh_gameplay_ready",
+      "provenance": "synthetic_existing_reset_contract",
+      "observation": {
+        "frameCount": 4,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "seedSlots": [{"slotIndex": 0, "plantType": 0}],
+        "seedSlotCount": 1,
+        "activeGameplayCardBankCount": 1,
+        "legalActions": [0],
+        "legalActionCount": 1
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "ready",
+        "done_reason": "none",
+        "phase": "ready",
+        "next_directive": "play",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": false
+      }
+    },
+    {
+      "name": "active_gameplay",
+      "provenance": "sanitized_live_20260627_gameplay",
+      "observation": {
+        "frameCount": 5,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "wave": 2,
+        "plantCount": 3,
+        "visiblePlantObjectCount": 3,
+        "zombieCount": 2,
+        "seedSlots": [{"slotIndex": 0, "plantType": 0}],
+        "seedSlotCount": 1,
+        "activeGameplayCardBankCount": 1,
+        "legalActions": [0, 1],
+        "legalActionCount": 2
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "active_gameplay",
+        "next_directive": "play",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": false
+      }
+    },
+    {
+      "name": "possible_win_confirmation_delay",
+      "provenance": "synthetic_existing_terminal_contract",
+      "observation": {
+        "frameCount": 6,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "terminalHint": "possible_win",
+        "wave": 10,
+        "maxWave": 10,
+        "seedSlots": [{"slotIndex": 0, "plantType": 0}],
+        "seedSlotCount": 1,
+        "activeGameplayCardBankCount": 1,
+        "legalActions": [0],
+        "legalActionCount": 1
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "win_pending_confirmation",
+        "next_directive": "wait_terminal_confirmation",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": true
+      }
+    },
+    {
+      "name": "derived_final_wave_confirmation_delay",
+      "provenance": "synthetic_existing_terminal_contract",
+      "observation": {
+        "frameCount": 16,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "terminalHint": "running",
+        "wave": 10,
+        "maxWave": 10,
+        "zombieCount": 0,
+        "moreZombiesComing": false,
+        "plantCount": 2,
+        "visiblePlantObjectCount": 2
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "win_pending_confirmation",
+        "next_directive": "wait_terminal_confirmation",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": true
+      }
+    },
+    {
+      "name": "level_complete_trophy",
+      "provenance": "sanitized_live_20260627_same_level_replay",
+      "observation": {
+        "frameCount": 7,
+        "boardFound": true,
+        "screenState": "level_complete_trophy",
+        "terminalHint": "reward_unlock",
+        "done": true,
+        "trophyVisible": true,
+        "levelCompleteTrophyVisible": true,
+        "postWinClickRequired": true
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "post_win_pending",
+        "done_reason": "win",
+        "phase": "win",
+        "next_directive": "continue_post_win",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "reward_unlock",
+      "provenance": "sanitized_live_20260627_startup_recovery",
+      "observation": {
+        "frameCount": 8,
+        "boardFound": true,
+        "screenState": "reward_unlock",
+        "terminalHint": "reward_unlock",
+        "rewardScreenVisible": true,
+        "unlockScreenVisible": true,
+        "newPlantUnlockedVisible": true
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "post_win_pending",
+        "done_reason": "win",
+        "phase": "reward_unlock",
+        "next_directive": "collect_or_continue_reward",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "stale_reward_cleanup_after_reset",
+      "provenance": "sanitized_live_20260630_startup_recovery",
+      "observation": {
+        "frameCount": 9,
+        "boardFound": true,
+        "screenState": "reward_unlock",
+        "nextStep": "cleanup_reward_ui",
+        "terminalHint": "running"
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "resetting",
+        "done_reason": "none",
+        "phase": "loading",
+        "next_directive": "continue_reset_transition",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "same_level_replay_seed_selection",
+      "provenance": "sanitized_live_20260521_frontier_replay",
+      "observation": {
+        "frameCount": 10,
+        "boardFound": true,
+        "screenState": "seed_selection",
+        "seedSelectionActive": true
+      },
+      "context": {"transition_target": "same_level_replay", "expected_level": 3},
+      "expected": {
+        "legacy_state": "resetting",
+        "done_reason": "none",
+        "phase": "same_level_replay",
+        "next_directive": "continue_same_level_replay",
+        "seed_selection_visible": true,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "confirmed_loss_restart",
+      "provenance": "synthetic_existing_loss_contract",
+      "observation": {
+        "frameCount": 11,
+        "boardFound": true,
+        "screenState": "game_over_restart_screen",
+        "terminalHint": "game_over_or_loss",
+        "done": true,
+        "over": true,
+        "onGameOverScreen": true,
+        "onRestartScreen": true,
+        "gameOverTextVisible": true
+      },
+      "context": {},
+      "expected": {
+        "legacy_state": "loss_pending",
+        "done_reason": "loss",
+        "phase": "loss",
+        "next_directive": "click_restart",
+        "seed_selection_visible": false,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    },
+    {
+      "name": "active_gameplay_timeout",
+      "provenance": "synthetic_existing_timeout_contract",
+      "observation": {
+        "frameCount": 12,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "wave": 4,
+        "plantCount": 5,
+        "zombieCount": 3
+      },
+      "context": {"timeout": true},
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "timeout",
+        "next_directive": "reset_timeout",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": true
+      }
+    },
+    {
+      "name": "active_gameplay_corruption",
+      "provenance": "synthetic_existing_corruption_contract",
+      "observation": {
+        "frameCount": 13,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "wave": 3,
+        "plantCount": 8,
+        "zombieCount": 2
+      },
+      "context": {"corruption": true},
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "corruption",
+        "next_directive": "reset_corruption",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": true
+      }
+    },
+    {
+      "name": "authoritative_level_identity_mismatch",
+      "provenance": "synthetic_existing_startup_validation_contract",
+      "observation": {
+        "frameCount": 14,
+        "boardFound": true,
+        "gameplayReady": true,
+        "actualGameplayReady": true,
+        "screenState": "gameplay",
+        "nextStep": "play",
+        "wave": 1,
+        "currentAdventureLevel": 7,
+        "profileAdventureLevel": 7
+      },
+      "context": {
+        "expected_level": 6,
+        "observed_level": 7,
+        "identity_reliable": false,
+        "level_mismatch_authoritative": true
+      },
+      "expected": {
+        "legacy_state": "active_gameplay",
+        "done_reason": "none",
+        "phase": "active_gameplay",
+        "next_directive": "block_level_identity_mismatch",
+        "seed_selection_visible": false,
+        "gameplay_ready": true,
+        "transitional": false
+      }
+    },
+    {
+      "name": "adventure_progression_seed_flow",
+      "provenance": "sanitized_live_20260521_frontier_promotion",
+      "observation": {
+        "frameCount": 15,
+        "boardFound": true,
+        "screenState": "seed_selection",
+        "seedSelectionActive": true,
+        "currentAdventureLevel": 4,
+        "profileAdventureLevel": 4
+      },
+      "context": {
+        "transition_target": "adventure_progression",
+        "expected_level": 4,
+        "observed_level": 4,
+        "identity_reliable": false
+      },
+      "expected": {
+        "legacy_state": "resetting",
+        "done_reason": "none",
+        "phase": "adventure_progression",
+        "next_directive": "continue_adventure_progression",
+        "seed_selection_visible": true,
+        "gameplay_ready": false,
+        "transitional": true
+      }
+    }
+  ]
+}
