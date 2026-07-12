@@ -71,6 +71,7 @@ $refArgs = $refs | ForEach-Object { "/reference:$_" }
     /nostdlib+ `
     /target:library `
     /optimize+ `
+    /deterministic+ `
     /debug:portable `
     /langversion:10.0 `
     /nullable:enable `
