@@ -1899,8 +1899,8 @@ def build_env_fusion_probe(
         Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]],
     ]
 ]:
-    base = getattr(env, "base", None)
-    client = getattr(base, "client", None) if base is not None else None
+    base = getattr(env, "base", None) or env
+    client = getattr(base, "client", None)
     if client is None or not hasattr(client, "request"):
         return None
 

@@ -773,6 +773,32 @@ def main() -> int:
         },
     )
 
+    bare_probe_env = FakeEnv(
+        observation([0], include_fusion_board=True),
+        mask_with(0),
+        fusion_policy="none",
+        human_coach_fusion_enabled=True,
+        bridge_client=FakeBridgeClient(probe_payload=fusion_probe_payload()),
+    )
+    bare_probe_env.client = bare_probe_env.base.client
+    del bare_probe_env.base
+    bare_probe_hook = HumanCoachOverrideHook(
+        enabled=True,
+        source=QueueCoachCommandSource(["!fuse 0 1 1"]),
+        fusion_enabled=True,
+    )
+    bare_probe_decision = bare_probe_hook.select_action(bare_probe_env, 0)
+    assert_case(
+        results,
+        "fusion bridge probe supports a bare PvZGymEnv client boundary",
+        bool(
+            not bare_probe_decision.rejected
+            and isinstance(bare_probe_decision.selected_bridge_command, dict)
+            and bare_probe_decision.selected_bridge_command.get("command") == "fusion_step"
+        ),
+        bare_probe_decision.to_dict(),
+    )
+
     offset_obs = observation([0], include_fusion_board=True)
     for index, slot in enumerate(offset_obs.get("seedSlots", [])):
         if isinstance(slot, dict):
