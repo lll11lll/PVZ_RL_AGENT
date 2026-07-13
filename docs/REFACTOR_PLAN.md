@@ -1,144 +1,164 @@
-# PvZRL Repository Refinement Plan
+# PvZRL Adventure Generalist Refactor Plan
 
-Status: Phase 8 automated/local-Tk validation and partial real-game validation complete; overall acceptance remains incomplete because live fixed training/evaluation and lifecycle-transition coverage, the cross-run performance gate, and the net runtime-volume gate remain unmet
-Plan date: 2026-07-11
-Verified baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
+Status: implementation is in final integration and verification. The obsolete product path has been removed from source/configuration/GUI/tests; repository-wide validation and live Generalist acceptance remain the finish line.
 
-## Objective and boundaries
+Adventure Generalist is the sole maintained training and evaluation path. Legacy fixed/specialist mode was removed during the repository refactor.
 
-Refine the working local PvZRL application across Python, the MelonLoader bridge, configuration, diagnostics, and Tkinter without changing supported behavior or checkpoint semantics. The work must reduce duplicated rule implementations and unnecessary hot-path work while improving lifecycle, concurrency, testing, and ownership.
+## Objective
 
-This is not a greenfield rewrite. It does not add a website, web service, public stream adapter, remote game-session service, or production networking layer. Models, checkpoints, datasets, recordings, assets, generated runs, and recovery points are protected.
+Reduce PvZRL to one coherent train/eval/checkpoint surface while preserving the reusable environment, masks, observations, action execution, fusion, rewards, bridge, lifecycle, progression, coaches, diagnostics, and GUI infrastructure required by Adventure Generalist.
 
-The supplied `PvZRL Internal Architecture Refinement Plan` is the initial roadmap. Findings below are verified against the current checkout rather than copied forward as assumptions.
+The protected compatibility target is:
 
-## Verified ownership map
-
-| Area | Current owner and boundary |
+| Contract | Required value |
 | --- | --- |
-| Game state | Plants vs. Zombies owns authoritative plants, zombies, waves, cooldowns, sun, progression, and spawning. Unity objects are read or mutated only from the bridge's Melon `OnUpdate` thread. |
-| Bridge request state | `BridgeServerTypes.cs` owns request/client state; `BridgeDtos.cs` owns wire DTOs; the `BridgeMod.*.cs` partials own server dispatch, commands, observation, placement, fusion, reset, Adventure UI, seed/UI caches, and runtime control. Unity access remains on Melon's `OnUpdate` thread. |
-| Base environment | `python/pvzrl_env.py` owns bridge orchestration, reset acceptance, Python execution safeguards, corruption recovery, fusion accounting, and terminal handoff. `pvzrl_observation_facts.py`, `pvzrl_rewards.py`, `pvzrl_lane_diagnostics.py`, `pvzrl_diagnostics.py`, and `pvzrl_lifecycle.py` own the pure facts/reward/diagnostic/classification projections. |
-| Action decisions | `python/pvzrl_actions.py` owns immutable policy/legacy/bridge action intents, pure Python legality decisions, frame/config cache proofs, and structured execution results. The base environment owns the cache and the bridge remains final authority. |
-| RL adapter | `python/pvzrl_sb3.py` owns numeric observation encoding, policy-action translation, MaskablePPO masks, coach arbitration, watchdog diagnostics, episode counters, and summaries. |
-| Adventure | `python/pvzrl_adventure.py` owns inference transitions. `python/pvzrl_adventure_generalist.py` owns runtime curriculum/effects, while `pvzrl_generalist_progression.py` owns the pure frontier/replay/unlock reducer. |
-| GUI | `python/pvzrl_gui.py` owns Tk state/layout. `pvzrl_gui_commands.py`, `pvzrl_gui_process.py`, `pvzrl_gui_status.py`, `pvzrl_gui_view.py`, and `pvzrl_gui_coach.py` own command serialization, subprocess/log control, normalized status reads, rendering, and local queue writes respectively. The GUI does not own gameplay state. |
-| Coach inputs | `python/pvzrl_human_coach.py`, `python/pvzrl_stream_coach.py`, and `python/pvzrl_assisted_coach.py` own local parsing, validation, aggregation, and intervention records; `pvzrl_file_tail.py` owns partial-record-safe JSONL tailing. Human coach precedence is intentional. |
-| Configuration | CLI and JSON flow through `ConfigResolver` into a deeply immutable typed `ResolvedRunConfig`; `build_config()` provides the flat compatibility adapter for runtime dictionaries, metadata, bridge configuration, and GUI-launched commands. |
-| Artifacts | Trainer and Adventure writers emit live status, episode JSONL/CSV, progress, TensorBoard, metadata, checkpoints, and watchdog bundles. GUI consumes a compatibility-heavy view of live status. |
+| Model family | `ppo_adventure_generalist_14slot_identity_v1` |
+| Action mode | `adventure_14slot_identity` |
+| Actions | `701` (`0` wait, `1..700` placement/fusion) |
+| Decoder | `seedslot14x50_plus_wait_v1` |
+| Observation | `adventure_14slot_identity_v1`, shape `(4297,)` |
+| Board/capacity | 5x10, 14 identity slots |
+| Protected checkpoint | `runs/ppo_adventure_generalist_14slot_identity_v1_20260627_172727/checkpoints/ppo_pvz_370000_steps.zip` |
+| Initial identity loadout | `SunFlower,SunFlower,Peashooter,Peashooter` / `[1,1,0,0]` |
 
-## Verified execution paths
+## Scope classification
 
-- Fixed training: `train_ppo.py -> build_config -> train -> DummyVecEnv/Monitor -> PvZMaskedPPOEnv -> MaskablePPO.learn -> ExperimentCallback`.
-- Fixed evaluation: `train_ppo.py -> evaluate -> metadata validation -> MaskablePPO.load -> run_eval_episode`.
-- Adventure evaluation: `train_ppo.py -> adventure_evaluate -> run_adventure_eval`, optionally through `ModelRouter`.
-- Action: source-attributed policy intent -> one cached pure decision -> mask/coach/diagnostic/execution projections -> policy-to-legacy bridge conversion -> final bridge validation -> structured result -> reward and episode accounting.
-- Fusion: immutable recipe/runtime-only compatibility registry -> source-attributed fusion intent -> one validation/execution adapter -> bridge mouse/reflection execution -> shared tile-scope contract -> event-ID-deduplicated diagnostics and reward accounting.
-- Plant deletion remains outside the policy/manual action surface. Destruction is limited to reset, stale-object cleanup, and board recovery.
+The pre-removal classification is retained in `docs/FIXED_MODE_REMOVAL_INVENTORY.md`.
 
-## Immutable compatibility contracts
+### Generalist-required
 
-Unless a separately documented defect correction has focused regression coverage, preserve all of the following.
+- `python/pvzrl_adventure_generalist.py`
+- `python/pvzrl_generalist_progression.py`
+- Adventure attempt/lifecycle orchestration in `python/pvzrl_adventure.py`
+- Generalist CLI/config/metadata/checkpoint dispatch in `python/train_ppo.py` and `python/pvzrl_config.py`
+- Generalist GUI train/resume/eval and model-selection workflows
+- the protected 370k checkpoint and adjacent metadata
 
-### Actions
+### Shared reusable infrastructure
 
-- Fixed mode: wait action `0`; placement `1 + slot * 50 + row * 10 + column`.
-- Adventure identity mode: exactly 14 slots, 5 rows, 10 columns, 701 actions; wait `0`; placement range `1..700`; slot 13, row 4, column 9 is action 700.
-- Dynamic-14 legacy mode retains its distinct wait/action ordering.
-- Preserve action counts, ordering, decoder versions, wait identity, seed-slot order, and bridge action/response shapes.
+- base environment, bridge client, reset state machine, and lifecycle predicates;
+- 14-slot observation construction, `StepFacts`, action masks, cached legality, and action execution;
+- fusion recipes/probes/execution, rewards, metrics, watchdog, telemetry, and live status;
+- registry generation, coach inputs, Tk process/status/queue infrastructure;
+- C# bridge server, DTOs, Unity dispatch, observation, placement, seed UI, Adventure UI, fusion, and reset;
+- bridge-free tests, C# lifecycle harness, and synthetic benchmarks that exercise maintained behavior.
 
-### Observations and models
+### Removed product-specific surface
 
-- Protected model family: `ppo_adventure_generalist_14slot_identity_v1`.
-- Protected checkpoint: `runs/ppo_adventure_generalist_14slot_identity_v1_20260627_172727/checkpoints/ppo_pvz_370000_steps.zip`.
-- Protected model contract: `Discrete(701)`, observation shape `(4297,)`, decoder `seedslot14x50_plus_wait_v1`, observation version `adventure_14slot_identity_v1`.
-- Keep the older June 21 370k checkpoint inventoried as an additional compatibility control.
-- Fixed control model: `python/runs/ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_130623/model.zip`, with `Discrete(201)`, observation shape `(357,)`, and exact four-slot order.
-- Preserve model metadata inference rules, checkpoint loading, resume semantics, and observation feature meanings.
+- alternate training/evaluation dispatch and CLI selectors;
+- level-specific startup gates, loadouts, model selection, and reporting;
+- alternate action/observation layouts and action-ID adapters;
+- obsolete configs, schedules, GUI controls, callbacks, metadata branches, tests, fixtures, and runnable documentation;
+- compatibility wrappers whose only consumer was the removed path.
 
-### Legality and fusion
+### Investigate-before-delete rule
 
-- Wait is always legal.
-- Python execution safeguards remain even after mask reuse; cached decisions may be reused only for a demonstrably unchanged observation frame and configuration fingerprint.
-- Bridge-side validation remains final runtime authority.
-- Preserve occupied-cell fusion exposure, self-fusions, compatibility-only cases, tile scoping, recursive results, source attribution, costs, cooldowns, reasons, and one-time reward/count accounting.
-- Required recursive identities, corrected against the live game enum and observed results, are DoubleShooer `1030`, SplitPea `1090`, Gatling Pea `1032`, and TwinFlower `1033`. Plant type `1031` is SunShroom, not a pea-chain result.
+Generic filenames are not proof that code is obsolete. `pvzrl_adventure.py`, environment lifecycle helpers, telemetry builders, and bridge operations are retained when the Generalist runner consumes them. Before deleting an unclear symbol, search definitions, imports, call sites, configuration keys, serialized outputs, tests, and protected checkpoint metadata.
 
-### Rewards and serialized artifacts
+## Incremental implementation sequence
 
-- Preserve reward coefficients, component meanings, `REWARD_COMPONENT_FIELDS`, episode totals, coach deltas, positive fusion cap semantics, and negative penalties.
-- Preserve episode-summary keys, CSV headers/types, JSONL records, live-status compatibility keys, atomic writes, and timeout/freeze evidence.
-- A live-status schema version may be added only while retaining current keys through an adapter window.
+### 1. Inventory and safety boundary
 
-### Adventure and GUI
+- Record the classification and protected contract.
+- Preserve hashes and paths for the protected checkpoint, metadata, installed bridge DLL, and local profile before live work.
+- Stop any task that assumes the removed path remains a compatibility invariant.
 
-- Preserve frontier level, replay streaks, seed capacity, unlock state, progress files, strict startup validation, same-level replay, difficulty, and checkpoint continuation.
-- Preserve GUI controls, presets, command serialization, moderation semantics, status health behavior except confirmed defects, and bounded process-stop behavior.
+Exit: inventory exists and no deletion begins without dependency classification.
 
-## Audit corrections and newly verified defects
+### 2. Remove obsolete files and dispatch
 
-1. The explicitly protected 370k checkpoint is the June 27 run, not merely any 370k artifact. Both June 27 and June 21 models currently load.
-2. The bridge has no live `CheckMix` call. Fusion is mouse/reflection driven; attempted methods can report provisional success without observed mutation, and sun/cooldown may be charged before the final postcondition failure. Fusion execution changes are isolated from lifecycle work.
-3. Four argparse defaults (`advance_on_wins`, `max_adventure_levels`, `max_attempts_per_level`, `adventure_start_level`) currently override JSON even when the user did not explicitly supply those flags. This is a confirmed configuration-precedence defect.
-4. `lane_diagnostics()` references a nonexistent local `cherry_delayed_diag`, so four serialized delayed CherryBomb counters are always zero even when reward calculation observed delayed results.
-5. GUI polling does reparse unchanged live status, but existing panel setters already suppress identical text-widget rewrites. The primary measured costs are JSON parsing, normalization/render computation, and unconditional `StringVar` updates.
-6. GUI live health checks `blocked_reason` before file age, so arbitrarily old blocked payloads remain `BLOCKED_*` and suppress stale-writer warnings.
-7. `model_schedule.json` paths are non-runnable from the repository root. The corresponding models live under `python/runs`, and the utility model's actual run/timestep differs from the stale schedule entry.
-8. `docs/ADVENTURE_GENERALIST.md` contains a metadata-dry-run example that omits the duplicate generalist seed list and currently fails compatibility validation.
+- Delete unused configs, schedules, router/backfill utilities, and dedicated artifacts.
+- Reduce `train_ppo.py`, `pvzrl_config.py`, and environment run-mode validation to Generalist train/eval.
+- Remove unsupported flags and reject old run-mode/action-mode strings.
+- Preserve config precedence: explicit CLI > JSON > Generalist mode default > global default.
 
-## Ordered phases and gates
+Exit: only two run modes are constructible and no import points to deleted modules.
 
-| Phase | Scope | Current status | Required gate before next phase |
-| --- | --- | --- | --- |
-| 0 | Baseline, behavior locks, fixtures, benchmarks, plan/report | Complete | Full existing Python baseline, bridge build, checkpoint loads, new contract tests, benchmark record |
-| 1 | Request deadlines/shutdown, seed cache warnings, shared JSONL tailing, GUI close, confirmed defects/dead code | Complete | Deterministic stale-request, shutdown, partial-record, GUI lifecycle tests; zero-warning bridge build; full baseline |
-| 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
-| 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Complete | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
-| 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Complete | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
-| 5 | Explicit episode/reset/progression/watchdog state, authoritative lifecycle predicates, and shadow aggregate classification | Complete for automated gates; partial final live coverage | Recorded lifecycle equivalence plus real loss/retry/reset; win, timeout, reward/unlock, replay, and advancement traces remain outstanding |
-| 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete for source/automated gates; partial final live coverage | Final DLL startup, observation, legality, wait, placement, invalid-action safety, fusion, reset, and the corrected clean-start Generalist evaluation pass; live latency and broader transition checks remain outstanding |
-| 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete for automated and local-Tk gates; live game-backed GUI pending | Command/status/process lifecycle coverage passes; live game-backed GUI interaction remains outstanding |
-| 8 | Full validation, independent reviews, final benchmarks/statistics/report | Complete for automated/local-Tk and partial real-game validation; overall acceptance gaps recorded | Executed live evidence and exact remaining gates documented without closing performance or volume deviations |
+### 3. Collapse core contracts
 
-## Risk controls and rollback boundaries
+- Make `pvzrl_action_space.py` identity-only: 701 actions, wait 0, actions 1..700.
+- Remove action-ID conversion and obsolete intent fields.
+- Pin environment/SB3 validation to 14 slots and 5x10 geometry.
+- Preserve `dynamic_seed_slots=true` as checkpoint metadata describing inventory capability, not another decoder.
+- Keep observation shape/version and board identity behavior byte-for-byte compatible with the protected model.
 
-- One local commit per coherent phase when the phase is green. No push, merge, force operation, history rewrite, or branch change.
-- Phase 0 is test/tool/documentation only and can be reverted without runtime impact.
-- Phase 1 bridge lifecycle changes remain separate from fusion execution and observation optimization.
-- Registry forwarding APIs remain during the compatibility window.
-- Action/fusion wrappers remain until every source migrates and parity tests pass.
-- Pure reward/metric extraction, aggregation consolidation, and I/O throttling are separate diff groups.
-- Lifecycle state records began in shadow mode; after trace and randomized parity gates, `pvzrl_lifecycle.py` became the pure predicate authority while aggregate `classify_lifecycle()` remains a shadow/contract surface and the environment reset state machine retains side-effect ownership.
-- Bridge file splitting is move-only before any optimization, and moved lines do not count as code reduction.
-- GUI process, status reader, and rendering changes remain separable.
-- Stop a phase at a failed compatibility gate, diagnose the regression, and restore the last green boundary before proceeding.
+Exit: exact action/observation contract tests pass and the protected checkpoint loads.
 
-## Validation matrix
+### 4. Simplify GUI and local coaching
 
-Always run from the repository root.
+- Expose only Generalist fresh train, resume, evaluation, diagnostics, runs/models, and coach workflows.
+- Remove obsolete tabs, presets, argv builders, and status projections.
+- Keep human-over-crowd precedence, dry-run defaults, intervention logging, and bounded shutdown.
+
+Exit: command snapshots contain only supported flags and withdrawn Tk construction/shutdown passes.
+
+### 5. Replace tests and fixtures
+
+- Delete tests whose sole purpose was removed checkpoint/layout compatibility.
+- Replace them with negative rejection tests for unsupported modes plus exact Generalist contract tests.
+- Preserve regression coverage for masks, identity observation, progression, timeouts, fusion/recursive fusion, rewards, watchdog, telemetry, bridge lifecycle, and GUI.
+- Update deterministic hashes only after reviewing the intended schema change.
+
+Exit: focused suites and full `pytest` pass without imports or fixtures for removed code.
+
+### 6. Rewrite documentation
+
+- Update `AGENTS.md`, configuration, architecture, learning, bridge, coach, roadmap, refactor plan/report, and README material.
+- Retain concise historical removal statements only where they prevent accidental reintroduction.
+- Remove runnable unsupported commands and unsupported compatibility promises.
+
+Exit: repository Markdown and source scans find no obsolete support language outside the deliberate inventory/removal statement.
+
+### 7. Verification
+
+Bridge-free gates:
 
 ```powershell
 python .\python\train_ppo.py --check-deps
 python -m compileall -q python
 python -m pytest -q
-python .\python\test_adventure_corruption_trackers.py
-python .\python\test_adventure_fusion_chain_diagnostics.py
-python .\python\test_adventure_generalist_14slot_identity.py
-python .\python\test_adventure_timeout_semantics.py
-python .\python\test_fusion_compatibility.py
-python .\python\test_fusion_reward_policy.py
-python .\python\test_human_coach.py
-python .\python\test_model_metadata_compatibility.py
-python .\python\test_stream_coach.py
-.\scripts\build_bridge.ps1
+python .\python\train_ppo.py --config configs\ppo_adventure_generalist_14slot_identity_v1.json --metadata-dry-run --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip
 ```
 
-Checkpoint gates additionally run metadata dry-run plus actual `MaskablePPO.load` for the protected generalist and fixed control models. Live gates require installing the newly built bridge DLL, starting the bundled game, and exercising observation, placement, fusion, reset, transitions, short training/resume, and evaluation without modifying source checkpoints.
+Bridge gates:
 
-## Performance policy
+```powershell
+.\scripts\build_bridge.ps1
+.\scripts\test_bridge_lifecycle.ps1
+python .\python\benchmark_hotpaths.py --samples 50 --rounds 5 --json-out runs\benchmarks\generalist_refactor.json
+.\scripts\benchmark_bridge_observation.ps1 -OutputPath runs\benchmarks\generalist_bridge.json
+```
 
-Record median and p95 for action masks, observation encoding, reward calculation, fusion scans, environment/bridge steps where live execution is possible, live-status construction/serialization/write frequency, watchdog persistence, and unchanged GUI polling. Retain an optimization only when it simplifies ownership, removes demonstrated I/O/allocation pressure, or improves its target materially without an unexplained greater-than-5% regression elsewhere.
+Live gates are stateful and must be run separately from the correct profile/screen:
 
-## Stop rule
+1. Protected checkpoint loads with 701 actions, `(4297,)`, and timestep 370000.
+2. Fresh Generalist training reaches model creation and at least one rollout/checkpoint in a new run directory.
+3. Resume loads that compatible model, advances timesteps, and writes only to a second run directory.
+4. Generalist evaluation loads the protected model and reaches Adventure gameplay.
+5. Progression/startup validation, action masks, fusion chain, reward totals, lifecycle/reset, status, and GUI remain functional.
+6. No source checkpoint, adjacent metadata, installed recovery DLL, or profile is unintentionally modified.
 
-Continue through the phases while compatibility gates pass and high-confidence duplication remains. Do not rewrite stable behavior merely to enlarge the diff or hit a line target. Completion requires the full final validation and independent reviews, not just recommendations or green unit tests.
+## Acceptance matrix
+
+| Gate | Acceptance condition |
+| --- | --- |
+| Imports/config | No reference to deleted files, flags, schedules, or run modes. |
+| Action | `Discrete(701)`, wait `0`, placements/fusions `1..700`; inactive slots masked. |
+| Observation | Version `adventure_14slot_identity_v1`, exact shape `(4297,)`. |
+| Checkpoint | Protected 370k metadata validation and actual CPU `MaskablePPO.load` pass. |
+| Training | Fresh start produces new artifacts; resume advances in an isolated destination. |
+| Evaluation | Starts from a validated Adventure boundary and does not mutate source model. |
+| Progression | Frontier/replay/unlock transitions remain reducer-driven and inspectable. |
+| Fusion/reward | Known recursive identities, tile scope, event deduplication, and exact additive totals pass. |
+| GUI | Launches with maintained workflows only; command and shutdown tests pass. |
+| Bridge | Build is clean under the repository warning policy and lifecycle harness passes. |
+| Documentation | No unsupported runnable path remains; required removal statement is present. |
+
+## Rollback and stop rules
+
+- Version control is the recovery mechanism; do not keep large dead implementations behind flags.
+- Never overwrite the protected checkpoint during resume or evaluation.
+- Do not force progression when profile, bridge, UI, and wrapper level identities disagree.
+- Stop live work and restore the protected installed DLL if the bridge/game becomes unstable.
+- A metadata dry run is not live acceptance, and a process start is not a completed training/evaluation gate.
+- Record unresolved disagreements or performance drift as pending evidence, not as success.

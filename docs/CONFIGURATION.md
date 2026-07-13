@@ -1,54 +1,179 @@
-# PvZRL Configuration Resolution
+# PvZRL Configuration
 
-PvZRL resolves training, evaluation, Adventure, coach, diagnostics, artifact, and bridge settings with one precedence rule:
+PvZRL supports one product path: Adventure Generalist training and evaluation.
+
+The canonical tracked configuration is:
 
 ```text
-explicit CLI value > JSON configuration > mode-specific default > global default
+configs/ppo_adventure_generalist_14slot_identity_v1.json
 ```
 
-`python/pvzrl_config.py` defines the immutable `ResolvedRunConfig` view and its typed sections. `train_ppo.build_resolved_config()` constructs that view; `train_ppo.build_config()` remains the compatibility adapter that returns the historical flat dictionary consumed by existing runtime code and written to `resolved_config.json`.
+## Run modes
 
-The typed view also exposes an immutable `value_sources` mapping for resolved fields, using `cli`, `json`, `mode_default`, or `global_default`. This makes parser-default mistakes inspectable without adding provenance keys to the legacy flat output.
+Exactly two run modes are accepted:
 
-## What counts as an explicit CLI value
+```text
+adventure_generalist_14slot_train
+adventure_generalist_14slot_eval
+```
 
-An argparse value of `None` means the option was not supplied. Falsey values that can be supplied explicitly, including `0`, `False`, and an empty string, are still explicit and win over JSON. JSON keys are authoritative when present, including an explicit JSON `null`; downstream type validation continues to determine whether that value is valid for the selected setting.
+Use the matching CLI selectors:
 
-Precedence-sensitive Adventure options use `None` as their parser default:
+```text
+--adventure-generalist-train
+--adventure-generalist-eval
+```
 
-- `--advance-on-wins`
-- `--max-adventure-levels`
-- `--max-attempts-per-level`
-- `--adventure-start-level`
+`--run-mode` accepts the same two values. Unsupported mode strings fail during resolution; there is no fallback into another trainer or evaluator.
 
-This prevents the parser defaults from silently replacing values in a JSON file. Their global defaults remain `1`, `5`, `10`, and `1`, respectively.
+## Resolution precedence
 
-Boolean enable-only switches retain their historical behavior: an asserted CLI switch enables the feature; otherwise the JSON value or existing default is used. Paired enable/disable options already use an unset state where a three-way choice is required.
+Every field resolves in this order:
 
-Run-mode shortcut flags are resolved as one semantic field before any mode-specific defaults are applied. Explicit `--run-mode`, Adventure Generalist, Level 3, Adventure Eval, and generic train/eval selectors therefore cannot be overridden by a JSON `run_mode`. Conflicting explicit specialized selectors fail before startup. Runtime dispatch uses the resolved mode, so a redundant generic `--eval` cannot route an Adventure request into fixed evaluation.
+```text
+explicit CLI value > JSON configuration > Generalist mode default > global default
+```
 
-`stream_coach_mode` and `stream_coach_platform` are aliases for one semantic value. All explicit CLI aliases are considered before either JSON alias, and both compatibility output keys are kept coherent.
+An argparse value of `None` means not supplied. Explicit falsey values still override JSON. `ConfigResolver` records the winning source for inspectable `resolved_config.json` output.
 
-## Mode-specific defaults
+`ResolvedRunConfig` is the immutable typed view. `train_ppo.build_config()` is the flat dictionary/artifact adapter used by runtime consumers. Do not add another resolver.
 
-Mode defaults apply only when neither CLI nor JSON supplied the value. Current examples include:
+## Permanent model contract
 
-- quick-wait board and gameplay-ready timeouts;
-- the Level 3 specialist target and four-card seed list;
-- the Adventure Generalist 14-slot action capacity and identity loadout;
-- Adventure Generalist unlock-capacity inference.
+The following are not tunable run variants:
 
-Explicit `plant_types` are resolved through the same CLI-over-JSON rule. Their exact slot order must match the canonical IDs resolved from `seed_list`, including duplicate slots; a mismatch blocks startup instead of silently changing decoder semantics.
+| Field | Required value |
+| --- | --- |
+| `model_family` | `ppo_adventure_generalist_14slot_identity_v1` |
+| `action_space_mode` | `adventure_14slot_identity` |
+| `max_seed_slots` | `14` |
+| action count | `701` |
+| wait/placement range | `0` / `1..700` |
+| `action_decoder_version` | `seedslot14x50_plus_wait_v1` |
+| `observation_version` | `adventure_14slot_identity_v1` |
+| observation shape | `(4297,)` |
+| board geometry | 5 rows x 10 columns |
 
-The typed view groups the resolved values into optimization, environment, seed/action, Adventure, fusion, coach, diagnostics, artifacts, bridge, model-contract, and reward sections. GUI widget state remains owned by `pvzrl_gui.py`; values the GUI launches are serialized as ordinary CLI options and enter the same resolver.
+The initial identity loadout is:
 
-## Compatibility guarantees
+```json
+{
+  "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
+  "initial_loadout": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+}
+```
 
-- Existing CLI flag names and JSON keys remain accepted.
-- The flat resolved output retains its existing keys and JSON-compatible value shapes.
-- Runtime consumers may migrate section by section while `build_config()` provides the compatibility window.
-- Model metadata validation checks the resolved decoder, action count, slot identity, board geometry, placement range, and actual loaded observation shape.
+Duplicates and order are intentional. The current live loadout may grow with unlocks, but it never resizes the policy action or observation spaces.
 
-Recognized legacy no-op fields emit `IgnoredLegacyConfigWarning` instead of disappearing silently. This currently covers top-level `enable_fusion_diagnostics` and the unused `proximity_penalty` reward field in both top-level and nested `reward` JSON shapes. `proximity_penalty` remains in the resolved reward dictionary during the compatibility window even though no runtime reward term consumes it.
+## Important configuration groups
 
-The precedence matrix, typed round-trip, parser defaults, mode defaults, schedule paths, and falsey-value behavior are locked by `python/test_resolved_config.py`.
+### Training
+
+- `total_timesteps`, `learning_rate`, `n_steps`, `batch_size`, `gamma`, `gae_lambda`, `ent_coef`, `clip_range`
+- `checkpoint_freq`, `run_dir`
+- `resume_model_path` for explicit compatible continuation
+
+Fresh training has no resume source. Resume requires a compatible Generalist model and writes new artifacts to the requested destination; it never overwrites the source model.
+
+### Adventure lifecycle and progression
+
+- `adventure_start_level`
+- `max_adventure_levels`, `max_attempts_per_level`, `advance_on_wins`
+- `adventure_soft_max_steps`, `adventure_hard_max_steps`
+- `adventure_final_wave_extension`
+- `adventure_generalist_strict_startup_validation`
+- `adventure_replay_cleared_levels`
+- frontier/recent/maintenance sample probabilities and frontier win-streak requirement
+
+Startup validation compares wrapper, bridge, profile, UI, seed-selection, and gameplay identity. Configuration cannot authorize forcing a mismatched level.
+
+### Seed curriculum
+
+- `unlock_aware_seed_curriculum`
+- `seed_curriculum`
+- `unlock_introduction_delay`
+- `new_plant_min_inclusion_prob`
+- `infer_capacity_from_unlocks`
+- `allow_weak_unlocked_capacity_fallback`
+- `randomize_seed_order`
+
+The protected checkpoint starts with ordered duplicate identities. Change order/randomization only when the current model contract and experiment explicitly permit it.
+
+### Fusion and tactical behavior
+
+- `fusion_policy`: `none`, `observe`, or `scripted` (`assist` aliases scripted)
+- `fusion_action_mask_enabled`
+- `enable_board_plant_identity`
+- fusion chain/discovery/repeat rewards
+- fusion/later-plant/coach curriculum toggles and probabilities
+- `tactical_masks`, `wallnut_tactical_mask`, `cherrybomb_tactical_mask`
+
+The bridge/game is final fusion authority. Configuration may enable prediction, masks, scripted selection, or reward accounting; it cannot invent result identities.
+
+### Watchdog and diagnostics
+
+- `enable_action_watchdog`
+- `action_timeout_seconds`
+- `save_freeze_debug_bundle`
+- `action_diagnostics_path`, `freeze_debug_dir`
+- `live_status_path`
+
+Status and diagnostics paths should normally live beneath the run directory. Writes are bounded/atomic where implemented.
+
+### Coaches
+
+Human coach and crowd coach use local command/log paths. Human coach takes precedence when both are enabled. Crowd coach is dry-run unless apply is explicitly enabled. Intervention logging and fusion probes remain local.
+
+## Command forms
+
+Check dependencies:
+
+```powershell
+python .\python\train_ppo.py --check-deps
+```
+
+Fresh training:
+
+```powershell
+python .\python\train_ppo.py `
+  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --adventure-generalist-train `
+  --run-dir runs\manual_generalist\fresh
+```
+
+Resume into a separate destination:
+
+```powershell
+python .\python\train_ppo.py `
+  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --adventure-generalist-train `
+  --resume-model-path runs\manual_generalist\fresh\model.zip `
+  --run-dir runs\manual_generalist\resume
+```
+
+Evaluate the protected model:
+
+```powershell
+python .\python\train_ppo.py `
+  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --adventure-generalist-eval `
+  --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip `
+  --run-dir runs\manual_generalist\eval
+```
+
+Bridge-free metadata and actual CPU model-load check:
+
+```powershell
+python .\python\train_ppo.py `
+  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --metadata-dry-run `
+  --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip
+```
+
+Use `python .\python\train_ppo.py --help` as the executable authority for optional tuning flags.
+
+## Artifacts
+
+Each run should contain its own resolved configuration, model metadata, logs, progress metrics, checkpoints/model, live status, and diagnostics as applicable. Most run artifacts are intentionally ignored. Treat models, profiles, installed bridge DLLs, and live logs as user data.
+
+Before protected live work, record hashes for the source checkpoint/metadata, installed DLL, and profile. Confirm them again after the run.

@@ -2,7 +2,7 @@
 
 Date: 2026-07-13
 Inventory baseline: `0afae6e4683eef6fa9836d143597b28d42332e6c`
-Status: pre-removal classification; no implementation is authorized by classification alone
+Status: classification completed before implementation; source removal and bridge-free/bridge verification completed on 2026-07-13; no new post-removal live rollout was run
 
 Adventure Generalist is the sole maintained training and evaluation path. Legacy fixed/specialist mode was removed during the repository refactor.
 
@@ -40,7 +40,7 @@ These areas must be cleaned of obsolete branches, not deleted.
 - `python/train_ppo.py::write_eval_live_status`: currently serves Generalist compatibility-failure publication; retain or migrate that use before deleting fixed-eval construction.
 - `python/pvzrl_adventure.py::run_adventure_eval`: retain the evaluator; remove only legacy generic/fixed routing and staged specialist selection.
 - `src/PvZRLBridge/` and bridge build/lifecycle/benchmark scripts: no fixed/Level-3 identifiers were found; the bridge is shared.
-- Registry presets and slot×cell helpers whose names mention four-slot/fixed require caller-level classification. Generalist uses the duplicate four-card startup loadout and the same `action - 1` slot×cell arithmetic, so reusable logic must be renamed or narrowed before old wrappers are removed.
+- Registry presets and slot-by-cell helpers whose names mention four-slot/fixed require caller-level classification. Generalist uses the duplicate four-card startup loadout and the same `action - 1` slot-by-cell arithmetic, so reusable logic must be renamed or narrowed before old wrappers are removed.
 
 ## 3. Fixed-mode-only obsolete code
 
