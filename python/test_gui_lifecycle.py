@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pvzrl_gui_process
+from pvzrl_gui_status import classify_live_health
 from pvzrl_gui import (
     LOG_DRAIN_MAX_ITEMS,
     LOG_HISTORY_MAX_CHARS,
@@ -468,17 +469,18 @@ def test_status_age_overrides_old_blocked_payload(tmp_path: Path) -> None:
 
     _, info = dashboard._read_live_status_file()
     assert info["health"] == "DEAD"
-    assert dashboard._live_health(LIVE_MAX_AGE_SECONDS + 0.01, {"blocked_reason": "post_win_timeout"}) == "STALE"
+    assert classify_live_health(
+        LIVE_MAX_AGE_SECONDS + 0.01,
+        {"blocked_reason": "post_win_timeout"},
+    ) == "STALE"
 
 
 def test_health_aliases_preserve_case_insensitive_empty_fallbacks(tmp_path: Path) -> None:
-    dashboard = _status_dashboard(tmp_path / "unused.json")
-
-    assert dashboard._live_health(
+    assert classify_live_health(
         0.0,
         {"blocked_reason": "", "adventure": {"blocked_reason": "post_win_next_screen_timeout"}},
     ) == "BLOCKED_POST_WIN"
-    assert dashboard._live_health(
+    assert classify_live_health(
         0.0,
         {"Blocked_Reason": "post_win_next_screen_timeout"},
     ) == "BLOCKED_POST_WIN"

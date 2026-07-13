@@ -14,7 +14,7 @@ import re
 import socket
 import subprocess
 import time
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -51,9 +51,6 @@ from pvzrl_fusion import (
     fusion_execution_from_result,
     fusion_intent_from_candidate,
     get_fusion_illegal_reason,
-    is_buckethead_zombie,
-    is_conehead_zombie,
-    is_tough_zombie,
     merge_episode_fusion_stats,
     normalize_fusion_policy,
     plant_name as fusion_plant_name,

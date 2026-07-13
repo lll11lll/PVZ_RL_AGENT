@@ -11,10 +11,8 @@ from tkinter import scrolledtext
 
 from pvzrl_gui_status import (
     MISSING,
-    DiagnosticsRenderKey,
     LiveStatusReader,
     NormalizedStatusIndex,
-    classify_live_health,
     diagnostics_render_key,
 )
 
@@ -149,9 +147,6 @@ class GuiStatusViewMixin:
 
     def _read_live_status_file(self) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         return self._status_reader().read()
-
-    def _live_health(self, age: float, payload: Optional[Dict[str, Any]] = None) -> str:
-        return classify_live_health(age, payload)
 
     def _set_live_status(self, info: Dict[str, Any]) -> None:
         path = info.get("path", self.live_status_path)
