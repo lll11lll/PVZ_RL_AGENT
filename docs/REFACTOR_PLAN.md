@@ -95,7 +95,7 @@ Unless a separately documented defect correction has focused regression coverage
 | 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
 | 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Complete | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Complete | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
-| 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete for automated gates; partial final live coverage | Recorded lifecycle equivalence plus real loss/retry/reset; win, timeout, reward/unlock, replay, and advancement traces remain outstanding |
+| 5 | Explicit episode/reset/progression/watchdog state and authoritative pure lifecycle classification | Complete for automated gates; partial final live coverage | Recorded lifecycle equivalence plus real loss/retry/reset; win, timeout, reward/unlock, replay, and advancement traces remain outstanding |
 | 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete for source/automated gates; partial final live coverage | Final DLL startup, observation, legality, wait, placement, invalid-action safety, fusion, reset, and the corrected clean-start Generalist evaluation pass; live latency and broader transition checks remain outstanding |
 | 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete for automated and local-Tk gates; live game-backed GUI pending | Command/status/process lifecycle coverage passes; live game-backed GUI interaction remains outstanding |
 | 8 | Full validation, independent reviews, final benchmarks/statistics/report | Complete for automated/local-Tk and partial real-game validation; overall acceptance gaps recorded | Executed live evidence and exact remaining gates documented without closing performance or volume deviations |
@@ -108,7 +108,7 @@ Unless a separately documented defect correction has focused regression coverage
 - Registry forwarding APIs remain during the compatibility window.
 - Action/fusion wrappers remain until every source migrates and parity tests pass.
 - Pure reward/metric extraction, aggregation consolidation, and I/O throttling are separate diff groups.
-- Lifecycle state records begin in shadow mode; existing reset logic remains authoritative until traces match.
+- Lifecycle state records began in shadow mode; after trace and randomized parity gates, `pvzrl_lifecycle.py` became the pure predicate authority while the environment reset state machine retained side-effect ownership.
 - Bridge file splitting is move-only before any optimization, and moved lines do not count as code reduction.
 - GUI process, status reader, and rendering changes remain separable.
 - Stop a phase at a failed compatibility gate, diagnose the regression, and restore the last green boundary before proceeding.

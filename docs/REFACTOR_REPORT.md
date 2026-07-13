@@ -8,7 +8,7 @@ Baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
 
 The repository-wide implementation, every bridge-free/local-Tk validation phase, and a bounded final-source real-game gate are complete. Separate compatibility, concurrency, refactoring-quality, performance, and final-diff reviews were run, and their high-confidence findings were resolved where the environment allowed.
 
-The overall goal is not labeled complete. The final bridge was exercised in the real game for startup, menu/seed/gameplay entry, observation and action semantics, repeated loss/retry reset, fusion, and a corrected protected Generalist evaluation. Short fresh/resumed fixed training, fixed Level-3 evaluation, win/timeout/reward/unlock/replay/advancement traces, live game-backed GUI operation, and measured live latency remain outstanding. The cross-run approximately-5% performance gate also remains unresolved, and first-party runtime code increased from 48,127 to 55,339 physical lines rather than achieving a net reduction.
+The overall goal is not labeled complete. The final bridge was exercised in the real game for startup, menu/seed/gameplay entry, observation and action semantics, repeated loss/retry reset, fusion, and a corrected protected Generalist evaluation. Short fresh/resumed fixed training, fixed Level-3 evaluation, win/timeout/reward/unlock/replay/advancement traces, live game-backed GUI operation, and measured live latency remain outstanding. The cross-run approximately-5% performance gate also remains unresolved, and first-party runtime code increased from 48,127 to 54,821 physical lines rather than achieving a net reduction.
 
 ## Baseline repository state
 
@@ -461,17 +461,18 @@ Final implementation and review fixes:
 - The concurrency review found that a child which continued to report alive after `kill()` could renew the GUI close deadline indefinitely. Commit `34dabc1` makes the deadline hard: one final kill attempt is followed by an actionable still-alive record, bounded 0.2-second thread joins, bounded log drain, callback cancellation, and root destruction. A `NeverExitProcess` regression locks the behavior.
 - The refactoring-quality review found 260 lines of unmounted GUI tab builders/options, an expired private action-filter adapter, four additional private Python helpers, and a 300-line dead C# mix/reflection/reset/seed/observation helper graph. Tests now inspect the mounted Training tab and call the canonical action decision/status health paths. Commits `409138a` and `80376cf` remove 636 runtime lines and add one, net `-635`; full Python, bridge, script, and real-Tk gates remain green.
 - The final ownership map now names the split bridge, pure facts/reward/lifecycle modules, Generalist reducer, GUI command/process/status/view/queue modules, and shared file tailer rather than attributing those systems to their former monoliths.
-- No further high-confidence bulk deletion remains. Python production imports are acyclic; no private Python no-caller helper or C# private identifier-singleton helper remains. Closing the overall volume gap would require another substantive redesign of live-compatible state schemas and large reset/step loops, not safe dead-code cleanup.
+- A final post-report simplification pass made `pvzrl_lifecycle.py` the pure lifecycle predicate authority (`43ce840`, runtime net `-209`), removed a dormant dashboard/coach shell (`07714b3`, `-157`), derived redundant reward schema and seed projections (`32c9e20`, `-39`), unified evaluation reducers without the initially measured reporting slowdown (`1cb533f`, runtime `-63`, tests `+24`), shared exact live-fusion test setup (`c2bd74e`, `-33`), and removed the duplicate bridge type-count projector (`dd563de`, `-15`). Together with the two-line mask fast path, this reduces final runtime by another 518 physical lines. Every slice received a separate clean review.
+- No further high-confidence bulk deletion remains after this second sweep. Python production imports are acyclic; no private Python no-caller helper or C# private identifier-singleton helper remains. Closing the overall volume gap would require another substantive redesign of live-compatible state schemas and large reset/step loops, not safe dead-code cleanup.
 - The first retained live Generalist attempt exposed a real recursive-fusion identity defect: Python predicted plant `1031` after DoubleShooer plus Peashooter while the game produced `1090`, yielding five `fusion_result_mismatch`/mask-bridge disagreements. Authoritative live results and the game enum identify `1030` as DoubleShooer, `1090` as SplitPea, `1032` as GatlingPea, and `1031` as SunShroom. Commit `c7d38bc` corrects the registry/feature chain and adds bridge-free empty/unrelated-board candidate regressions; the failed attempt is retained rather than hidden.
 
 Final automated and compatibility evidence:
 
-- Dependency readiness and `compileall`: PASS. Full pytest: PASS, 294 tests plus 10 subtests. All nine retained standalone regression entrypoints exit zero after the final recursive-fusion correction.
-- Bridge build: PASS with zero warnings. Three consecutive final-source builds are byte-identical. Final DLL SHA-256 is `f6be2f86b9c001b15f88ac5637853a3f8a6eda2f103ef06a67a43e2a632c187a`; PDB SHA-256 is `86b89424d889dc75e42ed7344bc586c236b741618634c5317542569280ba5934`. The lifecycle harness passes 58,553 checks.
+- Dependency readiness and `compileall`: PASS. Full pytest: PASS, 295 tests plus 10 subtests. All nine retained standalone regression entrypoints exit zero after the final recursive-fusion correction.
+- Bridge build: PASS with zero warnings. Three consecutive current-source builds are byte-identical. Final DLL SHA-256 is `3b849aa40505e40bc01ecf54bc2c0ff40b2970cb1d33a237d76e42ff0185de5f`; PDB SHA-256 is `f0e21eff77ccf8593b876b69a0aba01468429d1b158e2702e19d3597ea7922e5`. The lifecycle harness passes 58,553 checks.
 - A withdrawn real `tk.Tk()` dashboard builds the mounted Training, Evaluation, Coach, Diagnostics, Runs/Models, status, and log surfaces, schedules both pollers, processes an event cycle, and closes through the production callback. Command, status, queue, process, rollover, and never-exits lifecycle coverage remains green.
-- Both protected metadata dry-runs return `compatible=true`, `ok=true`, no warnings, and no blocked reason. Actual CPU loads remain Generalist `(701, (4297,), 370000)` and fixed `(201, (357,), 350368)`. The June 21 Generalist control also remains loadable.
+- Both protected metadata dry-runs return `compatible=true`, `ok=true`, empty compatibility-warning lists, and no blocked reason. The fixed invocation also emits the known `IgnoredLegacyConfigWarning` for the retired `enable_fusion_diagnostics` key in its resolved legacy configuration. Actual CPU loads remain Generalist `(701, (4297,), 370000)` and fixed `(201, (357,), 350368)`. The June 21 Generalist control also remains loadable.
 - All six protected model/metadata sizes, mtimes, and SHA-256 values exactly match the Phase 5 table. The installed recovery DLL was preserved before the live gate, the deterministic final DLL was installed temporarily for validation, and the original DLL was restored and reverified at `5643ec37984762ab72fea3c50e87fcc466b905c5cf046c307fdaa6e0ce42a0f4`.
-- Deterministic Python contracts remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; recursive live-status schema `53e6489a...`; GUI alias projection `400cd2f1...`; corrected fusion-candidate snapshot `bac8d8a6...`. Bridge top-level observation and recursive nested DTO contracts remain 122 properties and `c0d34a11...`.
+- Current deterministic Python contracts are: dense observation `c341506a...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `26a09c13...`; recursive live-status schema `5d826a00...`; GUI alias projection `400cd2f1...`; corrected fusion-candidate snapshot `bac8d8a6...`. The dense/diagnostic/status hashes intentionally include the corrected recursive fusion identities; the mask/vector/GUI alias contracts remain unchanged. Bridge top-level observation and recursive nested DTO contracts remain 122 properties and `c0d34a11...`.
 
 Partial real-game evidence:
 
@@ -497,7 +498,9 @@ Independent review disposition:
 
 Final performance record:
 
-- Durable repeat artifacts are `runs/benchmarks/phase8_python_final_run1.json` and `runs/benchmarks/phase8_python_final.json`, each 50 samples by five rounds. Their deterministic hashes and 49 writes/451 suppressions plus one forced final write match exactly.
+- The current-source confirmation is `runs/benchmarks/phase8_post_reduction_final.json`, 50 samples by five rounds. It records the current hashes above and the unchanged 49 writes/451 suppressions plus one forced final write. Historical Phase 8 repeats remain `runs/benchmarks/phase8_python_final_run1.json` and `runs/benchmarks/phase8_python_final.json`.
+- The fixed/identity SB3 mask projection now copies index-preserving raw masks directly while retaining the shifted `dynamic_14` loop. An alternating exact-output A/B measures fixed projection `0.01960 -> 0.00850 ms` median (2.31x) and identity projection `0.39195 -> 0.03970 ms` (9.87x). In the full current benchmark, fixed/identity mask medians are `0.84485/1.30230 ms`; compared with the immediately preceding same-machine lifecycle-source run they are 6.0% and 22.4% lower, but that cross-process comparison is supporting evidence rather than a causal claim.
+- Evaluation aggregation was benchmarked after consolidation because the first canonical-row version doubled a 100-log synthetic workload. The retained typed-record path is performance-neutral: old `2.3314 s`, new `2.3038 s` across 200 complete summaries (1.2% faster), with 1,000 randomized whole-summary differentials and exact malformed-input parity.
 - GUI case-insensitive status lookup measures 200 mixed-case alias lookups per operation with index construction outside timing. Across the two repeats, the legacy repeated-map surrogate is `10.40030/13.70210` and `11.46040/19.79760 ms` median/p95; the hot cached index is `0.16425/0.16760` and `0.19930/0.20720 ms`, a 57.5-63.3x median improvement.
 - The 5,000-line no-op-widget log surrogate is `0.04610/0.05500 -> 0.00450/0.00480 ms` in run 1 and `0.05940/0.08640 -> 0.00550/0.00610 ms` in run 2, a 10.2-10.8x median improvement. Same-object render-key checks are `0.00030 ms`; equal fresh payload comparisons are `0.48155/0.55820` and `0.59505/0.64550 ms`.
 - The final C# pure-helper benchmark remains exact and unaffected by dead-code removal: indexed occupancy including set construction improves 75.1x/108.5x median/p95, and one-pass lanes improve 4.9x/5.0x. It excludes Unity scans, `CheckBox`, IL2CPP lifetime, sockets, and live bridge latency.
@@ -509,31 +512,31 @@ Final code statistics, using the exact baseline exclusions:
 | Measure | Baseline | Final | Change |
 | --- | ---: | ---: | ---: |
 | Runtime files | 17 | 47 | +30 |
-| Runtime physical lines | 48,127 | 55,339 | +7,212 (+14.99%) |
-| Python runtime lines | 36,562 | 43,158 | +6,596 |
-| C# runtime lines, excluding generated registry | 11,488 | 12,085 | +597 |
+| Runtime physical lines | 48,127 | 54,821 | +6,694 (+13.91%) |
+| Python runtime lines | 36,562 | 42,655 | +6,093 |
+| C# runtime lines, excluding generated registry | 11,488 | 12,070 | +582 |
 | Build-script lines | 77 | 96 | +19 |
-| Raw runtime diff | - | +25,092 / -17,880 | +7,212 |
+| Raw runtime diff | - | +25,374 / -18,680 | +6,694 |
 | Python test files | 9 | 32 | +23 |
-| Python test physical lines | 6,154 | 14,033 | +7,879 |
-| Raw Python test diff | - | +7,921 / -42 | +7,879 |
-| Documentation diff (`REFACTOR_PLAN.md`, `REFACTOR_REPORT.md`, root `AGENTS.md`) | - | +1,241 / -0 | +1,241 |
-| Python function definitions | 1,043 | 1,311 | +268 |
+| Python test physical lines | 6,154 | 14,057 | +7,903 |
+| Raw Python test diff | - | +7,945 / -42 | +7,903 |
+| Documentation diff (`REFACTOR_PLAN.md`, `REFACTOR_REPORT.md`, root `AGENTS.md`) | - | +1,248 / -0 | +1,248 |
+| Python function definitions | 1,043 | 1,294 | +251 |
 | Python class definitions | 59 | 135 | +76 |
-| Confirmed function/method names removed | - | 81 | 68 Python + 13 C# |
-| Confirmed class names removed | - | 0 | 0 |
-| Subsystem duplicate families consolidated | - | 18 | semantic count; no textual-clone claim |
+| Confirmed function/method names removed | - | 98 | 84 Python + 14 C# |
+| Confirmed class names removed | - | 1 | one internal C# helper class |
+| Subsystem duplicate families consolidated | - | 22 | semantic count; no textual-clone claim |
 | Explicit compatibility wrapper/view/projection surfaces remaining | - | 12 | retained where consumers cannot be proven migrated |
 | Source units split | - | 2 | bridge monolith and GUI dashboard |
 | Runtime files deleted | - | 0 | source was split/additive; dead bodies were removed in place |
 
-The raw removal count is not a code-reduction claim: 10,742 C# method-body lines were moved during the bridge split, and most of Phase 7's 1,862-line GUI deletion was relocated into focused modules. The final physical total is authoritative. The 18 consolidated duplicate families cover request ownership, JSONL tailing, registry/configuration, action decisions, fusion validation/execution, per-observation facts, rewards, lane/safety diagnostics, episode telemetry, live-status writing, lifecycle classification, Generalist progression, bridge occupancy/lanes/cards, GUI status/commands/process/logs, and coach queue/aliases. The 12 narrowly counted compatibility surfaces are four registry projections, reward/reset adapters, two deprecated fusion views, three SB3 state projections, and the compatibility fusion-candidate factory.
+The raw removal count is not a code-reduction claim: 10,742 C# method-body lines were moved during the bridge split, and most of Phase 7's 1,862-line GUI deletion was relocated into focused modules. The final physical total is authoritative. The 22 consolidated duplicate families cover request ownership, JSONL tailing, registry/configuration, action decisions, fusion validation/execution, per-observation facts, rewards and reward schema, lane/safety diagnostics, episode telemetry and evaluation reducers, live-status writing, lifecycle classification, Generalist progression, bridge occupancy/lanes/cards/type counts, GUI status/commands/process/logs, coach queue/aliases, and live fusion-test setup. The 12 narrowly counted compatibility surfaces are four registry projections, reward/reset adapters, two deprecated fusion views, three SB3 state projections, and the compatibility fusion-candidate factory.
 
 Measured acceptance deviation:
 
-- The initial audit expected 5,000-8,000 fewer runtime lines and named 4,800 lines/10% as its completion threshold. The final repository instead has 7,212 more runtime lines. This is not relabeled as reduction. The refactor deleted large duplicated bodies and improved ownership, but immutable schemas, pure compositors, compatibility projections, split scaffolding, stronger state models, and runtime diagnostics outweighed those deletions physically.
+- The initial audit expected 5,000-8,000 fewer runtime lines and named 4,800 lines/10% as its completion threshold. The final repository instead has 6,694 more runtime lines. This is not relabeled as reduction. The refactor deleted large duplicated bodies and improved ownership, but immutable schemas, pure compositors, compatibility projections, split scaffolding, stronger state models, and runtime diagnostics outweighed those deletions physically.
 - The coordinating goal text says not to sacrifice correctness, compatibility, diagnostics, or readability to hit an arbitrary deletion target. After the independent dead-code sweep, no further high-confidence bulk deletion remains. Meeting the original numeric target now would require a new, high-risk redesign rather than evidence-backed cleanup.
-- Large residual units remain: `pvzrl_env.py` is 10,238 lines, its reset state machine is about 988 lines, both environment/SB3 step methods exceed 700 lines, and bridge Seed/UI and Reset remain above 2,800 and 2,100 lines. `pvzrl_lifecycle.py` remains a 615-line shadow/contract artifact. Numeric coercion and compatibility-heavy live-status emission remain distributed.
+- Large residual units remain: `pvzrl_env.py` is 9,966 lines, its reset state machine remains about 988 lines, both environment/SB3 step methods exceed 700 lines, and bridge Seed/UI and Reset remain 2,865 and 2,198 lines. `pvzrl_lifecycle.py` is now the 649-line pure predicate authority rather than a shadow copy. Numeric coercion and compatibility-heavy live-status emission remain distributed.
 
 Live-game validation record and exact remaining commands:
 

@@ -179,6 +179,8 @@ Startup validation compares wrapper-expected, bridge-detected, profile, UI, seed
 
 Loss, win, timeout, transition, reset, reward, unlock, seed-selection, and gameplay-ready are distinct lifecycle states. Soft timeouts may extend only under the configured final-wave policy; hard timeouts remain terminal. Keep `terminal_reason`, `timeout_classification`, reset phase/reason, and post-win evidence coherent across results, status, and artifacts.
 
+`python/pvzrl_lifecycle.py` is the production authority for pure screen/lifecycle predicates. Compatibility methods in `pvzrl_env.py` and exact-parity Adventure helpers delegate to it; do not restore local predicate bodies. The environment reset state machine still owns clicks, polling, guards, observation handoff, and other side effects.
+
 ## 5. Sources of truth
 
 | Concept | Authoritative source | Consumers | Must not be duplicated in |
@@ -186,7 +188,7 @@ Loss, win, timeout, transition, reset, reward, unlock, seed-selection, and gamep
 | Plant metadata | `configs/plant_registry.json`, parsed by `python/pvzrl_registry.py`; live `CardUI` remains runtime cost/cooldown/unlock authority | environment, seed inventory, GUI presets, fusion base IDs, generated bridge fallback | Python/C# name/ID/cost switches, GUI constants, config resolver |
 | Action definitions | `python/pvzrl_action_space.py` | SB3 spaces, decoder, metadata, GUI/config tests | environment arithmetic, coach parsers, C# DTOs |
 | Action validation | `python/pvzrl_actions.py`; bridge/game is final execution authority | masks, policy, coach, diagnostics, execution adapter | GUI-only checks, separate coach/fusion legality branches |
-| Action masks | `PvZGymEnv._action_cache_for`/`action_mask` using `build_action_decision_cache` | MaskablePPO, live status, coach, mask diagnostics | SB3 wrapper rescans, live-status builder, GUI |
+| Action masks | `PvZGymEnv._action_cache_for`/`action_mask` using `build_action_decision_cache`; SB3 fixed/identity projection is index-preserving while only `dynamic_14` shifts wait/placement indices | MaskablePPO, live status, coach, mask diagnostics | SB3 legality rescans, live-status builder, GUI |
 | Observation layout | `python/pvzrl_observation_layout.py`, `python/pvzrl_seed_inventory.py`, and actual Gym observation space | SB3 encoder, metadata compatibility, checkpoints | model loader guesses, config-only width formulas |
 | Observation facts | `python/pvzrl_observation_facts.py::StepFacts`/`StepFactsCache` | validation, masks, encoding, rewards, fusion, lane/safety diagnostics | per-consumer raw observation rescans |
 | Fusion recipes | `python/pvzrl_fusion.py::FUSION_RECIPES` | scripted/model fusion policy, diagnostics, rewards, tests | registry JSON, GUI, coach parser, C# prediction table |
@@ -279,6 +281,8 @@ python .\python\benchmark_hotpaths.py --samples 50 --rounds 5 --json-out runs\be
 ```
 
 The C# benchmark builds the bridge and requires the workstation paths encoded in its script. Compare deterministic fixture hashes before interpreting timings. Interleave candidate/baseline cases or record host/power state before making a regression claim.
+
+The final-source bridge-free confirmation is `runs/benchmarks/phase8_post_reduction_final.json`. It is a local ignored artifact, not a committed fixture. Its targeted mask-projection improvement and deterministic contract hashes do not close the separate live-step/rollout or repository-wide cross-run performance gates.
 
 ### Local dashboard
 
