@@ -127,7 +127,9 @@ def test_fusion_result_identity_overlay_remains_separate_from_seed_registry() ->
     assert registry.resolve_name("Repeater") == 7
     assert normalize_plant_name_or_id("Repeater") == 1030
     assert fusion_plant_name(7) == "Repeater"
-    assert fusion_plant_name(1030) == "Repeater"
+    assert fusion_plant_name(1030) == "DoubleShooer"
+    assert normalize_plant_name_or_id("SplitPea") == 1090
+    assert fusion_plant_name(1090) == "SplitPea"
 
 
 def test_gui_profiles_are_derived_from_named_registry_presets() -> None:

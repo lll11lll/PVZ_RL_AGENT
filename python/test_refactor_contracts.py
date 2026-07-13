@@ -67,7 +67,7 @@ FIXED_MASK_SHA = "b8162a3a0d68495dd173f3665f8ecef6f330e8ed774fc1928b7c353404eeaf
 IDENTITY_MASK_SHA = "e77f9e0e07daf76885f73facfa1ccdfb5effd02e952413d61f23b866cf1c9339"
 ALLOWED_FIXTURE_ACTIONS = [0, 1, 2, 10, 24, 101, 124, 150]
 REWARD_BREAKDOWN_SHA = "0dbceb5d5c57a4f4c7f37e535ef015af2b461061aa5323e9581bfad3676a8316"
-FUSION_CANDIDATES_SHA = "7e048edcf56f08762a985e8c87e69b35197261d4953c7d5f69c81cb8400a3565"
+FUSION_CANDIDATES_SHA = "bac8d8a636a975bd8a1bf1ac5cd1c6a7daed1a1dd869dd676f8b7a0b589d29a1"
 REWARD_FIELDS_SHA = "b1ad4a442ba5c66d18deed257550d6cbdc05ee5af6c3d6325f770798825de184"
 EPISODE_FIELDS_SHA = "6d965a7482b710ef6481d581feac1baf94ba7e43fe1aec5618616c52d9331ba6"
 FUSION_FIELDS_SHA = "3fe73b60ad282971dd505f727b02808bd3ef48534498a1efd3a10da0eba95b2f"
@@ -177,8 +177,8 @@ def test_complete_fixture_masks_lock_sun_cooldown_occupancy_and_fusion() -> None
 def test_fusion_recipes_reason_order_and_candidate_snapshot() -> None:
     expected_results = {
         (0, 0): 1030,
-        (1030, 0): 1031,
-        (1031, 0): 1032,
+        (1030, 0): 1090,
+        (1090, 0): 1032,
         (1, 1): 1033,
     }
     assert {pair: int(rule["predicted_result_type"]) for pair, rule in FUSION_RULES.items()} == expected_results

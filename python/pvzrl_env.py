@@ -6776,6 +6776,43 @@ def cooldown_test(env: PvZGymEnv) -> bool:
     return all(ok for _, ok, _ in checks)
 
 
+def _select_live_fusion_probe_candidates(
+    raw_probe: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], int]:
+    """Return the first legal and Peashooter/SunFlower live candidates.
+
+    An empty board or a board with only unrelated legal candidates is setup
+    state, not a failed semantic check. The live harness uses the second return
+    value to decide whether it must place a Peashooter before testing fusion.
+    """
+
+    candidates = raw_probe.get("fusionCandidates") or raw_probe.get("fusion_candidates") or []
+    if not isinstance(candidates, list):
+        candidates = []
+    first_legal: Optional[Dict[str, Any]] = None
+    pea_sun_legal: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        is_legal = bool(candidate.get("fusionLegal") or candidate.get("fusion_legal"))
+        if is_legal and first_legal is None:
+            first_legal = candidate
+        try:
+            source_type = int(candidate.get("sourcePlantType", candidate.get("source_plant_type", -1)))
+            ingredient_type = int(
+                candidate.get(
+                    "ingredientPlantType",
+                    candidate.get("ingredient_plant_type", candidate.get("targetPlantType", -1)),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+        if is_legal and source_type == 0 and ingredient_type == 1:
+            pea_sun_legal = candidate
+            break
+    return first_legal, pea_sun_legal, len(candidates)
+
+
 def fusion_semantics_test(env: PvZGymEnv) -> bool:
     checks: List[Tuple[str, bool, str]] = []
 
@@ -6859,25 +6896,6 @@ def fusion_semantics_test(env: PvZGymEnv) -> bool:
             current_observation, _, _, _, _ = env.step(0)
         return current_observation, int(max_wait_steps), "timeout"
 
-    def select_probe_candidates(raw_probe: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], int]:
-        candidates = raw_probe.get("fusionCandidates") or raw_probe.get("fusion_candidates") or []
-        if not isinstance(candidates, list):
-            candidates = []
-        first_legal: Optional[Dict[str, Any]] = None
-        pea_sun_legal: Optional[Dict[str, Any]] = None
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            is_legal = value_bool(candidate, "fusionLegal", "fusion_legal")
-            if is_legal and first_legal is None:
-                first_legal = candidate
-            source_type_probe = value_int(candidate, "sourcePlantType", "source_plant_type", default=-1)
-            ingredient_type_probe = value_int(candidate, "ingredientPlantType", "ingredient_plant_type", "targetPlantType", default=-1)
-            if is_legal and source_type_probe == 0 and ingredient_type_probe == 1:
-                pea_sun_legal = candidate
-                break
-        return first_legal, pea_sun_legal, len(candidates)
-
     try:
         env.configure()
         observation = env.wait_for_gameplay_ready(timeout=30.0, poll_seconds=0.25, quiet=True, fail_on_terminal=False)
@@ -6892,7 +6910,7 @@ def fusion_semantics_test(env: PvZGymEnv) -> bool:
     peashooter_sunflower_candidate: Optional[Dict[str, Any]] = None
     try:
         probe = env.client.request("fusion_probe")
-        legal_candidate, peashooter_sunflower_candidate, candidate_count = select_probe_candidates(probe)
+        legal_candidate, peashooter_sunflower_candidate, candidate_count = _select_live_fusion_probe_candidates(probe)
         print(
             "[fusion-test] initial_probe "
             f"candidate_count={candidate_count} "
@@ -6954,7 +6972,7 @@ def fusion_semantics_test(env: PvZGymEnv) -> bool:
                     ),
                 )
                 probe = env.client.request("fusion_probe")
-                legal_candidate, peashooter_sunflower_candidate, candidate_count = select_probe_candidates(probe)
+                legal_candidate, peashooter_sunflower_candidate, candidate_count = _select_live_fusion_probe_candidates(probe)
                 record(
                     "fusion_probe_after_setup_has_legal_candidate",
                     legal_candidate is not None,

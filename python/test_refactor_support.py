@@ -104,8 +104,8 @@ def dense_observation(*, slot_count: int) -> Dict[str, Any]:
     ]
 
     occupied_flats = {index * 2 for index in range(25)}
-    board_types = [1, 0, 1030, 1031]
-    board_names = {0: "Peashooter", 1: "SunFlower", 1030: "Repeater", 1031: "Threepeater"}
+    board_types = [1, 0, 1030, 1090]
+    board_names = {0: "Peashooter", 1: "SunFlower", 1030: "DoubleShooer", 1090: "SplitPea"}
     plants = []
     for index, flat in enumerate(sorted(occupied_flats)):
         plant_type = board_types[index % len(board_types)]

@@ -927,8 +927,8 @@ def _recipe_observation(source_type: int, ingredient_type: int) -> dict:
 def test_all_recipe_self_recursive_and_runtime_only_compatibility_pairs() -> None:
     expected_recipes = {
         (0, 0): 1030,
-        (1030, 0): 1031,
-        (1031, 0): 1032,
+        (1030, 0): 1090,
+        (1090, 0): 1032,
         (1, 1): 1033,
     }
     assert {pair: int(rule["predicted_result_type"]) for pair, rule in FUSION_RULES.items()} == expected_recipes
@@ -941,10 +941,10 @@ def test_all_recipe_self_recursive_and_runtime_only_compatibility_pairs() -> Non
         (0, 1),
         (0, 2),
         (0, 1030),
-        (0, 1031),
+        (0, 1090),
         (1, 1),
     }
-    compatibility_ids = {0, 1, 2, 3, 1030, 1031, 1032, 1033}
+    compatibility_ids = {0, 1, 2, 3, 1030, 1032, 1033, 1090}
     for left, right in product(compatibility_ids, repeat=2):
         pair = tuple(sorted((left, right)))
         assert are_fusion_compatible(left, right) is (pair in expected_undirected_pairs)
@@ -962,6 +962,37 @@ def test_all_recipe_self_recursive_and_runtime_only_compatibility_pairs() -> Non
             assert are_fusion_compatible(partner, source)
 
 
+def test_live_fusion_probe_empty_or_unrelated_board_requires_peashooter_setup() -> None:
+    assert pvzrl_env._select_live_fusion_probe_candidates({}) == (None, None, 0)
+
+    unrelated = {
+        "fusionCandidates": [
+            {
+                "fusionLegal": True,
+                "sourcePlantType": 1,
+                "ingredientPlantType": 1,
+            }
+        ]
+    }
+    first_legal, pea_sun, count = pvzrl_env._select_live_fusion_probe_candidates(unrelated)
+    assert first_legal is unrelated["fusionCandidates"][0]
+    assert pea_sun is None
+    assert count == 1
+
+    pea_sun_candidate = {
+        "fusion_candidates": [
+            {
+                "fusion_legal": True,
+                "source_plant_type": 0,
+                "ingredient_plant_type": 1,
+            }
+        ]
+    }
+    first_legal, pea_sun, count = pvzrl_env._select_live_fusion_probe_candidates(pea_sun_candidate)
+    assert first_legal is pea_sun is pea_sun_candidate["fusion_candidates"][0]
+    assert count == 1
+
+
 def test_recipe_registry_is_immutable_directional_and_derives_legacy_views() -> None:
     assert isinstance(FUSION_RECIPES, tuple)
     assert tuple(recipe.pair for recipe in FUSION_RECIPES) == tuple(FUSION_RECIPES_BY_PAIR)
@@ -970,8 +1001,8 @@ def test_recipe_registry_is_immutable_directional_and_derives_legacy_views() -> 
         for pair, recipe in FUSION_RECIPES_BY_PAIR.items()
     } == {
         (0, 0): 1030,
-        (1030, 0): 1031,
-        (1031, 0): 1032,
+        (1030, 0): 1090,
+        (1090, 0): 1032,
         (1, 1): 1033,
     }
     for pair, recipe in FUSION_RECIPES_BY_PAIR.items():
@@ -1006,7 +1037,7 @@ def test_recipe_registry_is_immutable_directional_and_derives_legacy_views() -> 
         source="debug",
     )
     assert wrong_known_result.predicted_result_type == 1030
-    assert wrong_known_result.predicted_result_name == "Repeater"
+    assert wrong_known_result.predicted_result_name == "DoubleShooer"
 
     runtime_only = fusion_intent_from_candidate(
         {
@@ -1329,7 +1360,7 @@ def test_environment_fusion_adapter_is_tile_scoped_source_attributed_and_exactly
                     "row": row,
                     "column": column,
                     "plantType": 1030,
-                    "plantTypeName": "Repeater",
+                    "plantTypeName": "DoubleShooer",
                 },
             }
 
@@ -1424,7 +1455,7 @@ def test_model_fusion_reuses_prebuilt_action_and_seed_slot_facts(
                     "row": 2,
                     "column": 4,
                     "plantType": 1030,
-                    "plantTypeName": "Repeater",
+                    "plantTypeName": "DoubleShooer",
                 },
             }
 
@@ -1511,10 +1542,10 @@ def test_environment_fusion_adapter_preserves_all_recipe_results_and_runtime_aut
             return None
 
     cases = (
-        (0, 0, 1030, "Repeater", "recipe"),
-        (1030, 0, 1031, "Threepeater", "recipe"),
-        (1031, 0, 1032, "GatlingPea", "recipe"),
-        (1, 1, 1033, "TwinSunFlower", "recipe"),
+        (0, 0, 1030, "DoubleShooer", "recipe"),
+        (1030, 0, 1090, "SplitPea", "recipe"),
+        (1090, 0, 1032, "GatlingPea", "recipe"),
+        (1, 1, 1033, "TwinFlower", "recipe"),
         (1, 0, -1, "", "runtime_only"),
         (0, 2, -1, "", "runtime_only"),
     )
@@ -1679,7 +1710,7 @@ def _candidate() -> dict:
         "target_or_ingredient_name": "Peashooter",
         "target_or_ingredient_type": 0,
         "ingredient_seed_slot_index": 0,
-        "predicted_result_name": "Repeater",
+        "predicted_result_name": "DoubleShooer",
         "predicted_result_type": 1030,
         "fusion_legal": True,
         "fusion_blocked_reason": "",

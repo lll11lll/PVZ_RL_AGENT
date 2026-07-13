@@ -19,16 +19,16 @@ from pvzrl_sb3 import PvZMaskedPPOEnv
 class FusionChainIdentityTests(unittest.TestCase):
     def test_recursive_pea_chain_is_compatible(self) -> None:
         self.assertTrue(are_fusion_compatible(1030, 0))
-        self.assertTrue(are_fusion_compatible(1031, 0))
+        self.assertTrue(are_fusion_compatible(1090, 0))
         self.assertTrue(can_accept_fusion(1030))
         self.assertEqual(fusion_tier(1030), 1)
-        self.assertEqual(fusion_tier(1031), 2)
+        self.assertEqual(fusion_tier(1090), 2)
         self.assertEqual(fusion_tier(1032), 3)
 
     def test_board_identity_distinguishes_each_pea_tier(self) -> None:
         identities = {
             board_plant_identity_features({"type": plant_type})
-            for plant_type in (0, 1030, 1031, 1032)
+            for plant_type in (0, 1030, 1090, 1032)
         }
         self.assertEqual(len(identities), 4)
         self.assertEqual(board_plant_identity_features({"type": 0}), (0.0, 1.0))

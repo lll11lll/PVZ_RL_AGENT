@@ -116,10 +116,11 @@ FUSION_REJECTION_REASONS = (
 )
 
 FUSION_RESULT_NAMES: Mapping[int, str] = MappingProxyType({
-    1030: "Repeater",
-    1031: "Threepeater",
+    1030: "DoubleShooer",
+    1031: "SunShroom",
     1032: "GatlingPea",
-    1033: "TwinSunFlower",
+    1033: "TwinFlower",
+    1090: "SplitPea",
 })
 PLANT_NAMES: Mapping[int, str] = MappingProxyType({
     **{definition.plant_type_id: definition.canonical_name for definition in _PLANT_REGISTRY.plants},
@@ -215,15 +216,16 @@ def _recipe(
     )
 
 
-# The one authoritative result-producing recipe registry.  Recursive result IDs
-# intentionally live in the mod-result namespace (1030-1033); numeric seed ID 7
-# remains the canonical base-game Repeater seed and is never conflated with 1030.
+# The one authoritative result-producing recipe registry.  These IDs match the
+# live hybrid game's PlantType enum and observed fusion results.  Numeric seed
+# ID 7 remains the base-game Repeater seed and is never conflated with the
+# recursive fusion chain.
 FUSION_RECIPES: Tuple[FusionRecipe, ...] = (
     _recipe(
         PEASHOOTER_ID,
         PEASHOOTER_ID,
         1030,
-        "Repeater",
+        "DoubleShooer",
         "Peashooter-on-Peashooter should improve lane DPS.",
         "dps",
         True,
@@ -231,18 +233,18 @@ FUSION_RECIPES: Tuple[FusionRecipe, ...] = (
     _recipe(
         1030,
         PEASHOOTER_ID,
-        1031,
-        "Threepeater",
-        "Peashooter on Repeater advances the recursive pea fusion chain.",
+        1090,
+        "SplitPea",
+        "Peashooter on DoubleShooer advances the recursive pea fusion chain.",
         "dps",
         True,
     ),
     _recipe(
-        1031,
+        1090,
         PEASHOOTER_ID,
         1032,
         "GatlingPea",
-        "Peashooter on Threepeater completes the high-tier pea fusion chain.",
+        "Peashooter on SplitPea completes the high-tier pea fusion chain.",
         "dps",
         True,
     ),
@@ -250,7 +252,7 @@ FUSION_RECIPES: Tuple[FusionRecipe, ...] = (
         SUNFLOWER_ID,
         SUNFLOWER_ID,
         1033,
-        "TwinSunFlower",
+        "TwinFlower",
         "SunFlower-on-SunFlower is known economy fusion but is not a defensive assist.",
         "economy",
         False,
@@ -305,10 +307,16 @@ BUCKETHEAD_TYPES = {4, 13}
 # Result aliases intentionally win for ambiguous text such as ``Repeater``;
 # numeric base seed ID 7 still resolves through the canonical plant registry.
 FUSION_RESULT_NAME_TO_ID: Mapping[str, int] = MappingProxyType({
+    "doubleshooer": 1030,
+    "doubleshooter": 1030,
+    # Compatibility alias retained for older coach/config text. The live
+    # PlantType 1030 canonical name is DoubleShooer; seed ID 7 is Repeater.
     "repeater": 1030,
-    "threepeater": 1031,
-    "3pea": 1031,
+    "splitpea": 1090,
+    "threepeater": 1090,
+    "3pea": 1090,
     "gatlingpea": 1032,
+    "twinflower": 1033,
     "twinsunflower": 1033,
 })
 _BASE_PLANT_NAME_TO_ID: Dict[str, int] = {
@@ -339,7 +347,7 @@ FUSION_COMPATIBILITY: Mapping[int, frozenset[int]] = _build_fusion_compatibility
 FUSION_TIER_BY_TYPE: Mapping[int, int] = MappingProxyType({
     PEASHOOTER_ID: 0,
     1030: 1,
-    1031: 2,
+    1090: 2,
     1032: 3,
     SUNFLOWER_ID: 0,
     1033: 1,
@@ -371,7 +379,7 @@ def board_plant_identity_features(plant: Dict[str, Any]) -> Tuple[float, float]:
     known = {
         1033: (0.75, 0.0),
         1030: (0.0, 0.75),
-        1031: (0.0, 0.50),
+        1090: (0.0, 0.50),
         1032: (0.0, 0.25),
         WALLNUT_ID: (-0.25, 0.0),
         CHERRYBOMB_ID: (-0.50, 0.0),
