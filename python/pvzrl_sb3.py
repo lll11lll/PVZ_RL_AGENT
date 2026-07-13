@@ -22,6 +22,7 @@ from gymnasium import spaces
 from pvzrl_actions import build_action_intent
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ACTION_SPACE_DYNAMIC_14,
     ACTION_SPACE_FIXED,
     DYNAMIC_WAIT_ACTION,
     build_action_space_spec,
@@ -1638,7 +1639,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             self._adopt_observation(observation, source="action_masks_observe")
         mask = np.zeros(self.action_count, dtype=bool)
         raw_mask = self.base.action_mask(observation)
-        if self.action_spec.dynamic_seed_slots:
+        if self.action_spec.mode == ACTION_SPACE_DYNAMIC_14:
             for legacy_action, allowed in enumerate(raw_mask):
                 if not bool(allowed):
                     continue
@@ -1648,14 +1649,11 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 )
                 if 0 <= policy_action < self.action_count:
                     mask[policy_action] = True
-            if self.action_spec.mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-                mask[0] = True
-            else:
-                mask[DYNAMIC_WAIT_ACTION] = True
+            mask[DYNAMIC_WAIT_ACTION] = True
         else:
-            for action, allowed in enumerate(raw_mask[: self.action_count]):
-                if bool(allowed):
-                    mask[action] = True
+            copied = min(len(raw_mask), self.action_count)
+            if copied:
+                mask[:copied] = np.asarray(raw_mask[:copied], dtype=bool)
             mask[0] = True
         self._last_action_mask_ms = round((time.perf_counter() - started) * 1000.0, 3)
         return mask
