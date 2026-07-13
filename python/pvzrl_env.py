@@ -6893,22 +6893,17 @@ def fusion_semantics_test(env: PvZGymEnv) -> bool:
     try:
         probe = env.client.request("fusion_probe")
         legal_candidate, peashooter_sunflower_candidate, candidate_count = select_probe_candidates(probe)
-        record("fusion_probe_has_legal_candidate", legal_candidate is not None, f"candidate_count={candidate_count}")
-        record(
-            "fusion_probe_has_peashooter_sunflower_candidate",
-            peashooter_sunflower_candidate is not None,
-            (
-                f"candidate_count={candidate_count}, "
-                f"selected_source={value_int(peashooter_sunflower_candidate or {}, 'sourcePlantType', 'source_plant_type', default=-1)}, "
-                f"selected_ingredient={value_int(peashooter_sunflower_candidate or {}, 'ingredientPlantType', 'ingredient_plant_type', 'targetPlantType', default=-1)}"
-            ),
+        print(
+            "[fusion-test] initial_probe "
+            f"candidate_count={candidate_count} "
+            f"peashooter_sunflower_available={peashooter_sunflower_candidate is not None}"
         )
     except Exception as exc:
         record("fusion_probe_runtime", False, str(exc))
         print_smoke_results(checks)
         return False
 
-    if legal_candidate is None:
+    if peashooter_sunflower_candidate is None:
         try:
             rows = int(observation.get("rowCount") or env.config.row_count or 5)
             cols = int(observation.get("columnCount") or env.config.column_count or 10)
