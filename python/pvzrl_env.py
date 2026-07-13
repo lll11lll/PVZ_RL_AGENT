@@ -60,7 +60,7 @@ from pvzrl_fusion import (
 from pvzrl_registry import (
     DEFAULT_PLANT_REGISTRY_PATH,
     get_plant_registry,
-    normalize_plant_name as normalize_registry_plant_name,
+    normalize_plant_name,
 )
 from pvzrl_observation_facts import StepFacts, StepFactsCache, build_step_facts
 from pvzrl_diagnostics import (
@@ -539,12 +539,6 @@ class PvZBridgeClient:
         if self.debug_performance and isinstance(data, dict):
             data["bridge_roundtrip_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
         return data
-
-
-def normalize_plant_name(value: str) -> str:
-    """Compatibility forwarding wrapper for the canonical registry normalizer."""
-
-    return normalize_registry_plant_name(value)
 
 
 def load_plant_registry(path: Path = PLANT_REGISTRY_PATH) -> Dict[str, Any]:

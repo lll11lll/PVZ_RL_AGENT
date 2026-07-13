@@ -46,7 +46,12 @@ from pvzrl_action_space import (
     normalize_action_space_mode,
 )
 from pvzrl_env import parse_seed_list, resolve_seed_list
-from pvzrl_rewards import REWARD_COMPONENT_FIELDS, REWARD_EPISODE_TOTAL_FIELDS, RewardConfig
+from pvzrl_rewards import (
+    FUSION_REWARD_COMPONENT_NAMES,
+    REWARD_COMPONENT_FIELDS,
+    REWARD_EPISODE_TOTAL_FIELDS,
+    RewardConfig,
+)
 from pvzrl_env import (
     LEVEL3_SPECIALIST_PLANT_TYPES,
     LEVEL3_SPECIALIST_SEED_LIST,
@@ -248,20 +253,8 @@ PROGRESS_CSV_ACTION_DURATION_FIELDS = [
 ]
 PROGRESS_CSV_DIAGNOSTIC_FIELDS = PROGRESS_CSV_DIAGNOSTIC_INT_FIELDS + PROGRESS_CSV_ACTION_DURATION_FIELDS
 FUSION_REWARD_FLOAT_FIELDS = [
-    "fusion_attempt_reward_total",
-    "fusion_success_reward_total",
-    "fusion_new_recipe_reward_total",
-    "fusion_recursive_reward_total",
-    "fusion_tier_reward_total",
-    "fusion_repeat_decay_total",
-    "fusion_threatened_row_bonus_total",
-    "fusion_active_wave_bonus_total",
-    "fusion_defensive_value_bonus_total",
-    "fusion_incompatible_penalty_total",
-    "fusion_empty_tile_penalty_total",
-    "fusion_failed_penalty_total",
-    "fusion_bridge_error_penalty_total",
-    "fusion_spam_penalty_total",
+    f"{name}_total" for name in FUSION_REWARD_COMPONENT_NAMES
+] + [
     "fusion_last_reward_delta",
     "fusion_last_usefulness_bonus",
 ]

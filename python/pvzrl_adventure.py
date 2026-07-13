@@ -39,16 +39,6 @@ from pvzrl_seed_inventory import inventory_from_runtime_sources
 from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
 
 
-ADVENTURE_SEED_PRIORITY = [
-    "SunFlower",
-    "Peashooter",
-    "WallNut",
-    "PotatoMine",
-    "SnowPea",
-    "Repeater",
-    "CherryBomb",
-]
-
 BASE_UNLOCKED_SEEDS = ("SunFlower", "Peashooter")
 KNOWN_ADVENTURE_LEVEL_UNLOCKS = {
     1: ["CherryBomb"],
@@ -185,19 +175,6 @@ def launch_gui(live_status_path: Path) -> Optional[subprocess.Popen[Any]]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-
-
-def choose_seed_loadout(
-    configured_seed_list: List[str],
-    available_seed_names: List[str],
-    unlocked_seed_names: List[str],
-    conservative_seeds: bool,
-    allow_new_plants: bool,
-) -> List[str]:
-    # The PPO decoder is slot-semantic, so Adventure must not reorder or replace
-    # seeds at runtime. Newly unlocked plants are tracked elsewhere until a model
-    # family explicitly declares that layout.
-    return list(configured_seed_list)
 
 
 def _seed_alias_map() -> Dict[str, str]:
@@ -2900,13 +2877,10 @@ def run_adventure_eval(
                 state = env.base.adventure_screen_state()
                 update_unlocked_from_state(unlocked, state, source="level_start", level=tracker_level)
                 available = _ordered_unique_seed_names(list(state.get("availableSeedNames", []) or []))
-                selected_seeds = choose_seed_loadout(
-                    list(config_for_level.get("seed_list", [])),
-                    available_seed_names=available,
-                    unlocked_seed_names=sorted(unlocked.keys()),
-                    conservative_seeds=conservative_seeds,
-                    allow_new_plants=allow_new_plants,
-                )
+                # The PPO decoder is slot-semantic, so Adventure must not reorder or replace
+                # seeds at runtime. Newly unlocked plants are tracked elsewhere until a model
+                # family explicitly declares that layout.
+                selected_seeds = list(config_for_level.get("seed_list", []))
                 level.selected_seeds = selected_seeds
                 level.available_seed_names = available
                 level.unknown_visible_seed_names = list(state.get("unknownVisibleSeedNames", []) or [])
