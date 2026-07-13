@@ -2244,37 +2244,42 @@ def main() -> int:
         generalist_module.build_live_status = original_live_status
 
     dash = fake_dashboard()
-    generalist_tab_source = inspect.getsource(PvZDashboard._build_adventure_generalist_tab)
+    generalist_tab_source = inspect.getsource(PvZDashboard._build_train_tab)
     assert_case(results, "GUI has reusable scrollable container helper", hasattr(PvZDashboard, "_make_scrollable_container"))
     assert_case(
         results,
-        "GUI generalist tab uses scrollable container",
+        "GUI live generalist training tab uses scrollable container",
         "_make_scrollable_container(parent)" in generalist_tab_source,
         generalist_tab_source,
     )
-    launch_idx = generalist_tab_source.find("Launch Controls")
-    basic_idx = generalist_tab_source.find("Basic Training Settings")
-    advanced_idx = generalist_tab_source.find("Advanced Curriculum / Unlock Behavior")
-    masks_idx = generalist_tab_source.find("Masks / Timeouts")
+    status_idx = generalist_tab_source.find("Adventure Generalist Training")
+    basic_idx = generalist_tab_source.find("Core Training Settings")
+    paths_idx = generalist_tab_source.find("Model / Run Paths")
+    advanced_idx = generalist_tab_source.find("Advanced Settings")
     preview_idx = generalist_tab_source.find("Command Preview")
-    train_button_idx = generalist_tab_source.find("Start Adventure Generalist Train")
+    train_button_idx = generalist_tab_source.find("Start Training")
+    resume_button_idx = generalist_tab_source.find("Resume Training")
     assert_case(
         results,
-        "GUI section hierarchy is ordered for usability",
-        0 <= launch_idx < basic_idx < advanced_idx < masks_idx < preview_idx,
+        "GUI live section hierarchy is ordered for usability",
+        0 <= status_idx < basic_idx < paths_idx < train_button_idx < advanced_idx < preview_idx,
         {
-            "launch_idx": launch_idx,
+            "status_idx": status_idx,
             "basic_idx": basic_idx,
+            "paths_idx": paths_idx,
             "advanced_idx": advanced_idx,
-            "masks_idx": masks_idx,
             "preview_idx": preview_idx,
         },
     )
     assert_case(
         results,
-        "GUI Start button is in top launch section before basic settings",
-        0 <= train_button_idx < basic_idx,
-        {"train_button_idx": train_button_idx, "basic_idx": basic_idx},
+        "GUI live training actions expose start and resume before advanced settings",
+        0 <= train_button_idx < resume_button_idx < advanced_idx,
+        {
+            "train_button_idx": train_button_idx,
+            "resume_button_idx": resume_button_idx,
+            "advanced_idx": advanced_idx,
+        },
     )
 
     resume_cli_config = build_generalist_config_for_test(resume_model_path="runs/old_generalist/model.zip")

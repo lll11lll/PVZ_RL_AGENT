@@ -150,9 +150,6 @@ class GuiStatusViewMixin:
     def _read_live_status_file(self) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         return self._status_reader().read()
 
-    def _reset_live_status_cache(self) -> None:
-        self._status_reader().reset()
-
     def _live_health(self, age: float, payload: Optional[Dict[str, Any]] = None) -> str:
         return classify_live_health(age, payload)
 

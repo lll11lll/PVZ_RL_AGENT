@@ -75,9 +75,7 @@ DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
 _PLANT_REGISTRY = get_plant_registry()
 _FOUR_SLOT_CURRENT = _PLANT_REGISTRY.require_gui_preset("four_slot_current")
 _FOUR_SLOT_DUPLICATE = _PLANT_REGISTRY.require_gui_preset("four_slot_duplicate")
-_DEFAULT_PROFILE_NAME = _FOUR_SLOT_CURRENT.display_name
 ADVENTURE_DEFAULT_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
-FUSION_POLICY_CHOICES = ("none", "observe", "scripted", "assist")
 STRUCTURED_COACH_COMMANDS = tuple(command.value for command in AssistedCommandType)
 ASSISTED_EXECUTION_MODES = tuple(mode.value for mode in AssistedExecutionMode)
 LAB_MODES = ("Normal", "Assisted", "Fusion", "Curriculum")
@@ -85,7 +83,6 @@ LEVEL3_SEED_LIST = _FOUR_SLOT_CURRENT.seed_csv
 LEVEL3_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
 ADVENTURE_GENERALIST_INITIAL_LOADOUT = _FOUR_SLOT_DUPLICATE.seed_csv
-PROFILES = {preset.display_name: preset.seed_csv for preset in _PLANT_REGISTRY.gui_presets}
 
 
 class _Tooltip:
@@ -140,7 +137,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.board_timeout_var = tk.StringVar(value="60")
         self.gameplay_ready_timeout_var = tk.StringVar(value="30")
         self.checkpoint_freq_var = tk.StringVar(value="5000")
-        self.profile_var = tk.StringVar(value=_DEFAULT_PROFILE_NAME)
         self.fusion_policy_var = tk.StringVar(value="none")
         self.quick_wait_var = tk.BooleanVar(value=True)
         self.wait_gameplay_ready_var = tk.BooleanVar(value=True)
@@ -823,49 +819,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         preview.columnconfigure(0, weight=1)
         self.eval_preview = self._preview_box(preview, height=6)
 
-    def _build_level3_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(4, weight=1)
-
-        mode = ttk.LabelFrame(parent, text="Level 3 Specialist")
-        mode.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        mode.columnconfigure(1, weight=1)
-        ttk.Radiobutton(mode, text="Train", variable=self.level3_mode_var, value="train").grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Radiobutton(mode, text="Eval", variable=self.level3_mode_var, value="eval").grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        self._add_labeled_entry(mode, 1, 0, "Target level", self.level3_target_level_var)
-        self._add_labeled_entry(mode, 1, 2, "Model .zip", self.level3_model_path_var, width=46, columnspan=3)
-
-        settings = ttk.LabelFrame(parent, text="Run Settings")
-        settings.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
-        for column in (1, 3):
-            settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Timesteps", self.level3_total_timesteps_var)
-        self._add_labeled_entry(settings, 0, 2, "Episodes", self.level3_episodes_var)
-        self._add_labeled_entry(settings, 1, 0, "Max steps", self.level3_max_steps_var)
-        self._add_labeled_entry(settings, 1, 2, "Game speed", self.level3_game_speed_var)
-        self._add_labeled_entry(settings, 2, 0, "Step seconds", self.level3_step_seconds_var)
-        self._add_labeled_entry(settings, 2, 2, "Board timeout", self.level3_board_timeout_var)
-        self._add_labeled_entry(settings, 3, 0, "Seed list", self.level3_seed_list_var, width=46, columnspan=3)
-        self._add_labeled_entry(settings, 4, 0, "Plant types", self.level3_plant_types_var, width=46, columnspan=3)
-
-        masks = ttk.LabelFrame(parent, text="Tactical Masks")
-        masks.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        ttk.Checkbutton(masks, text="tactical masks", variable=self.level3_tactical_masks_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="WallNut mask", variable=self.level3_wallnut_mask_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="CherryBomb mask", variable=self.level3_cherrybomb_mask_var).grid(row=0, column=2, sticky="w", padx=6, pady=3)
-
-        actions = ttk.Frame(parent)
-        actions.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
-        self._add_launch_button(actions, "Start Level 3", self.start_level3_specialist).grid(row=0, column=0, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Models", command=self.refresh_models).grid(row=0, column=1, sticky="w", padx=(0, 5))
-        self._add_stop_button(actions, "Stop Run").grid(row=0, column=2, sticky="w", padx=(0, 5))
-
-        preview = ttk.LabelFrame(parent, text="Command Preview")
-        preview.grid(row=4, column=0, sticky="nsew", padx=8, pady=(3, 6))
-        preview.rowconfigure(0, weight=1)
-        preview.columnconfigure(0, weight=1)
-        self.level3_preview = self._preview_box(preview, height=5)
-
     def _build_diagnostics_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(3, weight=1)
@@ -1514,12 +1467,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         ttk.Button(charts, text="Analyze Selected Run", command=self.analyze_selected_run).grid(row=0, column=0, sticky="w", padx=6, pady=6)
         ttk.Button(charts, text="Show Charts", command=self.show_charts).grid(row=0, column=1, sticky="w", padx=6, pady=6)
 
-    def _build_logs_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        actions = ttk.LabelFrame(parent, text="Logs")
-        actions.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        ttk.Button(actions, text="Clear logs", command=self.clear_logs).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-
     def _toggle_train_advanced(self) -> None:
         frame = self.train_advanced_frame
         if frame is None:
@@ -1609,21 +1556,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             return
         self.coach_queue_status_var.set(f"Queued {count} Fusion command(s) at {time.strftime('%H:%M:%S')}")
         self._append_log(f"Queued {count} Fusion command(s) to {queue_path}.\n")
-
-    def _add_options(self, parent: ttk.Frame) -> None:
-        ttk.Checkbutton(parent, text="quick-wait", variable=self.quick_wait_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(parent, text="wait gameplay", variable=self.wait_gameplay_ready_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(parent, text="auto seeds", variable=self.auto_select_seeds_var).grid(row=0, column=2, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(parent, text="debug perf", variable=self.debug_perf_var).grid(row=0, column=3, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(parent, text="fast-only diag", variable=self.fast_only_var).grid(row=0, column=4, sticky="w", padx=6, pady=3)
-        ttk.Label(parent, text="fusion").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Combobox(
-            parent,
-            textvariable=self.fusion_policy_var,
-            values=FUSION_POLICY_CHOICES,
-            state="readonly",
-            width=10,
-        ).grid(row=1, column=1, sticky="w", padx=6, pady=3)
 
     def _add_labeled_entry(
         self,
@@ -1863,12 +1795,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             f"mode={self.assisted_execution_mode_var.get()}"
         )
 
-    def _on_profile_selected(self, _event: Any = None) -> None:
-        seed_list = PROFILES.get(self.profile_var.get())
-        if seed_list:
-            self.seed_list_var.set(seed_list)
-            self._append_log(f"Profile selected: {self.profile_var.get()} seed_list={seed_list}\n")
-
     def _update_command_previews(self) -> None:
         if self.train_preview is not None:
             resume_model_path = self.generalist_resume_model_path_var.get().strip()
@@ -1937,202 +1863,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
                 self._command_text(self._build_level3_command()),
             ]
             self._set_text_widget(self.level3_preview, "\n".join(lines))
-
-    def _build_adventure_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-        parent.rowconfigure(3, weight=1)
-
-        model = ttk.LabelFrame(parent, text="Model")
-        model.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        model.columnconfigure(1, weight=1)
-        self._add_labeled_entry(model, 0, 0, "Model .zip", self.adventure_model_path_var, width=54)
-        ttk.Button(model, text="Browse", command=self.browse_adventure_model).grid(row=0, column=2, sticky="w", padx=(0, 5), pady=2)
-        ttk.Button(model, text="Refresh", command=self.refresh_adventure_model).grid(row=0, column=3, sticky="w", padx=(0, 6), pady=2)
-        live_entry = self._add_labeled_entry(model, 1, 0, "Live status", self.adventure_live_status_var, width=54)
-        live_entry.configure(state="readonly")
-
-        main = ttk.Frame(parent)
-        main.grid(row=1, column=0, sticky="nsew", padx=8, pady=3)
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=2)
-        main.rowconfigure(0, weight=1)
-
-        settings = ttk.LabelFrame(main, text="Adventure Settings")
-        settings.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=0)
-        for column in (1, 3):
-            settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Seed list", self.adventure_seed_list_var, width=42, columnspan=3)
-        self._add_labeled_entry(settings, 1, 0, "Plant types", self.adventure_plant_types_var, width=42, columnspan=3)
-        self._add_labeled_entry(settings, 2, 0, "Max levels", self.adventure_max_levels_var)
-        self._add_labeled_entry(settings, 2, 2, "Max attempts", self.adventure_max_attempts_var)
-        self._add_labeled_entry(settings, 3, 0, "Episodes", self.adventure_episodes_var)
-        self._add_labeled_entry(settings, 3, 2, "Wins to advance", self.adventure_advance_wins_var)
-        self._add_labeled_entry(settings, 4, 0, "Game speed", self.adventure_game_speed_var)
-        self._add_labeled_entry(settings, 4, 2, "Step seconds", self.adventure_step_seconds_var)
-        self._add_labeled_entry(settings, 5, 0, "Soft Max Steps", self.adventure_soft_max_steps_var)
-        self._add_labeled_entry(settings, 5, 2, "Hard Max Steps", self.adventure_hard_max_steps_var)
-        self._add_labeled_entry(settings, 6, 0, "Board timeout", self.adventure_board_timeout_var)
-
-        ttk.Checkbutton(settings, text="adventure eval", variable=self.adventure_eval_var).grid(row=7, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="advance on wins", variable=self.adventure_advance_on_wins_var).grid(row=7, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="auto seeds", variable=self.adventure_auto_select_seeds_var).grid(row=7, column=2, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="wait gameplay", variable=self.adventure_wait_gameplay_ready_var).grid(row=7, column=3, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="quick wait", variable=self.adventure_quick_wait_var).grid(row=8, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="final-wave extension", variable=self.adventure_final_wave_extension_var).grid(row=8, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="tactical masks", variable=self.adventure_tactical_masks_var).grid(row=9, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="WallNut mask", variable=self.adventure_wallnut_mask_var).grid(row=9, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(settings, text="CherryBomb mask", variable=self.adventure_cherrybomb_mask_var).grid(row=9, column=2, sticky="w", padx=6, pady=3)
-        ttk.Label(settings, text="fusion").grid(row=8, column=2, sticky="w", padx=6, pady=3)
-        ttk.Combobox(
-            settings,
-            textvariable=self.adventure_fusion_policy_var,
-            values=FUSION_POLICY_CHOICES,
-            state="readonly",
-            width=10,
-        ).grid(row=8, column=3, sticky="w", padx=6, pady=3)
-
-        status = ttk.LabelFrame(main, text="Adventure Live Summary")
-        status.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=0)
-        status.rowconfigure(0, weight=1)
-        status.columnconfigure(0, weight=1)
-        self.adventure_status_text = scrolledtext.ScrolledText(status, height=12, wrap="word", font=("Consolas", 9))
-        self.adventure_status_text.grid(row=0, column=0, sticky="nsew")
-        self.adventure_status_text.configure(state="disabled")
-
-        actions = ttk.Frame(parent)
-        actions.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        self._add_launch_button(actions, "Start Adventure Eval", self.start_adventure_eval).grid(row=0, column=0, sticky="w", padx=(0, 5))
-        self._add_stop_button(actions, "Stop Run").grid(row=0, column=1, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Open Run Folder", command=self.open_adventure_run_folder).grid(row=0, column=2, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Diagnostics Now", command=self.refresh_diagnostics_now).grid(row=0, column=3, sticky="w", padx=(0, 5))
-
-        preview = ttk.LabelFrame(parent, text="Command Preview")
-        preview.grid(row=3, column=0, sticky="nsew", padx=8, pady=(3, 6))
-        preview.rowconfigure(0, weight=1)
-        preview.columnconfigure(0, weight=1)
-        self.adventure_preview = self._preview_box(preview, height=3)
-
-    def _build_adventure_generalist_tab(self, parent: ttk.Frame) -> None:
-        scroll_content = self._make_scrollable_container(parent)
-        scroll_content.columnconfigure(0, weight=1)
-
-        schema = ttk.LabelFrame(scroll_content, text="Adventure Generalist 14-Slot Identity")
-        schema.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        schema.columnconfigure(1, weight=1)
-        ttk.Label(schema, text=f"family: {ADVENTURE_GENERALIST_MODEL_FAMILY}").grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=6, pady=2
-        )
-        ttk.Label(schema, text="schema: action_count=701, wait=0, slots=14, observation=adventure_14slot_identity_v1").grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=6, pady=2
-        )
-        self._add_labeled_entry(schema, 2, 0, "Initial loadout", self.generalist_initial_loadout_var, width=52, columnspan=3)
-        max_slots_entry = self._add_labeled_entry(schema, 3, 0, "Max seed slots", self.generalist_max_seed_slots_var)
-        max_slots_entry.configure(state="readonly")
-
-        launch = ttk.LabelFrame(scroll_content, text="Launch Controls")
-        launch.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
-        launch.columnconfigure(0, weight=1)
-        launch.columnconfigure(1, weight=1)
-        launch.columnconfigure(2, weight=1)
-        ttk.Label(launch, text="Starts a fresh 14-slot Adventure Generalist training run.").grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 2)
-        )
-        self._add_launch_button(launch, "Start Adventure Generalist Train", self.start_adventure_generalist_train).grid(
-            row=1, column=0, sticky="w", padx=6, pady=(0, 4)
-        )
-        self._add_stop_button(launch, "Stop Run").grid(row=1, column=1, sticky="w", padx=6, pady=(0, 4))
-
-        settings = ttk.LabelFrame(scroll_content, text="Basic Training Settings")
-        settings.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        for column in (1, 3):
-            settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Timesteps", self.generalist_total_timesteps_var)
-        self._add_labeled_entry(settings, 0, 2, "Checkpoint freq", self.generalist_checkpoint_freq_var)
-        self._add_labeled_entry(settings, 1, 0, "Start level", self.generalist_start_level_var)
-        self._add_labeled_entry(settings, 1, 2, "Max levels", self.generalist_max_levels_var)
-        self._add_labeled_entry(settings, 2, 0, "Max attempts", self.generalist_max_attempts_var)
-        self._add_labeled_entry(settings, 2, 2, "Game speed", self.generalist_game_speed_var)
-        self._add_labeled_entry(settings, 3, 0, "Step seconds", self.generalist_step_seconds_var)
-        self._add_labeled_entry(settings, 3, 2, "Board timeout", self.generalist_board_timeout_var)
-        self._add_labeled_entry(settings, 4, 0, "Soft Max Steps", self.generalist_soft_max_steps_var)
-        self._add_labeled_entry(settings, 4, 2, "Hard Max Steps", self.generalist_hard_max_steps_var)
-        self._add_labeled_entry(settings, 5, 0, "Run dir", self.generalist_run_dir_var, width=48, columnspan=3)
-        self._add_labeled_entry(
-            settings,
-            6,
-            0,
-            "Resume training model .zip",
-            self.generalist_resume_model_path_var,
-            width=44,
-            columnspan=2,
-        )
-        ttk.Button(settings, text="Browse", command=self.browse_generalist_resume_model).grid(
-            row=6, column=3, sticky="w", padx=(0, 5), pady=2
-        )
-        ttk.Button(settings, text="Refresh", command=self.refresh_generalist_resume_model).grid(
-            row=6, column=4, sticky="w", padx=(0, 6), pady=2
-        )
-        self._add_labeled_entry(settings, 7, 0, "Eval model .zip", self.generalist_eval_model_path_var, width=44, columnspan=2)
-        ttk.Button(settings, text="Browse", command=self.browse_generalist_eval_model).grid(row=7, column=3, sticky="w", padx=(0, 5), pady=2)
-        ttk.Button(settings, text="Refresh", command=self.refresh_generalist_eval_model).grid(row=7, column=4, sticky="w", padx=(0, 6), pady=2)
-        self._add_labeled_entry(settings, 8, 0, "Eval episodes", self.generalist_eval_episodes_var)
-        self._add_launch_button(settings, "Start Adventure Generalist Eval", self.start_adventure_generalist_eval).grid(
-            row=8, column=2, sticky="w", padx=6, pady=2
-        )
-
-        curriculum = ttk.LabelFrame(scroll_content, text="Advanced Curriculum / Unlock Behavior")
-        curriculum.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
-        for column in (1, 3):
-            curriculum.columnconfigure(column, weight=1)
-        ttk.Checkbutton(curriculum, text="unlock-aware", variable=self.generalist_unlock_curriculum_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(curriculum, text="replay cleared", variable=self.generalist_replay_cleared_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(curriculum, text="randomize seed order", variable=self.generalist_randomize_seed_order_var).grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Label(curriculum, text="curriculum").grid(row=0, column=2, sticky="w", padx=6, pady=3)
-        ttk.Combobox(
-            curriculum,
-            textvariable=self.generalist_curriculum_var,
-            values=("conservative", "varied"),
-            state="readonly",
-            width=14,
-        ).grid(row=0, column=3, sticky="w", padx=6, pady=3)
-        self._add_labeled_entry(curriculum, 1, 2, "Unlock delay", self.generalist_unlock_delay_var)
-        self._add_labeled_entry(curriculum, 2, 0, "New plant min prob", self.generalist_new_plant_prob_var)
-        self._add_labeled_entry(curriculum, 2, 2, "Frontier prob", self.generalist_frontier_prob_var)
-        self._add_labeled_entry(curriculum, 3, 0, "Recent prob", self.generalist_recent_prob_var)
-        self._add_labeled_entry(curriculum, 3, 2, "Maintenance prob", self.generalist_maintenance_prob_var)
-        self._add_labeled_entry(
-            curriculum,
-            4,
-            0,
-            "Wins in a row before level promotion",
-            self.generalist_frontier_win_streak_required_var,
-        )
-
-        masks = ttk.LabelFrame(scroll_content, text="Masks / Timeouts")
-        masks.grid(row=4, column=0, sticky="ew", padx=8, pady=3)
-        ttk.Checkbutton(masks, text="quick wait", variable=self.generalist_quick_wait_var).grid(row=0, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="wait gameplay", variable=self.generalist_wait_gameplay_ready_var).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="final-wave extension", variable=self.generalist_final_wave_extension_var).grid(row=0, column=2, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="tactical masks", variable=self.generalist_tactical_masks_var).grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="WallNut mask", variable=self.generalist_wallnut_mask_var).grid(row=1, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="CherryBomb mask", variable=self.generalist_cherrybomb_mask_var).grid(row=1, column=2, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="fusion mask (train)", variable=self.generalist_fusion_action_mask_train_var).grid(row=2, column=0, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(masks, text="fusion mask (eval)", variable=self.generalist_fusion_action_mask_eval_var).grid(row=2, column=1, sticky="w", padx=6, pady=3)
-
-        preview = ttk.LabelFrame(scroll_content, text="Command Preview")
-        preview.grid(row=5, column=0, sticky="ew", padx=8, pady=(3, 3))
-        preview.rowconfigure(0, weight=1)
-        preview.columnconfigure(0, weight=1)
-        self.generalist_preview = self._preview_box(preview, height=3)
-
-        status = ttk.LabelFrame(scroll_content, text="Adventure Generalist Live Status")
-        status.grid(row=6, column=0, sticky="ew", padx=8, pady=(3, 6))
-        status.rowconfigure(0, weight=1)
-        status.columnconfigure(0, weight=1)
-        self.generalist_status_text = scrolledtext.ScrolledText(status, height=6, wrap="word", font=("Consolas", 9))
-        self.generalist_status_text.grid(row=0, column=0, sticky="nsew")
-        self.generalist_status_text.configure(state="disabled")
 
     def _set_text_widget(self, widget: tk.Text, content: str) -> None:
         widget.configure(state="normal")

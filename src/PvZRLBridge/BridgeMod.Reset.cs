@@ -1654,44 +1654,6 @@ public sealed partial class BridgeMod
         return false;
     }
 
-    private bool IsLossScreenActive(bool broadScan = false)
-    {
-        var info = DetectRestartScreenInfo(broadScan);
-        return HasLossRestartEvidence(info);
-    }
-
-    private bool IsRestartButtonActive(bool broadScan = false)
-    {
-        return DetectRestartScreenInfo(broadScan).RestartButtonActive;
-    }
-
-    private bool IsLoseMenuButtonVisible()
-    {
-        try
-        {
-            foreach (var button in Object.FindObjectsOfType<LoseMenuBtn>())
-            {
-                try
-                {
-                    if (button == null || button.gameObject == null || !button.gameObject.activeInHierarchy)
-                    {
-                        continue;
-                    }
-
-                    WorldToScreen(button.transform.position, out var inBounds);
-                    if (inBounds)
-                    {
-                        return true;
-                    }
-                }
-                catch { }
-            }
-        }
-        catch { }
-
-        return false;
-    }
-
     private RestartScreenInfo DetectRestartScreenInfo(bool broadScan = false) =>
         broadScan ? DetectRestartScreenSlowDiagnostic() : DetectRestartScreenFastCached();
 

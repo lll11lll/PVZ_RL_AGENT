@@ -670,13 +670,15 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
         assert second_stats["hits"] >= 1
 
         decision = base.action_decision(124, observation, source="human_coach")
-        allowed, reason = base._python_action_filter(
+        filter_decision = base.action_decision(
             124,
             observation,
+            source="python_filter",
             bridge_actions=list(observation["legalActions"]),
         )
         assert decision.cache_reused and decision.source == "human_coach"
-        assert allowed and reason == ""
+        assert filter_decision.cache_reused and filter_decision.legal
+        assert filter_decision.rejection_reason == ""
         mismatched_intent = build_action_intent(
             124,
             source="gui",

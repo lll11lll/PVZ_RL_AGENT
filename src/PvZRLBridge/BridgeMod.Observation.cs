@@ -1206,23 +1206,4 @@ public sealed partial class BridgeMod
         }
     }
 
-    private object BuildDoneInfo()
-    {
-        var obs = BuildObservation();
-        return new { obs.Done, obs.TerminalHint, obs.Over, obs.Wave, obs.MaxWave, obs.ZombieCount };
-    }
-
-    private object BuildRewardHints()
-    {
-        var obs = BuildObservation();
-        return new
-        {
-            obs.KillCount,
-            obs.Wave,
-            obs.TotalPlantHealth,
-            obs.Done,
-            obs.TerminalHint,
-            nearestZombieXByLane = obs.Lanes.Select(l => new { l.Row, l.NearestZombieX }).ToArray()
-        };
-    }
 }

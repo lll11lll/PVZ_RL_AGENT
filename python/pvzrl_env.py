@@ -5938,20 +5938,6 @@ class PvZGymEnv:
             "actionCacheKey": cache.key.to_dict(),
         }
 
-    def _python_action_filter(
-        self,
-        action: int,
-        observation: Dict[str, Any],
-        bridge_actions: Optional[List[int]] = None,
-    ) -> Tuple[bool, str]:
-        decision = self.action_decision(
-            int(action),
-            observation,
-            source="python_filter",
-            bridge_actions=bridge_actions,
-        )
-        return bool(decision.legal), str(decision.rejection_reason or "")
-
     def _fusion_action_mask_enabled(self) -> bool:
         return bool(getattr(self.config, "fusion_action_mask_enabled", False))
 
@@ -6214,17 +6200,6 @@ class PvZGymEnv:
             except (TypeError, ValueError):
                 continue
         return int(default)
-
-    @staticmethod
-    def _safe_float(*values: Any, default: float = 0.0) -> float:
-        for value in values:
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return float(default)
 
 def validate_observation(observation: Dict[str, Any]) -> None:
     required = [

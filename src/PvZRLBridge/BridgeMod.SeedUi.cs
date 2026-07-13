@@ -1296,25 +1296,6 @@ public sealed partial class BridgeMod
         };
     }
 
-    private bool IsSeedSelectionLikelyActive(Board? board, List<SeedCardDto> cards)
-    {
-        if (cards.Count == 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            var gameplayReady = ComputeRawGameplayReady(board);
-            return IsSeedSelectionPanelActive(FindInitBoard(), board) ||
-                   (!gameplayReady && !(board?.startMove ?? false) && cards.Any(card => card.UiVisible && !card.OnCardBank));
-        }
-        catch
-        {
-            return cards.Any(card => card.UiVisible && !card.OnCardBank);
-        }
-    }
-
     private List<UiProbeEntryDto> BuildSeedChooserSignals()
     {
         return BuildUiProbeEntries(includeAll: false, maxEntries: 500)
@@ -1756,23 +1737,6 @@ public sealed partial class BridgeMod
         catch { }
 
         return result;
-    }
-
-    private static bool NameSuggestsSelectedBank(SeedCardDto card)
-    {
-        if (IsSelectedSeedBankPath(card.HierarchyPath))
-        {
-            return true;
-        }
-
-        var text = NormalizeUiText($"{card.GameObjectName}/{card.ParentName}/{card.CardParentName}/{card.RootName}/{card.HierarchyPath}/{card.Text}/{card.TextBg}");
-        return (text.Contains("selectedbank") ||
-                text.Contains("selectedseed") ||
-                text.Contains("cardbank") ||
-                text.Contains("seedbank") ||
-                text.Contains("bank")) &&
-               !text.Contains("almanac") &&
-               !NameSuggestsAvailableChooser(card);
     }
 
     private static bool NameSuggestsAvailableChooser(SeedCardDto card)
@@ -2898,9 +2862,4 @@ public sealed partial class BridgeMod
         catch { return false; }
     }
 
-    private bool SafeCardDisabled(CardUI card)
-    {
-        try { return card.disabled; }
-        catch { return true; }
-    }
 }

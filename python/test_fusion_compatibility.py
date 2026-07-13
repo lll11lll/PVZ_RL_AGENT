@@ -131,11 +131,20 @@ def run_mask_cases(results: List[Dict[str, Any]]) -> None:
     # not in the bridge's normal placement set); they include the empty-tile plant.
     bridge = [0, plant_empty]
 
+    def filter_result(env: PvZGymEnv, action: int, bridge_actions: List[int]) -> tuple[bool, str]:
+        decision = env.action_decision(
+            action,
+            obs,
+            source="fusion_compatibility_test",
+            bridge_actions=bridge_actions,
+        )
+        return bool(decision.legal), str(decision.rejection_reason or "")
+
     decoded = decode_action(fuse_compatible, obs, [1, 0, 3, 2])
-    on_compatible = env_on._python_action_filter(fuse_compatible, obs, bridge_actions=bridge)
-    on_incompatible = env_on._python_action_filter(fuse_incompatible, obs, bridge_actions=bridge)
-    on_plant_empty = env_on._python_action_filter(plant_empty, obs, bridge_actions=bridge)
-    off_compatible = env_off._python_action_filter(fuse_compatible, obs, bridge_actions=bridge)
+    on_compatible = filter_result(env_on, fuse_compatible, bridge)
+    on_incompatible = filter_result(env_on, fuse_incompatible, bridge)
+    on_plant_empty = filter_result(env_on, plant_empty, bridge)
+    off_compatible = filter_result(env_off, fuse_compatible, bridge)
     obs["legalActions"] = list(bridge)
     complete_mask = env_on.action_mask(obs)
 
@@ -153,9 +162,7 @@ def run_mask_cases(results: List[Dict[str, Any]]) -> None:
                 bool(complete_mask[encode(0, 2, 4)]), complete_mask[encode(0, 2, 4)])
     assert_case(results, "complete action mask excludes incompatible fusion",
                 not bool(complete_mask[fuse_incompatible]), complete_mask[fuse_incompatible])
-    sunflower_self_fusion = env_on._python_action_filter(
-        encode(0, 2, 4), obs, bridge_actions=[0, encode(0, 2, 4)]
-    )
+    sunflower_self_fusion = filter_result(env_on, encode(0, 2, 4), [0, encode(0, 2, 4)])
     assert_case(results, "mask exposes SunFlower self-fusion",
                 sunflower_self_fusion == (True, ""), sunflower_self_fusion)
 

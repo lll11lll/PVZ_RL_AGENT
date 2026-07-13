@@ -1605,18 +1605,6 @@ def _active_seed_slot_count(
     return None
 
 
-def _seed_slot_for_index(observation: Dict[str, Any], *, seed_index: int) -> Optional[Dict[str, Any]]:
-    slots = observation.get("seedSlots")
-    if not isinstance(slots, list):
-        return None
-    if not (0 <= int(seed_index) < len(slots)):
-        return None
-    slot = slots[int(seed_index)]
-    if not isinstance(slot, dict):
-        return None
-    return slot
-
-
 def _seed_slot_block_reason(observation: Dict[str, Any], slot: Optional[Dict[str, Any]]) -> str:
     if not isinstance(slot, dict):
         return ""
@@ -1864,21 +1852,6 @@ def _legal_policy_actions(spec: ActionSpaceSpec, observation: Dict[str, Any], ac
             except Exception:
                 continue
     return {action for action in result if 0 <= action < int(spec.action_count)}
-
-
-def _policy_action_allowed(
-    action: int,
-    spec: ActionSpaceSpec,
-    observation: Dict[str, Any],
-    action_mask: Optional[Any],
-) -> bool:
-    if action_mask is not None:
-        try:
-            if 0 <= action < len(action_mask):
-                return bool(action_mask[action])
-        except TypeError:
-            pass
-    return action in _legal_policy_actions(spec, observation, action_mask)
 
 
 def _has_legality_signal(action_mask: Optional[Any], observation: Dict[str, Any]) -> bool:
