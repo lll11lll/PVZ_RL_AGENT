@@ -1,6 +1,6 @@
 # PvZRL Repository Refinement Plan
 
-Status: Phase 8 available validation complete; overall acceptance incomplete because live-game, cross-run performance, and net runtime-volume gates remain unmet
+Status: Phase 8 automated/local-Tk validation and partial real-game validation complete; overall acceptance remains incomplete because live fixed training/evaluation and lifecycle-transition coverage, the cross-run performance gate, and the net runtime-volume gate remain unmet
 Plan date: 2026-07-11
 Verified baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
 
@@ -62,7 +62,7 @@ Unless a separately documented defect correction has focused regression coverage
 - Python execution safeguards remain even after mask reuse; cached decisions may be reused only for a demonstrably unchanged observation frame and configuration fingerprint.
 - Bridge-side validation remains final runtime authority.
 - Preserve occupied-cell fusion exposure, self-fusions, compatibility-only cases, tile scoping, recursive results, source attribution, costs, cooldowns, reasons, and one-time reward/count accounting.
-- Required recursive identities include Repeater `1030`, Threepeater `1031`, Gatling Pea `1032`, and Twin SunFlower `1033`.
+- Required recursive identities, corrected against the live game enum and observed results, are DoubleShooer `1030`, SplitPea `1090`, Gatling Pea `1032`, and TwinFlower `1033`. Plant type `1031` is SunShroom, not a pea-chain result.
 
 ### Rewards and serialized artifacts
 
@@ -95,10 +95,10 @@ Unless a separately documented defect correction has focused regression coverage
 | 2 | Immutable plant registry, generated bridge fallbacks, typed resolved configuration, schedule repair | Complete | Registry parity, precedence matrix, model/action/observation metadata snapshots |
 | 3 | Authoritative action intent/decision/result and fusion recipe/validation/execution pipeline | Complete | Exhaustive encode/decode, 701 masks, source parity, legal/illegal/self/recursive fusion contracts |
 | 4 | Per-observation facts, reward/metric consolidation, watchdog/live-status I/O | Complete | Component reward replay at `1e-9`, identical external schemas, before/after benchmarks |
-| 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete (automated; live game unavailable) | Recorded lifecycle equivalence, state/schema parity, all automated gates, and exact final-live omissions recorded |
-| 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete (automated; live game unavailable) | Build after every split, DTO snapshots, zero warnings, live placement/fusion/reset/seed checks |
-| 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete (automated and local Tk; live game unavailable) | Command snapshots, malformed/stale/unchanged status, bounded logs, callback/process lifecycle, interactive smoke |
-| 8 | Full validation, independent reviews, final benchmarks/statistics/report | Complete for available automated/local-Tk validation; overall acceptance gaps recorded | Every automated gate green; environment-specific omissions documented with exact commands |
+| 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete for automated gates; partial final live coverage | Recorded lifecycle equivalence plus real loss/retry/reset; win, timeout, reward/unlock, replay, and advancement traces remain outstanding |
+| 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete for source/automated gates; partial final live coverage | Final DLL startup, observation, legality, wait, placement, invalid-action safety, fusion, reset, and the corrected clean-start Generalist evaluation pass; live latency and broader transition checks remain outstanding |
+| 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete for automated and local-Tk gates; live game-backed GUI pending | Command/status/process lifecycle coverage passes; live game-backed GUI interaction remains outstanding |
+| 8 | Full validation, independent reviews, final benchmarks/statistics/report | Complete for automated/local-Tk and partial real-game validation; overall acceptance gaps recorded | Executed live evidence and exact remaining gates documented without closing performance or volume deviations |
 
 ## Risk controls and rollback boundaries
 

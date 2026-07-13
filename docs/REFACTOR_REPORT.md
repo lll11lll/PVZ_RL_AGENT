@@ -1,14 +1,14 @@
 # PvZRL Refactor Execution Report
 
-Status: available Phase 8 validation complete; overall goal acceptance remains incomplete
+Status: automated/local-Tk validation and partial real-game Phase 8 validation complete; overall goal acceptance remains incomplete
 Report started: 2026-07-11
 Baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
 
 ## Executive status
 
-The repository-wide implementation and every available bridge-free/local-Tk validation phase are complete. Separate compatibility, concurrency, refactoring-quality, performance, and final-diff reviews were run, and their high-confidence findings were resolved where the environment allowed.
+The repository-wide implementation, every bridge-free/local-Tk validation phase, and a bounded final-source real-game gate are complete. Separate compatibility, concurrency, refactoring-quality, performance, and final-diff reviews were run, and their high-confidence findings were resolved where the environment allowed.
 
-The overall goal is not labeled complete: no game/bridge process was available for the required real-game traces, training/resume, or evaluation, and first-party runtime code increased from 48,127 to 55,318 physical lines instead of achieving a net reduction. The report preserves these as acceptance gaps rather than converting strong automated coverage into unsupported live or code-volume claims.
+The overall goal is not labeled complete. The final bridge was exercised in the real game for startup, menu/seed/gameplay entry, observation and action semantics, repeated loss/retry reset, fusion, and a corrected protected Generalist evaluation. Short fresh/resumed fixed training, fixed Level-3 evaluation, win/timeout/reward/unlock/replay/advancement traces, live game-backed GUI operation, and measured live latency remain outstanding. The cross-run approximately-5% performance gate also remains unresolved, and first-party runtime code increased from 48,127 to 55,339 physical lines rather than achieving a net reduction.
 
 ## Baseline repository state
 
@@ -454,7 +454,7 @@ Rollback boundaries, in order: `14e1a3d` status reader; `6373f82` command snapsh
 
 ### Phase 8 - full validation and independent review
 
-Status: complete for every available automated and local-Tk gate. Overall goal acceptance remains incomplete because the required live-game checks could not run, the repeat benchmark did not close the cross-run 5% policy gate, and physical runtime volume increased rather than decreased.
+Status: complete for every automated/local-Tk gate and the recorded partial real-game gate. Overall goal acceptance remains incomplete because fixed training/evaluation and several terminal/progression traces remain unexecuted, the repeat benchmark did not close the cross-run 5% policy gate, and physical runtime volume increased rather than decreased.
 
 Final implementation and review fixes:
 
@@ -462,15 +462,30 @@ Final implementation and review fixes:
 - The refactoring-quality review found 260 lines of unmounted GUI tab builders/options, an expired private action-filter adapter, four additional private Python helpers, and a 300-line dead C# mix/reflection/reset/seed/observation helper graph. Tests now inspect the mounted Training tab and call the canonical action decision/status health paths. Commits `409138a` and `80376cf` remove 636 runtime lines and add one, net `-635`; full Python, bridge, script, and real-Tk gates remain green.
 - The final ownership map now names the split bridge, pure facts/reward/lifecycle modules, Generalist reducer, GUI command/process/status/view/queue modules, and shared file tailer rather than attributing those systems to their former monoliths.
 - No further high-confidence bulk deletion remains. Python production imports are acyclic; no private Python no-caller helper or C# private identifier-singleton helper remains. Closing the overall volume gap would require another substantive redesign of live-compatible state schemas and large reset/step loops, not safe dead-code cleanup.
+- The first retained live Generalist attempt exposed a real recursive-fusion identity defect: Python predicted plant `1031` after DoubleShooer plus Peashooter while the game produced `1090`, yielding five `fusion_result_mismatch`/mask-bridge disagreements. Authoritative live results and the game enum identify `1030` as DoubleShooer, `1090` as SplitPea, `1032` as GatlingPea, and `1031` as SunShroom. Commit `c7d38bc` corrects the registry/feature chain and adds bridge-free empty/unrelated-board candidate regressions; the failed attempt is retained rather than hidden.
 
 Final automated and compatibility evidence:
 
-- Dependency readiness and `compileall`: PASS. Full pytest: PASS, 293 tests plus 10 subtests. All nine retained standalone regression entrypoints exit zero after the final code cleanup.
+- Dependency readiness and `compileall`: PASS. Full pytest: PASS, 294 tests plus 10 subtests. All nine retained standalone regression entrypoints exit zero after the final recursive-fusion correction.
 - Bridge build: PASS with zero warnings. Three consecutive final-source builds are byte-identical. Final DLL SHA-256 is `f6be2f86b9c001b15f88ac5637853a3f8a6eda2f103ef06a67a43e2a632c187a`; PDB SHA-256 is `86b89424d889dc75e42ed7344bc586c236b741618634c5317542569280ba5934`. The lifecycle harness passes 58,553 checks.
 - A withdrawn real `tk.Tk()` dashboard builds the mounted Training, Evaluation, Coach, Diagnostics, Runs/Models, status, and log surfaces, schedules both pollers, processes an event cycle, and closes through the production callback. Command, status, queue, process, rollover, and never-exits lifecycle coverage remains green.
 - Both protected metadata dry-runs return `compatible=true`, `ok=true`, no warnings, and no blocked reason. Actual CPU loads remain Generalist `(701, (4297,), 370000)` and fixed `(201, (357,), 350368)`. The June 21 Generalist control also remains loadable.
-- All six protected model/metadata sizes, mtimes, and SHA-256 values exactly match the Phase 5 table. The installed recovery DLL remains untouched at `5643ec37984762ab72fea3c50e87fcc466b905c5cf046c307fdaa6e0ce42a0f4`; current source was not copied into `Game Files/Mods`.
-- Deterministic Python contracts remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; recursive live-status schema `53e6489a...`; GUI alias projection `400cd2f1...`. Bridge top-level observation and recursive nested DTO contracts remain 122 properties and `c0d34a11...`.
+- All six protected model/metadata sizes, mtimes, and SHA-256 values exactly match the Phase 5 table. The installed recovery DLL was preserved before the live gate, the deterministic final DLL was installed temporarily for validation, and the original DLL was restored and reverified at `5643ec37984762ab72fea3c50e87fcc466b905c5cf046c307fdaa6e0ce42a0f4`.
+- Deterministic Python contracts remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; recursive live-status schema `53e6489a...`; GUI alias projection `400cd2f1...`; corrected fusion-candidate snapshot `bac8d8a6...`. Bridge top-level observation and recursive nested DTO contracts remain 122 properties and `c0d34a11...`.
+
+Partial real-game evidence:
+
+- The installed recovery DLL was copied to `runs/manual_phase8/final_live_gate/PvZRLBridge.recovery.dll` and verified at SHA-256 `5643ec37984762ab72fea3c50e87fcc466b905c5cf046c307fdaa6e0ce42a0f4` before the deterministic final DLL was installed. The final bridge loaded and accepted connections on port 32323; after the gate the recovery DLL was restored to `Game Files/Mods`, its hash was reverified, and the listener was closed.
+- Adventure startup passed through popup dismissal, the reward/menu state, Adventure selection, Level 6 seed selection, and gameplay with the duplicate `SunFlower,SunFlower,Peashooter,Peashooter` loadout. The corrected-source startup is persisted in `runs/manual_phase8/final_live_gate/recursive_fix_startup_state_smoke.log`.
+- The environment smoke obtained a structured observation and 201 legal actions, preserved occupied-cell exclusion, accepted a legal teacher action, advanced on wait, placed on the requested tile, and rejected an invalid action safely.
+- A soft reset requested during active wave 7 was rejected by the production safety guard. This is expected safety behavior, not a reset failure. Three real losses exercised `LoseMenuBtn.TryAgain`, seed selection, Let's Rock, and reset acceptance on clean four-slot wave-0 boards with no plants and five mowers (`reset_after_fusion_patch.log`, `reset_for_generalist_eval.log`, and `recursive_fix_reset_for_eval.log`). A separate seed-selection flow accepted a clean two-slot board (`reset_before_coach_scope_rerun.log`); it is not mislabeled as a TryAgain reset.
+- Live fusion semantics passed through the dedicated fusion bridge command. Peashooter plus SunFlower produced plant ID `1000` (`PeaSunFlower`) with exactly one changed tile; an empty source was rejected as `source_not_found`; occupied normal placement remained blocked; and the control plant was unchanged. The initial empty-board diagnostic was corrected so setup state is informational rather than a false failure.
+- The live coach fusion-scope test exposed and fixed a bare-`PvZGymEnv.client` compatibility defect. Its rerun selected one fresh `fusion_step`, mutated only the requested tile, and preserved the control plant; the bridge-free coach suite now covers both wrapped and bare environment boundaries.
+- The first protected Generalist run is a retained FAIL for fusion compatibility, not final evidence: `generalist_eval_20260712_203311` recorded five illegal `fusion_result_mismatch` events and five mask/bridge disagreements. After the correction, a 311-step run joined an already active wave-3 board and proved 13/13 fusion success with no disagreement, but was not accepted as a clean episode.
+- The final protected 370,000-step Generalist run started at the Level-6 seed-selection boundary, auto-selected the exact duplicate loadout, and entered a clean wave-0 board with 201 legal actions, no plants, and five mowers. `generalist_eval_recursive_fix_clean_20260712_210447` completed a classified loss in 547 policy steps with process exit zero, final wave 9, two mowers lost, 45 attempted/45 successful/0 failed fusions, zero illegal actions, zero bridge errors, zero reset failures, zero mask/bridge disagreements, and no rejection reasons. Result counts were runtime-only/unknown `-1`: 3, DoubleShooer `1030`: 8, SplitPea `1090`: 7, GatlingPea `1032`: 6, and TwinFlower `1033`: 21. The shell exit and run path are persisted in `generalist_eval_recursive_fix_clean.log`; no anomaly diagnostics file was produced because no anomaly occurred.
+- The protected fixed Level-3 evaluator was invoked from an isolated output directory and correctly failed fast at the actual Level-6 boundary with `blocked_reason=not_at_level3_specialist_start_state`. WallNut and CherryBomb were not unlocked in this profile, so fresh/resumed four-slot fixed training was not started against an incompatible live seed bank.
+- Short fresh/resumed fixed training, fixed Level-3 evaluation at Level 3, win/timeout/reward/unlock/replay/advancement traces, live game-backed GUI operation, and measured live bridge/step latency remain unverified.
+- Final cleanup reverified the installed recovery hash and a closed port 32323, but Windows continued to expose an elevated `PlantsVsZombiesRH.exe` process record (PID 23116, no window/listener). Normal stop, forced `Stop-Process`, and `taskkill /F` could not remove it because access was denied. Manual elevated-process cleanup remains required and is not mislabeled as a stopped-process proof.
 
 Independent review disposition:
 
@@ -494,15 +509,15 @@ Final code statistics, using the exact baseline exclusions:
 | Measure | Baseline | Final | Change |
 | --- | ---: | ---: | ---: |
 | Runtime files | 17 | 47 | +30 |
-| Runtime physical lines | 48,127 | 55,318 | +7,191 (+14.94%) |
-| Python runtime lines | 36,562 | 43,137 | +6,575 |
+| Runtime physical lines | 48,127 | 55,339 | +7,212 (+14.99%) |
+| Python runtime lines | 36,562 | 43,158 | +6,596 |
 | C# runtime lines, excluding generated registry | 11,488 | 12,085 | +597 |
 | Build-script lines | 77 | 96 | +19 |
-| Raw runtime diff | - | +25,032 / -17,841 | +7,191 |
+| Raw runtime diff | - | +25,092 / -17,880 | +7,212 |
 | Python test files | 9 | 32 | +23 |
-| Python test physical lines | 6,154 | 13,974 | +7,820 |
-| Raw Python test diff | - | +7,851 / -31 | +7,820 |
-| Documentation diff | - | +773 / -0 | +773 |
+| Python test physical lines | 6,154 | 14,033 | +7,879 |
+| Raw Python test diff | - | +7,921 / -42 | +7,879 |
+| Documentation diff (`REFACTOR_PLAN.md`, `REFACTOR_REPORT.md`, root `AGENTS.md`) | - | +1,241 / -0 | +1,241 |
 | Python function definitions | 1,043 | 1,311 | +268 |
 | Python class definitions | 59 | 135 | +76 |
 | Confirmed function/method names removed | - | 81 | 68 Python + 13 C# |
@@ -516,13 +531,29 @@ The raw removal count is not a code-reduction claim: 10,742 C# method-body lines
 
 Measured acceptance deviation:
 
-- The initial audit expected 5,000-8,000 fewer runtime lines and named 4,800 lines/10% as its completion threshold. The final repository instead has 7,191 more runtime lines. This is not relabeled as reduction. The refactor deleted large duplicated bodies and improved ownership, but immutable schemas, pure compositors, compatibility projections, split scaffolding, stronger state models, and runtime diagnostics outweighed those deletions physically.
+- The initial audit expected 5,000-8,000 fewer runtime lines and named 4,800 lines/10% as its completion threshold. The final repository instead has 7,212 more runtime lines. This is not relabeled as reduction. The refactor deleted large duplicated bodies and improved ownership, but immutable schemas, pure compositors, compatibility projections, split scaffolding, stronger state models, and runtime diagnostics outweighed those deletions physically.
 - The coordinating goal text says not to sacrifice correctness, compatibility, diagnostics, or readability to hit an arbitrary deletion target. After the independent dead-code sweep, no further high-confidence bulk deletion remains. Meeting the original numeric target now would require a new, high-risk redesign rather than evidence-backed cleanup.
-- Large residual units remain: `pvzrl_env.py` is 10,225 lines, its reset state machine is about 988 lines, both environment/SB3 step methods exceed 700 lines, and bridge Seed/UI and Reset remain above 2,800 and 2,100 lines. `pvzrl_lifecycle.py` remains a 615-line shadow/contract artifact. Numeric coercion and compatibility-heavy live-status emission remain distributed.
+- Large residual units remain: `pvzrl_env.py` is 10,238 lines, its reset state machine is about 988 lines, both environment/SB3 step methods exceed 700 lines, and bridge Seed/UI and Reset remain above 2,800 and 2,100 lines. `pvzrl_lifecycle.py` remains a 615-line shadow/contract artifact. Numeric coercion and compatibility-heavy live-status emission remain distributed.
 
-Exact remaining live-game validation commands:
+Live-game validation record and exact remaining commands:
 
-The commands below are deliberately not run automatically while the installed recovery DLL is the only known-good live install. They preserve it first, install the deterministic final build, and write new outputs under a timestamped validation directory rather than protected runs.
+The final-source install/startup and bounded environment checks above have now run, and the original installed recovery DLL has been restored and reverified. The commands below are retained as reproducibility evidence or remain required where explicitly marked.
+
+| Live gate | Status |
+| --- | --- |
+| Final DLL load and bridge connection | PASS |
+| Popup/menu/seed/gameplay entry | PASS |
+| Observation, legality, wait, placement, invalid-action safety | PASS |
+| Active-wave reset safety guard | PASS, safely blocked as designed |
+| Real-loss retry/reset to clean gameplay | PASS, three TryAgain resets to clean four-slot boards; separate two-slot seed-selection flow also passed |
+| Dedicated live fusion semantics and tile scope | PASS |
+| Coach fusion scope through bare environment boundary | PASS |
+| Protected Generalist Level-6 evaluation | PASS after correcting a retained mismatch: clean-start 547-step classified loss, 45/45 fusions, zero illegal/disagreement/bridge/reset failures, zero exit |
+| Fixed Level-3 evaluation | BLOCKED as designed at current Level 6 |
+| Fresh fixed training and resume | PENDING; required plants are not unlocked in the current profile |
+| Win, timeout, reward/unlock, replay, and advancement traces | PENDING |
+| Live game-backed GUI interaction | PENDING |
+| Live bridge/step latency and rollout SPS | PENDING |
 
 ```powershell
 $tag = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -536,17 +567,19 @@ Start-Process -FilePath '.\Game Files\PlantsVsZombiesRH.exe'
 Test-NetConnection 127.0.0.1 -Port 32323
 ```
 
-Expected: the installed DLL hashes to `f6be2f86...`, MelonLoader reports a zero-error PvZRLBridge load, and `TcpTestSucceeded` is `True`. Preserve `$backup` until every command below passes.
+Observed: the installed DLL hashed to `f6be2f86...`, the bridge loaded, and port 32323 accepted connections. The preserved recovery DLL was restored after the bounded gate.
+
+The following live commands have incompatible state preconditions and are not a sequential recipe. Reset/relaunch to the required clean gameplay, loss/retry, or seed-selection boundary before each command. In particular, the reset command requires a transition-safe loss/seed path; the production guard correctly blocks destructive reset during an active wave.
 
 ```powershell
-python .\python\pvzrl_env.py --smoke-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
-python .\python\pvzrl_env.py --fusion-semantics-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
-python .\python\pvzrl_env.py --coach-fusion-scope-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
-python .\python\pvzrl_env.py --reset-state-machine-test --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --quick-wait
-python .\python\pvzrl_env.py --auto-select-seeds-test --episodes 2 --seed-list SunFlower,Peashooter,WallNut,CherryBomb --quick-wait
+python .\python\pvzrl_env.py --smoke-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --start-sun 9990
+python .\python\pvzrl_env.py --fusion-semantics-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --start-sun 9990
+python .\python\pvzrl_env.py --coach-fusion-scope-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --start-sun 9990
+python .\python\pvzrl_env.py --reset-state-machine-test --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --quick-wait
+python .\python\pvzrl_env.py --auto-select-seeds-test --episodes 2 --seed-list SunFlower,SunFlower,Peashooter,Peashooter --quick-wait
 ```
 
-Expected: every smoke row reports PASS; observations and legal actions are structured; wait advances; a normal plant changes only the requested tile; invalid/empty/incompatible fusions retain their exact reasons; legal self/recursive fusions report one tile-scoped mutation and one event; reset returns a clean playable observation; two seed selections complete without unsafe gameplay-before-selection.
+Observed for the bounded smoke/fusion/coach/reset checks: structured observations and legal actions, wait advancement, normal placement, safe invalid-action rejection, exact empty-source rejection, one tile-scoped Peashooter-plus-SunFlower fusion, control-plant preservation, and repeated loss-to-seed-to-clean-board resets. Dedicated incompatible/self/recursive recipe scenarios and the two-episode command remain part of the broader live matrix.
 
 ```powershell
 $fixedRun = Join-Path $manualRoot 'fixed_fresh'
@@ -556,20 +589,31 @@ python .\python\train_ppo.py --run-mode fixed_train --config configs\ppo_sunflow
 python .\python\train_ppo.py --level3-eval --target-level 3 --model-path python\runs\ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_130623\model.zip --episodes 1 --seed-list SunFlower,Peashooter,WallNut,CherryBomb --plant-types 1,0,3,2 --fusion-policy none --tactical-masks --wallnut-tactical-mask --cherrybomb-tactical-mask --quick-wait --wait-gameplay-ready
 ```
 
-Expected: fresh training collects at least one rollout and writes new checkpoint/model/metadata files under `$fixedRun`; resume loads that new model into `$resumeRun`, advances `num_timesteps` beyond 512 without changing action/observation metadata, and never writes the source model; fixed evaluation completes one real terminal episode.
+These commands remain pending. They require the exact live bank `SunFlower,Peashooter,WallNut,CherryBomb`; the validation profile exposed only SunFlower and Peashooter at Level 6. The Level-3 command was run from an isolated directory and correctly failed fast with `blocked_reason=not_at_level3_specialist_start_state`. Once the prerequisites exist, fresh training must collect at least one rollout under `$fixedRun`, resume must advance a newly written model under `$resumeRun`, and fixed evaluation must complete one real terminal episode without writing the protected source model.
 
 ```powershell
 python .\python\pvzrl_env.py --adventure-state-smoke --duration-seconds 180 --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --quick-wait
-python .\python\train_ppo.py --adventure-generalist-eval --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip --episodes 1 --seed-list SunFlower,SunFlower,Peashooter,Peashooter --initial-loadout SunFlower,SunFlower,Peashooter,Peashooter --plant-types 1,1,0,0 --action-space-mode adventure_14slot_identity --max-seed-slots 14 --max-adventure-levels 10 --max-attempts-per-level 10 --quick-wait --wait-gameplay-ready
+$generalistRun = Join-Path $manualRoot 'generalist_level6'
+python .\python\train_ppo.py --config configs\ppo_adventure_generalist_14slot_identity_v1.json --adventure-generalist-eval --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip --run-dir $generalistRun --live-status-path (Join-Path $generalistRun 'live_status.json') --adventure-start-level 6 --max-adventure-levels 1 --max-attempts-per-level 1 --advance-on-wins 1 --quick-wait --wait-gameplay-ready
 python .\python\pvzrl_gui.py --live-status-path runs\live_status.json
 ```
 
-Expected: Adventure smoke observes valid menu/seed/gameplay/post-win states without bridge errors; Generalist evaluation loads 701 actions/4,297 observations and completes one real episode while preserving startup identity, unlock, replay, and advancement state; the GUI starts, renders live health/status, submits local coach/mock commands, launches/stops a validation process, and closes within the hard deadline. Win, loss, timeout, reward/unlock, same-level replay, and Adventure advancement must each be retained as inspectable live-status/progress traces before accepting the new DLL.
+Observed after the recursive-identity correction: the clean-boundary Generalist command loaded 701 model actions/4,297 observations, entered wave 0 with 201 currently legal actions, and completed a 547-step real loss with 45/45 successful fusions, no illegal action, no bridge/reset error, no mask/bridge disagreement, and process exit zero. The longer Adventure state smoke, live game-backed GUI, and win/timeout/reward/unlock/replay/advancement coverage remain pending; each must be retained as an inspectable trace before those gates can be accepted.
 
-If any live check fails, stop the game and restore the preserved install before further diagnosis:
+If any live check fails, stop the game, wait for bridge port 32323 to close, restore the preserved install, and verify its session backup hash before further diagnosis:
 
 ```powershell
+$backupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash
+Get-Process PlantsVsZombiesRH -ErrorAction SilentlyContinue | Stop-Process
+$deadline = (Get-Date).AddSeconds(15)
+do {
+    $listening = (Test-NetConnection 127.0.0.1 -Port 32323 -WarningAction SilentlyContinue).TcpTestSucceeded
+    if ($listening) { Start-Sleep -Milliseconds 250 }
+} while ($listening -and (Get-Date) -lt $deadline)
+if ($listening) { throw 'Bridge listener still open; do not overwrite the installed DLL.' }
 Copy-Item -LiteralPath $backup -Destination $installed -Force
+$restoredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash
+if ($restoredHash -ne $backupHash) { throw "Installed bridge restore hash mismatch: $restoredHash != $backupHash" }
 ```
 
-Final rollback boundaries added in Phase 8: `34dabc1` bounded hard close; `409138a` dead GUI/Python/C# compatibility paths; `80376cf` expired helper adapters. The earlier phase rollback commits remain listed in their phase sections.
+Final rollback boundaries added in Phase 8: `34dabc1` bounded hard close; `409138a` dead GUI/Python/C# compatibility paths; `80376cf` expired helper adapters; `8c06886` empty-board-aware live fusion diagnostics; `62b197b` bare live coach environment support; `c7d38bc` corrected live recursive fusion identities and bridge-free setup regression. The earlier phase rollback commits remain listed in their phase sections.
