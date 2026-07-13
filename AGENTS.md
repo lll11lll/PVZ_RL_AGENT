@@ -179,7 +179,7 @@ Startup validation compares wrapper-expected, bridge-detected, profile, UI, seed
 
 Loss, win, timeout, transition, reset, reward, unlock, seed-selection, and gameplay-ready are distinct lifecycle states. Soft timeouts may extend only under the configured final-wave policy; hard timeouts remain terminal. Keep `terminal_reason`, `timeout_classification`, reset phase/reason, and post-win evidence coherent across results, status, and artifacts.
 
-`python/pvzrl_lifecycle.py` is the production authority for pure screen/lifecycle predicates. Compatibility methods in `pvzrl_env.py` and exact-parity Adventure helpers delegate to it; do not restore local predicate bodies. The environment reset state machine still owns clicks, polling, guards, observation handoff, and other side effects.
+`python/pvzrl_lifecycle.py` is the production authority for pure screen/lifecycle predicates. Compatibility methods in `pvzrl_env.py` and exact-parity Adventure helpers delegate to it; do not restore local predicate bodies. Aggregate `classify_lifecycle()` remains a shadow/contract projection. The environment reset state machine still owns clicks, polling, guards, observation handoff, and other side effects.
 
 ## 5. Sources of truth
 
