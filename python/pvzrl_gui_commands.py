@@ -5,14 +5,11 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
-
-from pvzrl_action_space import ACTION_SPACE_ADVENTURE_14_IDENTITY
+from typing import Any, List
 
 
 DEFAULT_INTERVENTION_LOG_PATH = Path("logs") / "interventions" / "dashboard_interventions.jsonl"
 STREAM_COACH_PLATFORMS = ("mock", "twitch", "youtube")
-ADVENTURE_GENERALIST_ACTION_SPACE_MODE = ACTION_SPACE_ADVENTURE_14_IDENTITY
 
 
 class _FallbackValue:
@@ -35,33 +32,6 @@ class GuiCommandMixin:
     def _add_enabled_flag(self, command: List[str], flag: str, enabled: bool) -> None:
         if enabled:
             command.append(flag)
-
-    def _safe_run_name(self, value: str) -> str:
-        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value.strip())
-        return "_".join(part for part in cleaned.split("_") if part) or "run"
-
-    def _append_train_run_target(self, command: List[str]) -> None:
-        run_dir = self.run_dir_var.get().strip()
-        run_name = self.run_name_var.get().strip()
-        if run_dir:
-            command.extend(["--run-dir", run_dir])
-        elif run_name:
-            command.extend(["--run-dir", str(Path("runs") / self._safe_run_name(run_name))])
-
-    def _append_eval_run_dir(self, command: List[str]) -> None:
-        run_dir = self.run_dir_var.get().strip()
-        if run_dir:
-            command.extend(["--run-dir", run_dir])
-
-    def _append_common_train_eval_flags(self, command: List[str]) -> None:
-        self._add_enabled_flag(command, "--quick-wait", self.quick_wait_var.get())
-        self._add_enabled_flag(command, "--wait-gameplay-ready", self.wait_gameplay_ready_var.get())
-        self._add_enabled_flag(command, "--auto-select-seeds", self.auto_select_seeds_var.get())
-        self._add_enabled_flag(command, "--debug-perf", self.debug_perf_var.get())
-        command.extend(["--fusion-policy", self.fusion_policy_var.get().strip() or "none"])
-        lab_var_name = "eval_lab_mode_var" if any("eval" in part for part in command) else "train_lab_mode_var"
-        lab_mode = getattr(self, lab_var_name, _FallbackValue("Normal")).get()
-        self._append_coach_flags(command, lab_mode=lab_mode)
 
     def _append_coach_flags(self, command: List[str], *, lab_mode: str = "") -> None:
         selected_lab_mode = str(lab_mode or "Normal").strip().lower()
@@ -120,85 +90,12 @@ class GuiCommandMixin:
     def _append_live_status_arg(self, command: List[str]) -> None:
         command.extend(["--live-status-path", self._path_for_command(self.live_status_path)])
 
-    def _build_train_command(self, resume: bool = False) -> List[str]:
-        command = self._script_command("train_ppo.py", "--train")
-        self._add_optional_value(command, "--seed-list", self.seed_list_var.get())
-        self._add_optional_value(command, "--total-timesteps", self.total_timesteps_var.get())
-        self._add_optional_value(command, "--max-steps", self.max_steps_var.get())
-        self._add_optional_value(command, "--step-seconds", self.step_seconds_var.get())
-        self._add_optional_value(command, "--game-speed", self.game_speed_var.get())
-        self._add_optional_value(command, "--start-sun", self.start_sun_var.get())
-        self._add_optional_value(command, "--board-timeout", self.board_timeout_var.get())
-        self._add_optional_value(command, "--gameplay-ready-timeout", self.gameplay_ready_timeout_var.get())
-        self._add_optional_value(command, "--checkpoint-freq", self.checkpoint_freq_var.get())
-        self._append_common_train_eval_flags(command)
-        if resume:
-            model_path = self.model_path_var.get().strip()
-            if model_path:
-                command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-        self._append_train_run_target(command)
-        self._append_live_status_arg(command)
-        return command
-
-    def _build_eval_command(self, episodes_override: Optional[str] = None) -> List[str]:
-        command = self._script_command("train_ppo.py", "--eval")
-        model_path = self.model_path_var.get().strip()
-        if model_path:
-            command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-        self._add_optional_value(command, "--episodes", episodes_override or self.episodes_var.get())
-        self._add_optional_value(command, "--max-steps", self.max_steps_var.get())
-        self._add_optional_value(command, "--step-seconds", self.step_seconds_var.get())
-        self._add_optional_value(command, "--game-speed", self.game_speed_var.get())
-        self._append_common_train_eval_flags(command)
-        self._add_optional_value(command, "--seed-list", self.seed_list_var.get())
-        self._append_eval_run_dir(command)
-        self._append_live_status_arg(command)
-        return command
-
-    def _build_adventure_command(self) -> List[str]:
-        command = self._script_command("train_ppo.py")
-        self._add_enabled_flag(command, "--adventure-eval", self.adventure_eval_var.get())
-        model_path = self.adventure_model_path_var.get().strip()
-        if model_path:
-            command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-        self._add_optional_value(command, "--episodes", self.adventure_episodes_var.get())
-        self._add_optional_value(command, "--game-speed", self.adventure_game_speed_var.get())
-        self._add_optional_value(command, "--step-seconds", self.adventure_step_seconds_var.get())
-        self._add_optional_value(command, "--adventure-soft-max-steps", self.adventure_soft_max_steps_var.get())
-        self._add_optional_value(command, "--adventure-hard-max-steps", self.adventure_hard_max_steps_var.get())
-        command.append(
-            "--adventure-final-wave-extension"
-            if self.adventure_final_wave_extension_var.get()
-            else "--no-adventure-final-wave-extension"
-        )
-        self._add_optional_value(command, "--board-timeout", self.adventure_board_timeout_var.get())
-        self._add_enabled_flag(command, "--quick-wait", self.adventure_quick_wait_var.get())
-        self._add_enabled_flag(command, "--wait-gameplay-ready", self.adventure_wait_gameplay_ready_var.get())
-        self._add_enabled_flag(command, "--auto-select-seeds", self.adventure_auto_select_seeds_var.get())
-        if self.adventure_advance_on_wins_var.get():
-            self._add_optional_value(command, "--advance-on-wins", self.adventure_advance_wins_var.get())
-        self._add_optional_value(command, "--max-adventure-levels", self.adventure_max_levels_var.get())
-        self._add_optional_value(command, "--max-attempts-per-level", self.adventure_max_attempts_var.get())
-        self._add_optional_value(command, "--seed-list", self.adventure_seed_list_var.get())
-        self._add_optional_value(command, "--plant-types", self.adventure_plant_types_var.get())
-        self._add_enabled_flag(command, "--tactical-masks", self.adventure_tactical_masks_var.get())
-        self._add_enabled_flag(command, "--wallnut-tactical-mask", self.adventure_wallnut_mask_var.get())
-        self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.adventure_cherrybomb_mask_var.get())
-        command.extend(["--fusion-policy", self.adventure_fusion_policy_var.get().strip() or "none"])
-        self._append_coach_flags(
-            command,
-            lab_mode=getattr(self, "eval_lab_mode_var", _FallbackValue("Normal")).get(),
-        )
-        self._append_live_status_arg(command)
-        return command
-
     def _build_adventure_generalist_command(self) -> List[str]:
         command = self._script_command("train_ppo.py", "--adventure-generalist-train")
         self._add_optional_value(command, "--total-timesteps", self.generalist_total_timesteps_var.get())
         self._add_optional_value(command, "--checkpoint-freq", self.generalist_checkpoint_freq_var.get())
         self._add_optional_value(command, "--initial-loadout", self.generalist_initial_loadout_var.get())
         self._add_optional_value(command, "--seed-list", self.generalist_initial_loadout_var.get())
-        command.extend(["--action-space-mode", ADVENTURE_GENERALIST_ACTION_SPACE_MODE])
         self._add_optional_value(command, "--max-seed-slots", self.generalist_max_seed_slots_var.get())
         self._add_optional_value(command, "--adventure-start-level", self.generalist_start_level_var.get())
         self._add_optional_value(command, "--max-adventure-levels", self.generalist_max_levels_var.get())
@@ -251,10 +148,8 @@ class GuiCommandMixin:
         model_path = self.generalist_eval_model_path_var.get().strip()
         if model_path:
             command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-        self._add_optional_value(command, "--episodes", self.generalist_eval_episodes_var.get())
         self._add_optional_value(command, "--initial-loadout", self.generalist_initial_loadout_var.get())
         self._add_optional_value(command, "--seed-list", self.generalist_initial_loadout_var.get())
-        command.extend(["--action-space-mode", ADVENTURE_GENERALIST_ACTION_SPACE_MODE])
         self._add_optional_value(command, "--max-seed-slots", self.generalist_max_seed_slots_var.get())
         self._add_optional_value(command, "--adventure-start-level", self.generalist_start_level_var.get())
         self._add_optional_value(command, "--max-adventure-levels", self.generalist_max_levels_var.get())
@@ -282,34 +177,6 @@ class GuiCommandMixin:
             command,
             lab_mode=getattr(self, "eval_lab_mode_var", _FallbackValue("Normal")).get(),
         )
-        self._append_live_status_arg(command)
-        return command
-
-    def _build_level3_command(self) -> List[str]:
-        mode = self.level3_mode_var.get().strip().lower()
-        command = self._script_command("train_ppo.py", "--level3-eval" if mode == "eval" else "--level3-train")
-        self._add_optional_value(command, "--target-level", self.level3_target_level_var.get())
-        if mode == "eval":
-            model_path = self.level3_model_path_var.get().strip()
-            if model_path:
-                command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-            self._add_optional_value(command, "--episodes", self.level3_episodes_var.get())
-        else:
-            self._add_optional_value(command, "--total-timesteps", self.level3_total_timesteps_var.get())
-            model_path = self.level3_model_path_var.get().strip()
-            if model_path:
-                command.extend(["--model-path", str(self._resolve_text_path(model_path))])
-        self._add_optional_value(command, "--seed-list", self.level3_seed_list_var.get())
-        self._add_optional_value(command, "--plant-types", self.level3_plant_types_var.get())
-        self._add_optional_value(command, "--game-speed", self.level3_game_speed_var.get())
-        self._add_optional_value(command, "--step-seconds", self.level3_step_seconds_var.get())
-        self._add_optional_value(command, "--max-steps", self.level3_max_steps_var.get())
-        self._add_optional_value(command, "--board-timeout", self.level3_board_timeout_var.get())
-        command.extend(["--quick-wait", "--wait-gameplay-ready", "--auto-select-seeds"])
-        self._add_enabled_flag(command, "--tactical-masks", self.level3_tactical_masks_var.get())
-        self._add_enabled_flag(command, "--wallnut-tactical-mask", self.level3_wallnut_mask_var.get())
-        self._add_enabled_flag(command, "--cherrybomb-tactical-mask", self.level3_cherrybomb_mask_var.get())
-        command.extend(["--fusion-policy", "none"])
         self._append_live_status_arg(command)
         return command
 

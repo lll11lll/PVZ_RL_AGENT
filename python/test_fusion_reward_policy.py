@@ -26,11 +26,9 @@ from pvzrl_rewards import fusion_source_from_result
 from train_ppo import (
     EPISODE_METRIC_FIELDS,
     PROGRESS_CSV_DIAGNOSTIC_FIELDS,
-    EvalLog,
     build_reward_config,
     clean_episode_row,
     summarize_episode_rows,
-    summarize_eval_logs,
     write_progress_csv_rows,
 )
 
@@ -235,13 +233,6 @@ class FusionRewardPolicyTests(unittest.TestCase):
         self.assertGreater(summary["fusion_reward_total"], 0.0)
         self.assertGreater(summary["fusion_success_reward_total"], 0.0)
 
-        eval_log = EvalLog(policy="ppo", episode=1)
-        eval_log.fusion_reward_total = outcome["delta"]
-        eval_log.fusion_success_reward_total = env._fusion_reward_live_fields()["fusion_success_reward_total"]
-        eval_summary = summarize_eval_logs([eval_log])
-        self.assertGreater(eval_summary["fusion_reward_total"], 0.0)
-        self.assertGreater(eval_summary["fusion_success_reward_total"], 0.0)
-
     def test_progress_csv_writer_accepts_new_diagnostics_with_old_header(self) -> None:
         old_fieldnames = [field for field in EPISODE_METRIC_FIELDS if field not in PROGRESS_CSV_DIAGNOSTIC_FIELDS]
         row = clean_episode_row(
@@ -290,9 +281,6 @@ class FusionRewardPolicyTests(unittest.TestCase):
             fusion_attempt_reward=0.03,
             fusion_success_reward=0.7,
             max_fusion_reward_per_episode=1.25,
-            run_mode="",
-            level3_train=False,
-            level3_eval=False,
         )
         reward = build_reward_config(args, {})
         self.assertEqual(reward["fusion_attempt_reward"], 0.03)
@@ -349,23 +337,24 @@ class FusionRewardPolicyTests(unittest.TestCase):
         self.assertLess(delta, 0.0)
         self.assertLess(env._fusion_reward_live_fields()["fusion_bridge_error_penalty_total"], 0.0)
 
-    def test_eval_log_aggregation_uses_canonical_row_reducers(self) -> None:
-        first = EvalLog(policy="ppo", episode=1)
-        first.threat_steps_by_row = {"10": 2, "2": 3, "alpha": 1}
-        first.undefended_threat_age_avg_by_row = {"2": 2.0, "alpha": 5.0}
-        first.undefended_threat_age_max_by_row = {"2": 7, "alpha": 5}
-        first.threatened_rows_with_zero_defender_steps_by_row = {"2": 2, "alpha": 1}
-        first.first_defense_step_by_row = {"2": 5, "alpha": 0}
-        first.all_rows_peashooter_covered_step = 12
+    def test_generalist_episode_aggregation_uses_canonical_row_reducers(self) -> None:
+        first = {
+            "threat_steps_by_row": {"10": 2, "2": 3, "alpha": 1},
+            "undefended_threat_age_avg_by_row": {"2": 2.0, "alpha": 5.0},
+            "undefended_threat_age_max_by_row": {"2": 7, "alpha": 5},
+            "threatened_rows_with_zero_defender_steps_by_row": {"2": 2, "alpha": 1},
+            "first_defense_step_by_row": {"2": 5, "alpha": 0},
+            "all_rows_peashooter_covered_step": 12,
+        }
+        second = {
+            "threat_steps_by_row": {"2": 4, "alpha": 2, "bad": "not-a-count"},
+            "undefended_threat_age_avg_by_row": {"2": 8.0, "alpha": 1.0},
+            "undefended_threat_age_max_by_row": {"2": 4, "10": 9},
+            "threatened_rows_with_zero_defender_steps_by_row": {"2": 1, "alpha": 3},
+            "first_defense_step_by_row": {"2": 7, "10": 3, "alpha": -1},
+        }
 
-        second = EvalLog(policy="ppo", episode=2)
-        second.threat_steps_by_row = {"2": 4, "alpha": 2, "bad": "not-a-count"}
-        second.undefended_threat_age_avg_by_row = {"2": 8.0, "alpha": 1.0}
-        second.undefended_threat_age_max_by_row = {"2": 4, "10": 9}
-        second.threatened_rows_with_zero_defender_steps_by_row = {"2": 1, "alpha": 3}
-        second.first_defense_step_by_row = {"2": 7, "10": 3, "alpha": -1}
-
-        summary = summarize_eval_logs([first, second])
+        summary = summarize_episode_rows([first, second], 2, Path("."), Path("model.zip"), 1.0)
 
         self.assertEqual(summary["threat_steps_by_row"], {"2": 7, "10": 2, "alpha": 3})
         self.assertEqual(summary["undefended_threat_age_max_by_row"], {"2": 7, "10": 9, "alpha": 5})

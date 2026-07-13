@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List
 
-from pvzrl_env import RUN_MODE_ADVENTURE_EVAL, PvZEnvConfig, PvZGymEnv
+from pvzrl_env import RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL, PvZEnvConfig, PvZGymEnv
 
 
 def observation(
@@ -62,7 +62,7 @@ def event_names(diagnostics: Dict[str, Any]) -> List[str]:
 
 
 def main() -> int:
-    env = PvZGymEnv(PvZEnvConfig(run_mode=RUN_MODE_ADVENTURE_EVAL))
+    env = PvZGymEnv(PvZEnvConfig(run_mode=RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL))
     results: List[Dict[str, Any]] = []
 
     fresh_board = observation(range(5), frame=100, wave=0, plants=0)

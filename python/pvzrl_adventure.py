@@ -1,8 +1,8 @@
-"""Adventure Mode evaluation/progression runner for PvZRL.
+"""Adventure Generalist evaluation/progression runner for PvZRL.
 
-This module intentionally runs loaded policies in inference mode only. It does
-not call PPO learning APIs and it keeps seed/action-space compatibility checks
-outside the live game loop so failures are clear and early.
+This module intentionally runs the loaded Generalist policy in inference mode
+only. It does not call PPO learning APIs and it keeps seed/action-space
+compatibility checks outside the live game loop so failures are clear and early.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from pvzrl_lifecycle import (
     adventure_startup_visible,
     screen_state as lifecycle_screen_state,
 )
-from pvzrl_model_router import ModelRouter
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_seed_inventory import inventory_from_runtime_sources
 from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
@@ -48,6 +47,8 @@ POST_WIN_RECOVERY_TIMEOUT_SECONDS = 35.0
 POST_WIN_RECOVERY_POLL_SECONDS = 0.25
 DEFAULT_ADVENTURE_SOFT_MAX_STEPS = 2000
 DEFAULT_ADVENTURE_HARD_MAX_STEPS = 3500
+ADVENTURE_GENERALIST_EVAL_RUN_MODE = "adventure_generalist_14slot_eval"
+ADVENTURE_GENERALIST_ACTION_SPACE_MODE = "adventure_14slot_identity"
 LEVEL_IDENTITY_POST_WIN_STATES = {"level_complete_trophy", "reward_unlock", "reward_screen"}
 LEVEL_IDENTITY_TRANSITIONAL_STATES = {
     *LEVEL_IDENTITY_POST_WIN_STATES,
@@ -809,8 +810,6 @@ def adventure_stop_reason(reason: str) -> str:
         return "env_corruption"
     if "reset" in lowered or "seed_selection" in lowered or "startup_popup" in lowered:
         return "reset_error"
-    if lowered.startswith("missing_required_") or lowered.startswith("model_") or "router" in lowered:
-        return "router_blocked"
     if "loss_retry_failed" in lowered:
         return "reset_error"
     if "unhandled_screen" in lowered or "reward_screen_unhandled" in lowered or "game_over_unhandled" in lowered:
@@ -1618,7 +1617,7 @@ def _timeout_summary(
     summary = _episode_summary_from_info(info)
     if not summary:
         summary = {
-            "run_mode": "adventure_eval",
+            "run_mode": ADVENTURE_GENERALIST_EVAL_RUN_MODE,
             "result": "timeout",
             "reward_total": float(log.episode_reward),
             "episode_reward": float(log.episode_reward),
@@ -2028,7 +2027,11 @@ def build_agent_payload(
             "col": int(decoded.get("column", -1)),
         },
         "legal_action_count": legal_count,
-        "action_space_mode": getattr(env, "action_spec", None).mode if getattr(env, "action_spec", None) is not None else "fixed",
+        "action_space_mode": (
+            getattr(env, "action_spec", None).mode
+            if getattr(env, "action_spec", None) is not None
+            else ADVENTURE_GENERALIST_ACTION_SPACE_MODE
+        ),
         "action_decoder_version": getattr(env, "action_spec", None).action_decoder_version if getattr(env, "action_spec", None) is not None else "",
         "observation_version": getattr(env, "action_spec", None).observation_version if getattr(env, "action_spec", None) is not None else "",
     }
@@ -2106,7 +2109,11 @@ def build_live_status(
         "stage": context.get("current_stage", ""),
         "model_family": context.get("current_model_family", context.get("model_family", "")),
         "model_path": context.get("current_model_path", ""),
-        "action_space_mode": getattr(getattr(env, "action_spec", None), "mode", "fixed"),
+        "action_space_mode": getattr(
+            getattr(env, "action_spec", None),
+            "mode",
+            ADVENTURE_GENERALIST_ACTION_SPACE_MODE,
+        ),
         "action_count": int(getattr(env, "action_count", 0) or 0),
         "action_decoder_version": getattr(getattr(env, "action_spec", None), "action_decoder_version", ""),
         "observation_version": getattr(getattr(env, "action_spec", None), "observation_version", ""),
@@ -2144,7 +2151,7 @@ def build_live_status(
             "model_compatibility_blocked_reason": model_compatibility.get("blocked_reason"),
         }
     )
-    run_mode = str(context.get("run_mode") or context.get("mode") or "adventure_eval")
+    run_mode = str(context.get("run_mode") or context.get("mode") or ADVENTURE_GENERALIST_EVAL_RUN_MODE)
     selected_loadout = list(context.get("selected_seeds", getattr(env.config, "seed_list", [])))
     selected_loadout_count = int(context.get("selected_loadout_count", len(selected_loadout)) or len(selected_loadout))
     selected_loadout_count = max(0, min(max_seed_slots, selected_loadout_count))
@@ -2153,19 +2160,6 @@ def build_live_status(
             "configured_seed_list",
             context.get("initial_loadout", getattr(env.config, "seed_list", [])),
         )
-    )
-    model_seed_list = list(model_compatibility.get("model_seed_list", []))
-    dynamic_identity_loadout = "adventure_generalist_14slot" in run_mode
-    seed_order_metadata_mismatch = bool(
-        model_seed_list
-        and selected_loadout
-        and model_seed_list != selected_loadout
-        and not dynamic_identity_loadout
-    )
-    seed_order_warning = (
-        "model_metadata_seed_list_differs_from_runtime_selected_loadout"
-        if seed_order_metadata_mismatch
-        else ""
     )
     observed_seed_bank_capacity = int(
         context.get("observed_seed_bank_capacity")
@@ -2242,8 +2236,6 @@ def build_live_status(
         "seed_order_source": context.get("seed_order_source", ""),
         "seed_order_preserved": bool(context.get("seed_order_preserved", True)),
         "seed_order_blocked_reason": context.get("seed_order_blocked_reason", ""),
-        "seed_order_metadata_mismatch": seed_order_metadata_mismatch,
-        "seed_order_warning": seed_order_warning,
         "randomize_seed_order": bool(context.get("randomize_seed_order", False)),
         "episode_sample_source": context.get("episode_sample_source", ""),
         "requested_episode_sample_source": context.get("requested_episode_sample_source", ""),
@@ -2429,8 +2421,6 @@ def build_live_status(
             "seed_order_source": context.get("seed_order_source", ""),
             "seed_order_preserved": bool(context.get("seed_order_preserved", True)),
             "seed_order_blocked_reason": context.get("seed_order_blocked_reason", ""),
-            "seed_order_metadata_mismatch": seed_order_metadata_mismatch,
-            "seed_order_warning": seed_order_warning,
             "randomize_seed_order": bool(context.get("randomize_seed_order", False)),
             "eligible_seeds": eligible_seeds,
             "selectable_seeds": selectable_seeds,
@@ -2453,8 +2443,6 @@ def build_live_status(
             "rejected_priority_seeds": rejected_priority_seeds,
             "inactive_model_slots": inactive_model_slots,
             "available_seeds": available_seeds,
-            "conservative_seeds": bool(context.get("conservative_seeds", True)),
-            "allow_new_plants": bool(context.get("allow_new_plants", False)),
             "latest_unlock": context.get("latest_unlock", ""),
             "newly_unlocked": context.get("newly_unlocked", []),
             "current_stage": context.get("current_stage", ""),
@@ -2553,8 +2541,6 @@ def build_live_status(
             "excluded_new_plants": context.get("excluded_new_plants", []),
             "unknown_visible_seed_cards": unlock_snapshot.get("unknownVisibleSeedCards", []),
             "unknown_unlock_objects": unlock_snapshot.get("unknownUnlockObjects", []),
-            "conservative_seeds": bool(context.get("conservative_seeds", True)),
-            "allow_new_plants": bool(context.get("allow_new_plants", False)),
         },
         "seed_inventory": seed_inventory,
         "model_compatibility": model_compatibility,
@@ -2639,12 +2625,8 @@ def run_adventure_eval(
     max_adventure_levels: int,
     max_attempts_per_level: int,
     adventure_start_level: int,
-    conservative_seeds: bool,
-    allow_new_plants: bool,
     live_status_path: Optional[Path],
     gui: bool = False,
-    model_router: Optional[ModelRouter] = None,
-    router_stage_loader: Optional[Callable[[Any], Dict[str, Any]]] = None,
     adventure_soft_max_steps: Optional[int] = None,
     adventure_hard_max_steps: Optional[int] = None,
     adventure_final_wave_extension: Optional[bool] = None,
@@ -2668,15 +2650,7 @@ def run_adventure_eval(
     run_dir.mkdir(parents=True, exist_ok=True)
     writer = LiveStatusWriter(live_status_path)
     gui_process = launch_gui(live_status_path) if gui and live_status_path is not None else None
-    env: Optional[PvZMaskedPPOEnv] = None
-    active_model = model
-    active_model_path = model_path
-    active_config = dict(config)
-    active_env_config = env_config
-    active_env_config.max_steps = int(hard_max_steps)
-    active_stage_id = ""
-    if model_router is None:
-        env = PvZMaskedPPOEnv(env_config)
+    env = PvZMaskedPPOEnv(env_config)
     unlocked: Counter[str] = Counter({canonical_seed_name(seed): 1 for seed in BASE_UNLOCKED_SEEDS})
     levels: List[AdventureLevelLog] = []
     stop_reason = ""
@@ -2700,8 +2674,6 @@ def run_adventure_eval(
         "active_run": str(run_dir),
         "selected_seeds": list(config.get("seed_list", [])),
         "unlocked_seeds": sorted(unlocked.keys()),
-        "conservative_seeds": bool(conservative_seeds),
-        "allow_new_plants": bool(allow_new_plants),
         "latest_unlock": "",
         "wins": 0,
         "total_wins": 0,
@@ -2728,6 +2700,11 @@ def run_adventure_eval(
         "reward_continue_click_count": 0,
         "eval_summary": {},
         "model_compatibility": config.get("model_compatibility", {}),
+        "run_mode": ADVENTURE_GENERALIST_EVAL_RUN_MODE,
+        "current_stage": "adventure_generalist_14slot_identity_v1",
+        "current_model_family": str(config.get("model_family", "")),
+        "current_model_path": str(model_path),
+        "metadata_path": str(config.get("metadata_path", "")),
     }
     print(
         "[adventure] timeout "
@@ -2741,15 +2718,8 @@ def run_adventure_eval(
         f"wallnut={bool(config.get('tactical_masks') or config.get('wallnut_tactical_mask'))} "
         f"cherrybomb={bool(config.get('tactical_masks') or config.get('cherrybomb_tactical_mask'))}"
     )
-    if model_router is None:
-        context["current_stage"] = "single_model"
-        context["current_model_family"] = str(config.get("model_family", ""))
-        context["current_model_path"] = str(model_path)
-        context["metadata_path"] = str(config.get("metadata_path", ""))
-
     try:
-        if env is not None:
-            env.base.configure()
+        env.base.configure()
         for level_offset in range(max(0, max_adventure_levels)):
             tracker_level = int(adventure_start_level) + level_offset
             progression_index = level_offset + 1
@@ -2789,98 +2759,15 @@ def run_adventure_eval(
             context["timeout_classification"] = "none"
             context["soft_timeout_extension_reason"] = ""
             last_blocked_reason = ""
-            router_blocked = False
 
-            if model_router is not None:
-                if router_stage_loader is None:
-                    raise SystemExit("blocked_reason=model_router_loader_missing")
-                router_state: Dict[str, Any] = {}
-                if env is not None:
-                    try:
-                        router_state = env.base.adventure_screen_state()
-                        update_unlocked_from_state(unlocked, router_state, source="router_level_start", level=tracker_level)
-                    except Exception as exc:
-                        context["last_error"] = str(exc)
-                detected_level = model_router.detect_level(router_state, tracker_level)
-                available_for_router = _ordered_unique_seed_names(
-                    list(router_state.get("availableSeedNames", []) or [])
-                    + list(router_state.get("visibleSeedCardNames", []) or [])
-                )
-                if not available_for_router and env is None:
-                    available_for_router = sorted(unlocked.keys())
-                decision = model_router.select_stage(
-                    level=detected_level,
-                    unlocked_seeds=sorted(unlocked.keys()),
-                    available_seeds=available_for_router,
-                )
-                context["router_level"] = decision.level_label
-                context["required_unlocked_seeds"] = list(decision.stage.requires_unlocked) if decision.stage else []
-                context["required_available_seeds"] = list(decision.stage.requires_available) if decision.stage else []
-                if not decision.ok or decision.stage is None:
-                    last_blocked_reason = decision.blocked_reason or "model_router_blocked"
-                    level.blocked_reason = last_blocked_reason
-                    level.available_seed_names = available_for_router
-                    context["blocked_reason"] = last_blocked_reason
-                    context["state"] = "ROUTER_BLOCKED"
-                    context["missing_required_unlocked"] = decision.missing_required_unlocked
-                    context["missing_required_available"] = decision.missing_required_available
-                    if env is not None:
-                        writer.write(build_live_status(env, context, adventure_state=router_state))
-                    router_blocked = True
-                if not router_blocked and decision.stage is not None and (active_stage_id != decision.stage.stage_id or env is None):
-                    if env is not None:
-                        try:
-                            env.close()
-                        except Exception as exc:
-                            print(f"[adventure] warning: env.close before router switch failed: {exc}")
-                    loaded = router_stage_loader(decision.stage)
-                    active_model = loaded["model"]
-                    active_model_path = loaded["model_path"]
-                    active_config = loaded["config"]
-                    active_env_config = loaded["env_config"]
-                    active_config["adventure_soft_max_steps"] = int(soft_max_steps)
-                    active_config["adventure_hard_max_steps"] = int(hard_max_steps)
-                    active_config["adventure_final_wave_extension"] = bool(final_wave_extension)
-                    active_config["max_steps"] = int(hard_max_steps)
-                    active_env_config.max_steps = int(hard_max_steps)
-                    compatibility = loaded.get("compatibility", {})
-                    env = PvZMaskedPPOEnv(active_env_config)
-                    env.base.configure()
-                    active_stage_id = decision.stage.stage_id
-                    print(
-                        "[adventure] router selected "
-                        f"level={decision.level_label} stage={decision.stage.stage_id} "
-                        f"family={decision.stage.family} model={decision.stage.model_path}"
-                    )
-                    context["metadata_path"] = str(compatibility.get("metadata_path", ""))
-                    context["metadata_inferred"] = bool(compatibility.get("metadata_inferred", False))
-                    context["model_compatibility"] = loaded.get("model_compatibility") or compatibility.get("model_compatibility", {})
-                if not router_blocked and decision.stage is not None:
-                    context["current_stage"] = decision.stage.stage_id
-                    context["current_model_family"] = decision.stage.family
-                    context["current_model_path"] = str(active_model_path)
-                    context["selected_seeds"] = list(decision.stage.seed_list)
-                    context["unlocked_seeds"] = sorted(unlocked.keys())
-                    config_for_level = active_config
-                else:
-                    config_for_level = active_config
-            else:
-                config_for_level = config
-
-            if not router_blocked and (env is None or active_model is None):
-                level.blocked_reason = "model_env_not_ready"
-                context["blocked_reason"] = level.blocked_reason
-                router_blocked = True
-
-            attempt_range = range(1, max(1, max_attempts_per_level) + 1) if not router_blocked else range(0)
-            for attempt_index in attempt_range:
+            for attempt_index in range(1, max(1, max_attempts_per_level) + 1):
                 state = env.base.adventure_screen_state()
                 update_unlocked_from_state(unlocked, state, source="level_start", level=tracker_level)
                 available = _ordered_unique_seed_names(list(state.get("availableSeedNames", []) or []))
                 # The PPO decoder is slot-semantic, so Adventure must not reorder or replace
-                # seeds at runtime. Newly unlocked plants are tracked elsewhere until a model
-                # family explicitly declares that layout.
-                selected_seeds = list(config_for_level.get("seed_list", []))
+                # seeds at runtime. Newly unlocked plants remain progression evidence; the
+                # protected Generalist identity layout controls which slots the policy uses.
+                selected_seeds = list(config.get("seed_list", []))
                 level.selected_seeds = selected_seeds
                 level.available_seed_names = available
                 level.unknown_visible_seed_names = list(state.get("unknownVisibleSeedNames", []) or [])
@@ -2891,7 +2778,7 @@ def run_adventure_eval(
 
                 attempt = run_policy_attempt(
                     env,
-                    active_model,
+                    model,
                     writer,
                     context,
                     attempt_index=attempt_index,
@@ -3168,9 +3055,8 @@ def run_adventure_eval(
     print(f"[adventure] stopping reason={stop_reason}")
     payload = {
         "status": "complete",
-        "mode": "adventure_eval",
-        "model_path": str(active_model_path),
-        "model_router": str(model_router.source_path) if model_router is not None else "",
+        "mode": ADVENTURE_GENERALIST_EVAL_RUN_MODE,
+        "model_path": str(model_path),
         "stop_reason": stop_reason,
         "levels_requested": int(max_adventure_levels),
         "levels_completed": len(levels),
@@ -3187,8 +3073,6 @@ def run_adventure_eval(
         ),
         "wallnut_tactical_mask_enabled": bool(config.get("tactical_masks") or config.get("wallnut_tactical_mask")),
         "cherrybomb_tactical_mask_enabled": bool(config.get("tactical_masks") or config.get("cherrybomb_tactical_mask")),
-        "conservative_seeds": bool(conservative_seeds),
-        "allow_new_plants": bool(allow_new_plants),
         "deterministic": bool(deterministic),
         "model_compatibility": context.get("model_compatibility", {}),
         "levels": [asdict(level) for level in levels],

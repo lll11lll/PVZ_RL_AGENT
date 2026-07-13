@@ -50,12 +50,9 @@ def test_registry_is_cached_deeply_immutable_and_source_compatible() -> None:
     assert registry.plants[0].fusion_metadata["identity_namespace"] == "base_seed"
     assert registry.plants[0].gui_display_metadata["display_name"] == "SunFlower"
 
-    current = registry.require_gui_preset("four_slot_current")
-    duplicate = registry.require_gui_preset("four_slot_duplicate")
-    assert current.seed_names == ("SunFlower", "Peashooter", "WallNut", "CherryBomb")
-    assert current.plant_type_ids == (1, 0, 3, 2)
-    assert duplicate.seed_names == ("SunFlower", "SunFlower", "Peashooter", "Peashooter")
-    assert duplicate.plant_type_ids == (1, 1, 0, 0)
+    generalist = registry.require_gui_preset("adventure_generalist_initial_loadout")
+    assert generalist.seed_names == ("SunFlower", "SunFlower", "Peashooter", "Peashooter")
+    assert generalist.plant_type_ids == (1, 1, 0, 0)
 
     source_payload = json.loads(PLANT_REGISTRY_PATH.read_text(encoding="utf-8"))
     assert registry.to_legacy_payload() == source_payload
@@ -132,13 +129,12 @@ def test_fusion_result_identity_overlay_remains_separate_from_seed_registry() ->
     assert fusion_plant_name(1090) == "SplitPea"
 
 
-def test_gui_profiles_are_derived_from_named_registry_presets() -> None:
+def test_gui_generalist_loadout_is_derived_from_named_registry_preset() -> None:
     gui = GUI_SOURCE.read_text(encoding="utf-8")
-    assert 'require_gui_preset("four_slot_current")' in gui
-    assert 'require_gui_preset("four_slot_duplicate")' in gui
-    assert '"SunFlower,Peashooter,WallNut,CherryBomb"' not in gui
+    assert 'require_gui_preset("adventure_generalist_initial_loadout")' in gui
+    assert 'require_gui_preset("four_slot_current")' not in gui
+    assert 'require_gui_preset("four_slot_duplicate")' not in gui
     assert '"SunFlower,SunFlower,Peashooter,Peashooter"' not in gui
-    assert '"1,0,3,2"' not in gui
 
 
 def test_generated_bridge_registry_is_deterministic_and_complete(tmp_path: Path) -> None:

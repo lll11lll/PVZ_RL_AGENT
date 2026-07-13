@@ -10,8 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
-    ACTION_SPACE_DYNAMIC_14,
-    ACTION_SPACE_FIXED,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
     action_count_for_config,
     build_action_space_spec,
     normalize_action_space_mode,
@@ -22,12 +21,9 @@ from pvzrl_observation_layout import observation_shape_for_config
 
 MODEL_METADATA_FILENAME = "model_metadata.json"
 MODEL_METADATA_VERSION = 1
-LEGACY_CONFIG_FILENAMES = ("resolved_config.json", "config.json")
 
 BLOCKED_MISSING_METADATA = "missing_model_metadata"
 BLOCKED_ACTION_COUNT = "action_count_mismatch"
-BLOCKED_SEED_LIST = "seed_list_mismatch"
-BLOCKED_PLANT_TYPE = "plant_type_mismatch"
 BLOCKED_ACTION_DECODER = "action_decoder_mismatch"
 BLOCKED_OBSERVATION = "observation_version_mismatch"
 BLOCKED_MAX_SEED_SLOTS = "max_seed_slots_mismatch"
@@ -38,14 +34,16 @@ BLOCKED_IDENTITY_SEED_SLOTS = "identity_seed_slots_mismatch"
 BLOCKED_OBSERVATION_SHAPE = "observation_shape_mismatch"
 BLOCKED_PLACEMENT_ACTION_RANGE = "placement_action_range_mismatch"
 BLOCKED_BOARD_GEOMETRY = "board_geometry_mismatch"
+BLOCKED_MODEL_FAMILY = "model_family_mismatch"
 
 
 @dataclass
 class CompatibilityCheck:
     """Structured compatibility report.
 
-    The legacy ``ok/expected/actual`` fields are kept for existing callers while
-    ``compatible/model_metadata/env_metadata`` provide the canonical report.
+    ``compatible/model_metadata/env_metadata`` are the canonical report.  The
+    ``ok/expected/actual`` projections remain in-process aliases for current
+    callers and live-status construction.
     """
 
     ok: bool
@@ -75,7 +73,7 @@ class CompatibilityCheck:
             "metadata_path": self.metadata_path,
             "metadata_inferred": self.metadata_inferred,
             "details": self.details,
-            # Backward-compatible aliases.
+            # Current in-process projections used by training/status callers.
             "ok": self.ok,
             "expected": self.expected or env_metadata,
             "actual": self.actual or model_metadata,
@@ -160,7 +158,6 @@ def model_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "resume_model_path",
         "resume_source_model_family",
         "scratch_initialization",
-        "incompatible_with_4slot_specialist",
         "initial_loadout",
         "configured_seed_list",
         "seed_order_source",
@@ -188,11 +185,13 @@ def model_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def apply_model_metadata_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(config)
-    mode = normalize_action_space_mode(updated.get("action_space_mode", ACTION_SPACE_FIXED))
+    mode = normalize_action_space_mode(
+        updated.get("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)
+    )
     plant_types = normalized_plant_types(updated.get("plant_types", []))
-    max_seed_slots = updated.get("max_seed_slots")
+    max_seed_slots = updated.get("max_seed_slots", ADVENTURE_IDENTITY_MAX_SEED_SLOTS)
     if max_seed_slots is None:
-        max_seed_slots = 14 if mode in {ACTION_SPACE_DYNAMIC_14, ACTION_SPACE_ADVENTURE_14_IDENTITY} else len(plant_types)
+        max_seed_slots = ADVENTURE_IDENTITY_MAX_SEED_SLOTS
     spec = build_action_space_spec(
         mode=mode,
         plant_types=plant_types,
@@ -243,7 +242,9 @@ def expected_model_metadata_from_env(env_metadata: Dict[str, Any]) -> Dict[str, 
         "model_family": str(env_metadata.get("model_family") or ""),
         "seed_list": normalized_seed_list(env_metadata.get("resolved_seed_list", [])),
         "plant_types": normalized_plant_types(env_metadata.get("resolved_plant_types", [])),
-        "action_space_mode": str(env_metadata.get("action_space_mode") or ACTION_SPACE_FIXED),
+        "action_space_mode": str(
+            env_metadata.get("action_space_mode") or ACTION_SPACE_ADVENTURE_14_IDENTITY
+        ),
         "action_count": _optional_int(env_metadata.get("env_action_count")),
         "max_seed_slots": _optional_int(env_metadata.get("max_seed_slots")),
         "dynamic_seed_slots": bool(env_metadata.get("dynamic_seed_slots", False)),
@@ -284,19 +285,13 @@ def _model_metadata_dirs(model_path: Path) -> List[Path]:
     return dirs
 
 
-def model_metadata_candidates(model_path: Path, *, include_legacy: bool = True) -> List[Path]:
+def model_metadata_candidates(model_path: Path) -> List[Path]:
     dirs = _model_metadata_dirs(model_path)
     candidates: List[Path] = []
     for directory in dirs:
         metadata = directory / MODEL_METADATA_FILENAME
         if metadata not in candidates:
             candidates.append(metadata)
-    if include_legacy:
-        for directory in dirs:
-            for filename in LEGACY_CONFIG_FILENAMES:
-                candidate = directory / filename
-                if candidate not in candidates:
-                    candidates.append(candidate)
     return candidates
 
 
@@ -312,59 +307,17 @@ def _load_json(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     return value, ""
 
 
-def infer_fixed_metadata_from_legacy_config(config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    seed_list = normalized_seed_list(config.get("seed_list", []))
-    plant_types = normalized_plant_types(config.get("plant_types", []))
-    raw_action_count = config.get("action_count")
-    if not seed_list or not plant_types or raw_action_count is None:
-        return None, BLOCKED_MISSING_METADATA
-    action_count = _optional_int(raw_action_count)
-    if action_count is None:
-        return None, BLOCKED_MISSING_METADATA
-    expected_action_count = 1 + len(plant_types) * 5 * 10
-    if action_count != expected_action_count:
-        return None, BLOCKED_ACTION_DECODER
-    inferred_config = dict(config)
-    inferred_config["seed_list"] = seed_list
-    inferred_config["plant_types"] = plant_types
-    inferred_config["action_space_mode"] = ACTION_SPACE_FIXED
-    inferred_config["max_seed_slots"] = len(plant_types)
-    inferred_config["action_count"] = action_count
-    metadata = model_metadata_from_config(apply_model_metadata_defaults(inferred_config))
-    metadata["metadata_source"] = "inferred_legacy_config"
-    return metadata, ""
-
-
 def load_model_metadata(
     model_path: Path,
-    *,
-    allow_missing_model_metadata: bool = False,
 ) -> Tuple[Optional[Path], Optional[Dict[str, Any]], bool, str]:
-    for candidate in model_metadata_candidates(model_path, include_legacy=False):
+    for candidate in model_metadata_candidates(model_path):
         if not candidate.exists():
             continue
         raw, load_error = _load_json(candidate)
         if raw is None:
             return candidate, None, False, load_error or BLOCKED_MISSING_METADATA
         return candidate, raw, False, ""
-
-    if not allow_missing_model_metadata:
-        return None, None, False, BLOCKED_MISSING_METADATA
-
-    saw_legacy = False
-    legacy_blocked_reason = BLOCKED_MISSING_METADATA
-    for candidate in model_metadata_candidates(model_path, include_legacy=True):
-        if candidate.name == MODEL_METADATA_FILENAME or not candidate.exists():
-            continue
-        raw, load_error = _load_json(candidate)
-        if raw is None:
-            return candidate, None, False, load_error or BLOCKED_MISSING_METADATA
-        saw_legacy = True
-        inferred, blocked_reason = infer_fixed_metadata_from_legacy_config(raw)
-        if inferred is not None:
-            return candidate, inferred, True, ""
-        legacy_blocked_reason = blocked_reason or legacy_blocked_reason
-    return None, None, False, legacy_blocked_reason if saw_legacy else BLOCKED_MISSING_METADATA
+    return None, None, False, BLOCKED_MISSING_METADATA
 
 
 def _compatibility_failure(
@@ -391,10 +344,6 @@ def _compatibility_failure(
     )
 
 
-def _values_match(left: Any, right: Any) -> bool:
-    return left == right
-
-
 def _bool_value(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -410,20 +359,14 @@ def validate_model_metadata(
     model_action_count: Optional[int] = None,
     model_observation_shape: Optional[Any] = None,
     env_metadata: Optional[Dict[str, Any]] = None,
-    allow_missing_model_metadata: bool = False,
 ) -> CompatibilityCheck:
     if env_metadata is None:
         if expected_config is None:
             raise ValueError("expected_config or env_metadata is required")
         env_metadata = env_metadata_from_config(expected_config)
     expected = expected_model_metadata_from_env(env_metadata)
-    metadata_path, actual, inferred, load_blocked_reason = load_model_metadata(
-        model_path,
-        allow_missing_model_metadata=allow_missing_model_metadata,
-    )
+    metadata_path, actual, inferred, load_blocked_reason = load_model_metadata(model_path)
     warnings: List[str] = []
-    if inferred:
-        warnings.append("model_metadata_inferred_from_legacy_config")
     if actual is None:
         return _compatibility_failure(
             load_blocked_reason or BLOCKED_MISSING_METADATA,
@@ -491,29 +434,18 @@ def validate_model_metadata(
             warnings,
         )
 
-    actual_mode = normalize_action_space_mode(actual.get("action_space_mode", ACTION_SPACE_FIXED))
-    env_mode = normalize_action_space_mode(env_metadata.get("action_space_mode", ACTION_SPACE_FIXED))
-
-    model_seed_list = normalized_seed_list(actual.get("seed_list", []))
-    env_seed_list = normalized_seed_list(env_metadata.get("resolved_seed_list", []))
-    if env_mode != ACTION_SPACE_ADVENTURE_14_IDENTITY and not _values_match(model_seed_list, env_seed_list):
+    env_mode = normalize_action_space_mode(
+        env_metadata.get("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)
+    )
+    actual_mode_value = actual.get("action_space_mode")
+    try:
+        if actual_mode_value in (None, ""):
+            raise ValueError("missing action_space_mode")
+        actual_mode = normalize_action_space_mode(actual_mode_value)
+    except ValueError:
         return _compatibility_failure(
-            BLOCKED_SEED_LIST,
-            "model seed_list does not match resolved environment seed_list",
-            metadata_path,
-            inferred,
-            expected,
-            actual,
-            env_metadata,
-            warnings,
-        )
-
-    model_plant_types = normalized_plant_types(actual.get("plant_types", []))
-    env_plant_types = normalized_plant_types(env_metadata.get("resolved_plant_types", []))
-    if env_mode != ACTION_SPACE_ADVENTURE_14_IDENTITY and not _values_match(model_plant_types, env_plant_types):
-        return _compatibility_failure(
-            BLOCKED_PLANT_TYPE,
-            "model plant_types do not match resolved environment plant_types",
+            BLOCKED_ACTION_SPACE_MODE,
+            f"unsupported model action_space_mode={actual.get('action_space_mode')!r}",
             metadata_path,
             inferred,
             expected,
@@ -689,7 +621,16 @@ def validate_model_metadata(
     model_family = str(actual.get("model_family") or "")
     env_family = str(env_metadata.get("model_family") or "")
     if model_family and env_family and model_family != env_family:
-        warnings.append(f"model_family_mismatch:model={model_family},environment={env_family}")
+        return _compatibility_failure(
+            BLOCKED_MODEL_FAMILY,
+            f"model_family: model={model_family!r}, environment={env_family!r}",
+            metadata_path,
+            inferred,
+            expected,
+            actual,
+            env_metadata,
+            warnings,
+        )
 
     return CompatibilityCheck(
         ok=True,
@@ -746,8 +687,8 @@ def format_compatibility_failure(result: CompatibilityCheck) -> str:
     lines.extend(
         [
             "",
-            "This model cannot be evaluated under a different seed-slot layout because action meanings would change.",
-            "Use the correct --seed-list or train a new model family.",
+            "This model cannot run under a different Generalist action or observation contract.",
+            "Use the current Adventure Generalist checkpoint family and configuration.",
         ]
     )
     return "\n".join(lines)

@@ -1,8 +1,8 @@
 """Gymnasium adapter for MaskablePPO training.
 
-This module turns the existing bridge-backed PvZGymEnv into a small fixed-shape
-Gymnasium environment. It does not change bridge behavior, rewards, plant types,
-or reset semantics.
+This module turns the existing bridge-backed PvZGymEnv into the maintained
+Adventure Generalist Gymnasium environment. It does not change bridge behavior,
+rewards, plant types, or reset semantics.
 """
 
 from __future__ import annotations
@@ -22,23 +22,13 @@ from gymnasium import spaces
 from pvzrl_actions import build_action_intent
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
-    ACTION_SPACE_DYNAMIC_14,
-    ACTION_SPACE_FIXED,
-    DYNAMIC_WAIT_ACTION,
     build_action_space_spec,
     decode_policy_action,
-    legacy_action_to_policy_action,
     normalize_action_space_mode,
-    policy_action_to_legacy_action,
 )
 from pvzrl_env import (
-    DEFAULT_PLANT_TYPES,
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
-    RUN_MODE_ADVENTURE_EVAL,
-    RUN_MODE_FIXED_TRAIN,
-    RUN_MODE_LEVEL3_SPECIALIST,
-    RUN_MODES,
     PvZEnvConfig,
     PvZGymEnv,
     BridgeTimeoutError,
@@ -71,10 +61,7 @@ from pvzrl_rewards import (
     merge_reward_components,
 )
 from pvzrl_runtime_state import EpisodeRuntimeState, WatchdogRuntimeState
-from pvzrl_seed_inventory import (
-    adventure_identity_features,
-    seed_inventory_v2_features,
-)
+from pvzrl_seed_inventory import adventure_identity_features
 from pvzrl_stream_coach import StreamCoachController
 from pvzrl_assisted_coach import InterventionJSONLLogger
 
@@ -91,11 +78,10 @@ class PvZSB3Config:
     freeze_debug_dir: str = ""
     step_seconds: float = 0.05
     plant_types: List[int] = None  # type: ignore[assignment]
-    action_space_mode: str = ACTION_SPACE_FIXED
+    action_space_mode: str = ACTION_SPACE_ADVENTURE_14_IDENTITY
     max_seed_slots: Optional[int] = None
     observation_version: str = ""
     action_decoder_version: str = ""
-    dynamic_seed_slots: bool = False
     row_count: int = 5
     column_count: int = 10
     game_speed: float = 4.0
@@ -108,8 +94,10 @@ class PvZSB3Config:
     board_timeout: float = 60.0
     gameplay_ready_timeout: float = 30.0
     poll_seconds: float = 0.2
-    auto_select_seeds: bool = False
-    seed_list: List[str] = field(default_factory=lambda: ["SunFlower", "Peashooter"])
+    auto_select_seeds: bool = True
+    seed_list: List[str] = field(
+        default_factory=lambda: ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+    )
     seed_click_delay: float = 0.35
     lets_rock_delay: float = 0.5
     post_start_delay: float = 1.0
@@ -120,7 +108,7 @@ class PvZSB3Config:
     debug_sun_sample_interval: int = 25
     fusion_policy: str = FUSION_POLICY_NONE
     fusion_action_mask_enabled: bool = False
-    enable_board_plant_identity: bool = False
+    enable_board_plant_identity: bool = True
     enable_fusion_chain_rewards: bool = False
     enable_recipe_discovery_reward: bool = False
     enable_repeat_recipe_decay: bool = False
@@ -130,12 +118,10 @@ class PvZSB3Config:
     fusion_curriculum_prob: float = 0.20
     later_plant_curriculum_prob: float = 0.10
     coach_fusion_prob: float = 0.10
-    run_mode: str = RUN_MODE_FIXED_TRAIN
-    target_level: int = 0
+    run_mode: str = RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN
     tactical_masks: bool = False
     wallnut_tactical_mask: bool = False
     cherrybomb_tactical_mask: bool = False
-    adventure_eval_mode: bool = False
     game_exe: Optional[str] = None
     human_coach_enabled: bool = False
     human_coach_log_path: str = ""
@@ -162,20 +148,22 @@ class PvZSB3Config:
 
     def __post_init__(self) -> None:
         requested_run_mode = str(self.run_mode or "").strip().lower()
-        if requested_run_mode not in RUN_MODES:
-            requested_run_mode = RUN_MODE_ADVENTURE_EVAL if bool(self.adventure_eval_mode) else RUN_MODE_FIXED_TRAIN
-        self.run_mode = requested_run_mode
-        self.adventure_eval_mode = requested_run_mode in {
-            RUN_MODE_ADVENTURE_EVAL,
+        maintained_run_modes = {
             RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
             RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
         }
+        if requested_run_mode not in maintained_run_modes:
+            raise ValueError(
+                f"Unsupported run_mode: {self.run_mode!r}; expected Adventure Generalist "
+                f"train/eval mode ({sorted(maintained_run_modes)!r})"
+            )
+        self.run_mode = requested_run_mode
         self.fusion_policy = normalize_fusion_policy(self.fusion_policy)
         if self.plant_types is None:
             try:
                 self.plant_types = resolve_seed_list(list(self.seed_list))
             except Exception:
-                self.plant_types = list(DEFAULT_PLANT_TYPES)
+                self.plant_types = [1, 1, 0, 0]
         self.action_space_mode = normalize_action_space_mode(self.action_space_mode)
         spec = build_action_space_spec(
             mode=self.action_space_mode,
@@ -185,9 +173,18 @@ class PvZSB3Config:
             cols=self.column_count,
         )
         self.max_seed_slots = int(spec.max_seed_slots)
-        self.observation_version = self.observation_version or spec.observation_version
-        self.action_decoder_version = self.action_decoder_version or spec.action_decoder_version
-        self.dynamic_seed_slots = spec.dynamic_seed_slots
+        if self.observation_version and self.observation_version != spec.observation_version:
+            raise ValueError(
+                "Adventure Generalist observation_version mismatch: "
+                f"expected={spec.observation_version!r} actual={self.observation_version!r}"
+            )
+        if self.action_decoder_version and self.action_decoder_version != spec.action_decoder_version:
+            raise ValueError(
+                "Adventure Generalist action_decoder_version mismatch: "
+                f"expected={spec.action_decoder_version!r} actual={self.action_decoder_version!r}"
+            )
+        self.observation_version = spec.observation_version
+        self.action_decoder_version = spec.action_decoder_version
 
     def get_env_metadata(self) -> Dict[str, Any]:
         spec = build_action_space_spec(
@@ -231,7 +228,7 @@ def _stream_raw_text(command: Optional[Dict[str, Any]]) -> str:
 
 
 class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
-    """Fixed-shape Gymnasium wrapper around the live PvZ bridge environment."""
+    """Adventure Generalist Gymnasium wrapper around the live PvZ bridge."""
 
     metadata = {"render_modes": []}
 
@@ -271,11 +268,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             enable_recipe_discovery_reward=self.config.enable_recipe_discovery_reward,
             enable_repeat_recipe_decay=self.config.enable_repeat_recipe_decay,
             run_mode=self.config.run_mode,
-            target_level=self.config.target_level,
             tactical_masks=self.config.tactical_masks,
             wallnut_tactical_mask=self.config.wallnut_tactical_mask,
             cherrybomb_tactical_mask=self.config.cherrybomb_tactical_mask,
-            adventure_eval_mode=self.config.adventure_eval_mode,
             game_exe=self.config.game_exe,
             reward=self.config.reward,
         )
@@ -291,10 +286,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             cols=self.cols,
         )
         self.action_count = self.action_spec.action_count
-        observation_layout = build_observation_layout(
-            self.action_spec,
-            plant_type_count=len(self.config.plant_types),
-        )
+        observation_layout = build_observation_layout(self.action_spec)
         self.global_features = observation_layout.global_features
         self.card_slot_count = observation_layout.card_slot_count
         self.card_features = observation_layout.card_features
@@ -323,8 +315,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._sun_diag_last_active_count: Optional[int] = None
         self._next_reset_reason = ""
         self._allow_active_gameplay_reset_next = False
-        self._last_episode_ended_by_timeout = False
-        self._last_episode_ended_by_win = False
         self._reset_requires_seed_flow_next = False
         self.human_coach_hook: Optional[HumanCoachOverrideHook] = None
         self.stream_coach_controller: Optional[StreamCoachController] = None
@@ -662,8 +652,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         reset_payload["startup_command_blocked"] = bool(stale_detected)
         if reset_requires_seed_flow:
             reset_payload["wrapperRequiredSeedFlow"] = True
-        self._last_episode_ended_by_timeout = False
-        self._last_episode_ended_by_win = False
         facts = self._initialize_episode_accounting(
             observation,
             reset_payload,
@@ -830,7 +818,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                         f"action={ppo_action} legal=False outcome=fallback_to_ppo "
                         f"reason={rejected_reason!r}"
                     )
-        bridge_action = self._policy_action_to_bridge_action(policy_action)
+        bridge_action = policy_action
         action_started_at = time.time()
         action_started_perf = time.perf_counter()
         pre_action_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
@@ -960,14 +948,13 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 reward = float(reward) + stream_delta
                 if self.stream_coach_controller is not None:
                     self.stream_coach_controller.aggregator.add_reward(stream_delta)
-        if self.action_spec.dynamic_seed_slots:
-            info["policy_action"] = policy_action
-            info["bridge_action"] = bridge_action
-            action_result = info.get("action_result", {})
-            if isinstance(action_result, dict):
-                action_result["policyAction"] = policy_action
-                action_result["bridgeAction"] = bridge_action
-                action_result["policyActionDecoderVersion"] = self.action_spec.action_decoder_version
+        info["policy_action"] = policy_action
+        info["bridge_action"] = bridge_action
+        action_result = info.get("action_result", {})
+        if isinstance(action_result, dict):
+            action_result["policyAction"] = policy_action
+            action_result["bridgeAction"] = bridge_action
+            action_result["policyActionDecoderVersion"] = self.action_spec.action_decoder_version
         if coach_decision is not None:
             coach_payload = coach_decision.to_dict()
             coach_status = self._coach_live_status()
@@ -1154,7 +1141,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info["terminal_reason"] = "timeout"
             info["truncated"] = True
             self._episode_timeout_reset_requested_count += 1
-            self._last_episode_ended_by_timeout = True
             self._reset_requires_seed_flow_next = True
             print(
                 "[reset] timeout_reset_requested "
@@ -1173,7 +1159,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         )
         episode_summary = {
             "run_mode": self.config.run_mode,
-            "target_level": int(self.config.target_level or 0),
             "episode": self.episode_state.index,
             "result": done_reason,
             "reward_total": self.episode_state.reward_total,
@@ -1451,10 +1436,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             )
             if done_reason in {"env_corruption", "action_freeze"}:
                 allow_active_gameplay_reset_next = terminal_reason != "bridge_timeout"
-            elif done_reason in ("win", "post_win_pending") and self.config.run_mode in {RUN_MODE_FIXED_TRAIN, RUN_MODE_LEVEL3_SPECIALIST}:
-                allow_active_gameplay_reset_next = False
-                self._last_episode_ended_by_win = True
-                self._reset_requires_seed_flow_next = True
             elif done_reason == "timeout":
                 allow_active_gameplay_reset_next = False
                 if timeout_near_terminal_win:
@@ -1464,10 +1445,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             info.update(episode_summary)
             info["episode_summary"] = episode_summary
 
-            if self.base._is_adventure_eval_mode():
-                self._begin_observation_transition(
-                    reason=f"adventure_terminal:{done_reason or terminal_reason or 'episode_end'}"
-                )
+            self._begin_observation_transition(
+                reason=f"adventure_terminal:{done_reason or terminal_reason or 'episode_end'}"
+            )
 
         facts = self.base._step_facts_cache.get_known(observation, self.config.plant_types)
         return self._encode_observation(observation, facts=facts), float(reward), terminated, truncated, info
@@ -1639,34 +1619,12 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             self._adopt_observation(observation, source="action_masks_observe")
         mask = np.zeros(self.action_count, dtype=bool)
         raw_mask = self.base.action_mask(observation)
-        if self.action_spec.mode == ACTION_SPACE_DYNAMIC_14:
-            for legacy_action, allowed in enumerate(raw_mask):
-                if not bool(allowed):
-                    continue
-                policy_action = legacy_action_to_policy_action(
-                    legacy_action,
-                    mode=self.action_spec.mode,
-                )
-                if 0 <= policy_action < self.action_count:
-                    mask[policy_action] = True
-            mask[DYNAMIC_WAIT_ACTION] = True
-        else:
-            copied = min(len(raw_mask), self.action_count)
-            if copied:
-                mask[:copied] = np.asarray(raw_mask[:copied], dtype=bool)
-            mask[0] = True
+        copied = min(len(raw_mask), self.action_count)
+        if copied:
+            mask[:copied] = np.asarray(raw_mask[:copied], dtype=bool)
+        mask[self.action_spec.wait_action] = True
         self._last_action_mask_ms = round((time.perf_counter() - started) * 1000.0, 3)
         return mask
-
-    def _policy_action_to_bridge_action(self, action: int) -> int:
-        if not self.action_spec.dynamic_seed_slots:
-            return int(action)
-        return policy_action_to_legacy_action(
-            int(action),
-            mode=self.action_spec.mode,
-            rows=self.rows,
-            cols=self.cols,
-        )
 
     def decode_policy_action(self, action: int, observation: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         return decode_policy_action(
@@ -2633,10 +2591,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 ]
             )
 
-        if self.action_spec.mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-            values.extend(adventure_identity_features(observation, self.action_spec.max_seed_slots))
-        elif self.action_spec.dynamic_seed_slots:
-            values.extend(seed_inventory_v2_features(observation, self.action_spec.max_seed_slots))
+        values.extend(adventure_identity_features(observation, self.action_spec.max_seed_slots))
 
         return np.asarray(values, dtype=np.float32)
 

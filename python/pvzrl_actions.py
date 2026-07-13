@@ -1,4 +1,4 @@
-"""Pure, structured PvZRL action decoding and validation.
+"""Pure Adventure Generalist action decoding and validation.
 
 The bridge remains the final runtime authority.  This module owns the Python
 decision that precedes a bridge call: normalize an action source into an
@@ -7,11 +7,10 @@ context, and expose the result as an ``ActionDecision``.  Complete masks are a
 tuple of those same decisions, so diagnostics and execution safeguards do not
 need independent legality implementations.
 
-The fixed, experimental dynamic, and Adventure identity policy layouts are
-kept distinct by :mod:`pvzrl_action_space`.  ``legacy_action`` is the historical
-Python/bridge placement identity (wait 0, placements 1..N); ``policy_action``
-is the model-facing identity; ``bridge_action`` is the integer actually sent
-to the bridge for ordinary placement/wait commands.
+Adventure Generalist has one permanent action identity: action ``0`` waits and
+actions ``1..700`` are fourteen seed-slot-major 5x10 placement/fusion blocks.
+``policy_action`` and ``bridge_action`` therefore carry the same integer; no
+alternate decoder identity or wait-position adapter remains.
 """
 
 from __future__ import annotations
@@ -22,12 +21,11 @@ from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Sequence, Tuple
 
 from pvzrl_action_space import (
-    ACTION_SPACE_FIXED,
+    ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
     ActionSpaceSpec,
     build_action_space_spec,
     decode_policy_action,
-    normalize_action_space_mode,
-    policy_action_to_legacy_action,
 )
 from pvzrl_observation_facts import (
     SeedSlotFact as SeedSlotFacts,
@@ -84,7 +82,6 @@ class ActionIntent:
 
     source: str
     policy_action: int
-    legacy_action: int
     bridge_action: int
     action_kind: str
     seed_slot: int
@@ -97,7 +94,6 @@ class ActionIntent:
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", str(self.source or "unknown"))
         object.__setattr__(self, "policy_action", int(self.policy_action))
-        object.__setattr__(self, "legacy_action", int(self.legacy_action))
         object.__setattr__(self, "bridge_action", int(self.bridge_action))
         object.__setattr__(self, "action_kind", str(self.action_kind or ACTION_KIND_INVALID))
         object.__setattr__(self, "seed_slot", int(self.seed_slot))
@@ -115,7 +111,6 @@ class ActionIntent:
         return {
             "source": self.source,
             "policy_action": self.policy_action,
-            "legacy_action": self.legacy_action,
             "bridge_action": self.bridge_action,
             "action_kind": self.action_kind,
             "seed_slot": self.seed_slot,
@@ -150,9 +145,9 @@ class ObservationFrameIdentity:
 class ActionValidationConfig:
     """Immutable configuration inputs that can affect Python action legality."""
 
-    action_space_mode: str = ACTION_SPACE_FIXED
+    action_space_mode: str = ACTION_SPACE_ADVENTURE_14_IDENTITY
     plant_types: Tuple[int, ...] = ()
-    max_seed_slots: Optional[int] = None
+    max_seed_slots: int = ADVENTURE_IDENTITY_MAX_SEED_SLOTS
     rows: int = 5
     cols: int = 10
     fusion_action_mask_enabled: bool = False
@@ -164,12 +159,18 @@ class ActionValidationConfig:
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "action_space_mode", normalize_action_space_mode(self.action_space_mode))
         object.__setattr__(self, "plant_types", tuple(int(value) for value in self.plant_types))
-        if self.max_seed_slots is not None:
-            object.__setattr__(self, "max_seed_slots", max(0, int(self.max_seed_slots)))
-        object.__setattr__(self, "rows", int(self.rows))
-        object.__setattr__(self, "cols", int(self.cols))
+        spec = build_action_space_spec(
+            mode=self.action_space_mode,
+            plant_types=list(self.plant_types),
+            max_seed_slots=int(self.max_seed_slots),
+            rows=int(self.rows),
+            cols=int(self.cols),
+        )
+        object.__setattr__(self, "action_space_mode", spec.mode)
+        object.__setattr__(self, "max_seed_slots", spec.max_seed_slots)
+        object.__setattr__(self, "rows", spec.rows)
+        object.__setattr__(self, "cols", spec.cols)
         object.__setattr__(
             self,
             "fusion_compatible_pairs",
@@ -283,10 +284,6 @@ class ActionDecision:
         return self.intent.policy_action
 
     @property
-    def legacy_action(self) -> int:
-        return self.intent.legacy_action
-
-    @property
     def bridge_action(self) -> int:
         return self.intent.bridge_action
 
@@ -302,7 +299,6 @@ class ActionDecision:
             "intent": self.intent.to_dict(),
             "source": self.source,
             "policy_action": self.policy_action,
-            "legacy_action": self.legacy_action,
             "bridge_action": self.bridge_action,
             "action_kind": self.resolved_action_kind,
             "legal": bool(self.legal),
@@ -401,7 +397,7 @@ class ActionDecisionCache:
         decision = self.decisions[action_id]
         if intent is None:
             return replace(decision, cache_reused=bool(cache_reused))
-        if intent.bridge_action != action_id or intent.legacy_action != action_id:
+        if intent.bridge_action != action_id:
             return None
         return decision.for_intent(intent, cache_reused=cache_reused)
 
@@ -491,8 +487,10 @@ def build_action_validation_context(
     rows = snapshot.rows
     cols = snapshot.columns
     slots = snapshot.seed_slots
-    default_count = config.spec.action_count
-    action_count = max(0, _safe_int(observation.get("actionCount"), default_count))
+    # Model-facing width is checkpoint semantics, never a mutable observation
+    # hint.  Startup validation reports bridge/config mismatches separately;
+    # the mask and decision cache must always retain the protected 701 entries.
+    action_count = config.spec.action_count
     occupancy = snapshot.occupancy
     config_fingerprint = config.fingerprint
     return ActionValidationContext(
@@ -528,7 +526,7 @@ def build_action_intent(
     policy_action: int,
     *,
     source: str,
-    mode: str,
+    mode: str = ACTION_SPACE_ADVENTURE_14_IDENTITY,
     observation: Optional[Mapping[str, Any]] = None,
     plant_types: Sequence[int] = (),
     max_seed_slots: Optional[int] = None,
@@ -572,11 +570,10 @@ def _build_action_intent_with_spec(
     source_metadata: Optional[Mapping[str, Any]] = None,
 ) -> ActionIntent:
     action_id = int(policy_action)
-    normalized_mode = spec.mode
     obs = dict(observation) if isinstance(observation, Mapping) else {}
     decoded = decode_policy_action(
         action_id,
-        mode=normalized_mode,
+        mode=spec.mode,
         observation=obs,
         plant_types=list(plant_types),
         max_seed_slots=max_seed_slots,
@@ -590,17 +587,10 @@ def _build_action_intent_with_spec(
         action_kind = ACTION_KIND_PLACEMENT
     else:
         action_kind = ACTION_KIND_INVALID
-    legacy_action = policy_action_to_legacy_action(
-        action_id,
-        mode=normalized_mode,
-        rows=rows,
-        cols=cols,
-    )
     return ActionIntent(
         source=source,
         policy_action=action_id,
-        legacy_action=legacy_action,
-        bridge_action=legacy_action,
+        bridge_action=action_id,
         action_kind=action_kind,
         seed_slot=_safe_int(decoded.get("slot_index"), -1),
         row=_safe_int(decoded.get("row"), -1),
@@ -637,7 +627,7 @@ def validate_action_intent(
     intent: ActionIntent,
     context: ActionValidationContext,
 ) -> ActionDecision:
-    """Pure placement/wait validation with the legacy rejection ordering.
+    """Pure placement/wait validation with the established rejection ordering.
 
     Ordering is externally visible in diagnostics and deliberately mirrors the
     pre-refactor ``PvZGymEnv._python_action_filter`` implementation.

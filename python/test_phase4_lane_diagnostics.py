@@ -253,7 +253,7 @@ def test_lane_diagnostics_input_is_frozen() -> None:
 def test_episode_lane_aggregation_does_not_evaluate_present_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     observation = _observation()
     info = {
         "lane_diagnostics": {

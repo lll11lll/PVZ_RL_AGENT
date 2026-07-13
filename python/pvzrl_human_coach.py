@@ -18,13 +18,11 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequenc
 from collections import deque
 
 from pvzrl_action_space import (
-    ACTION_SPACE_DYNAMIC_14,
+    ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ActionSpaceSpec,
     build_action_space_spec,
     decode_policy_action,
-    legacy_action_to_policy_action,
     normalize_action_space_mode,
-    policy_action_to_legacy_action,
 )
 from pvzrl_actions import (
     ACTION_KIND_FUSION,
@@ -812,7 +810,7 @@ class HumanCoachOverrideHook:
 
     def _wait_action_for_env(self, env: Any, *, observation: Dict[str, Any], fallback: int) -> int:
         action_spec = getattr(env, "action_spec", None)
-        mode = getattr(action_spec, "mode", "fixed")
+        mode = getattr(action_spec, "mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)
         rows = _safe_int(
             observation.get("rowCount"),
             getattr(env, "rows", None),
@@ -1437,7 +1435,7 @@ def validate_coach_command_for_env(
     force_fusion_enabled: bool = False,
 ) -> CoachActionValidation:
     action_spec = getattr(env, "action_spec", None)
-    mode = getattr(action_spec, "mode", "fixed")
+    mode = getattr(action_spec, "mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)
     rows = int(getattr(env, "rows", getattr(action_spec, "rows", 5)) or 5)
     cols = int(getattr(env, "cols", getattr(action_spec, "cols", 10)) or 10)
     max_seed_slots = int(getattr(action_spec, "max_seed_slots", 0) or 0) or None
@@ -1466,14 +1464,6 @@ def validate_coach_command_for_env(
     if callable(decision_fn):
         def _resolve_policy_decision(action: int) -> ActionDecision:
             policy_action = int(action)
-            legacy_action = int(
-                policy_action_to_legacy_action(
-                    policy_action,
-                    mode=mode,
-                    rows=rows,
-                    cols=cols,
-                )
-            )
             source = str(command.source or "human_coach")
             source_metadata = {
                 "coach_command_id": int(command.coach_command_id),
@@ -1491,7 +1481,7 @@ def validate_coach_command_for_env(
                 source_metadata=source_metadata,
             )
             return decision_fn(
-                legacy_action,
+                policy_action,
                 observation=observation,
                 source=source,
                 source_metadata=source_metadata,
@@ -1547,7 +1537,7 @@ def _encode_slot_cell_action(seed_index: int, row: int, col: int, *, spec: Actio
         return None, "col_out_of_bounds"
     cells = int(spec.rows) * int(spec.cols)
     encoded = seed_index * cells + row * int(spec.cols) + col
-    action = encoded if spec.mode == ACTION_SPACE_DYNAMIC_14 else encoded + 1
+    action = encoded + 1
     if not (0 <= action < int(spec.action_count)):
         return None, "action_out_of_bounds"
     if action != int(spec.wait_action) and not (int(spec.placement_action_min) <= action <= int(spec.placement_action_max)):
@@ -1719,10 +1709,7 @@ def _validate_policy_action(
         return _validation(command, False, policy_action=action, rejected_reason="action_out_of_bounds")
     has_signal = _has_legality_signal(action_mask, observation)
     allowed_policy_actions = _legal_policy_actions(spec, observation, action_mask)
-    bridge_actions = {
-        int(policy_action_to_legacy_action(policy, mode=spec.mode, rows=spec.rows, cols=spec.cols))
-        for policy in allowed_policy_actions
-    }
+    bridge_actions = {int(policy) for policy in allowed_policy_actions}
     validation_observation = dict(observation)
     validation_observation.setdefault("rowCount", int(spec.rows))
     validation_observation.setdefault("columnCount", int(spec.cols))
@@ -1838,7 +1825,7 @@ def _legal_policy_actions(spec: ActionSpaceSpec, observation: Dict[str, Any], ac
     if isinstance(raw_legal, list):
         for raw_action in raw_legal:
             try:
-                result.add(int(legacy_action_to_policy_action(int(raw_action), mode=spec.mode)))
+                result.add(int(raw_action))
             except Exception:
                 continue
     return {action for action in result if 0 <= action < int(spec.action_count)}

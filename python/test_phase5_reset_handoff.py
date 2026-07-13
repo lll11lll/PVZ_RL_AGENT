@@ -7,56 +7,13 @@ from typing import Any
 
 import pytest
 
-from pvzrl_env import RUN_MODE_LEVEL3_SPECIALIST, PvZEnvConfig, PvZGymEnv
 from test_refactor_support import load_observation_fixture, make_wrapper
-
-
-def test_level3_reset_reaches_state_machine_without_obsolete_preflight_local(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    env = PvZGymEnv(
-        PvZEnvConfig(
-            run_mode=RUN_MODE_LEVEL3_SPECIALIST,
-            target_level=3,
-        )
-    )
-    playable = {
-        "frameCount": 1,
-        "rowCount": 5,
-        "columnCount": 10,
-        "boardFound": True,
-        "gameplayReady": True,
-        "actualGameplayReady": True,
-        "screenState": "gameplay",
-        "terminalHint": "running",
-    }
-    monkeypatch.setattr(env, "configure", lambda: {"ok": True})
-    monkeypatch.setattr(
-        env,
-        "level3_specialist_start_state",
-        lambda: pytest.fail("reset duplicated the trainer-owned Level-3 preflight"),
-    )
-    monkeypatch.setattr(
-        env,
-        "_reset_state_machine",
-        lambda *_args, **_kwargs: dict(playable),
-    )
-    monkeypatch.setattr(env, "begin_new_attempt", lambda *_args, **_kwargs: None)
-    try:
-        observation, info = env.reset()
-        assert observation == playable
-        payload = info["reset"]
-        assert payload["resetReason"] == "level3_start"
-        assert "level3SpecialistStartState" not in payload
-        assert "targetLevel" not in payload
-    finally:
-        env.client.close()
 
 
 def test_action_freeze_keeps_episode_label_but_hands_base_a_valid_reset_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     wrapper.config.wait_for_board = False
     wrapper.config.wait_gameplay_ready = False
     observation = load_observation_fixture()

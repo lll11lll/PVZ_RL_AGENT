@@ -1,8 +1,8 @@
-"""Gymnasium-style client and baseline tools for the PvZRL bridge.
+"""Adventure Generalist environment and diagnostic tools for the PvZRL bridge.
 
 The MelonLoader mod owns direct Unity/IL2CPP access. This Python module owns
-trainer-facing reset/step/observe/reward/done behavior and computes rewards
-from observation deltas first. It intentionally does not start PPO.
+Generalist reset/step/observe/reward/done behavior and computes rewards from
+observation deltas first. It intentionally does not start PPO.
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ from pvzrl_actions import (
     build_action_validation_context,
     compatible_pairs_for_observation,
     validate_action_intent,
+)
+from pvzrl_action_space import (
+    ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
 )
 from pvzrl_fusion import (
     FUSION_POLICY_NONE,
@@ -109,24 +114,14 @@ from pvzrl_rewards import (
 )
 
 
-DEFAULT_PLANT_TYPES = [1, 0]  # SunFlower, Peashooter
-LEVEL3_SPECIALIST_TARGET_LEVEL = 3
-LEVEL3_SPECIALIST_SEED_LIST = ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
-LEVEL3_SPECIALIST_PLANT_TYPES = [1, 0, 3, 2]
+GENERALIST_INITIAL_PLANT_TYPES = [1, 1, 0, 0]
+GENERALIST_INITIAL_SEED_LIST = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLANT_REGISTRY_PATH = DEFAULT_PLANT_REGISTRY_PATH
 LAWN_STRINGS_PATH = PROJECT_ROOT / "Game Files" / "Mods" / "PvZ_Fusion_Translator" / "Dumps" / "LawnStrings.json"
-RUN_MODE_FIXED_TRAIN = "fixed_train"
-RUN_MODE_FIXED_EVAL = "fixed_eval"
-RUN_MODE_ADVENTURE_EVAL = "adventure_eval"
-RUN_MODE_LEVEL3_SPECIALIST = "level3_specialist"
 RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN = "adventure_generalist_14slot_train"
 RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL = "adventure_generalist_14slot_eval"
-RUN_MODES = {
-    RUN_MODE_FIXED_TRAIN,
-    RUN_MODE_FIXED_EVAL,
-    RUN_MODE_ADVENTURE_EVAL,
-    RUN_MODE_LEVEL3_SPECIALIST,
+ADVENTURE_GENERALIST_RUN_MODES = {
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
     RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
 }
@@ -179,9 +174,9 @@ class PvZEnvConfig:
     action_timeout_seconds: float = 10.0
     save_freeze_debug_bundle: bool = True
     step_seconds: float = 0.25
-    plant_types: List[int] = field(default_factory=lambda: list(DEFAULT_PLANT_TYPES))
+    plant_types: List[int] = field(default_factory=lambda: list(GENERALIST_INITIAL_PLANT_TYPES))
     row_count: int = 5
-    column_count: int = 9
+    column_count: int = 10
     game_speed: float = 1.0
     game_speed_mode: str = "game_speed"
     seed: int = 12345
@@ -189,8 +184,8 @@ class PvZEnvConfig:
     reset_mode: str = "soft"
     reset_wait_timeout: float = 30.0
     reset_poll_seconds: float = 0.2
-    auto_select_seeds: bool = False
-    seed_list: List[str] = field(default_factory=lambda: ["SunFlower", "Peashooter"])
+    auto_select_seeds: bool = True
+    seed_list: List[str] = field(default_factory=lambda: list(GENERALIST_INITIAL_SEED_LIST))
     seed_click_delay: float = 0.35
     lets_rock_delay: float = 0.5
     post_start_delay: float = 1.0
@@ -208,12 +203,10 @@ class PvZEnvConfig:
     enable_fusion_chain_rewards: bool = False
     enable_recipe_discovery_reward: bool = False
     enable_repeat_recipe_decay: bool = False
-    run_mode: str = RUN_MODE_FIXED_TRAIN
-    target_level: int = 0
+    run_mode: str = RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN
     tactical_masks: bool = False
     wallnut_tactical_mask: bool = False
     cherrybomb_tactical_mask: bool = False
-    adventure_eval_mode: bool = False
     game_exe: Optional[str] = None
     reward: RewardConfig = field(default_factory=RewardConfig)
 
@@ -848,14 +841,27 @@ class PvZGymEnv:
         self.config = config or PvZEnvConfig()
         self.config.fusion_policy = normalize_fusion_policy(getattr(self.config, "fusion_policy", FUSION_POLICY_NONE))
         requested_run_mode = str(getattr(self.config, "run_mode", "") or "").strip().lower()
-        if requested_run_mode not in RUN_MODES:
-            requested_run_mode = RUN_MODE_ADVENTURE_EVAL if bool(self.config.adventure_eval_mode) else RUN_MODE_FIXED_TRAIN
+        if requested_run_mode not in ADVENTURE_GENERALIST_RUN_MODES:
+            raise ValueError(
+                f"Unsupported run_mode: {self.config.run_mode!r}; expected Adventure Generalist "
+                f"train/eval mode ({sorted(ADVENTURE_GENERALIST_RUN_MODES)!r})"
+            )
+        if int(self.config.row_count) != 5 or int(self.config.column_count) != 10:
+            raise ValueError(
+                "Adventure Generalist requires a 5x10 board: "
+                f"row_count={self.config.row_count}, column_count={self.config.column_count}"
+            )
+        if len(self.config.plant_types) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
+            raise ValueError(
+                "Adventure Generalist supports at most 14 configured seed identities: "
+                f"plant_types={len(self.config.plant_types)}"
+            )
+        if len(self.config.seed_list) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
+            raise ValueError(
+                "Adventure Generalist supports at most 14 configured seed names: "
+                f"seed_list={len(self.config.seed_list)}"
+            )
         self.config.run_mode = requested_run_mode
-        self.config.adventure_eval_mode = requested_run_mode in {
-            RUN_MODE_ADVENTURE_EVAL,
-            RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
-            RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
-        }
         self.client = PvZBridgeClient(
             self.config.host,
             self.config.port,
@@ -894,99 +900,12 @@ class PvZGymEnv:
 
     def _run_mode(self) -> str:
         run_mode = str(getattr(self.config, "run_mode", "") or "").strip().lower()
-        if run_mode in RUN_MODES:
+        if run_mode in ADVENTURE_GENERALIST_RUN_MODES:
             return run_mode
-        return RUN_MODE_ADVENTURE_EVAL if bool(getattr(self.config, "adventure_eval_mode", False)) else RUN_MODE_FIXED_TRAIN
-
-    def _is_adventure_eval_mode(self) -> bool:
-        return self._run_mode() in {
-            RUN_MODE_ADVENTURE_EVAL,
-            RUN_MODE_ADVENTURE_GENERALIST_14SLOT_TRAIN,
-            RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL,
-        }
-
-    def _is_level3_specialist_mode(self) -> bool:
-        return self._run_mode() == RUN_MODE_LEVEL3_SPECIALIST
-
-    def _is_fixed_level_mode(self) -> bool:
-        return self._run_mode() in {RUN_MODE_FIXED_TRAIN, RUN_MODE_FIXED_EVAL, RUN_MODE_LEVEL3_SPECIALIST}
-
-    def level3_specialist_start_state(self) -> Dict[str, Any]:
-        observation: Dict[str, Any] = {}
-        state: Dict[str, Any] = {}
-        try:
-            observation = self.observe(force_seed_probe=True, force_restart_probe=True)
-        except Exception as exc:
-            observation = {"observe_error": str(exc)}
-        try:
-            state = self.adventure_screen_state()
-        except Exception as exc:
-            state = {"adventure_state_error": str(exc)}
-        target_level = int(getattr(self.config, "target_level", 0) or LEVEL3_SPECIALIST_TARGET_LEVEL)
-        obs_level = self._safe_int(
-            observation.get("currentAdventureLevel"),
-            observation.get("currentLevel"),
-            observation.get("boardLevel"),
-            default=0,
+        raise ValueError(
+            f"Unsupported run_mode: {self.config.run_mode!r}; expected Adventure Generalist "
+            f"train/eval mode ({sorted(ADVENTURE_GENERALIST_RUN_MODES)!r})"
         )
-        state_level = self._safe_int(
-            state.get("currentAdventureLevel"),
-            state.get("currentLevel"),
-            state.get("boardLevel"),
-            default=0,
-        )
-        level = state_level or obs_level
-        seed_selection = bool(
-            observation.get("seedSelectionActive")
-            or observation.get("onSeedSelectionScreen")
-            or state.get("seedSelectionActive")
-            or state.get("onSeedSelectionScreen")
-            or str(observation.get("screenState") or state.get("screenState") or "") == "seed_selection"
-        )
-        gameplay_ready = bool(observation.get("gameplayReady"))
-        adventure_button_visible = bool(state.get("isAdventureButtonVisible"))
-        startup_ok = bool(state.get("startupPopupVisible") or state.get("startupOkButtonVisible"))
-        ok = bool(
-            level == target_level
-            and (
-                seed_selection
-                or gameplay_ready
-                or adventure_button_visible
-                or startup_ok
-                or str(state.get("screenState") or observation.get("screenState") or "") in {"main_menu", "seed_selection"}
-            )
-        )
-        return {
-            "ok": ok,
-            "targetLevel": target_level,
-            "level": level,
-            "observationLevel": obs_level,
-            "adventureStateLevel": state_level,
-            "seedSelectionActive": seed_selection,
-            "gameplayReady": gameplay_ready,
-            "adventureButtonVisible": adventure_button_visible,
-            "startupOkVisible": startup_ok,
-            "screenState": state.get("screenState") or observation.get("screenState"),
-            "nextStep": state.get("nextStep") or observation.get("nextStep"),
-            "observation": {
-                "screenState": observation.get("screenState"),
-                "nextStep": observation.get("nextStep"),
-                "gameplayReady": observation.get("gameplayReady"),
-                "seedSelectionActive": observation.get("seedSelectionActive"),
-                "currentAdventureLevel": observation.get("currentAdventureLevel"),
-                "wave": observation.get("wave"),
-                "maxWave": observation.get("maxWave"),
-            },
-            "adventureState": {
-                "screenState": state.get("screenState"),
-                "nextStep": state.get("nextStep"),
-                "currentAdventureLevel": state.get("currentAdventureLevel"),
-                "isAdventureButtonVisible": state.get("isAdventureButtonVisible"),
-                "seedSelectionActive": state.get("seedSelectionActive"),
-                "gameplayReady": state.get("gameplayReady"),
-            },
-            "blocked_reason": "" if ok else "not_at_level3_specialist_start_state",
-        }
 
     def _reset_reward_episode_state(self) -> None:
         self._possible_win_pending_steps = 0
@@ -1036,55 +955,31 @@ class PvZGymEnv:
         baseline = observation if isinstance(observation, dict) else self.previous_observation
         if not isinstance(baseline, dict):
             baseline = {}
-        log_reset = bool(self._is_adventure_eval_mode() or previous_lost_mower_rows)
-        if log_reset:
+        print(
+            "[corruption-debug] reset corruption trackers "
+            f"reason={reason or 'new_attempt'} "
+            f"previous_lost_mower_rows={previous_lost_mower_rows} "
+            f"previous_wave={previous_observation.get('wave')} "
+            f"previous_plants={previous_observation.get('plantCount')} "
+            f"baseline_wave={baseline.get('wave')} "
+            f"baseline_plants={baseline.get('plantCount')} "
+            f"baseline_zombies={baseline.get('zombieCount')} "
+            f"baseline_mowers={baseline.get('logicalMowerCount')} "
+            f"screenState={baseline.get('screenState')} "
+            f"gameplayReady={baseline.get('gameplayReady')} "
+            f"seedSelectionActive={baseline.get('seedSelectionActive')}"
+        )
+        if baseline:
             print(
-                "[corruption-debug] reset corruption trackers "
+                "[corruption-debug] initializing board baseline after new gameplay board "
                 f"reason={reason or 'new_attempt'} "
-                f"previous_lost_mower_rows={previous_lost_mower_rows} "
-                f"previous_wave={previous_observation.get('wave')} "
-                f"previous_plants={previous_observation.get('plantCount')} "
-                f"baseline_wave={baseline.get('wave')} "
-                f"baseline_plants={baseline.get('plantCount')} "
-                f"baseline_zombies={baseline.get('zombieCount')} "
-                f"baseline_mowers={baseline.get('logicalMowerCount')} "
-                f"screenState={baseline.get('screenState')} "
-                f"gameplayReady={baseline.get('gameplayReady')} "
-                f"seedSelectionActive={baseline.get('seedSelectionActive')}"
+                f"frame={baseline.get('frameCount')} "
+                f"wave={baseline.get('wave')}/{baseline.get('maxWave')} "
+                f"plantCount={baseline.get('plantCount')} "
+                f"zombieCount={baseline.get('zombieCount')} "
+                f"mowerCount={baseline.get('logicalMowerCount')} "
+                f"nextStep={baseline.get('nextStep')}"
             )
-            if baseline:
-                print(
-                    "[corruption-debug] initializing board baseline after new gameplay board "
-                    f"reason={reason or 'new_attempt'} "
-                    f"frame={baseline.get('frameCount')} "
-                    f"wave={baseline.get('wave')}/{baseline.get('maxWave')} "
-                    f"plantCount={baseline.get('plantCount')} "
-                    f"zombieCount={baseline.get('zombieCount')} "
-                    f"mowerCount={baseline.get('logicalMowerCount')} "
-                    f"nextStep={baseline.get('nextStep')}"
-                )
-
-    def _autodetect_game_exe(self) -> Optional[str]:
-        candidates = [
-            Path.cwd() / "Game Files" / "PlantsVsZombiesRH.exe",
-            Path(__file__).resolve().parents[1] / "Game Files" / "PlantsVsZombiesRH.exe",
-        ]
-        for candidate in candidates:
-            try:
-                if candidate.exists():
-                    return str(candidate.resolve())
-            except OSError:
-                continue
-        return None
-
-    def _ensure_python_owned_hard_reset_available(self) -> bool:
-        if self.config.game_exe:
-            return True
-        detected = self._autodetect_game_exe()
-        if detected:
-            self.config.game_exe = detected
-            return True
-        return False
 
     def start_game(self) -> None:
         if not self.config.game_exe:
@@ -1222,7 +1117,7 @@ class PvZGymEnv:
                     reset_reason = inferred_reset_reason
                     print(f"[reset] inferred reset_reason={reset_reason} from previous terminal observation")
             if not reset_reason and self.previous_observation is None:
-                reset_reason = "level3_start" if self._is_level3_specialist_mode() else "manual"
+                reset_reason = "manual"
                 initial_manual_reset = True
                 allow_active_gameplay_reset = True
             elif not reset_reason and self._has_live_board_progress(self.previous_observation):
@@ -1236,7 +1131,6 @@ class PvZGymEnv:
             "timeout",
             "env_corruption",
             "manual",
-            "level3_start",
         }
         if reset_reason not in allowed_reset_reasons:
             raise RuntimeError(f"reset called without valid reset_reason={reset_reason}")
@@ -1251,12 +1145,7 @@ class PvZGymEnv:
             )
             if timeout_near_win_context:
                 reset_reason = "post_win_pending"
-        fixed_train_post_win_reset = bool(reset_reason in {"win", "post_win_pending"} and self._is_fixed_level_mode())
-        fixed_train_terminal_reset = bool(
-            self._is_fixed_level_mode()
-            and reset_reason in {"win", "loss", "post_win_pending", "timeout", "level3_start"}
-        )
-        if reset_reason in {"win", "post_win_pending"} or fixed_train_terminal_reset:
+        if reset_reason in {"win", "post_win_pending"}:
             allow_active_gameplay_reset = False
         timeout_requires_seed_flow = bool(
             reset_reason == "timeout"
@@ -1268,8 +1157,7 @@ class PvZGymEnv:
         self._last_episode_ended_by_timeout = bool(reset_reason == "timeout")
         self._last_episode_ended_by_win = bool(reset_reason in {"win", "post_win_pending"})
         self._reset_requires_seed_flow = bool(
-            fixed_train_terminal_reset
-            or timeout_requires_seed_flow
+            timeout_requires_seed_flow
             or reset_reason in {"win", "post_win_pending"}
         )
         self.clear_coach_runtime_state(queue_cleared=True, startup_command_blocked=False, reason=reset_reason)
@@ -1287,19 +1175,11 @@ class PvZGymEnv:
             "initialManualReset": bool(initial_manual_reset),
             "timeoutNearWinPromotedToPostWinPending": bool(timeout_near_win_context),
             "timeoutRequiresSeedFlow": bool(timeout_requires_seed_flow),
-            "fixedTrainPostWinReplayReset": bool(fixed_train_post_win_reset),
-            "fixedTrainTerminalReset": bool(fixed_train_terminal_reset),
-            "fixedTrainTerminalHardReset": False,
             "resetRequiresSeedFlow": bool(self._reset_requires_seed_flow),
             "resetGenerationId": int(self._reset_generation_id),
             "coach_command_queue_cleared_on_reset": True,
             "startup_command_blocked": False,
         }
-        if fixed_train_terminal_reset:
-            print("[reset-mode] level3_specialist" if self._is_level3_specialist_mode() else "[reset-mode] fixed_train")
-            print(f"[reset] reason={reset_reason}")
-            print("[reset] target=seed_selection")
-            print("[reset] attempting=in_game_reset")
         if timeout_requires_seed_flow:
             timeout_context = {
                 "screenState": previous_observation.get("screenState"),
@@ -1314,9 +1194,7 @@ class PvZGymEnv:
             }
             reset_result["timeoutContext"] = timeout_context
             print("[reset] timeout episode truncated; next reset requires full seed flow")
-            if fixed_train_terminal_reset:
-                reset_result["timeoutInGameResetHandledByFixedTrain"] = True
-            elif self.config.game_exe:
+            if self.config.game_exe:
                 print("[reset] timeout reset using verified hard reset before seed flow")
                 try:
                     hard_reset = self.hard_reset()
@@ -1365,29 +1243,7 @@ class PvZGymEnv:
                 reset_reason=reset_reason,
             )
         except Exception as exc:
-            if self._is_fixed_level_mode() and reset_reason in {"win", "loss", "post_win_pending", "timeout"}:
-                if not self._ensure_python_owned_hard_reset_available():
-                    try:
-                        self.restore_game_speed()
-                    except Exception:
-                        pass
-                    raise
-                print(
-                    "[reset] attempting=hard_process_restart "
-                    f"fallback=True reason=in_game_reset_failed error={exc}"
-                )
-                reset_result["inGameResetFailed"] = True
-                reset_result["inGameResetError"] = str(exc)
-                hard_reset = self.hard_reset()
-                reset_result["hardReset"] = hard_reset
-                reset_result["hardResetFallback"] = True
-                reset_result["methodUsed"] = f"hard_reset_fallback_fixed_train_{reset_reason}"
-                observation = self._reset_state_machine(
-                    reset_result,
-                    allow_active_gameplay_reset=False,
-                    reset_reason=reset_reason,
-                )
-            elif self.config.game_exe:
+            if self.config.game_exe:
                 reset_result = self.hard_reset()
                 reset_result["fallbackReason"] = str(exc)
                 observation = self._reset_state_machine(
@@ -1417,10 +1273,6 @@ class PvZGymEnv:
         stages: List[Dict[str, Any]] = reset_result.setdefault("stages", [])
         restart_attempts = 0
         last_restart_attempt_at = 0.0
-        post_win_replay_attempts = 0
-        last_post_win_replay_attempt_at = 0.0
-        post_win_replay_ready_at = 0.0
-        post_win_settle_logged = False
         cleanup_attempts = 0
         playable_reset_attempts = 0
         seed_selection_failures = 0
@@ -1428,37 +1280,14 @@ class PvZGymEnv:
         requires_seed_selection = bool(
             reset_reason in {"win", "post_win_pending"}
             or reset_result.get("timeoutRequiresSeedFlow")
-            or reset_result.get("fixedTrainTerminalReset")
-            or reset_result.get("fixedTrainTerminalHardReset")
-            or (self._is_level3_specialist_mode() and reset_reason == "level3_start")
         )
         reset_state = ResetRuntimeState(
             generation_id=int(self._reset_generation_id),
             reason=str(reset_reason or ""),
             requires_seed_selection=requires_seed_selection,
             started_from_win=requires_seed_selection,
-            fixed_post_win_replay=bool(
-                reset_reason in {"win", "post_win_pending"}
-                and self._is_fixed_level_mode()
-            ),
-            fixed_terminal_reset=bool(
-                reset_result.get("fixedTrainTerminalReset")
-                or (
-                    self._is_fixed_level_mode()
-                    and reset_reason
-                    in {
-                        "win",
-                        "loss",
-                        "post_win_pending",
-                        "timeout",
-                        "level3_start",
-                    }
-                )
-            ),
         )
         win_reset_invariant_armed = bool(reset_state.requires_seed_selection)
-        fixed_train_in_game_attempts = 0
-        last_fixed_train_in_game_attempt_at = 0.0
 
         def stage(name: str, **fields: Any) -> None:
             stages.append({"stage": name, "elapsed": round(time.monotonic() - started, 3), **fields})
@@ -1544,15 +1373,7 @@ class PvZGymEnv:
                 resetReason=reset_reason,
                 requireSeedSelectionThisReset=True,
                 sawSeedSelectionThisReset=False,
-                fixedTrainPostWinReplayReset=bool(reset_state.fixed_post_win_replay),
             )
-            if reset_state.fixed_post_win_replay:
-                stage(
-                    "fixed_train_post_win_replay_reset_started",
-                    resetReason=reset_reason,
-                    runMode=self._run_mode(),
-                )
-                print("[reset] post-win fixed_train reset started")
 
         while time.monotonic() < deadline:
             observation = self.observe(force_seed_probe=True, force_restart_probe=True)
@@ -1609,188 +1430,6 @@ class PvZGymEnv:
                 continue
 
             enforce_loss_reset_invariant(observation, note="loop_head")
-
-            post_win_replay_context = bool(
-                reset_state.fixed_post_win_replay
-                and not reset_state.saw_seed_selection
-                and not self._seed_selection_visible(observation)
-                and (
-                    lifecycle_state == LIFECYCLE_POST_WIN_PENDING
-                    or possible_win_reset_context
-                    or bool(observation.get("done"))
-                    or bool(observation.get("over"))
-                    or terminal_hint == "possible_win"
-                )
-            )
-            if post_win_replay_context:
-                now = time.monotonic()
-                if post_win_replay_ready_at <= 0.0:
-                    post_win_replay_ready_at = now
-                    stage(
-                        "post_win_fixed_train_settle_started",
-                        screenState=observation.get("screenState"),
-                        nextStep=next_step,
-                        terminalHint=terminal_hint,
-                        trophyVisible=observation.get("trophyVisible"),
-                        rewardObjectVisible=observation.get("rewardObjectVisible"),
-                        rewardScreenVisible=observation.get("rewardScreenVisible"),
-                    )
-                settle_seconds = 2.0
-                if now - post_win_replay_ready_at < settle_seconds:
-                    if not post_win_settle_logged:
-                        post_win_settle_logged = True
-                        print(
-                            "[reset] post-win fixed_train reward/trophy settle wait before level replay "
-                            f"seconds={settle_seconds:.1f} "
-                            f"screenState={observation.get('screenState')} "
-                            f"nextStep={next_step} "
-                            f"trophyVisible={observation.get('trophyVisible')} "
-                            f"rewardObjectVisible={observation.get('rewardObjectVisible')}"
-                        )
-                    stage(
-                        "post_win_fixed_train_settle_wait",
-                        elapsedSincePostWin=round(now - post_win_replay_ready_at, 3),
-                        requiredSeconds=settle_seconds,
-                        screenState=observation.get("screenState"),
-                        nextStep=next_step,
-                    )
-                    time.sleep(self.config.reset_poll_seconds)
-                    continue
-                if post_win_replay_attempts > 0 and now - last_post_win_replay_attempt_at < 1.0:
-                    time.sleep(self.config.reset_poll_seconds)
-                    continue
-                if post_win_replay_attempts >= 3:
-                    reset_result["postWinReplayResetFailed"] = True
-                    stage(
-                        "post_win_fixed_train_replay_reset_failed",
-                        attempts=post_win_replay_attempts,
-                        screenState=observation.get("screenState"),
-                        nextStep=next_step,
-                        gameplayReady=observation.get("gameplayReady"),
-                        seedSelectionActive=observation.get("seedSelectionActive"),
-                        terminalHint=terminal_hint,
-                        wave=observation.get("wave"),
-                        maxWave=observation.get("maxWave"),
-                        plantCount=observation.get("plantCount"),
-                        zombieCount=observation.get("zombieCount"),
-                        bulletCount=observation.get("bulletCount"),
-                        logicalMowerCount=observation.get("logicalMowerCount"),
-                    )
-                    raise RuntimeError(
-                        "post-win fixed_train reset failed to reach seed selection screen after replay attempts. "
-                        f"screenState={observation.get('screenState')} nextStep={next_step} "
-                        f"gameplayReady={observation.get('gameplayReady')} "
-                        f"seedSelectionActive={observation.get('seedSelectionActive')} "
-                        f"terminalHint={terminal_hint} wave={observation.get('wave')}/{observation.get('maxWave')} "
-                        f"plants={observation.get('plantCount')} zombies={observation.get('zombieCount')} "
-                        f"bullets={observation.get('bulletCount')} mowers={observation.get('logicalMowerCount')}"
-                    )
-                set_phase("fixed_train_replay_reset")
-                sync_invariant_fields()
-                replay = self.auto_reset(
-                    start_sun=self.config.start_sun,
-                    allow_active_gameplay_reset=False,
-                    reset_reason=reset_reason,
-                    require_seed_selection_path=True,
-                )
-                post_win_replay_attempts += 1
-                last_post_win_replay_attempt_at = now
-                reset_result["postWinReplayReset"] = replay
-                reset_result["methodUsed"] = replay.get("methodUsed", "auto_reset")
-                stage(
-                    "post_win_fixed_train_replay_reset_invoked",
-                    attempt=post_win_replay_attempts,
-                    ok=replay.get("ok", True),
-                    methodUsed=replay.get("methodUsed"),
-                    invokedUiRestart=replay.get("invokedUiRestart"),
-                    actions=replay.get("actions", []),
-                    message=replay.get("message"),
-                )
-                print(
-                    "[reset] post-win fixed_train replay reset invoked "
-                    f"attempt={post_win_replay_attempts} method={replay.get('methodUsed')}"
-                )
-                if not replay.get("ok", True):
-                    reset_result["postWinReplayResetFailed"] = True
-                    raise RuntimeError(f"post-win fixed_train replay reset failed: {replay}")
-                set_phase("waiting_seed_selection")
-                sync_invariant_fields()
-                time.sleep(max(0.25, self.config.reset_poll_seconds))
-                continue
-
-            fixed_train_in_game_reset_context = bool(
-                reset_state.fixed_terminal_reset
-                and reset_reason in {"timeout", "level3_start"}
-                and not reset_state.saw_seed_selection
-                and not self._seed_selection_visible(observation)
-                and (
-                    lifecycle_state in {LIFECYCLE_ACTIVE_GAMEPLAY, LIFECYCLE_READY}
-                    or self._timeout_reset_requires_full_seed_flow(observation)
-                )
-            )
-            if fixed_train_in_game_reset_context:
-                now = time.monotonic()
-                if fixed_train_in_game_attempts > 0 and now - last_fixed_train_in_game_attempt_at < 1.0:
-                    time.sleep(self.config.reset_poll_seconds)
-                    continue
-                if fixed_train_in_game_attempts >= 3:
-                    reset_result["inGameResetFailed"] = True
-                    stage(
-                        "fixed_train_in_game_reset_failed",
-                        attempts=fixed_train_in_game_attempts,
-                        resetReason=reset_reason,
-                        screenState=observation.get("screenState"),
-                        nextStep=next_step,
-                        gameplayReady=observation.get("gameplayReady"),
-                        seedSelectionActive=observation.get("seedSelectionActive"),
-                        terminalHint=terminal_hint,
-                        wave=observation.get("wave"),
-                        maxWave=observation.get("maxWave"),
-                        plantCount=observation.get("plantCount"),
-                        zombieCount=observation.get("zombieCount"),
-                        bulletCount=observation.get("bulletCount"),
-                    )
-                    raise RuntimeError(
-                        "fixed_train in-game reset failed to reach seed selection after attempts. "
-                        f"reason={reset_reason} screenState={observation.get('screenState')} "
-                        f"nextStep={next_step} gameplayReady={observation.get('gameplayReady')} "
-                        f"seedSelectionActive={observation.get('seedSelectionActive')} "
-                        f"terminalHint={terminal_hint} wave={observation.get('wave')}/{observation.get('maxWave')}"
-                    )
-                set_phase("fixed_train_in_game_reset")
-                sync_invariant_fields()
-                replay = self.auto_reset(
-                    start_sun=self.config.start_sun,
-                    allow_active_gameplay_reset=True,
-                    reset_reason=reset_reason,
-                    require_seed_selection_path=True,
-                )
-                fixed_train_in_game_attempts += 1
-                last_fixed_train_in_game_attempt_at = now
-                reset_result["inGameReset"] = replay
-                reset_result["methodUsed"] = replay.get("methodUsed", "auto_reset")
-                stage(
-                    "fixed_train_in_game_reset_invoked",
-                    attempt=fixed_train_in_game_attempts,
-                    ok=replay.get("ok", True),
-                    methodUsed=replay.get("methodUsed"),
-                    invokedUiRestart=replay.get("invokedUiRestart"),
-                    actions=replay.get("actions", []),
-                    message=replay.get("message"),
-                )
-                print(
-                    "[reset] attempting=in_game_reset "
-                    f"reason={reset_reason} attempt={fixed_train_in_game_attempts} "
-                    f"method={replay.get('methodUsed')} ok={replay.get('ok', True)}"
-                )
-                if not replay.get("ok", True):
-                    reset_result["inGameResetFailed"] = True
-                    raise RuntimeError(f"fixed_train in-game reset failed: {replay}")
-                print("[reset] in_game_reset_success=True")
-                set_phase("waiting_seed_selection")
-                sync_invariant_fields()
-                time.sleep(max(0.25, self.config.reset_poll_seconds))
-                continue
 
             if lifecycle_state == LIFECYCLE_LOSS_PENDING:
                 if not reset_state.started_from_loss:
@@ -1993,12 +1632,8 @@ class PvZGymEnv:
                 log_reset_state(observation, note="seed_selection_detected")
                 reset_result.setdefault("seedScreenAtSeconds", round(time.monotonic() - started, 3))
                 print(f"[reset] seed_screen_at={reset_result['seedScreenAtSeconds']:.2f}s")
-                if reset_state.fixed_terminal_reset:
-                    print("[reset] seed_selection_detected=True")
                 if reset_reason == "timeout":
                     print("[reset] seed screen observed after timeout reset")
-                if reset_state.fixed_post_win_replay:
-                    print("[reset] seed selection observed after post-win reset")
                 stage(
                     "seed_screen_detected",
                     lifecycleState=lifecycle_state,
@@ -2024,10 +1659,6 @@ class PvZGymEnv:
                 set_phase("selecting_seeds")
                 sync_invariant_fields()
                 stage("auto_select_started", seedList=list(self.config.seed_list))
-                if reset_state.fixed_terminal_reset:
-                    print(f"[reset] selected_seeds={','.join(str(seed) for seed in self.config.seed_list)}")
-                elif reset_state.fixed_post_win_replay:
-                    print(f"[reset] auto-selecting seeds after post-win reset: {list(self.config.seed_list)}")
                 selection = self.auto_select_seeds(seed_list=self.config.seed_list, start_level=True)
                 reset_result["autoSelectSeeds"] = selection
                 reset_result["letsRockAtSeconds"] = round(time.monotonic() - started, 3)
@@ -2046,10 +1677,6 @@ class PvZGymEnv:
                     startLog=selection.get("startLog", {}),
                 )
                 print(f"[reset] lets_rock_at={reset_result['letsRockAtSeconds']:.2f}s")
-                if reset_state.fixed_terminal_reset:
-                    print(f"[reset] lets_rock_clicked={bool(reset_state.clicked_lets_rock)}")
-                if reset_state.fixed_post_win_replay and reset_state.clicked_lets_rock:
-                    print("[reset] Let's Rock clicked after post-win reset")
                 if not selection.get("ok", False):
                     seed_selection_failures += 1
                     stage(
@@ -2093,28 +1720,14 @@ class PvZGymEnv:
                 )
                 reset_result["gameplayReadyAtSeconds"] = round(time.monotonic() - started, 3)
                 print(f"[reset] gameplay_ready_at={reset_result['gameplayReadyAtSeconds']:.2f}s")
-                if reset_state.fixed_terminal_reset:
-                    print(f"[reset] gameplay_ready={bool(observation.get('gameplayReady'))}")
                 if reset_state.requires_seed_selection and reset_state.saw_seed_selection:
                     seed_slot_count = self._safe_int(observation.get("seedSlotCount"), default=0)
-                    if reset_state.fixed_post_win_replay:
-                        print(
-                            "[reset] accepted board after post-win seed flow: "
-                            f"wave={observation.get('wave', 0)} "
-                            f"plants={observation.get('plantCount', 0)} "
-                            f"zombies={observation.get('zombieCount', 0)} "
-                            f"bullets={observation.get('bulletCount', 0)} "
-                            f"mowers={observation.get('logicalMowerCount', 0)} "
-                            f"seed_slots={seed_slot_count} "
-                            f"legalActionCount={observation.get('legalActionCount', len(observation.get('legalActions', [])))}"
-                        )
-                    else:
-                        print(
-                            "[reset] accepted board after seed flow: "
-                            f"wave={observation.get('wave', 0)} "
-                            f"seed_slots={seed_slot_count} "
-                            f"legalActionCount={observation.get('legalActionCount', len(observation.get('legalActions', [])))}"
-                        )
+                    print(
+                        "[reset] accepted board after seed flow: "
+                        f"wave={observation.get('wave', 0)} "
+                        f"seed_slots={seed_slot_count} "
+                        f"legalActionCount={observation.get('legalActionCount', len(observation.get('legalActions', [])))}"
+                    )
                 break
 
             if lifecycle_state in {LIFECYCLE_ACTIVE_GAMEPLAY, LIFECYCLE_READY}:
@@ -2126,24 +1739,14 @@ class PvZGymEnv:
                     reset_result["unsafeGameplayReadyBeforeSeedCount"] = int(
                         reset_state.unsafe_gameplay_ready_before_seed_count
                     )
-                    if reset_state.fixed_post_win_replay:
-                        print(
-                            "[reset] rejecting gameplay board: post-win fixed_train reset requires seed selection "
-                            f"sawSeed={bool(reset_state.saw_seed_selection)} "
-                            f"clickedLetsRock={bool(reset_state.clicked_lets_rock)} "
-                            f"seedSelectionActive={observation.get('seedSelectionActive')} "
-                            f"screenState={observation.get('screenState')} "
-                            f"gameplayReady={observation.get('gameplayReady')}"
-                        )
-                    else:
-                        print(
-                            "[reset] rejecting playable board: "
-                            f"{reset_reason} reset requires seed selection but "
-                            f"sawSeed={bool(reset_state.saw_seed_selection)} "
-                            f"seedSelectionActive={observation.get('seedSelectionActive')} "
-                            f"screenState={observation.get('screenState')} "
-                            f"gameplayReady={observation.get('gameplayReady')}"
-                        )
+                    print(
+                        "[reset] rejecting playable board: "
+                        f"{reset_reason} reset requires seed selection but "
+                        f"sawSeed={bool(reset_state.saw_seed_selection)} "
+                        f"seedSelectionActive={observation.get('seedSelectionActive')} "
+                        f"screenState={observation.get('screenState')} "
+                        f"gameplayReady={observation.get('gameplayReady')}"
+                    )
                     stage(
                         "seed_selection_required_blocked_gameplay_ready",
                         lifecycleState=lifecycle_state,
@@ -2320,9 +1923,7 @@ class PvZGymEnv:
             )
             raise RuntimeError("Reset invariant failed: seed selection and Let's Rock were not observed before reset completion.")
 
-        cleanup_allow_active_gameplay_reset = bool(
-            allow_active_gameplay_reset or reset_state.fixed_terminal_reset
-        )
+        cleanup_allow_active_gameplay_reset = bool(allow_active_gameplay_reset)
         cleanup = self.reset_cleanup(
             reset_card_cooldowns=True,
             allow_active_gameplay_reset=cleanup_allow_active_gameplay_reset,
@@ -2337,33 +1938,15 @@ class PvZGymEnv:
         reset_result["cleanupValidation"] = cleanup_message
         reset_result["cleanupSuccess"] = cleanup_ok
         stage("cleanup_complete", cleanupSuccess=cleanup_ok, message=cleanup_message)
-        mower_count_warning_only = bool(
-            not cleanup_ok
-            and reset_state.fixed_terminal_reset
-            and reset_state.requires_seed_selection
-            and reset_state.saw_seed_selection
-            and reset_state.clicked_lets_rock
-            and self._is_mower_count_only_cleanup_warning(cleanup_message)
-        )
         if not cleanup_ok:
-            if mower_count_warning_only:
-                reset_result["cleanupAcceptedWithWarning"] = True
-                reset_result["cleanupWarning"] = cleanup_message
-                stage("cleanup_mower_warning_accepted", message=cleanup_message)
-                print(
-                    "[reset-warning] in-game reset reached gameplay after seed flow; "
-                    "mower count is still settling, so not hard-restarting the game process: "
-                    f"{cleanup_message}"
-                )
-            else:
-                raise RuntimeError(f"reset cleanup validation failed: {cleanup_message}")
+            raise RuntimeError(f"reset cleanup validation failed: {cleanup_message}")
         observation, playable_ok, playable_message = self._wait_for_post_reset_playable(
             allow_active_gameplay_reset=cleanup_allow_active_gameplay_reset,
             reset_reason=reset_reason,
             require_seed_selection_this_reset=reset_state.requires_seed_selection,
             saw_seed_selection_this_reset=reset_state.saw_seed_selection,
             clicked_lets_rock_this_reset=reset_state.clicked_lets_rock,
-            require_mowers=not mower_count_warning_only,
+            require_mowers=True,
         )
         reset_result["postResetPlayableValidation"] = playable_message
         reset_result["postResetPlayableSuccess"] = playable_ok
@@ -3780,8 +3363,6 @@ class PvZGymEnv:
             return self.rule_based_teacher_action(observation)
 
     def _adventure_terminal_override(self) -> Tuple[Optional[str], Dict[str, Any]]:
-        if not self._is_adventure_eval_mode():
-            return None, {}
         try:
             state = self.adventure_screen_state()
         except Exception as exc:
@@ -4034,7 +3615,7 @@ class PvZGymEnv:
             candidate,
             pre_observation,
             action_count=int(action_count),
-            expected_action_count=int(action_count),
+            expected_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             reset_active=False,
             action_already_executed=False,
         )
@@ -4099,7 +3680,7 @@ class PvZGymEnv:
             and facts.seed_slots[slot_index].valid
             else None
         )
-        seed_type = int(slot_fact.legacy_action_plant_type) if slot_fact else -1
+        seed_type = int(slot_fact.plant_type) if slot_fact else -1
         occupant = facts.occupant_by_cell.get((row, col))
         if occupant is None:
             return None, diagnostics  # empty tile -> normal placement, let bridge step handle it
@@ -4313,7 +3894,6 @@ class PvZGymEnv:
         diagnostics: Dict[str, Any],
         requested_action: int,
         executed_action: int,
-        action_count: int,
         coach_bridge_command: Optional[Dict[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         if not isinstance(coach_bridge_command, dict):
@@ -4325,7 +3905,6 @@ class PvZGymEnv:
         rejection = freshness_rejection or self._coach_fusion_rejection_reason(
             pre_observation,
             candidate,
-            action_count=action_count,
         )
         raw_source = str(coach_bridge_command.get("coach_command_source") or "human_coach")
         intent = fusion_intent_from_candidate(
@@ -4377,10 +3956,7 @@ class PvZGymEnv:
         self,
         observation: Dict[str, Any],
         candidate: Dict[str, Any],
-        *,
-        action_count: int,
     ) -> str:
-        del action_count
         if bool(observation.get("done")) or bool(observation.get("over")):
             return "terminal_or_transition_state"
         if bool(observation.get("seedSelectionActive")):
@@ -4710,7 +4286,6 @@ class PvZGymEnv:
             fusion_diagnostics,
             requested_action,
             executed_action,
-            len(pre_step_mask),
             coach_bridge_payload,
         )
         fusion_action_result: Optional[Dict[str, Any]] = coach_fusion_action_result
@@ -4949,42 +4524,21 @@ class PvZGymEnv:
             and not self._is_confirmed_post_game_ui(observation)
             and not bool(observation.get("over"))
         ):
-            if self._is_fixed_level_mode() and self._is_confirmed_possible_win(observation):
-                self._possible_win_pending_steps += 1
-                append_safety_event(
-                    safety_diagnostics.setdefault("safety_events", []),
-                    "fixed_level_possible_win_confirmation",
-                    observation,
-                    pending_steps=self._possible_win_pending_steps,
-                    required_steps=2,
-                    last_action=requested_action,
-                    run_mode=self._run_mode(),
-                )
-                # Do not force terminal from possible_win alone. This signal can appear
-                # transiently before true post-game UI settles, and forcing done here can
-                # trigger unintended resets.
-                done = False
-                done_reason_override = "none"
-                terminal_reason_override = ""
-                terminal_reward_override = 0.0
-                if self._possible_win_pending_steps in {1, 2, 5} or self._possible_win_pending_steps % 20 == 0:
-                    print(self._format_safety_context("[terminal] fixed-level possible_win observed; waiting for explicit terminal UI", observation))
-            else:
-                self._possible_win_pending_steps += 1
-                done = False
-                terminal_reward_override = 0.0
-                append_safety_event(
-                    safety_diagnostics.setdefault("safety_events", []),
-                    "suspicious_screen_state_transition",
-                    observation,
-                    reason="possible_win_pending_confirmation",
-                    pending_steps=self._possible_win_pending_steps,
-                    last_action=requested_action,
-                    run_mode=self._run_mode(),
-                )
-                print(self._format_safety_context("[safety] delayed possible_win until post-game UI confirmation", observation))
-                done_reason_override = "none"
-                terminal_reason_override = ""
+            self._possible_win_pending_steps += 1
+            done = False
+            terminal_reward_override = 0.0
+            append_safety_event(
+                safety_diagnostics.setdefault("safety_events", []),
+                "suspicious_screen_state_transition",
+                observation,
+                reason="possible_win_pending_confirmation",
+                pending_steps=self._possible_win_pending_steps,
+                last_action=requested_action,
+                run_mode=self._run_mode(),
+            )
+            print(self._format_safety_context("[safety] delayed possible_win until post-game UI confirmation", observation))
+            done_reason_override = "none"
+            terminal_reason_override = ""
         else:
             self._possible_win_pending_steps = 0
         if (
@@ -5025,7 +4579,7 @@ class PvZGymEnv:
             if board_refresh_detected and possible_win_transition_context and not is_restart_screen_observation(observation):
                 done = True
                 done_reason_override = "win"
-                terminal_reason_override = "fixed_level_win_transition"
+                terminal_reason_override = "win_transition"
                 append_safety_event(
                     safety_events,
                     "win_transition_board_refresh_detected",
@@ -5100,13 +4654,6 @@ class PvZGymEnv:
         if inferred_done_reason == "win":
             info["done_reason"] = "win"
             info["terminal_reason"] = "win"
-            if self._is_fixed_level_mode():
-                print(
-                    "[terminal] reason=win "
-                    f"step={observation.get('frameCount', '')} "
-                    f"wave={observation.get('wave')}/{observation.get('maxWave')} "
-                    f"run_mode={self._run_mode()}"
-                )
         mask_diag = self.mask_diagnostics(observation, facts=current_step_facts)
         info["mask_diagnostics"] = mask_diag
         info["lane_diagnostics"] = self.lane_diagnostics(
@@ -5290,15 +4837,20 @@ class PvZGymEnv:
         rows = int(snapshot.rows or self.config.row_count)
         cols = int(snapshot.columns or self.config.column_count)
         slots = snapshot.seed_slots
-        cells = max(1, rows * cols)
-        default_action_count = 1 + len(slots) * cells
-        action_count = max(0, int(observation.get("actionCount") or default_action_count))
-        encoded_slot_capacity = (max(0, action_count - 1) + cells - 1) // cells
-        max_seed_slots = max(len(slots), encoded_slot_capacity)
+        if len(slots) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
+            raise ValueError(
+                "Adventure Generalist observation exceeds 14 seed slots: "
+                f"seed_slots={len(slots)}"
+            )
+        if len(self.config.plant_types) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
+            raise ValueError(
+                "Adventure Generalist configuration exceeds 14 plant identities: "
+                f"plant_types={len(self.config.plant_types)}"
+            )
         return ActionValidationConfig(
-            action_space_mode="fixed",
+            action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
             plant_types=tuple(int(value) for value in self.config.plant_types),
-            max_seed_slots=max_seed_slots,
+            max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
             rows=rows,
             cols=cols,
             fusion_action_mask_enabled=self._fusion_action_mask_enabled(),
@@ -5381,10 +4933,7 @@ class PvZGymEnv:
             self.config.plant_types,
         )
         validation_config = self._action_validation_config(observation, facts=snapshot)
-        action_count = max(
-            0,
-            int(observation.get("actionCount") or validation_config.spec.action_count),
-        )
+        action_count = validation_config.spec.action_count
         restart_screen = is_restart_screen_observation(observation)
         context = build_action_validation_context(
             observation,
@@ -5470,10 +5019,7 @@ class PvZGymEnv:
                 bridge_command=bridge_command,
                 source_metadata=source_metadata,
             )
-        if (
-            resolved_intent.bridge_action != action_id
-            or resolved_intent.legacy_action != action_id
-        ):
+        if resolved_intent.bridge_action != action_id:
             return ActionDecision(
                 intent=resolved_intent,
                 legal=False,
@@ -5804,7 +5350,7 @@ class PvZGymEnv:
         counts = {str(index): 0 for index in range(len(snapshot.seed_slots))}
         if (
             isinstance(actions_or_mask, list)
-            and len(actions_or_mask) == int(observation.get("actionCount") or len(actions_or_mask))
+            and len(actions_or_mask) == ADVENTURE_IDENTITY_ACTION_COUNT
             and all(isinstance(item, bool) or int(item) in (0, 1) for item in actions_or_mask)
         ):
             actions = [index for index, allowed in enumerate(actions_or_mask) if bool(allowed)]
@@ -6017,7 +5563,7 @@ def validate_observation(observation: Dict[str, Any]) -> None:
 
 def parse_plant_types(raw: Optional[str]) -> List[int]:
     if raw is None or not raw.strip():
-        return list(DEFAULT_PLANT_TYPES)
+        return list(GENERALIST_INITIAL_PLANT_TYPES)
     values: List[int] = []
     for part in raw.split(","):
         part = part.strip()
@@ -9253,7 +8799,6 @@ def terminal_auto_reset_test(env: PvZGymEnv, episodes: int, max_steps: int, poli
     logs: List[EpisodeLog] = []
     reset_results: List[Dict[str, Any]] = []
     loss_invariant_failures = 0
-    post_win_invariant_failures = 0
 
     def has_stage_sequence(stages: List[str], required_sequence: List[str]) -> bool:
         idx = 0
@@ -9315,59 +8860,6 @@ def terminal_auto_reset_test(env: PvZGymEnv, episodes: int, max_steps: int, poli
                         f"reset episode={episode} loss_invariant_failure requireSeed={require_seed} "
                         f"sawSeed={saw_seed} stageOrderOk={stage_order_ok} unsafeCount={unsafe_count}"
                     )
-            is_fixed_train_win_episode = bool(
-                env._is_fixed_level_mode()
-                and log.done_reason in ("win", "post_win_pending")
-            )
-            if is_fixed_train_win_episode:
-                require_seed = bool(reset_payload.get("requireSeedSelectionThisReset"))
-                saw_seed = bool(reset_payload.get("sawSeedSelectionThisReset"))
-                clicked_lets_rock = bool(reset_payload.get("clickedLetsRockThisReset"))
-                replay_reset = bool(reset_payload.get("fixedTrainPostWinReplayReset"))
-                unsafe_count = int(reset_payload.get("unsafeGameplayReadyBeforeSeedCount", 0) or 0)
-                method_used = str(reset_payload.get("methodUsed") or "")
-                required_stage_sequence = (
-                    [
-                        "fixed_train_post_win_replay_reset_started",
-                        "seed_screen_detected",
-                        "lets_rock_clicked",
-                        "gameplay_ready",
-                    ]
-                    if method_used.startswith("hard_reset_fallback_fixed_train_")
-                    else [
-                        "post_win_fixed_train_replay_reset_invoked",
-                        "seed_screen_detected",
-                        "lets_rock_clicked",
-                        "gameplay_ready",
-                    ]
-                )
-                stage_order_ok = has_stage_sequence(
-                    stages,
-                    required_stage_sequence,
-                )
-                reset_payload["postWinStageOrderValid"] = stage_order_ok
-                print(
-                    f"reset episode={episode} post_win_invariant requireSeed={require_seed} "
-                    f"sawSeed={saw_seed} clickedLetsRock={clicked_lets_rock} "
-                    f"replayReset={replay_reset} method={method_used} "
-                    f"stageOrderOk={stage_order_ok} unsafeCount={unsafe_count}"
-                )
-                if not (
-                    require_seed
-                    and saw_seed
-                    and clicked_lets_rock
-                    and replay_reset
-                    and stage_order_ok
-                    and unsafe_count == 0
-                ):
-                    post_win_invariant_failures += 1
-                    reset_payload["resetSuccess"] = False
-                    print(
-                        f"reset episode={episode} post_win_invariant_failure requireSeed={require_seed} "
-                        f"sawSeed={saw_seed} clickedLetsRock={clicked_lets_rock} "
-                        f"replayReset={replay_reset} method={method_used} "
-                        f"stageOrderOk={stage_order_ok} unsafeCount={unsafe_count}"
-                    )
         except Exception as exc:
             reset_results.append({"ok": False, "error": str(exc)})
             print(f"reset episode={episode} failed: {exc}")
@@ -9380,8 +8872,7 @@ def terminal_auto_reset_test(env: PvZGymEnv, episodes: int, max_steps: int, poli
     print(
         f"summary episodes={len(logs)} terminals={terminal_count} reset_successes={reset_successes} "
         f"bridge_errors={bridge_errors} reset_failures={reset_failures} "
-        f"loss_invariant_failures={loss_invariant_failures} "
-        f"post_win_invariant_failures={post_win_invariant_failures}"
+        f"loss_invariant_failures={loss_invariant_failures}"
     )
     return (
         len(logs) == episodes
@@ -9390,7 +8881,6 @@ def terminal_auto_reset_test(env: PvZGymEnv, episodes: int, max_steps: int, poli
         and bridge_errors == 0
         and reset_failures == 0
         and loss_invariant_failures == 0
-        and post_win_invariant_failures == 0
     )
 
 
@@ -9587,7 +9077,11 @@ def main() -> int:
     parser.add_argument("--fresh-seed-select-test", action="store_true")
     parser.add_argument("--seed-screen-gating-test", action="store_true")
     parser.add_argument("--dump-action-map", action="store_true")
-    parser.add_argument("--seed-list", default="SunFlower,Peashooter", help="Comma-separated seed names or PlantType ids for automation.")
+    parser.add_argument(
+        "--seed-list",
+        default="SunFlower,SunFlower,Peashooter,Peashooter",
+        help="Comma-separated seed names or PlantType ids for Generalist automation.",
+    )
     parser.add_argument("--seed-click-delay", type=float, default=0.35, help="Seconds to wait after each seed packet click before verifying the selected bank.")
     parser.add_argument("--lets-rock-delay", type=float, default=0.5, help="Seconds to wait after all seed packets are verified before pressing Start/Let's Rock.")
     parser.add_argument("--post-start-delay", type=float, default=1.0, help="Seconds to wait after pressing Start/Let's Rock before gameplayReady polling.")
@@ -9644,7 +9138,7 @@ def main() -> int:
     parser.add_argument(
         "--plant-types",
         default=None,
-        help="Comma-separated PlantType ids. Default: 1,0 (SunFlower,Peashooter).",
+        help="Comma-separated PlantType ids. Default: 1,1,0,0 (Generalist initial loadout).",
     )
     parser.add_argument("--action", type=int)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON for evaluation logs.")

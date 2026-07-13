@@ -92,7 +92,7 @@ def _hashable(value: Any) -> Hashable:
 
 
 def live_status_significant_state(*sources: Optional[Mapping[str, Any]]) -> Tuple[Hashable, ...]:
-    """Build the state-change token shared by fixed and Adventure writers.
+    """Build the state-change token shared by Adventure Generalist writers.
 
     Step counters, rewards, sun, and action diagnostics are intentionally not
     included: they are refreshed on the interval.  Lifecycle, screen, episode,

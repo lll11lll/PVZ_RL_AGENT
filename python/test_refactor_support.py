@@ -16,7 +16,6 @@ from typing import Any, Dict
 
 import numpy as np
 
-from pvzrl_action_space import ACTION_SPACE_ADVENTURE_14_IDENTITY, ACTION_SPACE_FIXED
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 
 
@@ -32,7 +31,6 @@ def load_observation_fixture() -> Dict[str, Any]:
 
 def make_wrapper(
     *,
-    identity: bool,
     fusion_enabled: bool = True,
     tactical_masks: bool = False,
     wallnut_tactical_mask: bool = False,
@@ -41,10 +39,7 @@ def make_wrapper(
     config = PvZSB3Config(
         plant_types=list(STARTER_TYPES),
         seed_list=list(STARTER_NAMES),
-        action_space_mode=(ACTION_SPACE_ADVENTURE_14_IDENTITY if identity else ACTION_SPACE_FIXED),
-        max_seed_slots=(14 if identity else 4),
         fusion_action_mask_enabled=bool(fusion_enabled),
-        enable_board_plant_identity=bool(identity),
         tactical_masks=bool(tactical_masks),
         wallnut_tactical_mask=bool(wallnut_tactical_mask),
         cherrybomb_tactical_mask=bool(cherrybomb_tactical_mask),

@@ -131,7 +131,7 @@ def test_watchdog_runtime_summary_preserves_existing_fields_and_nearest_rank_p95
 
 
 def test_reset_and_adventure_initialization_share_core_accounting_without_drift() -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     reset_observation = observation_for_wrapper(wrapper)
     reset_observation.update(frameCount=10, killCount=3, logicalMowerCount=4)
     reset_payload = {
@@ -223,8 +223,6 @@ def test_reset_runtime_state_projects_exact_compatibility_fields() -> None:
         saw_seed_selection=True,
         clicked_lets_rock=True,
         started_from_win=True,
-        fixed_post_win_replay=True,
-        fixed_terminal_reset=True,
         unsafe_gameplay_ready_before_seed_count=2,
     )
     assert state.compatibility_fields() == {
@@ -236,8 +234,6 @@ def test_reset_runtime_state_projects_exact_compatibility_fields() -> None:
         "clickedLetsRockThisReset": True,
         "resetStartedFromLoss": False,
         "resetStartedFromWin": True,
-        "fixedTrainPostWinReplayReset": True,
-        "fixedTrainTerminalReset": True,
         "unsafeGameplayReadyBeforeSeedCount": 2,
     }
     state.set_phase("done")

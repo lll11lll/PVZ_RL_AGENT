@@ -1,7 +1,7 @@
 """Typed resolved configuration and precedence helpers for PvZRL runs.
 
-The runtime historically consumes one flat dictionary.  ``ResolvedRunConfig``
-adds immutable, coherent sections without changing that public contract:
+The runtime consumes one flat dictionary. ``ResolvedRunConfig`` adds immutable,
+coherent sections without changing that public contract:
 ``to_flat_dict()`` returns the same keys and JSON-compatible value shapes.
 """
 
@@ -251,7 +251,6 @@ class OptimizationConfig:
 @dataclass(frozen=True)
 class EnvironmentConfig:
     max_steps: int
-    legacy_max_steps: int
     step_seconds: float
     game_speed: float
     game_speed_mode: str
@@ -269,7 +268,6 @@ class EnvironmentConfig:
 class SeedActionConfig:
     plant_types: Tuple[int, ...]
     action_space_mode: str
-    experimental_dynamic_seed_slots: bool
     max_seed_slots: int
     auto_select_seeds: bool
     seed_list: Tuple[str, ...]
@@ -287,8 +285,6 @@ class SeedActionConfig:
 @dataclass(frozen=True)
 class AdventureConfig:
     run_mode: str
-    target_level: int
-    adventure_eval_mode: bool
     adventure_soft_max_steps: int
     adventure_hard_max_steps: int
     adventure_final_wave_extension: bool
@@ -383,7 +379,6 @@ class ArtifactConfig:
     model_path: str
     run_dir: str
     checkpoint_freq: int
-    allow_missing_model_metadata: bool
 
 
 @dataclass(frozen=True)
@@ -406,12 +401,11 @@ class ModelContractConfig:
     rows: int
     cols: int
     cells_per_seed_slot: int
-    incompatible_with_4slot_specialist: bool
 
 
 @dataclass(frozen=True)
 class ResolvedRunConfig:
-    """Immutable typed view over the legacy flat resolved dictionary."""
+    """Immutable typed view over the resolved Generalist configuration."""
 
     optimization: OptimizationConfig
     environment: EnvironmentConfig
@@ -455,7 +449,6 @@ class ResolvedRunConfig:
             ),
             environment=EnvironmentConfig(
                 max_steps=int(flat["max_steps"]),
-                legacy_max_steps=int(flat["legacy_max_steps"]),
                 step_seconds=float(flat["step_seconds"]),
                 game_speed=float(flat["game_speed"]),
                 game_speed_mode=str(flat["game_speed_mode"]),
@@ -471,7 +464,6 @@ class ResolvedRunConfig:
             seed_actions=SeedActionConfig(
                 plant_types=_tuple_int(flat["plant_types"]),
                 action_space_mode=str(flat["action_space_mode"]),
-                experimental_dynamic_seed_slots=bool(flat["experimental_dynamic_seed_slots"]),
                 max_seed_slots=int(flat["max_seed_slots"]),
                 auto_select_seeds=bool(flat["auto_select_seeds"]),
                 seed_list=_tuple_str(flat["seed_list"]),
@@ -487,8 +479,6 @@ class ResolvedRunConfig:
             ),
             adventure=AdventureConfig(
                 run_mode=str(flat["run_mode"]),
-                target_level=int(flat["target_level"]),
-                adventure_eval_mode=bool(flat["adventure_eval_mode"]),
                 adventure_soft_max_steps=int(flat["adventure_soft_max_steps"]),
                 adventure_hard_max_steps=int(flat["adventure_hard_max_steps"]),
                 adventure_final_wave_extension=bool(flat["adventure_final_wave_extension"]),
@@ -575,7 +565,6 @@ class ResolvedRunConfig:
                 model_path=str(flat["model_path"]),
                 run_dir=str(flat["run_dir"]),
                 checkpoint_freq=int(flat["checkpoint_freq"]),
-                allow_missing_model_metadata=bool(flat["allow_missing_model_metadata"]),
             ),
             bridge=BridgeConfig(
                 host=str(flat["host"]),
@@ -594,7 +583,6 @@ class ResolvedRunConfig:
                 rows=int(flat["rows"]),
                 cols=int(flat["cols"]),
                 cells_per_seed_slot=int(flat["cells_per_seed_slot"]),
-                incompatible_with_4slot_specialist=bool(flat["incompatible_with_4slot_specialist"]),
             ),
             reward=MappingProxyType(reward),
             value_sources=MappingProxyType(dict(value_sources or {})),

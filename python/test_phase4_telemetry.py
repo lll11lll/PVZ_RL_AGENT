@@ -133,17 +133,16 @@ def test_episode_callback_keys_are_significant_transitions() -> None:
 def test_runtime_live_status_builder_keeps_compatibility_keys_and_types() -> None:
     payload = build_runtime_live_status_payload(
         config={
-            "run_mode": "fixed_train",
-            "target_level": 3,
+            "run_mode": "adventure_generalist_14slot_train",
             "run_dir": "runs/example",
-            "seed_list": ["SunFlower", "Peashooter"],
-            "plant_types": [1, 0],
-            "action_space_mode": "fixed",
-            "max_seed_slots": 2,
+            "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
+            "plant_types": [1, 1, 0, 0],
+            "action_space_mode": "adventure_14slot_identity",
+            "max_seed_slots": 14,
             "total_timesteps": 100,
         },
         status="running",
-        mode="fixed_train",
+        mode="adventure_generalist_14slot_train",
         summary={"episode": 2, "episode_length": 7, "episode_reward": 1.25, "total_timesteps": 42},
         observation={
             "sun": 150,
@@ -158,7 +157,7 @@ def test_runtime_live_status_builder_keeps_compatibility_keys_and_types() -> Non
         },
     )
     expected_keys = {
-        "mode", "run_mode", "status", "health", "updated_at", "target_level", "blocked_reason",
+        "mode", "run_mode", "status", "health", "updated_at", "blocked_reason",
         "active_run", "model_path", "current_timestep", "total_timesteps", "target_timesteps",
         "seed_list", "plant_types", "action_count", "tactical_mask_enabled", "fusion_action_mask_enabled",
         "current_episode", "current_step", "current_wave", "max_wave", "current_reward", "recent_win_rate",
@@ -178,7 +177,7 @@ def test_runtime_live_status_builder_keeps_compatibility_keys_and_types() -> Non
 
 
 def test_adventure_live_status_computes_action_mask_once() -> None:
-    env = make_wrapper(identity=False)
+    env = make_wrapper()
     env._last_observation = observation_for_wrapper(env)
     calls = 0
 
@@ -193,7 +192,7 @@ def test_adventure_live_status_computes_action_mask_once() -> None:
         return Mask()
 
     env.action_masks = counted_action_masks  # type: ignore[method-assign]
-    context = {"mode": "adventure_eval", "last_action_id": 0}
+    context = {"mode": "adventure_generalist_14slot_eval", "last_action_id": 0}
 
     standalone_agent = build_agent_payload(env, context, {})
     assert calls == 1
@@ -310,7 +309,7 @@ def _record_watchdog(
             "safety_events": (
                 [{"event": "board_refresh_detected"}]
                 if corruption
-                else [{"event": "fixed_level_possible_win_confirmation"}]
+                else [{"event": "possible_win_confirmation"}]
                 if safety_event
                 else []
             ),

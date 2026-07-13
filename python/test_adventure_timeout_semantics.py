@@ -1,4 +1,4 @@
-"""Bridge-free regression checks for Adventure Eval timeout semantics."""
+"""Bridge-free regression checks for Adventure Generalist evaluation timeouts."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ class FakeConfig:
 
     def __post_init__(self) -> None:
         if self.plant_types is None:
-            self.plant_types = [1, 0, 3, 2]
+            self.plant_types = [1, 1, 0, 0]
         if self.seed_list is None:
-            self.seed_list = ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
+            self.seed_list = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
 
 
 class FakeMask:
@@ -85,8 +85,7 @@ class FakeEnv:
         done_reason = str(step.get("done_reason") or ("timeout" if truncated else "none"))
         terminal_reason = str(step.get("terminal_reason") or ("timeout" if truncated else ""))
         summary = {
-            "run_mode": "adventure_eval",
-            "target_level": 0,
+            "run_mode": adventure.ADVENTURE_GENERALIST_EVAL_RUN_MODE,
             "episode": 0,
             "result": done_reason,
             "reward_total": float(self._index),

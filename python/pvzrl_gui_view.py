@@ -780,7 +780,6 @@ class GuiStatusViewMixin:
                 ("health", health_text),
                 ("mode", self._adventure_first(payload, ["mode", "run_mode", "config.run_mode"])),
                 ("run_mode", self._adventure_first(payload, ["run_mode", "config.run_mode", "mode"])),
-                ("target_level", self._adventure_first(payload, ["target_level", "config.target_level"])),
                 ("compatible", compatibility.get("compatible", "n/a")),
                 ("blocked_reason", self._adventure_compat_blocked_reason(payload, compatibility)),
                 ("stop_reason", self._adventure_first(payload, ["stop_reason", "adventure.stop_reason"])),

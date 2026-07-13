@@ -6,9 +6,13 @@ from pathlib import Path
 import pytest
 
 from pvzrl_model_metadata import (
+    BLOCKED_ACTION_SPACE_MODE,
     BLOCKED_BOARD_GEOMETRY,
+    BLOCKED_DYNAMIC_SEED_SLOTS,
     BLOCKED_IDENTITY_SEED_SLOTS,
     BLOCKED_METADATA_VERSION,
+    BLOCKED_MISSING_METADATA,
+    BLOCKED_MODEL_FAMILY,
     BLOCKED_OBSERVATION_SHAPE,
     BLOCKED_PLACEMENT_ACTION_RANGE,
     MODEL_METADATA_FILENAME,
@@ -18,16 +22,6 @@ from pvzrl_model_metadata import (
     validate_model_metadata,
 )
 
-
-FIXED_CONFIG = {
-    "model_family": "fixed-contract",
-    "seed_list": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
-    "plant_types": [1, 0, 3, 2],
-    "action_space_mode": "fixed",
-    "max_seed_slots": 4,
-    "row_count": 5,
-    "column_count": 10,
-}
 
 IDENTITY_CONFIG = {
     "model_family": "ppo_adventure_generalist_14slot_identity_v1",
@@ -50,28 +44,26 @@ def _model_with_metadata(tmp_path: Path, config: dict) -> tuple[Path, Path]:
     return model_path, metadata_path
 
 
-@pytest.mark.parametrize(
-    ("config", "action_count", "shape"),
-    [
-        (FIXED_CONFIG, 201, [357]),
-        (IDENTITY_CONFIG, 701, [4297]),
-    ],
-)
-def test_exact_observation_shapes_and_complete_metadata_pass(
-    tmp_path: Path,
-    config: dict,
-    action_count: int,
-    shape: list[int],
-) -> None:
-    model_path, _ = _model_with_metadata(tmp_path, config)
-    assert observation_shape_from_config(config) == shape
-    env_metadata = env_metadata_from_config(config)
+def test_exact_generalist_contract_and_complete_metadata_pass(tmp_path: Path) -> None:
+    model_path, _ = _model_with_metadata(tmp_path, IDENTITY_CONFIG)
+    shape = [4297]
+    assert observation_shape_from_config(IDENTITY_CONFIG) == shape
+    env_metadata = env_metadata_from_config(IDENTITY_CONFIG)
     assert env_metadata["observation_shape"] == shape
-    assert model_metadata_from_config(config)["observation_shape"] == shape
+    metadata = model_metadata_from_config(IDENTITY_CONFIG)
+    assert metadata["observation_shape"] == shape
+    assert metadata["action_space_mode"] == "adventure_14slot_identity"
+    assert metadata["action_count"] == 701
+    assert metadata["decoder_wait_action"] == 0
+    assert metadata["placement_action_range"] == [1, 700]
+    assert metadata["action_decoder_version"] == "seedslot14x50_plus_wait_v1"
+    assert metadata["observation_version"] == "adventure_14slot_identity_v1"
+    assert metadata["dynamic_seed_slots"] is True
+    assert metadata["identity_seed_slots"] is True
     result = validate_model_metadata(
         model_path,
-        config,
-        model_action_count=action_count,
+        IDENTITY_CONFIG,
+        model_action_count=701,
         model_observation_shape=tuple(shape),
     )
     assert result.ok, result.to_dict()
@@ -82,7 +74,10 @@ def test_exact_observation_shapes_and_complete_metadata_pass(
     ("field", "value", "blocked_reason"),
     [
         ("metadata_version", 999, BLOCKED_METADATA_VERSION),
+        ("action_space_mode", "fixed", BLOCKED_ACTION_SPACE_MODE),
+        ("dynamic_seed_slots", False, BLOCKED_DYNAMIC_SEED_SLOTS),
         ("identity_seed_slots", False, BLOCKED_IDENTITY_SEED_SLOTS),
+        ("model_family", "obsolete-specialist", BLOCKED_MODEL_FAMILY),
         ("decoder_wait_action", 700, "action_decoder_mismatch"),
         ("placement_action_range", [0, 699], BLOCKED_PLACEMENT_ACTION_RANGE),
         ("rows", 6, BLOCKED_BOARD_GEOMETRY),
@@ -116,18 +111,18 @@ def test_loaded_observation_shape_mismatch_is_rejected(tmp_path: Path) -> None:
         model_path,
         IDENTITY_CONFIG,
         model_action_count=701,
-        model_observation_shape=(357,),
+        model_observation_shape=(4296,),
     )
     assert not result.ok
     assert result.blocked_reason == BLOCKED_OBSERVATION_SHAPE
-    assert "model=[357]" in result.details
+    assert "model=[4296]" in result.details
     assert "environment=[4297]" in result.details
 
 
 def test_declared_observation_shape_mismatch_is_rejected_without_loading_model(tmp_path: Path) -> None:
     model_path, metadata_path = _model_with_metadata(tmp_path, IDENTITY_CONFIG)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["observation_shape"] = [357]
+    metadata["observation_shape"] = [4296]
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     result = validate_model_metadata(model_path, IDENTITY_CONFIG, model_action_count=701)
     assert not result.ok
@@ -150,15 +145,21 @@ def test_explicit_malformed_observation_shape_is_not_treated_as_legacy_absence(
     assert "malformed" in result.details
 
 
-def test_fixed_legacy_false_identity_default_remains_compatible(tmp_path: Path) -> None:
-    model_path, metadata_path = _model_with_metadata(tmp_path, FIXED_CONFIG)
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata.pop("identity_seed_slots", None)
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+def test_legacy_resolved_config_is_not_inferred_as_checkpoint_metadata(tmp_path: Path) -> None:
+    run_dir = tmp_path / "legacy-only"
+    run_dir.mkdir()
+    model_path = run_dir / "model.zip"
+    model_path.write_bytes(b"fixture")
+    (run_dir / "resolved_config.json").write_text(
+        json.dumps(IDENTITY_CONFIG, indent=2),
+        encoding="utf-8",
+    )
     result = validate_model_metadata(
         model_path,
-        FIXED_CONFIG,
-        model_action_count=201,
-        model_observation_shape=(357,),
+        IDENTITY_CONFIG,
+        model_action_count=701,
+        model_observation_shape=(4297,),
     )
-    assert result.ok, result.to_dict()
+    assert not result.ok
+    assert result.blocked_reason == BLOCKED_MISSING_METADATA
+    assert result.metadata_inferred is False

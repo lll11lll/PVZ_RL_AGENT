@@ -8,7 +8,7 @@ from test_refactor_support import make_wrapper, observation_for_wrapper
 
 
 def _lane_diagnostics_for_cherry_event(event: dict, *, kill_delta: int) -> dict:
-    wrapper = make_wrapper(identity=True)
+    wrapper = make_wrapper()
     try:
         previous = observation_for_wrapper(wrapper)
         current = copy.deepcopy(previous)

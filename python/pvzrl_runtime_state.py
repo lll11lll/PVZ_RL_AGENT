@@ -151,8 +151,6 @@ class ResetRuntimeState:
     clicked_lets_rock: bool = False
     started_from_loss: bool = False
     started_from_win: bool = False
-    fixed_post_win_replay: bool = False
-    fixed_terminal_reset: bool = False
     unsafe_gameplay_ready_before_seed_count: int = 0
 
     def set_phase(self, phase: str) -> None:
@@ -168,8 +166,6 @@ class ResetRuntimeState:
             "clickedLetsRockThisReset": bool(self.clicked_lets_rock),
             "resetStartedFromLoss": bool(self.started_from_loss),
             "resetStartedFromWin": bool(self.started_from_win),
-            "fixedTrainPostWinReplayReset": bool(self.fixed_post_win_replay),
-            "fixedTrainTerminalReset": bool(self.fixed_terminal_reset),
             "unsafeGameplayReadyBeforeSeedCount": int(
                 self.unsafe_gameplay_ready_before_seed_count
             ),

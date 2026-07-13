@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import pytest
 
-from pvzrl_env import RUN_MODE_ADVENTURE_EVAL
+from pvzrl_env import RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL
 from pvzrl_observation_facts import observation_identity
 from test_refactor_support import make_wrapper, observation_for_wrapper
 
@@ -37,7 +37,7 @@ def _step_info(observation: Dict[str, Any], *, done_reason: str = "") -> Dict[st
 
 
 def test_equal_content_observation_copies_are_synchronized() -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     observation = observation_for_wrapper(wrapper)
     wrapper._adopt_observation(observation, source="test")
     wrapper.base.previous_observation = copy.deepcopy(observation)
@@ -57,7 +57,7 @@ def test_divergent_observations_fail_before_policy_or_bridge_work(
     boundary: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     observation = observation_for_wrapper(wrapper)
     wrapper._adopt_observation(observation, source="test")
     divergent = copy.deepcopy(observation)
@@ -83,7 +83,7 @@ def test_divergent_observations_fail_before_policy_or_bridge_work(
 def test_reset_and_adventure_start_use_one_observation_adoption_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = make_wrapper(identity=False)
+    wrapper = make_wrapper()
     wrapper.config.wait_for_board = False
     wrapper.config.wait_gameplay_ready = False
     reset_observation = observation_for_wrapper(wrapper)
@@ -121,11 +121,9 @@ def test_reset_and_adventure_start_use_one_observation_adoption_boundary(
 def test_adventure_terminal_transition_blocks_policy_until_fresh_adoption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = make_wrapper(identity=False)
-    wrapper.config.run_mode = RUN_MODE_ADVENTURE_EVAL
-    wrapper.config.adventure_eval_mode = True
-    wrapper.base.config.run_mode = RUN_MODE_ADVENTURE_EVAL
-    wrapper.base.config.adventure_eval_mode = True
+    wrapper = make_wrapper()
+    wrapper.config.run_mode = RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL
+    wrapper.base.config.run_mode = RUN_MODE_ADVENTURE_GENERALIST_14SLOT_EVAL
     observation = observation_for_wrapper(wrapper)
     wrapper._adopt_observation(observation, source="test")
     terminal_observation = copy.deepcopy(observation)

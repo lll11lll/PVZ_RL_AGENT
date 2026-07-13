@@ -1,4 +1,4 @@
-"""Minimal MaskablePPO train/eval entrypoint for the limited PvZRL setup."""
+"""Adventure Generalist MaskablePPO training and evaluation entrypoint."""
 
 from __future__ import annotations
 
@@ -8,10 +8,9 @@ import json
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
@@ -35,12 +34,9 @@ from pvzrl_adventure_generalist import (
 )
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
-    ACTION_SPACE_DYNAMIC_14,
-    ACTION_SPACE_FIXED,
     ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
     ADVENTURE_IDENTITY_ACTION_COUNT,
     ADVENTURE_IDENTITY_OBSERVATION_VERSION,
-    DYNAMIC_WAIT_ACTION,
     action_count_for_config as action_space_count_for_config,
     build_action_space_spec,
     normalize_action_space_mode,
@@ -51,13 +47,6 @@ from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
     RewardConfig,
-)
-from pvzrl_env import (
-    LEVEL3_SPECIALIST_PLANT_TYPES,
-    LEVEL3_SPECIALIST_SEED_LIST,
-    LEVEL3_SPECIALIST_TARGET_LEVEL,
-    RUN_MODE_ADVENTURE_EVAL,
-    RUN_MODE_LEVEL3_SPECIALIST,
 )
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields, normalize_fusion_policy
 from pvzrl_human_coach import human_coach_live_status_defaults
@@ -77,38 +66,11 @@ from pvzrl_model_metadata import (
     validate_model_metadata,
     write_model_metadata,
 )
-from pvzrl_model_router import ModelRouter, stage_config
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
 
 
-DEFAULT_CONFIG_PATH = Path("configs/ppo_sunflower_peashooter.json")
-LEVEL3_REWARD_DEFAULTS = {
-    "early_sunflower_reward": 0.18,
-    "safe_sunflower_position_reward": 0.08,
-    "sunflower_overbuild_penalty": 0.12,
-    "economy_collapse_penalty": 0.12,
-    "first_defense_in_threatened_row_reward": 0.35,
-    "threatened_lane_coverage_reward": 0.18,
-    "row_balance_reward": 0.12,
-    "useful_peashooter_position_reward": 0.08,
-    "overdefense_penalty": 0.08,
-    "wallnut_threatened_lane_reward": 0.16,
-    "wallnut_between_zombie_and_house_reward": 0.18,
-    "wallnut_frontline_reward": 0.12,
-    "wallnut_emergency_block_reward": 0.28,
-    "wallnut_useless_penalty": 0.12,
-    "cherrybomb_kill_reward": 0.16,
-    "cherrybomb_heavy_zombie_bonus": 0.28,
-    "cherrybomb_cluster_bonus": 0.18,
-    "cherrybomb_emergency_reward": 0.22,
-    "cherrybomb_zero_kill_penalty": 0.25,
-    "cherrybomb_low_value_penalty": 0.16,
-    "row_danger_delta_reward": 0.01,
-    "high_danger_unanswered_penalty": 0.025,
-    "mower_exposure_penalty": 0.035,
-    "minimum_viable_defense_reward": 0.06,
-}
+DEFAULT_CONFIG_PATH = Path("configs/ppo_adventure_generalist_14slot_identity_v1.json")
 LANE_DIAGNOSTIC_DICT_FIELDS = [
     "plants_by_row",
     "peashooters_by_row",
@@ -265,7 +227,6 @@ EPISODE_STRING_FIELDS = [
 ]
 EPISODE_METRIC_FIELDS = [
     "run_mode",
-    "target_level",
     "episode",
     "result",
     "reward_total",
@@ -298,257 +259,6 @@ EPISODE_METRIC_FIELDS = [
     "fusion_candidate_count_avg",
     "fusion_avg_kills_after_use",
 ] + PROGRESS_CSV_DIAGNOSTIC_FIELDS + FUSION_REWARD_FLOAT_FIELDS + ["fusion_reward_capped"] + list(REWARD_EPISODE_TOTAL_FIELDS)
-
-
-@dataclass
-class EvalLog:
-    policy: str
-    episode: int
-    run_mode: str = ""
-    target_level: int = 0
-    result: str = "none"
-    reward_total: float = 0.0
-    episode_reward: float = 0.0
-    episode_length: int = 0
-    terminal_reason: str = ""
-    done_reason: str = "none"
-    final_wave: int = 0
-    max_wave: int = 0
-    zombies_killed: int = 0
-    plants_placed: int = 0
-    sunflowers_planted: int = 0
-    peashooters_planted: int = 0
-    wallnuts_planted: int = 0
-    cherrybombs_planted: int = 0
-    sun_spent: int = 0
-    sun_remaining: int = 0
-    mowers_lost: int = 0
-    reset_success: bool = True
-    reset_seconds: float = 0.0
-    avg_legal_actions: float = 0.0
-    illegal_actions: int = 0
-    bridge_errors: int = 0
-    reset_failures: int = 0
-    plants_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooters_by_row: Dict[str, int] = field(default_factory=dict)
-    sunflowers_by_row: Dict[str, int] = field(default_factory=dict)
-    threat_steps_by_row: Dict[str, int] = field(default_factory=dict)
-    undefended_threat_steps_by_row: Dict[str, int] = field(default_factory=dict)
-    undefended_threat_age_avg_by_row: Dict[str, float] = field(default_factory=dict)
-    undefended_threat_age_max_by_row: Dict[str, int] = field(default_factory=dict)
-    mower_losses_by_row: Dict[str, int] = field(default_factory=dict)
-    wait_under_threat_count: int = 0
-    close_zombie_undefended_count: int = 0
-    illegal_reason_counts: Dict[str, int] = field(default_factory=dict)
-    legal_peashooter_actions_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooter_available_but_waited_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooter_available_but_planted_elsewhere_by_row: Dict[str, int] = field(default_factory=dict)
-    sunflower_while_undefended_threat_by_row: Dict[str, int] = field(default_factory=dict)
-    wait_actions: int = 0
-    plant_actions: int = 0
-    wait_action_percent: float = 0.0
-    plant_action_percent: float = 0.0
-    plant_actions_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooter_actions_by_row: Dict[str, int] = field(default_factory=dict)
-    sunflower_actions_by_row: Dict[str, int] = field(default_factory=dict)
-    plant_placements_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooter_placements_by_row: Dict[str, int] = field(default_factory=dict)
-    sunflower_placements_by_row: Dict[str, int] = field(default_factory=dict)
-    row_defense_opportunities_by_row: Dict[str, int] = field(default_factory=dict)
-    row_defense_responses_by_row: Dict[str, int] = field(default_factory=dict)
-    undefended_threat_ratio_by_row: Dict[str, float] = field(default_factory=dict)
-    row_defense_response_rate_by_row: Dict[str, float] = field(default_factory=dict)
-    row_defense_response_rate: float = 0.0
-    threatened_rows_with_zero_defender_steps_by_row: Dict[str, int] = field(default_factory=dict)
-    peashooters_per_threat_step_by_row: Dict[str, float] = field(default_factory=dict)
-    first_defense_step_by_row: Dict[str, int] = field(default_factory=dict)
-    plants_in_threatened_row_count: int = 0
-    plants_in_unthreatened_row_count: int = 0
-    plants_in_threatened_row_ratio: float = 0.0
-    plants_in_unthreatened_row_ratio: float = 0.0
-    overdefended_while_undefended_count: int = 0
-    least_defended_threatened_row_plant_count: int = 0
-    rows_with_peashooter_count: int = 0
-    all_rows_peashooter_covered_step: int = 0
-    first_peashooter_by_row_step: Dict[str, int] = field(default_factory=dict)
-    sunflower_count_when_first_full_coverage: int = -1
-    sunflower_overbuild_before_defense_count: int = 0
-    sunflower_overbuild_count: int = 0
-    peashooter_coverage_rate_by_step: float = 0.0
-    peashooter_coverage_rate_sum: float = 0.0
-    legal_actions_by_seed_slot: Dict[str, int] = field(default_factory=dict)
-    bridge_legal_actions_by_seed_slot: Dict[str, int] = field(default_factory=dict)
-    python_mask_block_reason_counts: Dict[str, int] = field(default_factory=dict)
-    pre_step_mask_blocked_count: int = 0
-    cooldown_illegal_exposed_by_mask_count: int = 0
-    mask_bridge_disagreement_count: int = 0
-    kill_reward_total: float = 0.0
-    wave_reward_total: float = 0.0
-    win_loss_reward_total: float = 0.0
-    illegal_penalty_total: float = 0.0
-    mower_loss_penalty_total: float = 0.0
-    danger_delta_reward_total: float = 0.0
-    undefended_threat_penalty_total: float = 0.0
-    lane_response_reward_total: float = 0.0
-    plant_health_loss_penalty_total: float = 0.0
-    threat_balanced_row_reward_total: float = 0.0
-    overdefended_row_penalty_total: float = 0.0
-    role_positioning_reward_total: float = 0.0
-    first_peashooter_in_row_reward_total: float = 0.0
-    first_defense_undefended_threatened_row_reward_total: float = 0.0
-    all_rows_peashooter_coverage_reward_total: float = 0.0
-    sunflower_overbuild_before_defense_penalty_total: float = 0.0
-    defense_before_extra_economy_reward_total: float = 0.0
-    sunflower_while_undefended_threat_penalty_total: float = 0.0
-    plant_elsewhere_while_undefended_threat_penalty_total: float = 0.0
-    late_undefended_threat_penalty_total: float = 0.0
-    reduce_undefended_threat_reward_total: float = 0.0
-    wait_while_actionable_threat_penalty_total: float = 0.0
-    first_peashooter_threatened_row_reward_total: float = 0.0
-    all_active_threatened_rows_have_peashooter_reward_total: float = 0.0
-    sunflower_greed_while_defense_missing_penalty_total: float = 0.0
-    early_sunflower_reward_total: float = 0.0
-    safe_sunflower_position_reward_total: float = 0.0
-    sunflower_overbuild_penalty_total: float = 0.0
-    economy_collapse_penalty_total: float = 0.0
-    first_defense_in_threatened_row_reward_total: float = 0.0
-    threatened_lane_coverage_reward_total: float = 0.0
-    row_balance_reward_total: float = 0.0
-    useful_peashooter_position_reward_total: float = 0.0
-    overdefense_penalty_total: float = 0.0
-    wallnut_blocks_active_threat_reward_total: float = 0.0
-    wallnut_low_value_placement_penalty_total: float = 0.0
-    wallnut_threatened_lane_reward_total: float = 0.0
-    wallnut_between_zombie_and_house_reward_total: float = 0.0
-    wallnut_frontline_reward_total: float = 0.0
-    wallnut_emergency_block_reward_total: float = 0.0
-    wallnut_useless_penalty_total: float = 0.0
-    cherrybomb_tactical_kill_reward_total: float = 0.0
-    cherrybomb_wasted_penalty_total: float = 0.0
-    cherrybomb_kill_reward_total: float = 0.0
-    cherrybomb_heavy_zombie_bonus_total: float = 0.0
-    cherrybomb_cluster_bonus_total: float = 0.0
-    cherrybomb_emergency_reward_total: float = 0.0
-    cherrybomb_zero_kill_penalty_total: float = 0.0
-    cherrybomb_low_value_penalty_total: float = 0.0
-    mower_risk_reduction_reward_total: float = 0.0
-    tough_zombie_response_reward_total: float = 0.0
-    row_danger_delta_reward_total: float = 0.0
-    high_danger_unanswered_penalty_total: float = 0.0
-    mower_exposure_penalty_total: float = 0.0
-    minimum_viable_defense_reward_total: float = 0.0
-    wait_while_actionable_threat_count: int = 0
-    wait_while_peashooter_affordable_ready_count: int = 0
-    wait_while_wallnut_affordable_ready_count: int = 0
-    wait_while_cherrybomb_affordable_ready_count: int = 0
-    active_threat_rows_without_peashooter_count: int = 0
-    sunflower_greed_while_defense_missing_count: int = 0
-    wallnut_placements_by_row: Dict[str, int] = field(default_factory=dict)
-    wallnut_placements_by_col: Dict[str, int] = field(default_factory=dict)
-    wallnut_blocks_active_threat_count: int = 0
-    wallnut_low_value_placement_count: int = 0
-    wallnut_threatened_lane_placements: int = 0
-    wallnut_between_zombie_and_house_count: int = 0
-    wallnut_frontline_count: int = 0
-    wallnut_emergency_blocks: int = 0
-    wallnut_useless_placements: int = 0
-    wallnut_damage_absorbed_total: float = 0.0
-    cherrybomb_used_count: int = 0
-    cherrybomb_kills_total: int = 0
-    cherrybomb_avg_kills_per_use: float = 0.0
-    cherrybomb_zero_kill_count: int = 0
-    cherrybomb_zero_kill_uses: int = 0
-    cherrybomb_cluster_uses: int = 0
-    cherrybomb_emergency_uses: int = 0
-    cherrybomb_heavy_zombie_kills: int = 0
-    cherrybomb_buckethead_kills: int = 0
-    cherrybomb_conehead_kills: int = 0
-    cherrybomb_used_under_threat_count: int = 0
-    cherrybomb_used_low_value_count: int = 0
-    mower_risk_steps_by_row: Dict[str, int] = field(default_factory=dict)
-    mower_saves_estimated_by_row: Dict[str, int] = field(default_factory=dict)
-    close_zombie_with_no_defense_count: int = 0
-    buckethead_count_by_row: Dict[str, int] = field(default_factory=dict)
-    conehead_count_by_row: Dict[str, int] = field(default_factory=dict)
-    tough_zombie_count_by_row: Dict[str, int] = field(default_factory=dict)
-    tough_zombie_response_count: int = 0
-    undefended_threat_steps: int = 0
-    high_danger_unanswered_steps: int = 0
-    mower_exposure_steps: int = 0
-    overdefense_count: int = 0
-    mower_losses: int = 0
-    legal_action_count_mean: float = 0.0
-    max_row_danger: float = 0.0
-    avg_row_danger: float = 0.0
-    tactical_mask_enabled: bool = False
-    wallnut_actions_masked: int = 0
-    cherrybomb_actions_masked: int = 0
-    wallnut_actions_available: int = 0
-    cherrybomb_actions_available: int = 0
-    mask_all_but_wait_count: int = 0
-    fusion_policy: str = FUSION_POLICY_NONE
-    fusion_candidate_count_total: int = 0
-    fusion_candidate_count_avg: float = 0.0
-    fusion_attempted_count: int = 0
-    fusion_success_count: int = 0
-    fusion_failed_count: int = 0
-    fusion_rejected_count: int = 0
-    fusion_rejected_reasons: Dict[str, int] = field(default_factory=dict)
-    fusion_by_result_type: Dict[str, int] = field(default_factory=dict)
-    fusion_by_source_type: Dict[str, int] = field(default_factory=dict)
-    fusion_by_row: Dict[str, int] = field(default_factory=dict)
-    fusion_under_threat_count: int = 0
-    fusion_near_buckethead_count: int = 0
-    fusion_near_conehead_count: int = 0
-    fusion_estimated_mower_save_count: int = 0
-    fusion_kills_after_use_total: int = 0
-    fusion_avg_kills_after_use: float = 0.0
-    fusion_bridge_error_count: int = 0
-    fusion_unsafe_state_block_count: int = 0
-    fusion_reward_total: float = 0.0
-    fusion_attempt_reward_total: float = 0.0
-    fusion_success_reward_total: float = 0.0
-    fusion_new_recipe_reward_total: float = 0.0
-    fusion_recursive_reward_total: float = 0.0
-    fusion_tier_reward_total: float = 0.0
-    fusion_repeat_decay_total: float = 0.0
-    fusion_threatened_row_bonus_total: float = 0.0
-    fusion_active_wave_bonus_total: float = 0.0
-    fusion_defensive_value_bonus_total: float = 0.0
-    fusion_incompatible_penalty_total: float = 0.0
-    fusion_empty_tile_penalty_total: float = 0.0
-    fusion_failed_penalty_total: float = 0.0
-    fusion_bridge_error_penalty_total: float = 0.0
-    fusion_spam_penalty_total: float = 0.0
-    fusion_reward_capped: bool = False
-    fusion_last_reward_delta: float = 0.0
-    fusion_last_reward_reason: str = ""
-    fusion_last_usefulness_bonus: float = 0.0
-    fusion_last_source: str = ""
-    plant_action_counts: Dict[str, int] = field(default_factory=dict)
-    successful_placements_by_plant: Dict[str, int] = field(default_factory=dict)
-    invalid_actions_by_plant: Dict[str, int] = field(default_factory=dict)
-    fusion_attempts_by_pair: Dict[str, int] = field(default_factory=dict)
-    fusion_successes_by_pair: Dict[str, int] = field(default_factory=dict)
-    fusion_depth_counts: Dict[str, int] = field(default_factory=dict)
-    highest_fusion_tier: int = 0
-    recursive_fusion_count: int = 0
-    action_freeze_count: int = 0
-    mean_action_duration_seconds: float = 0.0
-    max_action_duration_seconds: float = 0.0
-    p95_action_duration_seconds: float = 0.0
-
-    @property
-    def won(self) -> bool:
-        return self.done_reason == "win"
-
-    @property
-    def timed_out(self) -> bool:
-        return self.done_reason == "timeout"
-
-    @property
-    def actual_terminal(self) -> bool:
-        return self.done_reason in ("win", "loss")
 
 
 def require_maskable_ppo() -> Any:
@@ -590,28 +300,12 @@ def pick_reward(args: argparse.Namespace, raw_config: Dict[str, Any], key: str, 
 def build_reward_config(
     args: argparse.Namespace,
     raw_config: Dict[str, Any],
-    *,
-    run_mode: Optional[str] = None,
 ) -> Dict[str, float]:
     defaults = asdict(RewardConfig())
     reward = {
         key: pick_reward(args, raw_config, key, float(default_value))
         for key, default_value in defaults.items()
     }
-    # Backward-compatible coach reward aliases kept for existing GUI presets.
-    if getattr(args, "coach_legal_execution_reward", None) is None and getattr(args, "human_coach_bonus", None) is not None:
-        reward["coach_legal_execution_reward"] = float(getattr(args, "human_coach_bonus"))
-    if getattr(args, "coach_match_reward", None) is None and getattr(args, "human_coach_match_bonus", None) is not None:
-        reward["coach_match_reward"] = float(getattr(args, "human_coach_match_bonus"))
-    if getattr(args, "coach_override_penalty", None) is None and getattr(args, "human_coach_override_penalty", None) is not None:
-        reward["coach_override_penalty"] = float(getattr(args, "human_coach_override_penalty"))
-    effective_run_mode = run_mode or resolve_effective_run_mode(args, raw_config)
-    if effective_run_mode == RUN_MODE_LEVEL3_SPECIALIST:
-        raw_reward = raw_config.get("reward", {})
-        raw_reward = raw_reward if isinstance(raw_reward, dict) else {}
-        for key, value in LEVEL3_REWARD_DEFAULTS.items():
-            if getattr(args, key, None) is None and key not in raw_reward and key not in raw_config:
-                reward[key] = float(value)
     return reward
 
 
@@ -675,26 +369,6 @@ def command_used() -> str:
     return "python " + subprocess.list2cmdline(sys.argv)
 
 
-def normalize_run_part(value: str) -> str:
-    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
-    return "_".join(part for part in normalized.split("_") if part) or "seed"
-
-
-def model_family_for_seed_list(seed_list: List[str]) -> str:
-    unique_parts: List[str] = []
-    for seed in seed_list:
-        part = normalize_run_part(seed)
-        if part not in unique_parts:
-            unique_parts.append(part)
-    return f"ppo_{len(seed_list)}slot_{'_'.join(unique_parts)}"
-
-
-def default_train_run_dir(seed_list: List[str]) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"{model_family_for_seed_list(seed_list)}_{timestamp}"
-    return Path("runs") / name
-
-
 def action_count_for_config(config: Dict[str, Any]) -> int:
     return action_space_count_for_config(apply_model_metadata_defaults(config))
 
@@ -715,7 +389,7 @@ def seed_slot_signature(config: Dict[str, Any]) -> Dict[str, Any]:
         "seed_list": seed_list,
         "plant_types": plant_types,
         "action_count": action_count,
-        "action_space_mode": str(config.get("action_space_mode", ACTION_SPACE_FIXED)),
+        "action_space_mode": str(config.get("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)),
         "action_decoder_version": str(config.get("action_decoder_version", "")),
         "observation_version": str(config.get("observation_version", "")),
     }
@@ -791,7 +465,6 @@ def loaded_model_compatibility_report(
         model_action_count=_model_action_count(model),
         model_observation_shape=_model_observation_shape(model),
         env_metadata=env_metadata or env_metadata_for_config(config),
-        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
 
 
@@ -802,43 +475,6 @@ def raise_if_incompatible(result: CompatibilityCheck) -> None:
 
 def print_compatibility_report(prefix: str, result: CompatibilityCheck) -> None:
     print(f"{prefix} model_compatibility=" + json.dumps(result.to_dict(), separators=(",", ":"), sort_keys=True))
-
-
-def validate_model_seed_slots(
-    model_path: Path,
-    config: Dict[str, Any],
-    context: str,
-    *,
-    env_metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    result = validate_model_metadata(
-        model_path,
-        config,
-        env_metadata=env_metadata or env_metadata_for_config(config),
-        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
-    )
-    print_compatibility_report(f"[compat:{context}]", result)
-    raise_if_incompatible(result)
-    return compatibility_summary_from_report(result)
-
-
-def validate_loaded_model_compatibility(
-    model: Any,
-    model_path: Path,
-    config: Dict[str, Any],
-    context: str,
-    *,
-    env_metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    result = loaded_model_compatibility_report(
-        model,
-        model_path,
-        config,
-        env_metadata=env_metadata or env_metadata_for_config(config),
-    )
-    print_compatibility_report(f"[compat:{context}]", result)
-    raise_if_incompatible(result)
-    return compatibility_summary_from_report(result)
 
 
 def _metadata_bool(value: Any) -> bool:
@@ -877,7 +513,6 @@ def validate_adventure_generalist_model_compatibility(
         model_action_count=loaded_action_count,
         model_observation_shape=loaded_observation_shape,
         env_metadata=env_metadata,
-        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
     print_compatibility_report(f"[compat:{context}]", result)
 
@@ -939,6 +574,7 @@ def validate_adventure_generalist_model_compatibility(
             "max_seed_slots_mismatch": "max_seed_slots",
             "action_space_mode_mismatch": "action_space_mode",
             "seed_list_mismatch": "seed_list",
+            "model_family_mismatch": "model_family",
         }
         mapped = blocked_to_field.get(str(result.blocked_reason or ""))
         if mapped:
@@ -983,59 +619,36 @@ def validate_adventure_generalist_model_compatibility(
 
 
 def resolve_effective_run_mode(args: argparse.Namespace, raw_config: Dict[str, Any]) -> str:
-    """Resolve mutually exclusive run modes with all explicit CLI forms first."""
+    """Resolve one of the two maintained Adventure Generalist run modes."""
 
-    specialized_cli_modes: List[str] = []
-    if getattr(args, "level3_train", False) or getattr(args, "level3_eval", False):
-        specialized_cli_modes.append(RUN_MODE_LEVEL3_SPECIALIST)
-    if getattr(args, "adventure_generalist_train", False):
-        specialized_cli_modes.append(ADVENTURE_GENERALIST_RUN_MODE_TRAIN)
-    if getattr(args, "adventure_generalist_eval", False):
-        specialized_cli_modes.append(ADVENTURE_GENERALIST_RUN_MODE_EVAL)
-    if getattr(args, "adventure_eval", False) or getattr(args, "adventure", False):
-        specialized_cli_modes.append(RUN_MODE_ADVENTURE_EVAL)
-    distinct_specialized_modes = list(dict.fromkeys(specialized_cli_modes))
-    if len(distinct_specialized_modes) > 1:
+    shortcuts: List[str] = []
+    if bool(getattr(args, "adventure_generalist_train", False)):
+        shortcuts.append(ADVENTURE_GENERALIST_RUN_MODE_TRAIN)
+    if bool(getattr(args, "adventure_generalist_eval", False)):
+        shortcuts.append(ADVENTURE_GENERALIST_RUN_MODE_EVAL)
+    if len(shortcuts) > 1:
         raise SystemExit(
-            "blocked_reason=invalid_cli: conflicting explicit run-mode shortcuts: "
-            + ",".join(distinct_specialized_modes)
+            "blocked_reason=invalid_cli: --adventure-generalist-train and "
+            "--adventure-generalist-eval are mutually exclusive."
         )
 
     explicit_run_mode = str(getattr(args, "run_mode", "") or "").strip().lower()
-    shortcut_mode = distinct_specialized_modes[0] if distinct_specialized_modes else ""
-    if not shortcut_mode and not explicit_run_mode:
-        if bool(getattr(args, "train", False)):
-            shortcut_mode = "fixed_train"
-        elif bool(getattr(args, "eval", False)):
-            shortcut_mode = "fixed_eval"
-
+    shortcut_mode = shortcuts[0] if shortcuts else ""
     if explicit_run_mode and shortcut_mode and explicit_run_mode != shortcut_mode:
         raise SystemExit(
             "blocked_reason=invalid_cli: --run-mode conflicts with explicit mode shortcut: "
             f"{explicit_run_mode}!={shortcut_mode}"
         )
-    if explicit_run_mode == "fixed_eval" and bool(getattr(args, "train", False)):
-        raise SystemExit("blocked_reason=invalid_cli: fixed_eval cannot be combined with --train.")
-    if explicit_run_mode == "fixed_train" and bool(getattr(args, "eval", False)):
-        raise SystemExit("blocked_reason=invalid_cli: fixed_train cannot be combined with --eval.")
-    if explicit_run_mode:
-        return explicit_run_mode
-    if shortcut_mode:
-        return shortcut_mode
 
     configured_run_mode = str(raw_config.get("run_mode", "") or "").strip().lower()
-    if configured_run_mode in {
-        "fixed_train",
-        "fixed_eval",
-        RUN_MODE_ADVENTURE_EVAL,
-        RUN_MODE_LEVEL3_SPECIALIST,
-        ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
-        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
-    }:
-        return configured_run_mode
-    if configured_run_mode:
-        raise SystemExit(f"blocked_reason=invalid_config_run_mode:{configured_run_mode}")
-    return "fixed_train"
+    selected = explicit_run_mode or shortcut_mode or configured_run_mode or ADVENTURE_GENERALIST_RUN_MODE_TRAIN
+    maintained_modes = {ADVENTURE_GENERALIST_RUN_MODE_TRAIN, ADVENTURE_GENERALIST_RUN_MODE_EVAL}
+    if selected not in maintained_modes:
+        raise SystemExit(
+            "blocked_reason=unsupported_run_mode: "
+            f"{selected}; Adventure Generalist is the sole maintained training/evaluation path."
+        )
+    return selected
 
 
 def _build_config_mapping(
@@ -1063,12 +676,6 @@ def _build_config_mapping(
     run_mode = resolve_effective_run_mode(args, raw_config)
     explicit_mode_cli = bool(
         getattr(args, "run_mode", None)
-        or getattr(args, "train", False)
-        or getattr(args, "eval", False)
-        or getattr(args, "level3_train", False)
-        or getattr(args, "level3_eval", False)
-        or getattr(args, "adventure", False)
-        or getattr(args, "adventure_eval", False)
         or getattr(args, "adventure_generalist_train", False)
         or getattr(args, "adventure_generalist_eval", False)
     )
@@ -1079,18 +686,12 @@ def _build_config_mapping(
         if "run_mode" in raw_config
         else ConfigSource.GLOBAL_DEFAULT
     )
-    level3_requested = run_mode == RUN_MODE_LEVEL3_SPECIALIST
     adventure_generalist_train_requested = run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
     adventure_generalist_eval_requested = run_mode == ADVENTURE_GENERALIST_RUN_MODE_EVAL
     adventure_generalist_requested = adventure_generalist_train_requested or adventure_generalist_eval_requested
     raw_initial_loadout = value("initial_loadout", ",".join(ADVENTURE_GENERALIST_INITIAL_LOADOUT))
     initial_loadout = parse_initial_loadout(raw_initial_loadout)
-    if adventure_generalist_requested:
-        default_seed_list = ",".join(initial_loadout)
-    elif level3_requested:
-        default_seed_list = ",".join(LEVEL3_SPECIALIST_SEED_LIST)
-    else:
-        default_seed_list = "SunFlower,Peashooter"
+    default_seed_list = ",".join(initial_loadout)
     cli_seed_list = getattr(args, "seed_list", None)
     config_seed_list_present = "seed_list" in raw_config and raw_config.get("seed_list") not in (None, "")
     seed_order_source = SEED_ORDER_SOURCE_DEFAULT
@@ -1100,12 +701,8 @@ def _build_config_mapping(
     else:
         raw_seed_list = value(
             "seed_list",
-            "SunFlower,Peashooter",
-            mode_default=(
-                default_seed_list
-                if adventure_generalist_requested or level3_requested
-                else CONFIG_UNSET
-            ),
+            default_seed_list,
+            mode_default=default_seed_list,
         )
         if adventure_generalist_requested and (cli_seed_list is not None or config_seed_list_present):
             seed_order_source = SEED_ORDER_SOURCE_EXPLICIT
@@ -1117,7 +714,7 @@ def _build_config_mapping(
     raw_plant_types = value(
         "plant_types",
         derived_plant_types,
-        mode_default=list(LEVEL3_SPECIALIST_PLANT_TYPES) if level3_requested else CONFIG_UNSET,
+        mode_default=derived_plant_types,
     )
     if isinstance(raw_plant_types, str):
         plant_types = [int(part.strip()) for part in raw_plant_types.split(",") if part.strip()]
@@ -1132,34 +729,27 @@ def _build_config_mapping(
             "blocked_reason=seed_plant_type_mismatch: seed_list and plant_types must preserve identical slot order; "
             f"seed_list_resolves_to={derived_plant_types} configured_plant_types={plant_types}"
         )
-    requested_action_space_mode = normalize_action_space_mode(
-        value("action_space_mode", ACTION_SPACE_FIXED)
-    )
-    experimental_dynamic = enabled("experimental_dynamic_seed_slots")
-    if adventure_generalist_requested:
-        requested_action_space_mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
-        plant_types = list(derived_plant_types)
-        experimental_dynamic = False
-    elif experimental_dynamic:
-        requested_action_space_mode = ACTION_SPACE_DYNAMIC_14
-    elif requested_action_space_mode == ACTION_SPACE_DYNAMIC_14:
+    raw_action_space_mode = value("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)
+    try:
+        requested_action_space_mode = normalize_action_space_mode(raw_action_space_mode)
+    except ValueError as exc:
         raise SystemExit(
-            "blocked_reason=experimental_dynamic_seed_slots_required: "
-            "dynamic_14 requires --experimental-dynamic-seed-slots."
-        )
+            "blocked_reason=unsupported_action_space_mode: "
+            f"{raw_action_space_mode}; Adventure Generalist requires "
+            f"{ACTION_SPACE_ADVENTURE_14_IDENTITY}."
+        ) from exc
+    plant_types = list(derived_plant_types)
     if adventure_generalist_train_requested and args.run_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = str(Path("runs") / f"{ADVENTURE_GENERALIST_MODEL_FAMILY}_{timestamp}")
-    elif args.train and args.run_dir is None:
-        run_dir = str(default_train_run_dir(seed_list))
     elif (
-        run_mode in {"fixed_eval", RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}
+        adventure_generalist_eval_requested
         and args.run_dir is None
         and getattr(args, "model", None) is not None
     ):
         run_dir = str(Path(args.model).resolve().parent)
     else:
-        run_dir = str(value("run_dir", "runs/ppo_sunflower_peashooter"))
+        run_dir = str(value("run_dir", f"runs/{ADVENTURE_GENERALIST_MODEL_FAMILY}"))
 
     game_speed = float(value("game_speed", 4.0))
     game_speed_mode = str(value("game_speed_mode", "game_speed"))
@@ -1168,31 +758,6 @@ def _build_config_mapping(
     fusion_policy = normalize_fusion_policy(
         value("fusion_policy", FUSION_POLICY_NONE)
     )
-    adventure_requested = run_mode == RUN_MODE_ADVENTURE_EVAL
-
-    target_level = int(
-        value(
-            "target_level",
-            0,
-            mode_default=LEVEL3_SPECIALIST_TARGET_LEVEL if run_mode == RUN_MODE_LEVEL3_SPECIALIST else CONFIG_UNSET,
-        )
-    )
-    if run_mode == RUN_MODE_LEVEL3_SPECIALIST:
-        if target_level != LEVEL3_SPECIALIST_TARGET_LEVEL:
-            raise SystemExit("blocked_reason=invalid_level3_target_level: Level 3 specialist requires --target-level 3.")
-        if list(seed_list) != list(LEVEL3_SPECIALIST_SEED_LIST):
-            raise SystemExit(
-                "blocked_reason=invalid_level3_seed_list: "
-                f"expected {','.join(LEVEL3_SPECIALIST_SEED_LIST)} got {','.join(seed_list)}"
-            )
-        if [int(value) for value in plant_types] != list(LEVEL3_SPECIALIST_PLANT_TYPES):
-            raise SystemExit(
-                "blocked_reason=invalid_level3_plant_types: "
-                f"expected {','.join(str(value) for value in LEVEL3_SPECIALIST_PLANT_TYPES)} got "
-                f"{','.join(str(value) for value in plant_types)}"
-            )
-        if requested_action_space_mode != ACTION_SPACE_FIXED or experimental_dynamic:
-            raise SystemExit("blocked_reason=invalid_level3_action_space: Level 3 specialist requires fixed 4-slot action space.")
     if adventure_generalist_requested:
         if list(seed_list) != list(initial_loadout):
             raise SystemExit(
@@ -1205,13 +770,9 @@ def _build_config_mapping(
                 "Adventure Generalist requires adventure_14slot_identity."
             )
 
-    legacy_max_steps = int(value("max_steps", 1000))
     raw_adventure_soft = getattr(args, "adventure_soft_max_steps", None)
     if raw_adventure_soft is None:
-        if run_mode in {RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_TRAIN, ADVENTURE_GENERALIST_RUN_MODE_EVAL} and getattr(args, "max_steps", None) is not None:
-            raw_adventure_soft = getattr(args, "max_steps")
-        else:
-            raw_adventure_soft = raw_config.get("adventure_soft_max_steps", DEFAULT_ADVENTURE_SOFT_MAX_STEPS)
+        raw_adventure_soft = raw_config.get("adventure_soft_max_steps", DEFAULT_ADVENTURE_SOFT_MAX_STEPS)
     adventure_soft_max_steps = max(1, int(raw_adventure_soft))
     adventure_hard_max_steps = max(
         adventure_soft_max_steps,
@@ -1225,12 +786,7 @@ def _build_config_mapping(
     if raw_generalist_strict_startup_validation is None:
         raw_generalist_strict_startup_validation = raw_config.get("adventure_generalist_strict_startup_validation", True)
     adventure_generalist_strict_startup_validation = bool(raw_generalist_strict_startup_validation)
-    adventure_run_mode = run_mode in {
-        RUN_MODE_ADVENTURE_EVAL,
-        ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
-        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
-    }
-    env_max_steps = adventure_hard_max_steps if adventure_run_mode else legacy_max_steps
+    env_max_steps = adventure_hard_max_steps
     requested_eval_model_path = str(args.model or raw_config.get("model_path", "") or "").strip()
     requested_resume_model_path = str(getattr(args, "resume_model_path", None) or raw_config.get("resume_model_path", "") or "").strip()
     if requested_resume_model_path and requested_eval_model_path and requested_resume_model_path != requested_eval_model_path:
@@ -1239,13 +795,9 @@ def _build_config_mapping(
             "Provide one path or make them match."
         )
     requested_model_path = requested_resume_model_path or requested_eval_model_path
-    if requested_resume_model_path and run_mode in {"fixed_eval", RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}:
+    if requested_resume_model_path and adventure_generalist_eval_requested:
         raise SystemExit("blocked_reason=invalid_cli: --resume-model-path is training-only.")
-    requested_training_continuation = bool(requested_model_path) and run_mode not in {
-        "fixed_eval",
-        RUN_MODE_ADVENTURE_EVAL,
-        ADVENTURE_GENERALIST_RUN_MODE_EVAL,
-    }
+    requested_training_continuation = bool(requested_model_path) and adventure_generalist_train_requested
     randomize_seed_order = enabled(
         "randomize_seed_order",
         json_aliases=("seed_order_randomization",),
@@ -1321,11 +873,7 @@ def _build_config_mapping(
 
     config = {
         "policy": raw_config.get("policy", "MlpPolicy"),
-        "model_family": (
-            ADVENTURE_GENERALIST_MODEL_FAMILY
-            if adventure_generalist_requested
-            else str(raw_config.get("model_family", model_family_for_seed_list(seed_list)))
-        ),
+        "model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
         "total_timesteps": int(value("total_timesteps", 25000)),
         "learning_rate": float(value("learning_rate", 3e-4)),
         "n_steps": int(value("n_steps", 512)),
@@ -1336,7 +884,6 @@ def _build_config_mapping(
         "clip_range": float(value("clip_range", 0.2)),
         "verbose": int(value("verbose", 1)),
         "max_steps": int(env_max_steps),
-        "legacy_max_steps": int(legacy_max_steps),
         "adventure_soft_max_steps": int(adventure_soft_max_steps),
         "adventure_hard_max_steps": int(adventure_hard_max_steps),
         "adventure_final_wave_extension": bool(adventure_final_wave_extension),
@@ -1353,15 +900,14 @@ def _build_config_mapping(
         "quick_wait": quick_wait,
         "plant_types": plant_types,
         "action_space_mode": requested_action_space_mode,
-        "experimental_dynamic_seed_slots": bool(experimental_dynamic),
         "max_seed_slots": int(
             value(
                 "max_seed_slots",
-                len(plant_types),
-                mode_default=14 if adventure_generalist_requested else CONFIG_UNSET,
+                SEED_CAPACITY_MAX,
+                mode_default=SEED_CAPACITY_MAX,
             )
         ),
-        "auto_select_seeds": bool(enabled("auto_select_seeds") or adventure_generalist_requested),
+        "auto_select_seeds": True,
         "seed_list": seed_list,
         "initial_loadout": list(initial_loadout),
         "configured_seed_list": list(seed_list),
@@ -1394,11 +940,9 @@ def _build_config_mapping(
         "later_plant_curriculum_prob": float(value("later_plant_curriculum_prob", 0.10)),
         "coach_fusion_prob": float(value("coach_fusion_prob", 0.10)),
         "run_mode": run_mode,
-        "target_level": int(target_level),
         "tactical_masks": enabled("tactical_masks"),
         "wallnut_tactical_mask": enabled("wallnut_tactical_mask"),
         "cherrybomb_tactical_mask": enabled("cherrybomb_tactical_mask"),
-        "adventure_eval_mode": bool(adventure_run_mode),
         "checkpoint_warm_start": bool(requested_training_continuation),
         "warm_start_used": False,
         "checkpoint_warm_start_reason": (
@@ -1410,11 +954,8 @@ def _build_config_mapping(
         "resume_model_path": requested_model_path if requested_training_continuation else "",
         "resume_source_model_family": "",
         "scratch_initialization": bool(adventure_generalist_train_requested and not requested_training_continuation),
-        "incompatible_with_4slot_specialist": bool(adventure_generalist_requested),
-        "active_seed_slots_at_start": len(initial_loadout) if adventure_generalist_requested else len(seed_list),
-        "unlock_aware_seed_curriculum": bool(
-            enabled("unlock_aware_seed_curriculum") or adventure_generalist_requested
-        ),
+        "active_seed_slots_at_start": len(initial_loadout),
+        "unlock_aware_seed_curriculum": enabled("unlock_aware_seed_curriculum", True),
         "seed_curriculum": str(value("seed_curriculum", "conservative")),
         "unlock_introduction_delay": int(value("unlock_introduction_delay", 0)),
         "new_plant_min_inclusion_prob": float(value("new_plant_min_inclusion_prob", 0.15)),
@@ -1422,7 +963,7 @@ def _build_config_mapping(
             value(
                 "infer_capacity_from_unlocks",
                 False,
-                mode_default=True if adventure_generalist_requested else CONFIG_UNSET,
+                mode_default=True,
             )
         ),
         "allow_weak_unlocked_capacity_fallback": enabled("allow_weak_unlocked_capacity_fallback"),
@@ -1439,7 +980,6 @@ def _build_config_mapping(
         "max_adventure_levels": int(value("max_adventure_levels", 5)),
         "max_attempts_per_level": int(value("max_attempts_per_level", 10)),
         "advance_on_wins": int(value("advance_on_wins", 1)),
-        "allow_missing_model_metadata": enabled("allow_missing_model_metadata"),
         "human_coach_enabled": bool(human_coach_enabled),
         "human_coach_command_path": str(human_coach_command_path),
         "human_coach_log_path": str(value("human_coach_log_path", "runs/human_coach.jsonl") or ""),
@@ -1471,7 +1011,7 @@ def _build_config_mapping(
         "stream_coach_fusion_enabled": bool(stream_coach_fusion_enabled),
         "coach_allow_fusion_planning": bool(coach_allow_fusion_planning),
         "fusion_bridge_enabled": bool(fusion_bridge_enabled),
-        "reward": build_reward_config(args, raw_config, run_mode=run_mode),
+        "reward": build_reward_config(args, raw_config),
         "model_path": requested_model_path,
         "run_dir": run_dir,
         "checkpoint_freq": int(value("checkpoint_freq", 5000)),
@@ -1490,10 +1030,6 @@ def _build_config_mapping(
         "game_exe": str(value("game_exe", "") or ""),
     }
     config = apply_model_metadata_defaults(config)
-    if run_mode == RUN_MODE_LEVEL3_SPECIALIST and action_count_for_config(config) != 201:
-        raise SystemExit(
-            f"blocked_reason=invalid_level3_action_count: expected 201 got {action_count_for_config(config)}"
-        )
     if adventure_generalist_requested and action_count_for_config(config) != ADVENTURE_IDENTITY_ACTION_COUNT:
         raise SystemExit(
             "blocked_reason=invalid_adventure_generalist_action_count: "
@@ -1530,11 +1066,10 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         freeze_debug_dir=str(config.get("freeze_debug_dir", "") or ""),
         step_seconds=config["step_seconds"],
         plant_types=list(config["plant_types"]),
-        action_space_mode=str(config.get("action_space_mode", ACTION_SPACE_FIXED)),
+        action_space_mode=str(config.get("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)),
         max_seed_slots=int(config.get("max_seed_slots", len(config["plant_types"]))),
         observation_version=str(config.get("observation_version", "")),
         action_decoder_version=str(config.get("action_decoder_version", "")),
-        dynamic_seed_slots=bool(config.get("dynamic_seed_slots", False)),
         row_count=5,
         column_count=10,
         game_speed=config["game_speed"],
@@ -1569,12 +1104,10 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         fusion_curriculum_prob=float(config.get("fusion_curriculum_prob", 0.20)),
         later_plant_curriculum_prob=float(config.get("later_plant_curriculum_prob", 0.10)),
         coach_fusion_prob=float(config.get("coach_fusion_prob", 0.10)),
-        run_mode=str(config.get("run_mode", "fixed_train")),
-        target_level=int(config.get("target_level", 0) or 0),
+        run_mode=str(config.get("run_mode", ADVENTURE_GENERALIST_RUN_MODE_TRAIN)),
         tactical_masks=bool(config.get("tactical_masks", False)),
         wallnut_tactical_mask=bool(config.get("wallnut_tactical_mask", False)),
         cherrybomb_tactical_mask=bool(config.get("cherrybomb_tactical_mask", False)),
-        adventure_eval_mode=bool(config.get("adventure_eval_mode", False)),
         game_exe=str(config.get("game_exe") or "") or None,
         human_coach_enabled=bool(config.get("human_coach_enabled", False)),
         human_coach_log_path=str(config.get("human_coach_log_path", "") or ""),
@@ -1667,7 +1200,7 @@ def write_action_map(config: Dict[str, Any], path: Path) -> None:
     plant_types = list(config["plant_types"])
     seed_list = list(config.get("seed_list", []))
     spec = build_action_space_spec(
-        mode=str(config.get("action_space_mode", ACTION_SPACE_FIXED)),
+        mode=str(config.get("action_space_mode", ACTION_SPACE_ADVENTURE_14_IDENTITY)),
         plant_types=[int(value) for value in plant_types],
         max_seed_slots=int(config.get("max_seed_slots", len(plant_types))),
         rows=rows,
@@ -1680,37 +1213,18 @@ def write_action_map(config: Dict[str, Any], path: Path) -> None:
             f"rows={rows} cols={cols} action_count={action_count} "
             f"decoder={spec.action_decoder_version} observation={spec.observation_version}\n"
         )
-        if spec.mode == ACTION_SPACE_DYNAMIC_14:
-            for slot_index in range(spec.max_seed_slots):
-                plant_type = plant_types[slot_index] if slot_index < len(plant_types) else -1
-                name = seed_list[slot_index] if slot_index < len(seed_list) else str(plant_type)
-                for row in range(rows):
-                    for col in range(cols):
-                        action = slot_index * rows * cols + row * cols + col
-                        handle.write(f"{action} slot={slot_index} plant={name} plant_type={plant_type} row={row} col={col}\n")
-            handle.write(f"{DYNAMIC_WAIT_ACTION} wait\n")
-            return
-        if spec.mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-            handle.write("0 wait\n")
-            for slot_index in range(spec.max_seed_slots):
-                plant_type = plant_types[slot_index] if slot_index < len(plant_types) else -1
-                name = seed_list[slot_index] if slot_index < len(seed_list) else "inactive"
-                active = slot_index < len(seed_list)
-                for row in range(rows):
-                    for col in range(cols):
-                        action = 1 + slot_index * rows * cols + row * cols + col
-                        handle.write(
-                            f"{action} slot={slot_index} plant={name} plant_type={plant_type} "
-                            f"row={row} col={col} active={active}\n"
-                        )
-            return
         handle.write("0 wait\n")
-        for slot_index, plant_type in enumerate(plant_types):
-            name = seed_list[slot_index] if slot_index < len(seed_list) else str(plant_type)
+        for slot_index in range(spec.max_seed_slots):
+            plant_type = plant_types[slot_index] if slot_index < len(plant_types) else -1
+            name = seed_list[slot_index] if slot_index < len(seed_list) else "inactive"
+            active = slot_index < len(seed_list)
             for row in range(rows):
                 for col in range(cols):
                     action = 1 + slot_index * rows * cols + row * cols + col
-                    handle.write(f"{action} slot={slot_index} plant={name} plant_type={plant_type} row={row} col={col}\n")
+                    handle.write(
+                        f"{action} slot={slot_index} plant={name} plant_type={plant_type} "
+                        f"row={row} col={col} active={active}\n"
+                    )
 
 
 def clean_episode_row(summary: Dict[str, Any], fallback_episode: int) -> Dict[str, Any]:
@@ -1718,7 +1232,6 @@ def clean_episode_row(summary: Dict[str, Any], fallback_episode: int) -> Dict[st
     for field in EPISODE_METRIC_FIELDS:
         row[field] = summary.get(field)
     row["run_mode"] = str(row.get("run_mode") or "")
-    row["target_level"] = int(row.get("target_level") or 0)
     row["episode"] = int(row["episode"] if row["episode"] is not None else fallback_episode)
     row["result"] = str(row.get("result") or row.get("done_reason") or "none")
     row["reward_total"] = float(row.get("reward_total") or row.get("episode_reward") or 0.0)
@@ -2366,21 +1879,6 @@ def print_validation_summary(summary: Dict[str, Any]) -> None:
             print(f"{key}: {value}")
 
 
-def write_eval_placeholder(config: Dict[str, Any], run_dir: Path, model_path: Path) -> None:
-    eval_flag = "--level3-eval --target-level 3 " if str(config.get("run_mode", "")) == RUN_MODE_LEVEL3_SPECIALIST else "--eval "
-    eval_command = (
-        f"python .\\python\\train_ppo.py {eval_flag}"
-        f"--model-path {model_path} "
-        "--episodes 10 "
-        f"--game-speed {config['game_speed']} "
-        "--quick-wait --wait-gameplay-ready --auto-select-seeds "
-        f"--seed-list {','.join(config['seed_list'])} "
-        f"--fusion-policy {config.get('fusion_policy', FUSION_POLICY_NONE)}"
-    )
-    payload = {"status": "not_run", "eval_command": eval_command}
-    (run_dir / "eval_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
 def resolved_live_status_path(path: Optional[Path]) -> Optional[Path]:
     if path is None:
         return None
@@ -2533,7 +2031,7 @@ def write_eval_live_status(
     model_path: Path,
     report: CompatibilityCheck,
     status: str,
-    mode: str = "fixed_eval",
+    mode: str = ADVENTURE_GENERALIST_RUN_MODE_EVAL,
     summary: Optional[Dict[str, Any]] = None,
     status_writer: Optional[LiveStatusWriter] = None,
 ) -> None:
@@ -2542,8 +2040,6 @@ def write_eval_live_status(
     live_status_path = resolved_live_status_path(live_status_path)
     if live_status_path is None:
         return
-    if str(config.get("run_mode", "")) == RUN_MODE_LEVEL3_SPECIALIST and mode == "fixed_eval":
-        mode = RUN_MODE_LEVEL3_SPECIALIST
     compatibility = model_compatibility_live_status(report)
     fusion_fields = fusion_live_fields(
         (summary or {}).get("fusion") if isinstance(summary, dict) else None,
@@ -2573,7 +2069,6 @@ def write_eval_live_status(
     payload = {
         "mode": mode,
         "run_mode": str(config.get("run_mode", mode)),
-        "target_level": int(config.get("target_level", 0) or 0),
         "status": status,
         "health": "LIVE" if status == "running" else ("DEAD" if status in {"complete", "blocked"} else status.upper()),
         "updated_at": time.time(),
@@ -2671,7 +2166,6 @@ def build_runtime_live_status_payload(
         "status": status,
         "health": "LIVE" if status == "running" else ("DEAD" if status in {"complete", "blocked"} else status.upper()),
         "updated_at": time.time(),
-        "target_level": int(config.get("target_level", 0) or 0),
         "blocked_reason": blocked_reason,
         "active_run": str(config.get("run_dir", "")),
         "model_path": str(model_path or config.get("model_path", "")),
@@ -2777,38 +2271,6 @@ def write_runtime_live_status(
     )
 
 
-def verify_level3_specialist_start_state(config: Dict[str, Any], live_status_path: Optional[Path], model_path: Optional[Path] = None) -> None:
-    if str(config.get("run_mode", "")) != RUN_MODE_LEVEL3_SPECIALIST:
-        return
-    env = PvZMaskedPPOEnv(make_env_config(config))
-    try:
-        state = env.base.level3_specialist_start_state()
-    finally:
-        close_env_safely(env, timeout_seconds=5.0)
-    if bool(state.get("ok")):
-        write_runtime_live_status(
-            live_status_path,
-            config=config,
-            status="running",
-            mode=RUN_MODE_LEVEL3_SPECIALIST,
-            model_path=model_path,
-            summary={"level3_start_state": state},
-            observation=state.get("observation") if isinstance(state.get("observation"), dict) else {},
-        )
-        return
-    write_runtime_live_status(
-        live_status_path,
-        config=config,
-        status="blocked",
-        mode=RUN_MODE_LEVEL3_SPECIALIST,
-        model_path=model_path,
-        summary={"level3_start_state": state},
-        observation=state.get("observation") if isinstance(state.get("observation"), dict) else {},
-        blocked_reason="not_at_level3_specialist_start_state",
-    )
-    raise SystemExit("blocked_reason=not_at_level3_specialist_start_state")
-
-
 def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> None:
     MaskablePPO = require_maskable_ppo()
     BaseCallback, CallbackList, CheckpointCallback, DummyVecEnv, _ = require_sb3_callbacks()
@@ -2821,6 +2283,10 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     initial_model_path = Path(str(config.get("model_path") or ""))
     requested_continuation = bool(str(config.get("model_path") or "").strip())
     generalist_training = str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN
+    if not generalist_training:
+        raise SystemExit(
+            "blocked_reason=unsupported_training_mode: Adventure Generalist is the sole maintained trainer."
+        )
     config["resume_training"] = bool(requested_continuation)
     config["resume_model_path"] = str(initial_model_path) if requested_continuation else ""
     config["resume_source_model_family"] = str(config.get("resume_source_model_family") or "")
@@ -2831,7 +2297,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         except OSError:
             return path
 
-    if requested_continuation and generalist_training:
+    if requested_continuation:
         source_run_dir = initial_model_path.parent.parent if initial_model_path.parent.name.lower() == "checkpoints" else initial_model_path.parent
         resolved_source_run_dir = _safe_resolve(source_run_dir)
         resolved_run_dir = _safe_resolve(run_dir)
@@ -3012,48 +2478,17 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
 
         def _on_step(self) -> bool:
             infos = self.locals.get("infos", [])
-            pvz_env = unwrap_pvz_env(runtime_env)
             for info in infos:
                 perf = info.get("performance")
                 if isinstance(perf, dict):
                     self.performance.add(perf)
-                raw_observation = info.get("raw_observation") if isinstance(info, dict) else {}
-                if isinstance(raw_observation, dict) and str(config.get("run_mode", "")) != ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
-                    write_runtime_live_status(
-                        live_status_path,
-                        config=config,
-                        status="running",
-                        mode=str(config.get("run_mode", "fixed_train")),
-                        model_path=Path(str(config.get("model_path") or run_dir / "model.zip")),
-                        observation=raw_observation,
-                        summary={
-                            "episode": getattr(pvz_env, "_episode_index", None),
-                            "episode_length": getattr(pvz_env, "_step_count", None),
-                            "episode_reward": getattr(pvz_env, "_episode_reward", None),
-                            "total_timesteps": int(getattr(self, "num_timesteps", 0) or 0),
-                            "callback_steps": int(getattr(self, "n_calls", 0) or 0),
-                        },
-                        status_writer=runtime_status_writer,
-                    )
-            rows = self.metrics.append_summaries(
+            self.metrics.append_summaries(
                 [
                     info["episode_summary"]
                     for info in infos
                     if isinstance(info, dict) and isinstance(info.get("episode_summary"), dict)
                 ]
             )
-            if rows:
-                if rows and str(config.get("run_mode", "")) != ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
-                    write_runtime_live_status(
-                        live_status_path,
-                        config=config,
-                        status="running",
-                        mode=str(config.get("run_mode", "fixed_train")),
-                        model_path=Path(str(config.get("model_path") or run_dir / "model.zip")),
-                        summary=rows[-1],
-                        status_writer=runtime_status_writer,
-                        force=True,
-                    )
             return True
 
     vec_env = DummyVecEnv([lambda: make_monitored_env(config, run_dir / "monitor.csv", live_status_path=live_status_path)])
@@ -3061,23 +2496,15 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     runtime_env_metadata = env_metadata_for_config(config, runtime_env)
     continuing = requested_continuation and initial_model_path.exists()
     if continuing:
-        if generalist_training:
-            print(f"[adventure-generalist] model_path_load_requested={initial_model_path}")
-            print("[adventure-generalist] loading prior PPO model for continued training")
-            compatibility = validate_adventure_generalist_model_compatibility(
-                initial_model_path,
-                config,
-                "Adventure Generalist training continuation metadata",
-                env_metadata=runtime_env_metadata,
-            )
-            config["resume_source_model_family"] = str(compatibility.get("model_family") or ADVENTURE_GENERALIST_MODEL_FAMILY)
-        else:
-            validate_model_seed_slots(
-                initial_model_path,
-                config,
-                "Training continuation",
-                env_metadata=runtime_env_metadata,
-            )
+        print(f"[adventure-generalist] model_path_load_requested={initial_model_path}")
+        print("[adventure-generalist] loading prior PPO model for continued training")
+        compatibility = validate_adventure_generalist_model_compatibility(
+            initial_model_path,
+            config,
+            "Adventure Generalist training continuation metadata",
+            env_metadata=runtime_env_metadata,
+        )
+        config["resume_source_model_family"] = str(compatibility.get("model_family") or ADVENTURE_GENERALIST_MODEL_FAMILY)
         print(f"Continuing PPO model from {initial_model_path}")
         model = MaskablePPO.load(
             str(initial_model_path),
@@ -3085,27 +2512,17 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             tensorboard_log=str(run_dir / "tensorboard"),
         )
         model.verbose = config["verbose"]
-        if generalist_training:
-            validate_adventure_generalist_model_compatibility(
-                initial_model_path,
-                config,
-                "Adventure Generalist training continuation loaded model",
-                model=model,
-                env_metadata=runtime_env_metadata,
-            )
-            config["warm_start_used"] = True
-            _write_run_config_files()
-            write_model_metadata(run_dir, config, config_path=config_path)
-            print(f"[adventure-generalist] model_path_loaded={initial_model_path}")
-        else:
-            validate_loaded_model_compatibility(
-                model,
-                initial_model_path,
-                config,
-                "Training continuation",
-                env_metadata=runtime_env_metadata,
-            )
-            config["warm_start_used"] = True
+        validate_adventure_generalist_model_compatibility(
+            initial_model_path,
+            config,
+            "Adventure Generalist training continuation loaded model",
+            model=model,
+            env_metadata=runtime_env_metadata,
+        )
+        config["warm_start_used"] = True
+        _write_run_config_files()
+        write_model_metadata(run_dir, config, config_path=config_path)
+        print(f"[adventure-generalist] model_path_loaded={initial_model_path}")
     elif requested_continuation:
         raise SystemExit(f"blocked_reason=resume_model_path_missing: {initial_model_path}")
     else:
@@ -3139,7 +2556,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         live_status_path,
         config=config,
         status="running",
-        mode=str(config.get("run_mode", "fixed_train")),
+        mode=ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
         model_path=Path(str(config.get("model_path") or run_dir / "model.zip")),
         summary={
             "episode": None,
@@ -3150,7 +2567,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         status_writer=runtime_status_writer,
         force=True,
     )
-    if generalist_training and bool(config.get("adventure_generalist_strict_startup_validation", True)):
+    if bool(config.get("adventure_generalist_strict_startup_validation", True)):
         pvz_env = unwrap_pvz_env(runtime_env)
         if not isinstance(pvz_env, AdventureGeneralistTrainingEnv):
             vec_env.close()
@@ -3163,11 +2580,10 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             error = str(validation.get("actionable_error") or validation.get("reason") or "startup validation failed")
             vec_env.close()
             raise SystemExit(f"blocked_reason=adventure_generalist_startup_validation_failed: {error}")
-    if generalist_training:
-        print(
-            "[adventure-generalist] "
-            f"sb3_learn_reset_num_timesteps={'false' if continuing else 'true'}"
-        )
+    print(
+        "[adventure-generalist] "
+        f"sb3_learn_reset_num_timesteps={'false' if continuing else 'true'}"
+    )
     started = time.perf_counter()
     try:
         model.learn(
@@ -3197,12 +2613,11 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     if config.get("debug_performance"):
         perf_summary = experiment_callback.performance.summary(fps_avg)
         (run_dir / "performance_summary.json").write_text(json.dumps(perf_summary, indent=2), encoding="utf-8")
-    write_eval_placeholder(config, run_dir, model_path)
     write_runtime_live_status(
         live_status_path,
         config=config,
         status="complete",
-        mode=str(config.get("run_mode", "fixed_train")),
+        mode=ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
         model_path=model_path,
         summary=summary,
         status_writer=runtime_status_writer,
@@ -3215,148 +2630,12 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     print(f"Saved episode metrics to {run_dir / 'episode_metrics.csv'}")
 
 
-def evaluate(config: Dict[str, Any], model_path: Path, episodes: int, live_status_path: Optional[Path] = None) -> None:
-    MaskablePPO = require_maskable_ppo()
-    model = MaskablePPO.load(str(model_path))
-    run_dir = Path(config["run_dir"])
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval] policy=ppo model_path={model_path}")
-    env_metadata = env_metadata_for_config(config)
-    report = loaded_model_compatibility_report(model, model_path, config, env_metadata=env_metadata)
-    print_compatibility_report("[compat:Fixed-level eval]", report)
-    write_eval_live_status(
-        live_status_path,
-        config=config,
-        model_path=model_path,
-        report=report,
-        status="blocked" if not report.ok else "running",
-    )
-    raise_if_incompatible(report)
-    compatibility = compatibility_summary_from_report(report)
-    print(
-        "[eval] compatible_seed_slots=True "
-        f"seed_list={compatibility['expected_seed_list']} "
-        f"plant_types={compatibility['expected_plant_types']} "
-        f"decoder={compatibility['action_decoder_version']} "
-        f"observation={compatibility['observation_version']} "
-        f"metadata={compatibility['metadata_path']}"
-    )
-
-    results: Dict[str, List[EvalLog]] = {"ppo": []}
-    ppo_steps = 0
-    env = PvZMaskedPPOEnv(make_env_config(config))
-    policy_started = time.perf_counter()
-    try:
-        for episode in range(episodes):
-            log = run_eval_episode(env, episode, model)
-            results["ppo"].append(log)
-            ppo_steps += log.episode_length
-            partial_summary = validation_summary_from_logs(
-                results["ppo"],
-                config["total_timesteps"],
-                run_dir,
-                model_path,
-                fps_avg=ppo_steps / max(1e-6, time.perf_counter() - policy_started),
-            )
-            write_eval_live_status(
-                live_status_path,
-                config=config,
-                model_path=model_path,
-                report=report,
-                status="running",
-                summary=partial_summary,
-            )
-    finally:
-        close_env_safely(env, timeout_seconds=5.0)
-
-    print_eval_table(results)
-    print_eval_diagnostics(results)
-    write_eval_outputs(run_dir, results, config, model_path)
-    ppo_logs = results.get("ppo", [])
-    ppo_elapsed = max(1e-6, time.perf_counter() - policy_started)
-    fps_avg = ppo_steps / ppo_elapsed
-    summary = validation_summary_from_logs(ppo_logs, config["total_timesteps"], run_dir, model_path, fps_avg=fps_avg)
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    write_eval_live_status(
-        live_status_path,
-        config=config,
-        model_path=model_path,
-        report=report,
-        status="complete",
-        summary=summary,
-    )
-    print_validation_summary(summary)
-    print(f"[eval] completed episodes={len(ppo_logs)} exiting")
-
-
 def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.Namespace) -> None:
     MaskablePPO = require_maskable_ppo()
-    if args.model_schedule is not None:
-        router = ModelRouter.from_file(args.model_schedule)
-
-        def load_stage(stage: Any) -> Dict[str, Any]:
-            selected_config = stage_config(config, stage)
-            if not stage.model_path.exists():
-                raise SystemExit(f"blocked_reason=model_path_missing: {stage.model_path}")
-            stage_model = MaskablePPO.load(str(stage.model_path))
-            stage_env_metadata = env_metadata_for_config(selected_config)
-            report = loaded_model_compatibility_report(
-                stage_model,
-                stage.model_path,
-                selected_config,
-                env_metadata=stage_env_metadata,
-            )
-            print_compatibility_report(f"[compat:Adventure router stage {stage.stage_id}]", report)
-            if not report.ok:
-                write_eval_live_status(
-                    args.live_status_path,
-                    config=selected_config,
-                    model_path=stage.model_path,
-                    report=report,
-                    status="blocked",
-                    mode="adventure_eval",
-                )
-            raise_if_incompatible(report)
-            compatibility = compatibility_summary_from_report(report)
-            selected_config["metadata_path"] = report.metadata_path
-            selected_config["metadata_inferred"] = bool(report.metadata_inferred)
-            selected_config["model_compatibility"] = model_compatibility_live_status(report)
-            return {
-                "model": stage_model,
-                "model_path": stage.model_path,
-                "config": selected_config,
-                "env_config": make_env_config(selected_config),
-                "compatibility": compatibility,
-                "model_compatibility": selected_config["model_compatibility"],
-            }
-
-        print(f"[adventure] router_schedule={args.model_schedule}")
-        run_adventure_eval(
-            config=config,
-            env_config=make_env_config(config),
-            model=None,
-            model_path=model_path,
-            deterministic=bool(args.deterministic),
-            advance_on_wins=max(1, int(config["advance_on_wins"])),
-            max_adventure_levels=max(1, int(config["max_adventure_levels"])),
-            max_attempts_per_level=max(1, int(config["max_attempts_per_level"])),
-            adventure_start_level=max(1, int(config["adventure_start_level"])),
-            conservative_seeds=bool(args.conservative_seeds),
-            allow_new_plants=bool(args.allow_new_plants),
-            live_status_path=args.live_status_path,
-            gui=bool(args.gui),
-            model_router=router,
-            router_stage_loader=load_stage,
-            adventure_soft_max_steps=int(config.get("adventure_soft_max_steps", DEFAULT_ADVENTURE_SOFT_MAX_STEPS)),
-            adventure_hard_max_steps=int(config.get("adventure_hard_max_steps", DEFAULT_ADVENTURE_HARD_MAX_STEPS)),
-            adventure_final_wave_extension=bool(config.get("adventure_final_wave_extension", True)),
-        )
-        return
-
     model = MaskablePPO.load(str(model_path))
     env_metadata = env_metadata_for_config(config)
     report = loaded_model_compatibility_report(model, model_path, config, env_metadata=env_metadata)
-    print_compatibility_report("[compat:Adventure eval]", report)
+    print_compatibility_report("[compat:Adventure Generalist eval]", report)
     if not report.ok:
         write_eval_live_status(
             args.live_status_path,
@@ -3364,21 +2643,26 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
             model_path=model_path,
             report=report,
             status="blocked",
-            mode="adventure_eval",
+            mode=ADVENTURE_GENERALIST_RUN_MODE_EVAL,
         )
     raise_if_incompatible(report)
-    compatibility = compatibility_summary_from_report(report)
+    compatibility = validate_adventure_generalist_model_compatibility(
+        model_path,
+        config,
+        "Adventure Generalist evaluation",
+        model=model,
+        env_metadata=env_metadata,
+    )
     config["metadata_path"] = report.metadata_path
     config["metadata_inferred"] = bool(report.metadata_inferred)
     config["model_compatibility"] = model_compatibility_live_status(report)
-    print(f"[adventure] policy=ppo model_path={model_path}")
+    print(f"[adventure-generalist-eval] policy=ppo model_path={model_path}")
     print(
-        "[adventure] inference_only=True "
-        f"deterministic={args.deterministic} action_count={compatibility['action_count']} "
-        f"conservative_seeds={args.conservative_seeds} allow_new_plants={args.allow_new_plants}"
+        "[adventure-generalist-eval] inference_only=True "
+        f"deterministic={args.deterministic} action_count={compatibility['action_count']}"
     )
     print(
-        "[adventure] compatible_seed_slots=True "
+        "[adventure-generalist-eval] compatible_seed_slots=True "
         f"seed_list={compatibility['expected_seed_list']} "
         f"plant_types={compatibility['expected_plant_types']} "
         f"decoder={compatibility['action_decoder_version']} "
@@ -3395,730 +2679,12 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
         max_adventure_levels=max(1, int(config["max_adventure_levels"])),
         max_attempts_per_level=max(1, int(config["max_attempts_per_level"])),
         adventure_start_level=max(1, int(config["adventure_start_level"])),
-        conservative_seeds=bool(args.conservative_seeds),
-        allow_new_plants=bool(args.allow_new_plants),
         live_status_path=args.live_status_path,
         gui=bool(args.gui),
         adventure_soft_max_steps=int(config.get("adventure_soft_max_steps", DEFAULT_ADVENTURE_SOFT_MAX_STEPS)),
         adventure_hard_max_steps=int(config.get("adventure_hard_max_steps", DEFAULT_ADVENTURE_HARD_MAX_STEPS)),
         adventure_final_wave_extension=bool(config.get("adventure_final_wave_extension", True)),
     )
-
-
-def close_env_safely(env: PvZMaskedPPOEnv, timeout_seconds: float = 5.0) -> bool:
-    error: List[BaseException] = []
-
-    def close_target() -> None:
-        try:
-            env.close()
-        except BaseException as exc:
-            error.append(exc)
-
-    thread = threading.Thread(target=close_target, name="PvZEvalEnvClose", daemon=True)
-    thread.start()
-    thread.join(max(0.1, timeout_seconds))
-    if thread.is_alive():
-        try:
-            env.base.client.close()
-        except Exception:
-            pass
-        print(f"[eval] warning: env.close() exceeded {timeout_seconds:.1f}s; continuing shutdown")
-        return False
-    if error:
-        print(f"[eval] warning: env.close() failed: {error[0]}")
-        return False
-    return True
-
-
-def apply_eval_diagnostics(log: EvalLog, summary: Dict[str, Any]) -> None:
-    for field in LANE_DIAGNOSTIC_DICT_FIELDS:
-        setattr(log, field, normalize_count_dict(summary.get(field)))
-    for field in LANE_DIAGNOSTIC_FLOAT_DICT_FIELDS:
-        setattr(log, field, normalize_float_dict(summary.get(field)))
-    for field in (
-        "wait_under_threat_count",
-        "close_zombie_undefended_count",
-        "wait_actions",
-        "plant_actions",
-        "overdefended_while_undefended_count",
-        "least_defended_threatened_row_plant_count",
-        "rows_with_peashooter_count",
-        "all_rows_peashooter_covered_step",
-        "sunflower_count_when_first_full_coverage",
-        "sunflower_overbuild_before_defense_count",
-        "sunflower_overbuild_count",
-        "pre_step_mask_blocked_count",
-        "cooldown_illegal_exposed_by_mask_count",
-        "mask_bridge_disagreement_count",
-    ):
-        setattr(log, field, int(summary.get(field) or 0))
-    log.wait_action_percent = float(summary.get("wait_action_percent") or 0.0)
-    log.plant_action_percent = float(summary.get("plant_action_percent") or 0.0)
-    log.row_defense_response_rate = float(summary.get("row_defense_response_rate") or 0.0)
-    log.plants_in_threatened_row_ratio = float(summary.get("plants_in_threatened_row_ratio") or 0.0)
-    log.plants_in_unthreatened_row_ratio = float(summary.get("plants_in_unthreatened_row_ratio") or 0.0)
-    log.peashooter_coverage_rate_by_step = float(summary.get("peashooter_coverage_rate_by_step") or 0.0)
-    for field in EPISODE_STRING_FIELDS:
-        setattr(log, field, str(summary.get(field) or ""))
-    for field in (
-        "wait_while_actionable_threat_count",
-        "wait_while_peashooter_affordable_ready_count",
-        "wait_while_wallnut_affordable_ready_count",
-        "wait_while_cherrybomb_affordable_ready_count",
-        "active_threat_rows_without_peashooter_count",
-        "sunflower_greed_while_defense_missing_count",
-        "wallnut_blocks_active_threat_count",
-        "wallnut_low_value_placement_count",
-        "wallnut_threatened_lane_placements",
-        "wallnut_between_zombie_and_house_count",
-        "wallnut_frontline_count",
-        "wallnut_emergency_blocks",
-        "wallnut_useless_placements",
-        "cherrybomb_used_count",
-        "cherrybomb_kills_total",
-        "cherrybomb_zero_kill_count",
-        "cherrybomb_zero_kill_uses",
-        "cherrybomb_cluster_uses",
-        "cherrybomb_emergency_uses",
-        "cherrybomb_heavy_zombie_kills",
-        "cherrybomb_buckethead_kills",
-        "cherrybomb_conehead_kills",
-        "cherrybomb_used_under_threat_count",
-        "cherrybomb_used_low_value_count",
-        "close_zombie_with_no_defense_count",
-        "undefended_threat_steps",
-        "high_danger_unanswered_steps",
-        "mower_exposure_steps",
-        "overdefense_count",
-        "mower_losses",
-        "wallnut_actions_masked",
-        "cherrybomb_actions_masked",
-        "wallnut_actions_available",
-        "cherrybomb_actions_available",
-        "mask_all_but_wait_count",
-        "tough_zombie_response_count",
-        "fusion_candidate_count_total",
-        "fusion_attempted_count",
-        "fusion_success_count",
-        "fusion_failed_count",
-        "fusion_rejected_count",
-        "fusion_under_threat_count",
-        "fusion_near_buckethead_count",
-        "fusion_near_conehead_count",
-        "fusion_estimated_mower_save_count",
-        "fusion_kills_after_use_total",
-        "fusion_bridge_error_count",
-        "fusion_unsafe_state_block_count",
-    ):
-        setattr(log, field, int(summary.get(field) or 0))
-    for field in (
-        "wallnut_damage_absorbed_total",
-        "cherrybomb_avg_kills_per_use",
-        "fusion_candidate_count_avg",
-        "fusion_avg_kills_after_use",
-        "legal_action_count_mean",
-        "max_row_danger",
-        "avg_row_danger",
-        *FUSION_REWARD_FLOAT_FIELDS,
-    ):
-        setattr(log, field, float(summary.get(field) or 0.0))
-    log.tactical_mask_enabled = bool(summary.get("tactical_mask_enabled"))
-    log.fusion_reward_capped = bool(summary.get("fusion_reward_capped"))
-    log.fusion_last_reward_reason = str(summary.get("fusion_last_reward_reason") or "")
-    log.fusion_last_source = str(summary.get("fusion_last_source") or "")
-    for field in (
-        "plant_action_counts",
-        "successful_placements_by_plant",
-        "invalid_actions_by_plant",
-        "fusion_attempts_by_pair",
-        "fusion_successes_by_pair",
-        "fusion_depth_counts",
-    ):
-        setattr(log, field, normalize_count_dict(summary.get(field)))
-    for field in REWARD_EPISODE_TOTAL_FIELDS:
-        setattr(log, field, float(summary.get(field) or 0.0))
-
-
-def run_eval_episode(env: PvZMaskedPPOEnv, episode: int, model: Any) -> EvalLog:
-    log = EvalLog(policy="ppo", episode=episode)
-    try:
-        obs, reset_info = env.reset()
-        reset_payload = reset_info.get("reset", {}) if isinstance(reset_info, dict) else {}
-        log.reset_success = bool(reset_payload.get("resetSuccess", reset_payload.get("ok", True)))
-        log.reset_seconds = float(
-            reset_payload.get("timeToPlayableSeconds")
-            or (float(reset_payload.get("reset_ms", 0.0) or 0.0) / 1000.0)
-            or 0.0
-        )
-    except Exception as exc:
-        log.reset_failures = 1
-        log.bridge_errors = 1
-        log.done_reason = "reset_error"
-        log.reset_success = False
-        print(f"ppo episode {episode} reset failed: {exc}")
-        return log
-
-    start_kills = int(env._last_observation.get("killCount", 0) if env._last_observation else 0)
-    start_mowers = int(env._last_observation.get("logicalMowerCount", env.rows) if env._last_observation else env.rows)
-    legal_total = 0
-    while True:
-        try:
-            action, _ = model.predict(obs, deterministic=True, action_masks=env.action_masks())
-            action_id = int(action)
-            obs, reward, terminated, truncated, info = env.step(action_id)
-        except Exception as exc:
-            log.bridge_errors += 1
-            log.done_reason = "bridge_error"
-            print(f"ppo episode {episode} bridge failed: {exc}")
-            break
-
-        log.episode_reward += float(reward)
-        log.episode_length += 1
-        legal_actions = info.get("legal_actions", [])
-        if isinstance(legal_actions, list):
-            legal_total += len(legal_actions)
-        log.final_wave = int(info.get("final_wave", log.final_wave))
-        log.zombies_killed = int(info.get("zombies_killed", log.zombies_killed))
-        log.plants_placed = int(info.get("plants_placed", log.plants_placed))
-        log.illegal_actions = int(info.get("illegal_actions", log.illegal_actions))
-        action_result = info.get("action_result", {})
-        placement = action_result.get("placement") or {}
-        if action_result.get("costPaid") or placement.get("costPaid"):
-            sun_before = int(action_result.get("sunBefore") or placement.get("sunBefore") or 0)
-            sun_after = int(action_result.get("sunAfter") or placement.get("sunAfter") or 0)
-            spent = max(0, sun_before - sun_after)
-            if spent == 0:
-                spent = int(action_result.get("plantCost") or placement.get("plantCost") or 0)
-            log.sun_spent += max(0, spent)
-        raw = info.get("raw_observation", {})
-        log.max_wave = int(raw.get("maxWave", log.max_wave))
-        log.sun_remaining = int(raw.get("sun", log.sun_remaining))
-        final_mowers = int(raw.get("logicalMowerCount", start_mowers))
-        log.mowers_lost = max(0, start_mowers - final_mowers)
-
-        if terminated or truncated:
-            summary = info.get("episode_summary", {})
-            log.run_mode = str(summary.get("run_mode", log.run_mode))
-            log.target_level = int(summary.get("target_level", log.target_level))
-            log.result = str(summary.get("result", log.result))
-            log.reward_total = float(summary.get("reward_total", log.reward_total or log.episode_reward))
-            log.done_reason = str(summary.get("done_reason", info.get("done_reason", "timeout" if truncated else "none")))
-            log.terminal_reason = str(summary.get("terminal_reason", info.get("terminal_reason", "")))
-            log.final_wave = int(summary.get("final_wave", log.final_wave))
-            log.max_wave = int(summary.get("max_wave", log.max_wave))
-            log.zombies_killed = int(summary.get("zombies_killed", log.zombies_killed))
-            log.plants_placed = int(summary.get("plants_placed", log.plants_placed))
-            log.sunflowers_planted = int(summary.get("sunflowers_planted", log.sunflowers_planted))
-            log.peashooters_planted = int(summary.get("peashooters_planted", log.peashooters_planted))
-            log.wallnuts_planted = int(summary.get("wallnuts_planted", log.wallnuts_planted))
-            log.cherrybombs_planted = int(summary.get("cherrybombs_planted", log.cherrybombs_planted))
-            log.sun_spent = int(summary.get("sun_spent", log.sun_spent))
-            log.sun_remaining = int(summary.get("sun_remaining", log.sun_remaining))
-            log.mowers_lost = int(summary.get("mowers_lost", log.mowers_lost))
-            log.mower_losses = int(summary.get("mower_losses", log.mower_losses))
-            log.reset_success = bool(summary.get("reset_success", log.reset_success))
-            log.reset_seconds = float(summary.get("reset_seconds", log.reset_seconds))
-            log.bridge_errors = int(summary.get("bridge_errors", log.bridge_errors))
-            log.illegal_actions = int(summary.get("illegal_actions", log.illegal_actions))
-            log.avg_legal_actions = float(summary.get("avg_legal_actions", legal_total / max(1, log.episode_length)))
-            apply_eval_diagnostics(log, summary)
-            break
-
-    if log.avg_legal_actions == 0.0:
-        log.avg_legal_actions = legal_total / max(1, log.episode_length)
-    if not log.reset_success:
-        log.reset_failures = 1
-    return log
-
-
-def print_eval_table(results: Dict[str, List[EvalLog]]) -> None:
-    headers = ["policy", "episodes", "win_rate", "avg_reward", "avg_len", "avg_wave", "avg_kills", "plants", "mowers", "sun", "reset_fail", "bridge_err"]
-    rows: List[List[str]] = []
-    for policy, logs in results.items():
-        summary = summarize_eval_logs(logs)
-        rows.append(
-            [
-                policy,
-                str(summary["episodes"]),
-                f"{summary['win_rate']:.2f}",
-                f"{summary['avg_reward']:.2f}",
-                f"{summary['avg_episode_length']:.1f}",
-                f"{summary['avg_wave']:.1f}",
-                f"{summary['avg_kills']:.1f}",
-                f"{summary['avg_plants']:.1f}",
-                f"{summary['avg_mowers_lost']:.1f}",
-                f"{summary['avg_sun_remaining']:.1f}",
-                str(summary["reset_failures"]),
-                str(summary["bridge_errors"]),
-            ]
-        )
-
-    widths = [len(header) for header in headers]
-    for row in rows:
-        for index, value in enumerate(row):
-            widths[index] = max(widths[index], len(value))
-
-    print("PPO Evaluation")
-    print("--------------")
-    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
-    print("  ".join("-" * width for width in widths))
-    for row in rows:
-        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
-
-
-def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
-    count = max(1, len(logs))
-    rows: List[Any] = logs
-    total_steps = sum(log.episode_length for log in logs)
-    wait_actions = sum(log.wait_actions for log in logs)
-    plant_actions = sum(log.plant_actions for log in logs)
-    threat_steps = sum_count_dicts_from_rows(rows, "threat_steps_by_row")
-    undefended_steps = sum_count_dicts_from_rows(rows, "undefended_threat_steps_by_row")
-    threatened_zero_defender_steps = sum_count_dicts_from_rows(rows, "threatened_rows_with_zero_defender_steps_by_row")
-    row_defense_opportunities = sum_count_dicts_from_rows(rows, "row_defense_opportunities_by_row")
-    row_defense_responses = sum_count_dicts_from_rows(rows, "row_defense_responses_by_row")
-    peashooter_placements = sum_count_dicts_from_rows(rows, "peashooter_placements_by_row")
-    plant_weight_total = sum(max(0, log.plants_placed) for log in logs)
-    full_coverage_sunflower_counts = [
-        log.sunflower_count_when_first_full_coverage
-        for log in logs
-        if log.all_rows_peashooter_covered_step > 0
-        and log.sunflower_count_when_first_full_coverage >= 0
-    ]
-    reward_component_totals = {
-        field: sum(float(getattr(log, field, 0.0)) for log in logs)
-        for field in REWARD_EPISODE_TOTAL_FIELDS
-    }
-    cherrybomb_used_count = sum(log.cherrybomb_used_count for log in logs)
-    fusion_success_count = sum(log.fusion_success_count for log in logs)
-    fusion_candidate_count_total = sum(log.fusion_candidate_count_total for log in logs)
-    return {
-        "episodes": len(logs),
-        "win_rate": sum(1 for log in logs if log.won) / count,
-        "avg_reward": sum(log.episode_reward for log in logs) / count,
-        "avg_episode_length": sum(log.episode_length for log in logs) / count,
-        "avg_wave": sum(log.final_wave for log in logs) / count,
-        "avg_kills": sum(log.zombies_killed for log in logs) / count,
-        "avg_plants": sum(log.plants_placed for log in logs) / count,
-        "sunflowers_planted": sum(log.sunflowers_planted for log in logs),
-        "peashooters_planted": sum(log.peashooters_planted for log in logs),
-        "wallnuts_planted": sum(log.wallnuts_planted for log in logs),
-        "cherrybombs_planted": sum(log.cherrybombs_planted for log in logs),
-        "avg_mowers_lost": sum(log.mowers_lost for log in logs) / count,
-        "avg_sun_remaining": sum(log.sun_remaining for log in logs) / count,
-        "reset_failures": sum(log.reset_failures for log in logs),
-        "bridge_errors": sum(log.bridge_errors for log in logs),
-        "wait_actions": wait_actions,
-        "plant_actions": plant_actions,
-        "wait_action_percent": 100.0 * wait_actions / max(1, total_steps),
-        "plant_action_percent": 100.0 * plant_actions / max(1, total_steps),
-        "plants_by_row": sum_count_dicts_from_rows(rows, "plants_by_row"),
-        "peashooters_by_row": sum_count_dicts_from_rows(rows, "peashooters_by_row"),
-        "sunflowers_by_row": sum_count_dicts_from_rows(rows, "sunflowers_by_row"),
-        "threat_steps_by_row": threat_steps,
-        "undefended_threat_steps_by_row": undefended_steps,
-        "undefended_threat_ratio_by_row": ratio_dict(undefended_steps, threat_steps),
-        "undefended_threat_age_avg_by_row": weighted_average_dict_from_rows(
-            rows,
-            "undefended_threat_age_avg_by_row",
-            "threatened_rows_with_zero_defender_steps_by_row",
-        ),
-        "undefended_threat_age_max_by_row": max_count_dicts_from_rows(rows, "undefended_threat_age_max_by_row"),
-        "threatened_rows_with_zero_defender_steps_by_row": threatened_zero_defender_steps,
-        "peashooters_per_threat_step_by_row": ratio_dict(peashooter_placements, threat_steps),
-        "first_defense_step_by_row": average_positive_step_dict_from_rows(rows, "first_defense_step_by_row"),
-        "plants_in_threatened_row_ratio": (
-            sum(log.plants_in_threatened_row_ratio * max(0, log.plants_placed) for log in logs) / plant_weight_total
-            if plant_weight_total > 0
-            else 0.0
-        ),
-        "plants_in_unthreatened_row_ratio": (
-            sum(log.plants_in_unthreatened_row_ratio * max(0, log.plants_placed) for log in logs) / plant_weight_total
-            if plant_weight_total > 0
-            else 0.0
-        ),
-        "overdefended_while_undefended_count": sum(log.overdefended_while_undefended_count for log in logs),
-        "least_defended_threatened_row_plant_count": sum(log.least_defended_threatened_row_plant_count for log in logs),
-        "rows_with_peashooter_count": sum(log.rows_with_peashooter_count for log in logs) / count,
-        "all_rows_peashooter_covered_step": average_positive_from_rows(rows, "all_rows_peashooter_covered_step"),
-        "first_peashooter_by_row_step": average_positive_step_dict_from_rows(rows, "first_peashooter_by_row_step"),
-        "sunflower_count_when_first_full_coverage": (
-            sum(full_coverage_sunflower_counts) / len(full_coverage_sunflower_counts)
-            if full_coverage_sunflower_counts
-            else -1.0
-        ),
-        "sunflower_overbuild_before_defense_count": sum(log.sunflower_overbuild_before_defense_count for log in logs),
-        "sunflower_overbuild_count": sum(log.sunflower_overbuild_count for log in logs),
-        "peashooter_coverage_rate_by_step": (
-            sum(log.peashooter_coverage_rate_by_step * log.episode_length for log in logs) / max(1, total_steps)
-        ),
-        "mower_losses_by_row": sum_count_dicts_from_rows(rows, "mower_losses_by_row"),
-        "wait_under_threat_count": sum(log.wait_under_threat_count for log in logs),
-        "close_zombie_undefended_count": sum(log.close_zombie_undefended_count for log in logs),
-        "illegal_reason_counts": sum_count_dicts_from_rows(rows, "illegal_reason_counts"),
-        "legal_peashooter_actions_by_row": sum_count_dicts_from_rows(rows, "legal_peashooter_actions_by_row"),
-        "peashooter_available_but_waited_by_row": sum_count_dicts_from_rows(rows, "peashooter_available_but_waited_by_row"),
-        "peashooter_available_but_planted_elsewhere_by_row": sum_count_dicts_from_rows(
-            rows,
-            "peashooter_available_but_planted_elsewhere_by_row",
-        ),
-        "sunflower_while_undefended_threat_by_row": sum_count_dicts_from_rows(rows, "sunflower_while_undefended_threat_by_row"),
-        "legal_actions_by_seed_slot": sum_count_dicts_from_rows(rows, "legal_actions_by_seed_slot"),
-        "bridge_legal_actions_by_seed_slot": sum_count_dicts_from_rows(rows, "bridge_legal_actions_by_seed_slot"),
-        "python_mask_block_reason_counts": sum_count_dicts_from_rows(rows, "python_mask_block_reason_counts"),
-        "pre_step_mask_blocked_count": sum(log.pre_step_mask_blocked_count for log in logs),
-        "cooldown_illegal_exposed_by_mask_count": sum(log.cooldown_illegal_exposed_by_mask_count for log in logs),
-        "mask_bridge_disagreement_count": sum(log.mask_bridge_disagreement_count for log in logs),
-        "wait_while_actionable_threat_count": sum(log.wait_while_actionable_threat_count for log in logs),
-        "wait_while_peashooter_affordable_ready_count": sum(log.wait_while_peashooter_affordable_ready_count for log in logs),
-        "wait_while_wallnut_affordable_ready_count": sum(log.wait_while_wallnut_affordable_ready_count for log in logs),
-        "wait_while_cherrybomb_affordable_ready_count": sum(log.wait_while_cherrybomb_affordable_ready_count for log in logs),
-        "active_threat_rows_without_peashooter_count": sum(log.active_threat_rows_without_peashooter_count for log in logs),
-        "sunflower_greed_while_defense_missing_count": sum(log.sunflower_greed_while_defense_missing_count for log in logs),
-        "wallnut_placements_by_row": sum_count_dicts_from_rows(rows, "wallnut_placements_by_row"),
-        "wallnut_placements_by_col": sum_count_dicts_from_rows(rows, "wallnut_placements_by_col"),
-        "wallnut_blocks_active_threat_count": sum(log.wallnut_blocks_active_threat_count for log in logs),
-        "wallnut_low_value_placement_count": sum(log.wallnut_low_value_placement_count for log in logs),
-        "wallnut_threatened_lane_placements": sum(log.wallnut_threatened_lane_placements for log in logs),
-        "wallnut_between_zombie_and_house_count": sum(log.wallnut_between_zombie_and_house_count for log in logs),
-        "wallnut_frontline_count": sum(log.wallnut_frontline_count for log in logs),
-        "wallnut_emergency_blocks": sum(log.wallnut_emergency_blocks for log in logs),
-        "wallnut_useless_placements": sum(log.wallnut_useless_placements for log in logs),
-        "wallnut_damage_absorbed_total": sum(float(log.wallnut_damage_absorbed_total) for log in logs),
-        "cherrybomb_used_count": cherrybomb_used_count,
-        "cherrybomb_kills_total": sum(log.cherrybomb_kills_total for log in logs),
-        "cherrybomb_avg_kills_per_use": (
-            sum(log.cherrybomb_kills_total for log in logs) / max(1, cherrybomb_used_count)
-        ),
-        "cherrybomb_zero_kill_count": sum(log.cherrybomb_zero_kill_count for log in logs),
-        "cherrybomb_zero_kill_uses": sum(log.cherrybomb_zero_kill_uses for log in logs),
-        "cherrybomb_cluster_uses": sum(log.cherrybomb_cluster_uses for log in logs),
-        "cherrybomb_emergency_uses": sum(log.cherrybomb_emergency_uses for log in logs),
-        "cherrybomb_buckethead_kills": sum(log.cherrybomb_buckethead_kills for log in logs),
-        "cherrybomb_conehead_kills": sum(log.cherrybomb_conehead_kills for log in logs),
-        "cherrybomb_heavy_zombie_kills": sum(log.cherrybomb_heavy_zombie_kills for log in logs),
-        "cherrybomb_used_under_threat_count": sum(log.cherrybomb_used_under_threat_count for log in logs),
-        "cherrybomb_used_low_value_count": sum(log.cherrybomb_used_low_value_count for log in logs),
-        "mower_risk_steps_by_row": sum_count_dicts_from_rows(rows, "mower_risk_steps_by_row"),
-        "mower_saves_estimated_by_row": sum_count_dicts_from_rows(rows, "mower_saves_estimated_by_row"),
-        "close_zombie_with_no_defense_count": sum(log.close_zombie_with_no_defense_count for log in logs),
-        "undefended_threat_steps": sum(log.undefended_threat_steps for log in logs),
-        "high_danger_unanswered_steps": sum(log.high_danger_unanswered_steps for log in logs),
-        "mower_exposure_steps": sum(log.mower_exposure_steps for log in logs),
-        "overdefense_count": sum(log.overdefense_count for log in logs),
-        "mower_losses": sum(log.mower_losses for log in logs),
-        "legal_action_count_mean": sum(log.legal_action_count_mean or log.avg_legal_actions for log in logs) / count,
-        "max_row_danger": max((log.max_row_danger for log in logs), default=0.0),
-        "avg_row_danger": sum(log.avg_row_danger for log in logs) / count,
-        "tactical_mask_enabled": any(log.tactical_mask_enabled for log in logs),
-        "wallnut_actions_masked": sum(log.wallnut_actions_masked for log in logs),
-        "cherrybomb_actions_masked": sum(log.cherrybomb_actions_masked for log in logs),
-        "wallnut_actions_available": sum(log.wallnut_actions_available for log in logs),
-        "cherrybomb_actions_available": sum(log.cherrybomb_actions_available for log in logs),
-        "mask_all_but_wait_count": sum(log.mask_all_but_wait_count for log in logs),
-        "buckethead_count_by_row": sum_count_dicts_from_rows(rows, "buckethead_count_by_row"),
-        "conehead_count_by_row": sum_count_dicts_from_rows(rows, "conehead_count_by_row"),
-        "tough_zombie_count_by_row": sum_count_dicts_from_rows(rows, "tough_zombie_count_by_row"),
-        "tough_zombie_response_count": sum(log.tough_zombie_response_count for log in logs),
-        "fusion_policy": logs[0].fusion_policy if logs else FUSION_POLICY_NONE,
-        "fusion_candidate_count_total": fusion_candidate_count_total,
-        "fusion_candidate_count_avg": fusion_candidate_count_total / max(1, total_steps),
-        "fusion_attempted_count": sum(log.fusion_attempted_count for log in logs),
-        "fusion_success_count": fusion_success_count,
-        "fusion_failed_count": sum(log.fusion_failed_count for log in logs),
-        "fusion_rejected_count": sum(log.fusion_rejected_count for log in logs),
-        "fusion_rejected_reasons": sum_count_dicts_from_rows(rows, "fusion_rejected_reasons"),
-        "fusion_by_result_type": sum_count_dicts_from_rows(rows, "fusion_by_result_type"),
-        "fusion_by_source_type": sum_count_dicts_from_rows(rows, "fusion_by_source_type"),
-        "fusion_by_row": sum_count_dicts_from_rows(rows, "fusion_by_row"),
-        "plant_action_counts": sum_count_dicts_from_rows(rows, "plant_action_counts"),
-        "successful_placements_by_plant": sum_count_dicts_from_rows(rows, "successful_placements_by_plant"),
-        "invalid_actions_by_plant": sum_count_dicts_from_rows(rows, "invalid_actions_by_plant"),
-        "fusion_attempts_by_pair": sum_count_dicts_from_rows(rows, "fusion_attempts_by_pair"),
-        "fusion_successes_by_pair": sum_count_dicts_from_rows(rows, "fusion_successes_by_pair"),
-        "fusion_depth_counts": sum_count_dicts_from_rows(rows, "fusion_depth_counts"),
-        "recursive_fusion_count": sum(log.recursive_fusion_count for log in logs),
-        "highest_fusion_tier": max((log.highest_fusion_tier for log in logs), default=0),
-        "action_freeze_count": sum(log.action_freeze_count for log in logs),
-        "mean_action_duration_seconds": (
-            sum(log.mean_action_duration_seconds for log in logs) / max(1, len(logs))
-        ),
-        "max_action_duration_seconds": max((log.max_action_duration_seconds for log in logs), default=0.0),
-        "p95_action_duration_seconds": max((log.p95_action_duration_seconds for log in logs), default=0.0),
-        "fusion_under_threat_count": sum(log.fusion_under_threat_count for log in logs),
-        "fusion_near_buckethead_count": sum(log.fusion_near_buckethead_count for log in logs),
-        "fusion_near_conehead_count": sum(log.fusion_near_conehead_count for log in logs),
-        "fusion_estimated_mower_save_count": sum(log.fusion_estimated_mower_save_count for log in logs),
-        "fusion_kills_after_use_total": sum(log.fusion_kills_after_use_total for log in logs),
-        "fusion_avg_kills_after_use": (
-            sum(log.fusion_kills_after_use_total for log in logs) / max(1, fusion_success_count)
-        ),
-        "fusion_bridge_error_count": sum(log.fusion_bridge_error_count for log in logs),
-        "fusion_unsafe_state_block_count": sum(log.fusion_unsafe_state_block_count for log in logs),
-        "plant_actions_by_row": sum_count_dicts_from_rows(rows, "plant_actions_by_row"),
-        "peashooter_actions_by_row": sum_count_dicts_from_rows(rows, "peashooter_actions_by_row"),
-        "sunflower_actions_by_row": sum_count_dicts_from_rows(rows, "sunflower_actions_by_row"),
-        "plant_placements_by_row": sum_count_dicts_from_rows(rows, "plant_placements_by_row"),
-        "peashooter_placements_by_row": sum_count_dicts_from_rows(rows, "peashooter_placements_by_row"),
-        "sunflower_placements_by_row": sum_count_dicts_from_rows(rows, "sunflower_placements_by_row"),
-        "row_defense_opportunities_by_row": row_defense_opportunities,
-        "row_defense_responses_by_row": row_defense_responses,
-        "row_defense_response_rate_by_row": ratio_dict(row_defense_responses, row_defense_opportunities),
-        "row_defense_response_rate": (
-            total_count(row_defense_responses) / total_count(row_defense_opportunities)
-            if total_count(row_defense_opportunities) > 0
-            else 0.0
-        ),
-        **{
-            field: sum(float(getattr(log, field, 0.0)) for log in logs)
-            for field in FUSION_REWARD_FLOAT_FIELDS[:-2]
-        },
-        "fusion_reward_total": float(reward_component_totals.get("fusion_reward_total", 0.0)),
-        "fusion_reward_capped": any(bool(log.fusion_reward_capped) for log in logs),
-        "fusion_last_reward_delta": float(logs[-1].fusion_last_reward_delta) if logs else 0.0,
-        "fusion_last_usefulness_bonus": float(logs[-1].fusion_last_usefulness_bonus) if logs else 0.0,
-        "fusion_last_reward_reason": str(logs[-1].fusion_last_reward_reason) if logs else "",
-        "fusion_last_source": str(logs[-1].fusion_last_source) if logs else "",
-        "reward_component_totals": reward_component_totals,
-        "reward_component_avgs": {field: value / count for field, value in reward_component_totals.items()},
-    }
-
-
-def print_eval_diagnostics(results: Dict[str, List[EvalLog]]) -> None:
-    for policy, logs in results.items():
-        summary = summarize_eval_logs(logs)
-        payload = {
-            "wait_action_percent": summary["wait_action_percent"],
-            "plant_action_percent": summary["plant_action_percent"],
-            "plants_by_row": summary["plants_by_row"],
-            "peashooters_by_row": summary["peashooters_by_row"],
-            "sunflowers_by_row": summary["sunflowers_by_row"],
-            "plant_actions_by_row": summary["plant_actions_by_row"],
-            "peashooter_actions_by_row": summary["peashooter_actions_by_row"],
-            "sunflower_actions_by_row": summary["sunflower_actions_by_row"],
-            "peashooter_placements_by_row": summary["peashooter_placements_by_row"],
-            "sunflower_placements_by_row": summary["sunflower_placements_by_row"],
-            "threat_steps_by_row": summary["threat_steps_by_row"],
-            "undefended_threat_steps_by_row": summary["undefended_threat_steps_by_row"],
-            "undefended_threat_ratio_by_row": summary["undefended_threat_ratio_by_row"],
-            "undefended_threat_age_avg_by_row": summary["undefended_threat_age_avg_by_row"],
-            "undefended_threat_age_max_by_row": summary["undefended_threat_age_max_by_row"],
-            "threatened_rows_with_zero_defender_steps_by_row": summary["threatened_rows_with_zero_defender_steps_by_row"],
-            "peashooters_per_threat_step_by_row": summary["peashooters_per_threat_step_by_row"],
-            "first_defense_step_by_row": summary["first_defense_step_by_row"],
-            "plants_in_threatened_row_ratio": summary["plants_in_threatened_row_ratio"],
-            "plants_in_unthreatened_row_ratio": summary["plants_in_unthreatened_row_ratio"],
-            "overdefended_while_undefended_count": summary["overdefended_while_undefended_count"],
-            "least_defended_threatened_row_plant_count": summary["least_defended_threatened_row_plant_count"],
-            "rows_with_peashooter_count": summary["rows_with_peashooter_count"],
-            "all_rows_peashooter_covered_step": summary["all_rows_peashooter_covered_step"],
-            "first_peashooter_by_row_step": summary["first_peashooter_by_row_step"],
-            "sunflower_count_when_first_full_coverage": summary["sunflower_count_when_first_full_coverage"],
-            "sunflower_overbuild_before_defense_count": summary["sunflower_overbuild_before_defense_count"],
-            "peashooter_coverage_rate_by_step": summary["peashooter_coverage_rate_by_step"],
-            "mower_losses_by_row": summary["mower_losses_by_row"],
-            "row_defense_opportunities_by_row": summary["row_defense_opportunities_by_row"],
-            "row_defense_responses_by_row": summary["row_defense_responses_by_row"],
-            "row_defense_response_rate_by_row": summary["row_defense_response_rate_by_row"],
-            "row_defense_response_rate": summary["row_defense_response_rate"],
-            "wait_under_threat_count": summary["wait_under_threat_count"],
-            "close_zombie_undefended_count": summary["close_zombie_undefended_count"],
-            "illegal_reason_counts": summary["illegal_reason_counts"],
-            "legal_peashooter_actions_by_row": summary["legal_peashooter_actions_by_row"],
-            "peashooter_available_but_waited_by_row": summary["peashooter_available_but_waited_by_row"],
-            "peashooter_available_but_planted_elsewhere_by_row": summary["peashooter_available_but_planted_elsewhere_by_row"],
-            "sunflower_while_undefended_threat_by_row": summary["sunflower_while_undefended_threat_by_row"],
-            "legal_actions_by_seed_slot": summary["legal_actions_by_seed_slot"],
-            "bridge_legal_actions_by_seed_slot": summary["bridge_legal_actions_by_seed_slot"],
-            "python_mask_block_reason_counts": summary["python_mask_block_reason_counts"],
-            "pre_step_mask_blocked_count": summary["pre_step_mask_blocked_count"],
-            "cooldown_illegal_exposed_by_mask_count": summary["cooldown_illegal_exposed_by_mask_count"],
-            "mask_bridge_disagreement_count": summary["mask_bridge_disagreement_count"],
-            "wait_while_actionable_threat_count": summary["wait_while_actionable_threat_count"],
-            "active_threat_rows_without_peashooter_count": summary["active_threat_rows_without_peashooter_count"],
-            "sunflower_greed_while_defense_missing_count": summary["sunflower_greed_while_defense_missing_count"],
-            "wallnut_placements_by_row": summary["wallnut_placements_by_row"],
-            "wallnut_blocks_active_threat_count": summary["wallnut_blocks_active_threat_count"],
-            "wallnut_low_value_placement_count": summary["wallnut_low_value_placement_count"],
-            "cherrybomb_used_count": summary["cherrybomb_used_count"],
-            "cherrybomb_kills_total": summary["cherrybomb_kills_total"],
-            "cherrybomb_avg_kills_per_use": summary["cherrybomb_avg_kills_per_use"],
-            "cherrybomb_zero_kill_count": summary["cherrybomb_zero_kill_count"],
-            "mower_risk_steps_by_row": summary["mower_risk_steps_by_row"],
-            "mower_saves_estimated_by_row": summary["mower_saves_estimated_by_row"],
-            "buckethead_count_by_row": summary["buckethead_count_by_row"],
-            "conehead_count_by_row": summary["conehead_count_by_row"],
-            "tough_zombie_count_by_row": summary["tough_zombie_count_by_row"],
-            "tough_zombie_response_count": summary["tough_zombie_response_count"],
-            "fusion_policy": summary["fusion_policy"],
-            "fusion_candidate_count_total": summary["fusion_candidate_count_total"],
-            "fusion_candidate_count_avg": summary["fusion_candidate_count_avg"],
-            "fusion_attempted_count": summary["fusion_attempted_count"],
-            "fusion_success_count": summary["fusion_success_count"],
-            "fusion_failed_count": summary["fusion_failed_count"],
-            "fusion_rejected_count": summary["fusion_rejected_count"],
-            "fusion_rejected_reasons": summary["fusion_rejected_reasons"],
-            "fusion_by_result_type": summary["fusion_by_result_type"],
-            "fusion_by_source_type": summary["fusion_by_source_type"],
-            "fusion_by_row": summary["fusion_by_row"],
-            "fusion_under_threat_count": summary["fusion_under_threat_count"],
-            "fusion_near_buckethead_count": summary["fusion_near_buckethead_count"],
-            "fusion_near_conehead_count": summary["fusion_near_conehead_count"],
-            "fusion_estimated_mower_save_count": summary["fusion_estimated_mower_save_count"],
-            "fusion_bridge_error_count": summary["fusion_bridge_error_count"],
-            "fusion_unsafe_state_block_count": summary["fusion_unsafe_state_block_count"],
-            "plant_action_counts": summary.get("plant_action_counts", {}),
-            "successful_placements_by_plant": summary.get("successful_placements_by_plant", {}),
-            "invalid_actions_by_plant": summary.get("invalid_actions_by_plant", {}),
-            "fusion_attempts_by_pair": summary.get("fusion_attempts_by_pair", {}),
-            "fusion_successes_by_pair": summary.get("fusion_successes_by_pair", {}),
-            "fusion_depth_counts": summary.get("fusion_depth_counts", {}),
-            "recursive_fusion_count": summary.get("recursive_fusion_count", 0),
-            "highest_fusion_tier": summary.get("highest_fusion_tier", 0),
-            "action_freeze_count": summary.get("action_freeze_count", 0),
-            "action_duration_seconds": {
-                "mean": summary.get("mean_action_duration_seconds", 0.0),
-                "p95": summary.get("p95_action_duration_seconds", 0.0),
-                "max": summary.get("max_action_duration_seconds", 0.0),
-            },
-            "reward_component_avgs": summary["reward_component_avgs"],
-        }
-        print(f"[eval-diagnostics] policy={policy} " + json.dumps(payload, separators=(",", ":"), sort_keys=True))
-
-
-def validation_summary_from_logs(
-    logs: List[EvalLog],
-    total_timesteps: int,
-    run_dir: Path,
-    model_path: Path,
-    fps_avg: float,
-) -> Dict[str, Any]:
-    summary = summarize_eval_logs(logs)
-    return {
-        "total_timesteps": total_timesteps,
-        "episodes": summary["episodes"],
-        "avg_reward": summary["avg_reward"],
-        "avg_length": summary["avg_episode_length"],
-        "win_rate": summary["win_rate"],
-        "avg_wave": summary["avg_wave"],
-        "avg_kills": summary["avg_kills"],
-        "avg_plants": summary["avg_plants"],
-        "avg_mowers_lost": summary["avg_mowers_lost"],
-        "reset_failures": summary["reset_failures"],
-        "bridge_errors": summary["bridge_errors"],
-        "wait_action_percent": summary["wait_action_percent"],
-        "plant_action_percent": summary["plant_action_percent"],
-        "plants_by_row": summary["plants_by_row"],
-        "peashooters_by_row": summary["peashooters_by_row"],
-        "sunflowers_by_row": summary["sunflowers_by_row"],
-        "peashooter_actions_by_row": summary["peashooter_actions_by_row"],
-        "peashooter_placements_by_row": summary["peashooter_placements_by_row"],
-        "threat_steps_by_row": summary["threat_steps_by_row"],
-        "undefended_threat_steps_by_row": summary["undefended_threat_steps_by_row"],
-        "undefended_threat_ratio_by_row": summary["undefended_threat_ratio_by_row"],
-        "undefended_threat_age_avg_by_row": summary["undefended_threat_age_avg_by_row"],
-        "undefended_threat_age_max_by_row": summary["undefended_threat_age_max_by_row"],
-        "threatened_rows_with_zero_defender_steps_by_row": summary["threatened_rows_with_zero_defender_steps_by_row"],
-        "peashooters_per_threat_step_by_row": summary["peashooters_per_threat_step_by_row"],
-        "first_defense_step_by_row": summary["first_defense_step_by_row"],
-        "plants_in_threatened_row_ratio": summary["plants_in_threatened_row_ratio"],
-        "plants_in_unthreatened_row_ratio": summary["plants_in_unthreatened_row_ratio"],
-        "overdefended_while_undefended_count": summary["overdefended_while_undefended_count"],
-        "least_defended_threatened_row_plant_count": summary["least_defended_threatened_row_plant_count"],
-        "rows_with_peashooter_count": summary["rows_with_peashooter_count"],
-        "all_rows_peashooter_covered_step": summary["all_rows_peashooter_covered_step"],
-        "first_peashooter_by_row_step": summary["first_peashooter_by_row_step"],
-        "sunflower_count_when_first_full_coverage": summary["sunflower_count_when_first_full_coverage"],
-        "sunflower_overbuild_before_defense_count": summary["sunflower_overbuild_before_defense_count"],
-        "peashooter_coverage_rate_by_step": summary["peashooter_coverage_rate_by_step"],
-        "mower_losses_by_row": summary["mower_losses_by_row"],
-        "wait_under_threat_count": summary["wait_under_threat_count"],
-        "close_zombie_undefended_count": summary["close_zombie_undefended_count"],
-        "illegal_reason_counts": summary["illegal_reason_counts"],
-        "legal_peashooter_actions_by_row": summary["legal_peashooter_actions_by_row"],
-        "peashooter_available_but_waited_by_row": summary["peashooter_available_but_waited_by_row"],
-        "peashooter_available_but_planted_elsewhere_by_row": summary["peashooter_available_but_planted_elsewhere_by_row"],
-        "sunflower_while_undefended_threat_by_row": summary["sunflower_while_undefended_threat_by_row"],
-        "legal_actions_by_seed_slot": summary["legal_actions_by_seed_slot"],
-        "bridge_legal_actions_by_seed_slot": summary["bridge_legal_actions_by_seed_slot"],
-        "python_mask_block_reason_counts": summary["python_mask_block_reason_counts"],
-        "pre_step_mask_blocked_count": summary["pre_step_mask_blocked_count"],
-        "cooldown_illegal_exposed_by_mask_count": summary["cooldown_illegal_exposed_by_mask_count"],
-        "mask_bridge_disagreement_count": summary["mask_bridge_disagreement_count"],
-        "wait_while_actionable_threat_count": summary["wait_while_actionable_threat_count"],
-        "active_threat_rows_without_peashooter_count": summary["active_threat_rows_without_peashooter_count"],
-        "sunflower_greed_while_defense_missing_count": summary["sunflower_greed_while_defense_missing_count"],
-        "wallnut_placements_by_row": summary["wallnut_placements_by_row"],
-        "wallnut_blocks_active_threat_count": summary["wallnut_blocks_active_threat_count"],
-        "wallnut_low_value_placement_count": summary["wallnut_low_value_placement_count"],
-        "cherrybomb_used_count": summary["cherrybomb_used_count"],
-        "cherrybomb_kills_total": summary["cherrybomb_kills_total"],
-        "cherrybomb_avg_kills_per_use": summary["cherrybomb_avg_kills_per_use"],
-        "cherrybomb_zero_kill_count": summary["cherrybomb_zero_kill_count"],
-        "cherrybomb_buckethead_kills": summary["cherrybomb_buckethead_kills"],
-        "cherrybomb_conehead_kills": summary["cherrybomb_conehead_kills"],
-        "mower_risk_steps_by_row": summary["mower_risk_steps_by_row"],
-        "mower_saves_estimated_by_row": summary["mower_saves_estimated_by_row"],
-        "buckethead_count_by_row": summary["buckethead_count_by_row"],
-        "conehead_count_by_row": summary["conehead_count_by_row"],
-        "tough_zombie_count_by_row": summary["tough_zombie_count_by_row"],
-        "tough_zombie_response_count": summary["tough_zombie_response_count"],
-        "fusion_policy": summary["fusion_policy"],
-        "fusion_candidate_count_total": summary["fusion_candidate_count_total"],
-        "fusion_candidate_count_avg": summary["fusion_candidate_count_avg"],
-        "fusion_attempted_count": summary["fusion_attempted_count"],
-        "fusion_success_count": summary["fusion_success_count"],
-        "fusion_failed_count": summary["fusion_failed_count"],
-        "fusion_rejected_count": summary["fusion_rejected_count"],
-        "fusion_rejected_reasons": summary["fusion_rejected_reasons"],
-        "fusion_by_result_type": summary["fusion_by_result_type"],
-        "fusion_by_source_type": summary["fusion_by_source_type"],
-        "fusion_by_row": summary["fusion_by_row"],
-        "fusion_under_threat_count": summary["fusion_under_threat_count"],
-        "fusion_near_buckethead_count": summary["fusion_near_buckethead_count"],
-        "fusion_near_conehead_count": summary["fusion_near_conehead_count"],
-        "fusion_estimated_mower_save_count": summary["fusion_estimated_mower_save_count"],
-        "fusion_kills_after_use_total": summary["fusion_kills_after_use_total"],
-        "fusion_avg_kills_after_use": summary["fusion_avg_kills_after_use"],
-        "fusion_bridge_error_count": summary["fusion_bridge_error_count"],
-        "fusion_unsafe_state_block_count": summary["fusion_unsafe_state_block_count"],
-        "fusion_reward_total": summary["fusion_reward_total"],
-        **{field: summary[field] for field in FUSION_REWARD_FLOAT_FIELDS},
-        "fusion_reward_capped": summary["fusion_reward_capped"],
-        "fusion_last_reward_reason": summary["fusion_last_reward_reason"],
-        "fusion_last_source": summary["fusion_last_source"],
-        "row_defense_opportunities_by_row": summary["row_defense_opportunities_by_row"],
-        "row_defense_responses_by_row": summary["row_defense_responses_by_row"],
-        "row_defense_response_rate_by_row": summary["row_defense_response_rate_by_row"],
-        "row_defense_response_rate": summary["row_defense_response_rate"],
-        "reward_component_totals": summary["reward_component_totals"],
-        "reward_component_avgs": summary["reward_component_avgs"],
-        "fps_avg": fps_avg,
-        "model_path": str(model_path),
-        "run_dir": str(run_dir),
-    }
-
-
-def write_eval_outputs(run_dir: Path, results: Dict[str, List[EvalLog]], config: Dict[str, Any], model_path: Path) -> None:
-    payload = {
-        "status": "complete",
-        "model_path": str(model_path),
-        "action_count": action_count_for_config(config),
-        "model_family": config.get("model_family", ""),
-        "seed_slot_signature": seed_slot_signature(config),
-        "policies": {policy: summarize_eval_logs(logs) for policy, logs in results.items()},
-        "episodes": {policy: [asdict(log) for log in logs] for policy, logs in results.items()},
-    }
-    (run_dir / "eval_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    with (run_dir / "eval_results.csv").open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = list(asdict(EvalLog(policy="ppo", episode=0)).keys())
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for logs in results.values():
-            for log in logs:
-                writer.writerow(csv_safe_row(asdict(log)))
-    print(f"Saved evaluation JSON to {run_dir / 'eval_results.json'}")
-    print(f"Saved evaluation CSV to {run_dir / 'eval_results.csv'}")
 
 
 def check_deps() -> int:
@@ -4144,16 +2710,10 @@ def loaded_model_contract(model_path: Path) -> Tuple[int, Optional[List[int]]]:
     return _model_action_count(model), _model_observation_shape(model)
 
 
-def loaded_model_action_count(model_path: Path) -> int:
-    """Backward-compatible helper retained for external callers."""
-
-    action_count, _observation_shape = loaded_model_contract(model_path)
-    return action_count
-
-
 def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
+    run_mode = str(config.get("run_mode", ""))
     if not model_path.exists():
-        if str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
+        if run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
             if str(config.get("model_path") or "").strip():
                 payload = {"ok": False, "blocked_reason": "model_path_missing", "model_path": str(model_path)}
                 print(json.dumps(payload, indent=2))
@@ -4182,128 +2742,42 @@ def metadata_dry_run(config: Dict[str, Any], model_path: Path) -> int:
         print(json.dumps(payload, indent=2))
         return 1
     model_action_count, model_observation_shape = loaded_model_contract(model_path)
-    if str(config.get("run_mode", "")) == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
-        summary = validate_adventure_generalist_model_compatibility(
-            model_path,
-            config,
-            "Adventure Generalist metadata dry run",
-            model_action_count=model_action_count,
-            model_observation_shape=model_observation_shape,
-            env_metadata=env_metadata_for_config(config),
-        )
-        payload = {
-            "ok": True,
-            "model_path": str(model_path),
-            "model_action_count": model_action_count,
-            "model_compatibility": summary.get("model_compatibility", {}),
-        }
-        print(json.dumps(payload, indent=2))
-        return 0
-    result = validate_model_metadata(
+    summary = validate_adventure_generalist_model_compatibility(
         model_path,
         config,
+        "Adventure Generalist metadata dry run",
         model_action_count=model_action_count,
         model_observation_shape=model_observation_shape,
         env_metadata=env_metadata_for_config(config),
-        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
     )
-    payload = result.to_dict()
-    payload["model_path"] = str(model_path)
-    payload["model_action_count"] = model_action_count
-    payload["model_compatibility"] = model_compatibility_live_status(result)
-    print(json.dumps(payload, indent=2))
-    return 0 if result.ok else 1
-
-
-def router_dry_run(config: Dict[str, Any], args: argparse.Namespace) -> int:
-    schedule_path = args.model_schedule or Path("configs/model_schedule.json")
-    if not schedule_path.exists():
-        payload = {"ok": False, "blocked_reason": "model_schedule_missing", "model_schedule": str(schedule_path)}
-        print(json.dumps(payload, indent=2))
-        return 1
-    router = ModelRouter.from_file(schedule_path)
-    level = args.dry_run_level or config.get("adventure_start_level") or "1-1"
-    unlocked = parse_seed_list(args.dry_run_unlocked_seeds or "SunFlower,Peashooter")
-    available = parse_seed_list(args.dry_run_available_seeds or args.dry_run_unlocked_seeds or "SunFlower,Peashooter")
-    decision = router.select_stage(level=level, unlocked_seeds=unlocked, available_seeds=available)
     payload = {
-        "ok": bool(decision.ok),
-        "model_schedule": str(schedule_path),
-        "dry_run_level": level,
-        "unlocked_seeds": unlocked,
-        "available_seeds": available,
-        "decision": decision.to_dict(),
+        "ok": True,
+        "run_mode": run_mode,
+        "model_path": str(model_path),
+        "model_action_count": model_action_count,
+        "model_observation_shape": model_observation_shape,
+        "model_compatibility": summary.get("model_compatibility", {}),
     }
-    if not decision.ok or decision.stage is None:
-        payload["blocked_reason"] = decision.blocked_reason
-        print(json.dumps(payload, indent=2))
-        return 1
-    if not decision.stage.model_path.exists():
-        payload["ok"] = False
-        payload["blocked_reason"] = "model_path_missing"
-        print(json.dumps(payload, indent=2))
-        return 1
-    selected_config = stage_config(config, decision.stage)
-    model_action_count, model_observation_shape = loaded_model_contract(decision.stage.model_path)
-    compatibility = validate_model_metadata(
-        decision.stage.model_path,
-        selected_config,
-        model_action_count=model_action_count,
-        model_observation_shape=model_observation_shape,
-        env_metadata=env_metadata_for_config(selected_config),
-        allow_missing_model_metadata=bool(config.get("allow_missing_model_metadata", False)),
-    )
-    payload["compatibility"] = compatibility.to_dict()
-    payload["model_compatibility"] = model_compatibility_live_status(compatibility)
-    payload["model_action_count"] = model_action_count
-    if not compatibility.ok:
-        payload["ok"] = False
-        payload["blocked_reason"] = compatibility.blocked_reason
-        print(json.dumps(payload, indent=2))
-        return 1
-    payload["selected_stage"] = decision.stage.stage_id
     print(json.dumps(payload, indent=2))
     return 0
 
 
 def execution_route_for_config(
     config: Dict[str, Any],
-    args: argparse.Namespace,
-    *,
-    configured_mode_explicit: bool = False,
 ) -> str:
     """Return the runtime branch selected by the resolved run mode."""
 
     run_mode = str(config.get("run_mode") or "")
     if run_mode == ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
         return "train"
-    if run_mode in {RUN_MODE_ADVENTURE_EVAL, ADVENTURE_GENERALIST_RUN_MODE_EVAL}:
-        return "adventure_eval"
-    if run_mode == RUN_MODE_LEVEL3_SPECIALIST:
-        if bool(getattr(args, "level3_eval", False)) or (
-            bool(getattr(args, "eval", False)) and not bool(getattr(args, "train", False))
-        ):
-            return "fixed_eval"
-        if bool(getattr(args, "level3_train", False)) or bool(getattr(args, "train", False)):
-            return "train"
-        return ""
-    if run_mode == "fixed_eval":
-        return "fixed_eval" if bool(getattr(args, "eval", False)) or configured_mode_explicit else ""
-    if run_mode == "fixed_train":
-        return "train" if bool(getattr(args, "train", False)) or configured_mode_explicit else ""
+    if run_mode == ADVENTURE_GENERALIST_RUN_MODE_EVAL:
+        return "adventure_generalist_eval"
     return ""
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train/evaluate MaskablePPO for the limited PvZRL environment.")
+    parser = argparse.ArgumentParser(description="Train or evaluate the PvZRL Adventure Generalist MaskablePPO policy.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--train", action="store_true")
-    parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--level3-train", action="store_true", help="Train the fixed 4-slot Level 3 specialist mode.")
-    parser.add_argument("--level3-eval", action="store_true", help="Evaluate the fixed 4-slot Level 3 specialist mode.")
-    parser.add_argument("--target-level", type=int, default=None)
-    parser.add_argument("--adventure", action="store_true", help="Alias for --adventure-eval.")
-    parser.add_argument("--adventure-eval", action="store_true", help="Run inference-only Adventure progression with a loaded PPO model.")
     parser.add_argument(
         "--adventure-generalist-train",
         action="store_true",
@@ -4313,28 +2787,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-mode",
         choices=(
-            "fixed_train",
-            "fixed_eval",
-            RUN_MODE_ADVENTURE_EVAL,
-            RUN_MODE_LEVEL3_SPECIALIST,
             ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
             ADVENTURE_GENERALIST_RUN_MODE_EVAL,
         ),
     )
     parser.add_argument("--check-deps", action="store_true")
     parser.add_argument("--metadata-dry-run", action="store_true", help="Validate model metadata/action compatibility without starting the game.")
-    parser.add_argument(
-        "--allow-missing-model-metadata",
-        action="store_true",
-        help="Allow legacy config-based metadata inference for old runs. Off by default to prevent silent seed-slot drift.",
-    )
-    parser.add_argument("--model-schedule", type=Path, default=None, help="Optional staged Adventure model schedule.")
-    parser.add_argument("--router-dry-run", action="store_true", help="Validate a model schedule decision without starting the game.")
-    parser.add_argument("--dry-run-level", default=None)
-    parser.add_argument("--dry-run-unlocked-seeds", default=None)
-    parser.add_argument("--dry-run-available-seeds", default=None)
-    parser.add_argument("--experimental-dynamic-seed-slots", action="store_true")
-    parser.add_argument("--action-space-mode", default=None)
     parser.add_argument("--model", "--model-path", dest="model", type=Path)
     parser.add_argument(
         "--resume-model-path",
@@ -4342,7 +2800,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Training-only checkpoint/model .zip to continue PPO learning from (adds timesteps; does not overwrite source).",
     )
-    parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--run-dir")
     parser.add_argument("--total-timesteps", type=int)
     parser.add_argument("--learning-rate", type=float)
@@ -4353,7 +2810,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ent-coef", type=float)
     parser.add_argument("--clip-range", type=float)
     parser.add_argument("--verbose", type=int)
-    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--step-seconds", type=float)
     parser.add_argument("--game-speed", type=float)
     parser.add_argument("--game-speed-mode", choices=("game_speed", "time_scale", "safe"))
@@ -4366,8 +2822,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait-gameplay-ready", action="store_true")
     parser.add_argument("--skip-board-wait", action="store_true")
     parser.add_argument("--quick-wait", action="store_true")
-    parser.add_argument("--plant-types")
-    parser.add_argument("--auto-select-seeds", action="store_true")
     parser.add_argument("--seed-list", default=None)
     parser.add_argument("--initial-loadout", default=None)
     parser.add_argument("--max-seed-slots", type=int, default=None)
@@ -4394,9 +2848,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="adventure_generalist_strict_startup_validation",
         action="store_false",
     )
-    parser.add_argument("--conservative-seeds", dest="conservative_seeds", action="store_true", default=True)
-    parser.add_argument("--no-conservative-seeds", dest="conservative_seeds", action="store_false")
-    parser.add_argument("--allow-new-plants", action="store_true", default=False)
     parser.add_argument("--unlock-aware-seed-curriculum", action="store_true")
     parser.add_argument("--seed-curriculum", choices=("conservative", "varied"), default=None)
     parser.add_argument("--randomize-seed-order", action="store_true")
@@ -4428,9 +2879,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--human-coach-log-path", type=Path, default=None, help="JSONL log path for human coach decisions.")
     parser.add_argument("--human-coach-reward", action="store_true", help="Apply small optional coach reward shaping.")
     parser.add_argument("--human-coach-fusion-enabled", action="store_true", help="Enable bridge-probed !fuse coach overrides.")
-    parser.add_argument("--human-coach-bonus", type=float, default=None, help="Legacy alias for --coach-legal-execution-reward.")
-    parser.add_argument("--human-coach-match-bonus", type=float, default=None, help="Legacy alias for --coach-match-reward.")
-    parser.add_argument("--human-coach-override-penalty", type=float, default=None, help="Legacy alias for --coach-override-penalty.")
     parser.add_argument("--stream-coach-enabled", action="store_true", help="Enable mock/local stream crowd coach overrides.")
     parser.add_argument(
         "--stream-coach-mode",
@@ -4564,24 +3012,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_arg_parser().parse_args()
 
-    if args.level3_train and args.level3_eval:
-        raise SystemExit("blocked_reason=invalid_cli: --level3-train and --level3-eval are mutually exclusive.")
     if args.adventure_generalist_train and args.adventure_generalist_eval:
         raise SystemExit(
             "blocked_reason=invalid_cli: --adventure-generalist-train and --adventure-generalist-eval are mutually exclusive."
         )
-    if (args.level3_train or args.level3_eval) and (
-        args.adventure_eval or args.adventure or args.adventure_generalist_train or args.adventure_generalist_eval
-    ):
-        raise SystemExit("blocked_reason=invalid_cli: Level 3 specialist does not use Adventure Eval progression.")
-    if (args.adventure_eval or args.adventure) and args.adventure_generalist_train:
-        raise SystemExit("blocked_reason=invalid_cli: Adventure Generalist training is separate from Adventure Eval.")
-    if args.level3_train:
-        args.train = True
-    if args.level3_eval:
-        args.eval = True
-    if args.adventure_generalist_train:
-        args.train = True
 
     if args.check_deps:
         return check_deps()
@@ -4591,61 +3025,24 @@ def main() -> int:
     if args.metadata_dry_run:
         model_path = args.model or Path(config["model_path"] or Path(config["run_dir"]) / "model.zip")
         return metadata_dry_run(config, model_path)
-    if args.router_dry_run:
-        return router_dry_run(config, args)
-    configured_mode_explicit = bool(getattr(args, "run_mode", None) or "run_mode" in raw_config)
-    execution_route = execution_route_for_config(
-        config,
-        args,
-        configured_mode_explicit=configured_mode_explicit,
-    )
-    if execution_route == "adventure_eval" and args.train:
-        raise SystemExit("Adventure eval is inference-only and cannot be combined with --train.")
-    if config.get("run_mode") == ADVENTURE_GENERALIST_RUN_MODE_TRAIN and args.eval:
-        raise SystemExit(
-            "Adventure Generalist training cannot be combined with generic --eval; "
-            "run Adventure Generalist eval separately."
-        )
-    if config.get("run_mode") == RUN_MODE_LEVEL3_SPECIALIST and execution_route:
-        candidate_model = args.model or Path(config["model_path"] or Path(config["run_dir"]) / "model.zip")
-        verify_level3_specialist_start_state(config, args.live_status_path, candidate_model)
+    execution_route = execution_route_for_config(config)
     if execution_route == "train":
         run_dir = Path(config["run_dir"])
         with TeeOutput(run_dir / "train.log"):
             print(f"Run directory: {run_dir}")
             train(config, args.live_status_path)
-            if args.eval:
-                model_path = args.model or run_dir / "model.zip"
-                if not model_path.exists() and (run_dir / "final_model.zip").exists():
-                    model_path = run_dir / "final_model.zip"
-                if not model_path.exists():
-                    raise SystemExit(f"Model not found: {model_path}")
-                evaluate(config, model_path, args.episodes, args.live_status_path)
-            return 0
-    elif execution_route == "fixed_eval":
-        model_path = args.model or Path(config["run_dir"]) / "model.zip"
+        return 0
+    if execution_route == "adventure_generalist_eval":
+        configured_model = str(config.get("model_path") or "").strip()
+        model_path = args.model or (Path(configured_model) if configured_model else Path(config["run_dir"]) / "model.zip")
         if not model_path.exists() and (Path(config["run_dir"]) / "final_model.zip").exists():
             model_path = Path(config["run_dir"]) / "final_model.zip"
         if not model_path.exists():
-            raise SystemExit(f"Model not found: {model_path}")
-        with TeeOutput(Path(config["run_dir"]) / "train.log"):
-            evaluate(config, model_path, args.episodes, args.live_status_path)
-        return 0
-    elif execution_route == "adventure_eval":
-        model_path = args.model or Path(config["run_dir"]) / "model.zip"
-        if args.model_schedule is not None:
-            model_path = args.model or Path("")
-        elif not model_path.exists() and (Path(config["run_dir"]) / "final_model.zip").exists():
-            model_path = Path(config["run_dir"]) / "final_model.zip"
-        if args.model_schedule is None and not model_path.exists():
-            raise SystemExit(f"Model not found for Adventure eval: {model_path}")
-        with TeeOutput(Path(config["run_dir"]) / "train.log"):
+            raise SystemExit(f"Model not found for Adventure Generalist evaluation: {model_path}")
+        with TeeOutput(Path(config["run_dir"]) / "eval.log"):
             adventure_evaluate(config, model_path, args)
         return 0
-    if not execution_route:
-        parser.print_help()
-        return 1
-    return 0
+    raise SystemExit(f"blocked_reason=unsupported_run_mode: {config.get('run_mode')!r}")
 
 
 if __name__ == "__main__":

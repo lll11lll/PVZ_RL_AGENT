@@ -29,7 +29,6 @@ from pvzrl_adventure_generalist import (
 )
 from pvzrl_env import PvZGymEnv, decode_action
 from pvzrl_gui import (
-    ADVENTURE_GENERALIST_ACTION_SPACE_MODE,
     ADVENTURE_GENERALIST_INITIAL_LOADOUT as GUI_INITIAL_LOADOUT,
     PvZDashboard,
 )
@@ -118,7 +117,6 @@ def fake_dashboard() -> PvZDashboard:
     dashboard.generalist_run_dir_var = Var("")
     dashboard.generalist_resume_model_path_var = Var("")
     dashboard.generalist_eval_model_path_var = Var("")
-    dashboard.generalist_eval_episodes_var = Var("5")
     dashboard.generalist_unlock_curriculum_var = Var(True)
     dashboard.generalist_replay_cleared_var = Var(True)
     dashboard.generalist_final_wave_extension_var = Var(True)
@@ -334,12 +332,6 @@ def reason_for(excluded: List[Dict[str, Any]], seed: str) -> str:
 
 def build_generalist_config_for_test(*, resume_model_path: str = "") -> Dict[str, Any]:
     args = DefaultArgs(
-        train=True,
-        eval=False,
-        adventure=False,
-        adventure_eval=False,
-        level3_train=False,
-        level3_eval=False,
         run_mode=None,
         run_dir=None,
         model=None,
@@ -2316,12 +2308,6 @@ def main() -> int:
     )
     raw_config_seed_list = build_config(
         DefaultArgs(
-            train=True,
-            eval=False,
-            adventure=False,
-            adventure_eval=False,
-            level3_train=False,
-            level3_eval=False,
             run_mode=None,
             run_dir=None,
             model=None,
@@ -2350,7 +2336,12 @@ def main() -> int:
 
     train_command = dash._build_adventure_generalist_command()
     assert_case(results, "GUI train command uses Adventure Generalist train flag", "--adventure-generalist-train" in train_command, train_command)
-    assert_case(results, "GUI train command includes 14-slot action-space mode", ADVENTURE_GENERALIST_ACTION_SPACE_MODE in train_command, train_command)
+    assert_case(
+        results,
+        "GUI train command relies on the sole Generalist action contract",
+        "--action-space-mode" not in train_command,
+        train_command,
+    )
     assert_case(results, "GUI train command includes initial loadout", GUI_INITIAL_LOADOUT in train_command, train_command)
     seed_list_index = train_command.index("--seed-list") if "--seed-list" in train_command else -1
     assert_case(

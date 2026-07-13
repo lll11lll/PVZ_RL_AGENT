@@ -1,4 +1,4 @@
-"""Focused contracts for typed run configuration and precedence."""
+"""Focused contracts for the Generalist-only typed run configuration."""
 
 from __future__ import annotations
 
@@ -10,12 +10,14 @@ from pathlib import Path
 import pytest
 
 from pvzrl_config import ConfigSource, IgnoredLegacyConfigWarning, resolve_config_value
-from train_ppo import build_arg_parser, build_config, build_resolved_config, execution_route_for_config
+from train_ppo import build_arg_parser, build_config, build_resolved_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_SCHEDULE = ROOT / "configs" / "model_schedule.json"
 GENERALIST_CONFIG = ROOT / "configs" / "ppo_adventure_generalist_14slot_identity_v1.json"
+GENERALIST_TRAIN = "adventure_generalist_14slot_train"
+GENERALIST_EVAL = "adventure_generalist_14slot_eval"
+GENERALIST_LOADOUT = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
 
 
 @pytest.mark.parametrize(
@@ -54,7 +56,7 @@ def test_precedence_requires_a_value_or_default() -> None:
         resolve_config_value("setting", cli_namespace=Namespace(), json_values={})
 
 
-def test_adventure_parser_marks_precedence_sensitive_options_unsupplied() -> None:
+def test_generalist_parser_marks_precedence_sensitive_options_unsupplied() -> None:
     args = build_arg_parser().parse_args([])
     assert args.advance_on_wins is None
     assert args.max_adventure_levels is None
@@ -62,7 +64,7 @@ def test_adventure_parser_marks_precedence_sensitive_options_unsupplied() -> Non
     assert args.adventure_start_level is None
 
 
-def test_json_values_win_when_adventure_cli_options_are_unsupplied() -> None:
+def test_json_values_win_when_generalist_cli_options_are_unsupplied() -> None:
     args = build_arg_parser().parse_args([])
     raw_config = {
         "advance_on_wins": 2,
@@ -74,7 +76,7 @@ def test_json_values_win_when_adventure_cli_options_are_unsupplied() -> None:
     assert {key: config[key] for key in raw_config} == raw_config
 
 
-def test_explicit_adventure_cli_values_win_over_json() -> None:
+def test_explicit_generalist_cli_values_win_over_json() -> None:
     args = build_arg_parser().parse_args(
         [
             "--advance-on-wins",
@@ -102,15 +104,18 @@ def test_explicit_adventure_cli_values_win_over_json() -> None:
     assert config["adventure_start_level"] == 5
 
 
-def test_global_adventure_defaults_remain_backward_compatible() -> None:
+def test_global_generalist_defaults_are_stable() -> None:
     config = build_config(build_arg_parser().parse_args([]), {})
+    assert config["run_mode"] == GENERALIST_TRAIN
     assert config["advance_on_wins"] == 1
     assert config["max_adventure_levels"] == 5
     assert config["max_attempts_per_level"] == 10
     assert config["adventure_start_level"] == 1
+    assert config["seed_list"] == GENERALIST_LOADOUT
+    assert config["plant_types"] == [1, 1, 0, 0]
 
 
-def test_ignored_legacy_json_field_emits_actionable_warning() -> None:
+def test_ignored_generalist_json_field_emits_actionable_warning() -> None:
     args = build_arg_parser().parse_args([])
     with pytest.warns(IgnoredLegacyConfigWarning, match="enable_fusion_diagnostics"):
         config = build_config(args, {"enable_fusion_diagnostics": True})
@@ -124,37 +129,31 @@ def test_ignored_legacy_json_field_emits_actionable_warning() -> None:
         {"reward": {"proximity_penalty": 0.125}},
     ],
 )
-def test_unused_legacy_reward_field_warns_but_preserves_resolved_shape(raw_config: dict) -> None:
+def test_unused_reward_field_warns_but_preserves_resolved_shape(raw_config: dict) -> None:
     args = build_arg_parser().parse_args([])
     with pytest.warns(IgnoredLegacyConfigWarning, match="proximity_penalty"):
         config = build_config(args, raw_config)
     assert config["reward"]["proximity_penalty"] == 0.125
 
 
-def test_mode_defaults_are_applied_after_cli_and_json() -> None:
+def test_quick_wait_mode_defaults_follow_normal_precedence() -> None:
     quick_args = build_arg_parser().parse_args(["--quick-wait"])
     assert build_config(quick_args, {})["board_timeout"] == 60.0
     assert build_config(quick_args, {"board_timeout": 75.0})["board_timeout"] == 75.0
     cli_args = build_arg_parser().parse_args(["--quick-wait", "--board-timeout", "45"])
     assert build_config(cli_args, {"board_timeout": 75.0})["board_timeout"] == 45.0
 
-    level3_args = build_arg_parser().parse_args(["--level3-train"])
-    level3 = build_config(level3_args, {})
-    assert level3["target_level"] == 3
-    assert level3["seed_list"] == ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
-
 
 @pytest.mark.parametrize(
     ("cli", "json_mode", "expected_mode"),
     [
-        (["--adventure-generalist-eval"], "adventure_generalist_14slot_train", "adventure_generalist_14slot_eval"),
-        (["--level3-train"], "adventure_generalist_14slot_train", "level3_specialist"),
-        (["--train"], "adventure_eval", "fixed_train"),
-        (["--eval"], "adventure_generalist_14slot_train", "fixed_eval"),
-        ([], "adventure_generalist_14slot_train", "adventure_generalist_14slot_train"),
+        (["--adventure-generalist-eval"], GENERALIST_TRAIN, GENERALIST_EVAL),
+        (["--adventure-generalist-train"], GENERALIST_EVAL, GENERALIST_TRAIN),
+        ([], GENERALIST_EVAL, GENERALIST_EVAL),
+        ([], GENERALIST_TRAIN, GENERALIST_TRAIN),
     ],
 )
-def test_explicit_cli_mode_shortcuts_win_over_json_run_mode(
+def test_generalist_cli_shortcuts_win_over_json_run_mode(
     cli: list[str],
     json_mode: str,
     expected_mode: str,
@@ -163,96 +162,78 @@ def test_explicit_cli_mode_shortcuts_win_over_json_run_mode(
     assert config["run_mode"] == expected_mode
 
 
-def test_conflicting_explicit_run_mode_forms_are_rejected() -> None:
+def test_conflicting_generalist_mode_forms_are_rejected() -> None:
     args = build_arg_parser().parse_args(
-        ["--run-mode", "fixed_train", "--adventure-generalist-eval"]
+        ["--run-mode", GENERALIST_TRAIN, "--adventure-generalist-eval"]
     )
     with pytest.raises(SystemExit, match="--run-mode conflicts"):
         build_config(args, {})
 
-
-@pytest.mark.parametrize(
-    ("cli", "expected"),
-    [
-        (["--run-mode", "adventure_generalist_14slot_train", "--train"], "adventure_generalist_14slot_train"),
-        (["--run-mode", "adventure_eval", "--eval"], "adventure_eval"),
-    ],
-)
-def test_generic_operation_flags_do_not_conflict_with_explicit_run_mode(
-    cli: list[str],
-    expected: str,
-) -> None:
-    assert build_config(build_arg_parser().parse_args(cli), {})["run_mode"] == expected
-
-
-def test_explicit_fixed_eval_rejects_generic_train() -> None:
-    args = build_arg_parser().parse_args(["--run-mode", "fixed_eval", "--train"])
-    with pytest.raises(SystemExit, match="fixed_eval cannot be combined"):
-        build_config(args, {})
-
-
-def test_explicit_fixed_train_rejects_generic_eval() -> None:
-    args = build_arg_parser().parse_args(["--run-mode", "fixed_train", "--eval"])
-    with pytest.raises(SystemExit, match="fixed_train cannot be combined"):
-        build_config(args, {})
-
-
-@pytest.mark.parametrize(
-    ("cli", "raw_config", "configured_explicit", "expected_route"),
-    [
-        (["--adventure-eval", "--eval"], {}, False, "adventure_eval"),
-        (["--adventure-generalist-eval", "--eval"], {}, False, "adventure_eval"),
-        (["--run-mode", "fixed_eval"], {}, True, "fixed_eval"),
-        ([], {"run_mode": "fixed_train"}, True, "train"),
-        ([], {}, False, ""),
-    ],
-)
-def test_main_execution_route_uses_resolved_mode_not_raw_generic_flags(
-    cli: list[str],
-    raw_config: dict,
-    configured_explicit: bool,
-    expected_route: str,
-) -> None:
-    args = build_arg_parser().parse_args(cli)
-    config = build_config(args, raw_config)
-    assert (
-        execution_route_for_config(
-            config,
-            args,
-            configured_mode_explicit=configured_explicit,
-        )
-        == expected_route
+    args = build_arg_parser().parse_args(
+        ["--adventure-generalist-train", "--adventure-generalist-eval"]
     )
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        build_config(args, {})
+
+
+@pytest.mark.parametrize(
+    "obsolete_mode",
+    ["fixed_train", "fixed_eval", "level3_specialist", "adventure_eval"],
+)
+def test_obsolete_run_modes_are_rejected(obsolete_mode: str) -> None:
+    args = build_arg_parser().parse_args([])
+    with pytest.raises(SystemExit, match="unsupported_run_mode"):
+        build_config(args, {"run_mode": obsolete_mode})
+
+
+def test_parser_exposes_only_maintained_mode_controls() -> None:
+    parser = build_arg_parser()
+    options = parser._option_string_actions
+    assert "--adventure-generalist-train" in options
+    assert "--adventure-generalist-eval" in options
+    for obsolete in (
+        "--train",
+        "--eval",
+        "--level3-train",
+        "--level3-eval",
+        "--target-level",
+        "--adventure",
+        "--adventure-eval",
+        "--allow-missing-model-metadata",
+        "--model-schedule",
+        "--router-dry-run",
+        "--dry-run-level",
+        "--dry-run-unlocked-seeds",
+        "--dry-run-available-seeds",
+        "--experimental-dynamic-seed-slots",
+        "--action-space-mode",
+        "--plant-types",
+        "--auto-select-seeds",
+        "--max-steps",
+    ):
+        assert obsolete not in options
+
+
+@pytest.mark.parametrize("obsolete_action_mode", ["fixed", "dynamic_14"])
+def test_obsolete_action_space_modes_are_rejected(obsolete_action_mode: str) -> None:
+    args = build_arg_parser().parse_args([])
+    with pytest.raises(SystemExit, match="unsupported_action_space_mode"):
+        build_config(args, {"action_space_mode": obsolete_action_mode})
 
 
 def test_json_plant_types_preserve_duplicate_slot_order_and_validate_names() -> None:
     args = build_arg_parser().parse_args([])
     config = build_config(
         args,
-        {
-            "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
-            "plant_types": [1, 1, 0, 0],
-        },
+        {"seed_list": GENERALIST_LOADOUT, "plant_types": [1, 1, 0, 0]},
     )
     assert config["plant_types"] == [1, 1, 0, 0]
 
     with pytest.raises(SystemExit, match="seed_plant_type_mismatch"):
         build_config(
             args,
-            {
-                "seed_list": ["SunFlower", "Peashooter"],
-                "plant_types": [0, 1],
-            },
+            {"seed_list": GENERALIST_LOADOUT, "plant_types": [0, 1, 0, 0]},
         )
-
-
-def test_explicit_cli_plant_types_win_over_json_before_alignment_check() -> None:
-    args = build_arg_parser().parse_args(["--plant-types", "1,0"])
-    config = build_config(
-        args,
-        {"seed_list": ["SunFlower", "Peashooter"], "plant_types": [0, 1]},
-    )
-    assert config["plant_types"] == [1, 0]
 
 
 @pytest.mark.parametrize(
@@ -291,14 +272,16 @@ def test_typed_sections_round_trip_without_flat_contract_drift() -> None:
     assert resolved.environment.board_timeout == flat["board_timeout"]
     assert resolved.seed_actions.seed_list == tuple(flat["seed_list"])
     assert resolved.adventure.advance_on_wins == flat["advance_on_wins"]
-    assert resolved.model_contract.action_count == flat["action_count"]
+    assert resolved.model_contract.action_count == 701
+    assert resolved.model_contract.action_decoder_version == "seedslot14x50_plus_wait_v1"
+    assert resolved.model_contract.observation_version == "adventure_14slot_identity_v1"
     assert dict(resolved.reward) == flat["reward"]
     assert resolved.value_sources["learning_rate"] is ConfigSource.GLOBAL_DEFAULT
 
     flat["seed_list"].append("WallNut")
     flat["reward"][next(iter(flat["reward"]))] = 999.0
-    assert resolved.seed_actions.seed_list == ("SunFlower", "Peashooter")
-    assert resolved.to_flat_dict()["seed_list"] == ["SunFlower", "Peashooter"]
+    assert resolved.seed_actions.seed_list == tuple(GENERALIST_LOADOUT)
+    assert resolved.to_flat_dict()["seed_list"] == GENERALIST_LOADOUT
     assert 999.0 not in resolved.reward.values()
 
     with pytest.raises(TypeError):
@@ -311,6 +294,26 @@ def test_typed_sections_round_trip_without_flat_contract_drift() -> None:
         resolved.adventure.advance_on_wins = 99  # type: ignore[misc]
 
 
+def test_removed_configuration_fields_are_absent() -> None:
+    resolved = build_resolved_config(build_arg_parser().parse_args([]), {})
+    flat = resolved.to_flat_dict()
+    for obsolete in (
+        "legacy_max_steps",
+        "experimental_dynamic_seed_slots",
+        "target_level",
+        "adventure_eval_mode",
+        "allow_missing_model_metadata",
+        "incompatible_with_4slot_specialist",
+    ):
+        assert obsolete not in flat
+    assert not hasattr(resolved.environment, "legacy_max_steps")
+    assert not hasattr(resolved.seed_actions, "experimental_dynamic_seed_slots")
+    assert not hasattr(resolved.adventure, "target_level")
+    assert not hasattr(resolved.adventure, "adventure_eval_mode")
+    assert not hasattr(resolved.artifacts, "allow_missing_model_metadata")
+    assert not hasattr(resolved.model_contract, "incompatible_with_4slot_specialist")
+
+
 def test_typed_config_exposes_immutable_value_provenance() -> None:
     args = build_arg_parser().parse_args(["--learning-rate", "0.002"])
     resolved = build_resolved_config(args, {"learning_rate": 0.001, "port": 40000})
@@ -320,36 +323,19 @@ def test_typed_config_exposes_immutable_value_provenance() -> None:
     assert resolved.value_sources["gamma"] is ConfigSource.GLOBAL_DEFAULT
 
 
-def test_tracked_model_schedule_paths_are_runnable_from_repository_root() -> None:
-    schedule = json.loads(MODEL_SCHEDULE.read_text(encoding="utf-8"))
-    assert schedule["example_status"] == "validated_local_example"
-    assert schedule["path_base"] == "repository_root"
-    assert schedule["requires_local_model_artifacts"] is True
-    stages = schedule["stages"]
-    assert [stage["id"] for stage in stages] == ["early", "post_unlock_utility"]
-    missing_local_artifacts = []
-    for stage in stages:
-        configured_path = Path(stage["model_path"])
-        assert not configured_path.is_absolute()
-        resolved_path = ROOT / configured_path
-        assert resolved_path.suffix == ".zip"
-        if not resolved_path.is_file():
-            missing_local_artifacts.append(str(configured_path))
-    if missing_local_artifacts:
-        pytest.skip(
-            "validated example requires optional gitignored models: "
-            + ", ".join(missing_local_artifacts)
-        )
-
-
-def test_tracked_generalist_config_preserves_model_metadata_values() -> None:
+def test_tracked_generalist_config_preserves_protected_contract() -> None:
     raw_config = json.loads(GENERALIST_CONFIG.read_text(encoding="utf-8"))
     args = build_arg_parser().parse_args(["--adventure-generalist-train"])
-    with pytest.warns(IgnoredLegacyConfigWarning, match="enable_fusion_diagnostics"):
-        config = build_config(args, raw_config)
-    assert config["run_mode"] == "adventure_generalist_14slot_train"
+    config = build_config(args, raw_config)
+    assert config["run_mode"] == GENERALIST_TRAIN
     assert config["model_family"] == "ppo_adventure_generalist_14slot_identity_v1"
-    assert config["seed_list"] == ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+    assert config["seed_list"] == GENERALIST_LOADOUT
     assert config["plant_types"] == [1, 1, 0, 0]
     assert config["max_seed_slots"] == 14
-    assert config["checkpoint_warm_start_reason"] == "new_incompatible_architecture"
+    assert config["action_count"] == 701
+    assert config["decoder_wait_action"] == 0
+    assert config["placement_action_range"] == [1, 700]
+    assert config["action_decoder_version"] == "seedslot14x50_plus_wait_v1"
+    assert config["observation_version"] == "adventure_14slot_identity_v1"
+    assert config["identity_seed_slots"] is True
+    assert "incompatible_with_4slot_specialist" not in config

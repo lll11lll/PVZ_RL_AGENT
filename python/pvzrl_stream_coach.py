@@ -14,7 +14,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Sequence, Set, Tuple, Union
 
-from pvzrl_action_space import build_action_space_spec, normalize_action_space_mode
+from pvzrl_action_space import (
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    build_action_space_spec,
+    normalize_action_space_mode,
+)
 from pvzrl_file_tail import IncrementalLineTailReader
 from pvzrl_human_coach import (
     COACH_COMMANDS,
@@ -1584,20 +1588,9 @@ def _plant_types_from_observation(observation: Dict[str, Any]) -> List[int]:
 
 
 def _infer_max_seed_slots(observation: Dict[str, Any], mode: str, plant_types: Sequence[int]) -> Optional[int]:
-    raw = observation.get("max_seed_slots", observation.get("maxSeedSlots"))
-    if raw is not None:
-        value = _safe_int(raw, default=-1)
-        if value > 0:
-            return int(value)
-    slots = observation.get("seedSlots")
-    if isinstance(slots, list) and slots:
-        return len(slots)
-    if plant_types:
-        return len(plant_types)
-    normalized_mode = normalize_action_space_mode(mode)
-    if normalized_mode in {"dynamic_14", "adventure_14slot_identity"}:
-        return 14
-    return None
+    del observation, plant_types
+    normalize_action_space_mode(mode)
+    return ADVENTURE_IDENTITY_MAX_SEED_SLOTS
 
 
 def _mask_from_legal_actions(

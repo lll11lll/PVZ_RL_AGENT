@@ -28,24 +28,6 @@ def _dashboard() -> PvZDashboard:
     dashboard.repo_root = PROJECT_ROOT
     dashboard.live_status_path = Path("runs/live_status.json")
     values = {
-        "seed_list_var": "SunFlower,Peashooter,WallNut,CherryBomb",
-        "total_timesteps_var": "1111",
-        "max_steps_var": "222",
-        "step_seconds_var": "0.07",
-        "game_speed_var": "3.5",
-        "start_sun_var": "450",
-        "board_timeout_var": "61",
-        "gameplay_ready_timeout_var": "31",
-        "checkpoint_freq_var": "333",
-        "quick_wait_var": True,
-        "wait_gameplay_ready_var": True,
-        "auto_select_seeds_var": True,
-        "debug_perf_var": True,
-        "fusion_policy_var": "observe",
-        "run_dir_var": "",
-        "run_name_var": "snapshot run",
-        "model_path_var": "runs/fixed/model.zip",
-        "episodes_var": "7",
         "train_lab_mode_var": "Normal",
         "eval_lab_mode_var": "Normal",
         "human_coach_enabled_var": False,
@@ -70,28 +52,6 @@ def _dashboard() -> PvZDashboard:
         "stream_coach_mock_script_var": "scripts/mock_stream_commands.jsonl",
         "coach_allow_fusion_planning_var": False,
         "fusion_bridge_enabled_var": False,
-        "adventure_eval_var": True,
-        "adventure_model_path_var": "runs/adventure/model.zip",
-        "adventure_episodes_var": "8",
-        "adventure_game_speed_var": "3.75",
-        "adventure_step_seconds_var": "0.06",
-        "adventure_soft_max_steps_var": "2100",
-        "adventure_hard_max_steps_var": "3600",
-        "adventure_final_wave_extension_var": True,
-        "adventure_board_timeout_var": "62",
-        "adventure_quick_wait_var": True,
-        "adventure_wait_gameplay_ready_var": True,
-        "adventure_auto_select_seeds_var": True,
-        "adventure_advance_on_wins_var": True,
-        "adventure_advance_wins_var": "2",
-        "adventure_max_levels_var": "6",
-        "adventure_max_attempts_var": "11",
-        "adventure_seed_list_var": "SunFlower,Peashooter,WallNut,CherryBomb",
-        "adventure_plant_types_var": "1,0,3,2",
-        "adventure_tactical_masks_var": True,
-        "adventure_wallnut_mask_var": True,
-        "adventure_cherrybomb_mask_var": True,
-        "adventure_fusion_policy_var": "none",
         "generalist_total_timesteps_var": "4444",
         "generalist_checkpoint_freq_var": "555",
         "generalist_initial_loadout_var": "SunFlower,SunFlower,Peashooter,Peashooter",
@@ -125,21 +85,6 @@ def _dashboard() -> PvZDashboard:
         "generalist_resume_model_path_var": "",
         "generalist_run_dir_var": "runs/generalist_snapshot",
         "generalist_eval_model_path_var": "runs/generalist/model.zip",
-        "generalist_eval_episodes_var": "9",
-        "level3_mode_var": "train",
-        "level3_target_level_var": "3",
-        "level3_model_path_var": "runs/level3/model.zip",
-        "level3_total_timesteps_var": "6666",
-        "level3_episodes_var": "25",
-        "level3_seed_list_var": "SunFlower,Peashooter,WallNut,CherryBomb",
-        "level3_plant_types_var": "1,0,3,2",
-        "level3_game_speed_var": "4.0",
-        "level3_step_seconds_var": "0.05",
-        "level3_max_steps_var": "1200",
-        "level3_board_timeout_var": "64",
-        "level3_tactical_masks_var": True,
-        "level3_wallnut_mask_var": True,
-        "level3_cherrybomb_mask_var": True,
     }
     for name, value in values.items():
         setattr(dashboard, name, Var(value))
@@ -166,16 +111,9 @@ def _snapshot_hash(command: list[str]) -> str:
 def _commands() -> dict[str, Callable[[], list[str]]]:
     dashboard = _dashboard()
 
-    def fixed_resume() -> list[str]:
-        return dashboard._build_train_command(resume=True)
-
     def generalist_resume() -> list[str]:
         dashboard.generalist_resume_model_path_var.set("runs/generalist/checkpoint.zip")
         return dashboard._build_adventure_generalist_command()
-
-    def level3_eval() -> list[str]:
-        dashboard.level3_mode_var.set("eval")
-        return dashboard._build_level3_command()
 
     def coach_fusion() -> list[str]:
         dashboard.train_lab_mode_var.set("Fusion")
@@ -191,30 +129,18 @@ def _commands() -> dict[str, Callable[[], list[str]]]:
         return dashboard._build_adventure_generalist_command()
 
     return {
-        "fixed_train": lambda: dashboard._build_train_command(),
-        "fixed_resume": fixed_resume,
-        "fixed_eval": lambda: dashboard._build_eval_command(),
-        "adventure_eval": dashboard._build_adventure_command,
         "generalist_fresh": dashboard._build_adventure_generalist_command,
         "generalist_resume": generalist_resume,
         "generalist_eval": dashboard._build_adventure_generalist_eval_command,
-        "level3_train": dashboard._build_level3_command,
-        "level3_eval": level3_eval,
         "coach_stream_fusion": coach_fusion,
     }
 
 
 EXPECTED_COMMAND_HASHES = {
-    "fixed_train": "fc55d0c6c61d8b6ad5e35ec23f75a5a81f504e35abb3f0bb2edfee511a358750",
-    "fixed_resume": "fdf3db5dccdde74bab930e1f891318e2c4e6833c09323bc0a77b561569d9d13c",
-    "fixed_eval": "67aa165a373b2288bf80ecd6b4d8552f1b8b41bcfa43c0d345bc6771ec78f758",
-    "adventure_eval": "2843d85674e79cc50a9c7ccaf8a36b6f7f46d27beb427d96d102c7756710cd34",
-    "generalist_fresh": "30ae9133395de867dafbe7f7745e81b794cbd3e47dbd13457f7372c481567968",
-    "generalist_resume": "c176b2e252d4c07eeb498c27ea78b9d2cfd8f1800fd595335b79a1bf1a2bb61d",
-    "generalist_eval": "17241c31276ae2ca6a563c8fbd2e30f064c7dadb971af8fe5885038b3d18e9e3",
-    "level3_train": "4433ac8c6e9e159f68352abebe28f7e63b5091af7fd4b3282c29f03bfb525225",
-    "level3_eval": "a24a9d3bd50ee39095f3a711dd77adecfff7b95bc3a8d12bcf154ef84fe12446",
-    "coach_stream_fusion": "1e0d75402e2a092010d8e16503032b460766f70cc1bc3361fef1ed9cba749735",
+    "generalist_fresh": "e78855ee8babcee83b869f4e86b9997924a5460b0ed8ecc74e64108a15448651",
+    "generalist_resume": "20ad5007105a721401acff4db55d7989aec2247bbc90db1412ecaf9db9ecf2de",
+    "generalist_eval": "3b026cb774ee1d297994e82ad73b7dd901d322d3f579851e3c066447c7e6afb4",
+    "coach_stream_fusion": "bf8496e1408cfdfc68c162b2a108814ab6020f99f8046d8164be45f2d7039d7f",
 }
 
 
@@ -225,3 +151,63 @@ def test_gui_command_snapshot(name: str) -> None:
     assert actual == EXPECTED_COMMAND_HASHES[name], (
         f"{name} argv snapshot changed: {actual}\n" + json.dumps(_normalized(command), indent=2)
     )
+
+
+def test_gui_command_surface_is_generalist_only() -> None:
+    dashboard = _dashboard()
+    for obsolete_builder in (
+        "_build_train_command",
+        "_build_eval_command",
+        "_build_adventure_command",
+        "_build_level3_command",
+    ):
+        assert not hasattr(dashboard, obsolete_builder)
+
+    for command in _commands().values():
+        argv = command()
+        assert "--action-space-mode" not in argv
+        assert not any(flag in argv for flag in ("--train", "--eval", "--adventure-eval", "--level3-train", "--level3-eval"))
+
+
+def test_model_discovery_rejects_non_generalist_metadata(tmp_path: Path) -> None:
+    dashboard = _dashboard()
+    dashboard.repo_root = tmp_path
+
+    fixed_dir = tmp_path / "runs" / "obsolete_fixed" / "checkpoints"
+    fixed_dir.mkdir(parents=True)
+    (fixed_dir / "ppo_pvz_999_steps.zip").write_bytes(b"fixed")
+    (fixed_dir.parent / "model_metadata.json").write_text(
+        json.dumps(
+            {
+                "metadata_version": 1,
+                "model_family": "ppo_fixed_specialist",
+                "action_count": 201,
+                "action_space_mode": "fixed",
+                "action_decoder_version": "fixed_slot_4x50_plus_wait_v1",
+                "observation_version": "fixed_slot_v1",
+                "max_seed_slots": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    generalist_dir = tmp_path / "runs" / "generalist" / "checkpoints"
+    generalist_dir.mkdir(parents=True)
+    expected = generalist_dir / "ppo_pvz_370000_steps.zip"
+    expected.write_bytes(b"generalist")
+    (generalist_dir.parent / "model_metadata.json").write_text(
+        json.dumps(
+            {
+                "metadata_version": 1,
+                "model_family": "ppo_adventure_generalist_14slot_identity_v1",
+                "action_count": 701,
+                "action_space_mode": "adventure_14slot_identity",
+                "action_decoder_version": "seedslot14x50_plus_wait_v1",
+                "observation_version": "adventure_14slot_identity_v1",
+                "max_seed_slots": 14,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert dashboard._find_newest_usable_model_zip() == expected

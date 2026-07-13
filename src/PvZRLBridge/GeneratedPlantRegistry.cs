@@ -45,7 +45,7 @@ internal sealed class GeneratedPlantMetadata
 
 internal static class GeneratedPlantRegistry
 {
-    public const string SourceSha256 = "11d97ca91c3224515c3ecd4d23abc00149a5486dbcc05f0600946d3092a10b74";
+    public const string SourceSha256 = "608c3064b836f4a219e765c07480763e84dd413c3f84075390b63196f5e8c7b2";
 
     private static readonly IReadOnlyDictionary<int, GeneratedPlantMetadata> ById =
         new Dictionary<int, GeneratedPlantMetadata>

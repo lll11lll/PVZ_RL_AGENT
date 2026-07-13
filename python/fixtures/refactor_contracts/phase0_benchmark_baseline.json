@@ -22,12 +22,10 @@
     "identity_vector_size": 4297
   },
   "results_ms": {
-    "action_mask_fixed_dense": {"median": 1.8603, "p95": 3.5211},
     "action_mask_identity_dense": {"median": 11.25345, "p95": 12.8124},
     "action_mask_identity_low_sun": {"median": 2.63705, "p95": 3.2915},
     "action_mask_identity_cooldown": {"median": 1.51315, "p95": 1.5571},
     "action_mask_identity_no_fusion": {"median": 8.6765, "p95": 9.1198},
-    "observation_encode_fixed_sparse": {"median": 0.206, "p95": 0.2201},
     "observation_encode_identity_sparse": {"median": 0.5377, "p95": 0.5553},
     "reward_breakdown_dense": {"median": 0.2715, "p95": 0.2855},
     "fusion_candidate_scan_dense": {"median": 5.81045, "p95": 6.119},

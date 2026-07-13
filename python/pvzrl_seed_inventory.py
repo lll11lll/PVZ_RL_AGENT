@@ -1,4 +1,4 @@
-"""Seed inventory diagnostics shared by Adventure live status and SB3 obs v2."""
+"""Seed inventory diagnostics and Adventure Generalist identity features."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ from typing import Any, Dict, Iterable, List, Optional
 from pvzrl_registry import get_plant_registry
 
 
-SEED_INVENTORY_V2_FEATURES_PER_SLOT = 6
-SEED_INVENTORY_V2_SUMMARY_FEATURES = 8
 ADVENTURE_IDENTITY_PLANT_TYPE_BUCKETS = 256
 ADVENTURE_IDENTITY_UNKNOWN_BUCKETS = 1
 ADVENTURE_IDENTITY_ONE_HOT_WIDTH = ADVENTURE_IDENTITY_PLANT_TYPE_BUCKETS + ADVENTURE_IDENTITY_UNKNOWN_BUCKETS
@@ -134,60 +132,6 @@ def inventory_from_runtime_sources(
         legal_action_count=legal_action_count,
         mask_block_reason_counts=mask_block_reason_counts,
     )
-
-
-def seed_inventory_v2_feature_count(max_seed_slots: int) -> int:
-    return int(max_seed_slots) * SEED_INVENTORY_V2_FEATURES_PER_SLOT + SEED_INVENTORY_V2_SUMMARY_FEATURES
-
-
-def seed_inventory_v2_features(observation: Dict[str, Any], max_seed_slots: int) -> List[float]:
-    slots = observation.get("seedSlots", []) if isinstance(observation.get("seedSlots", []), list) else []
-    sun = _safe_float(observation.get("sun"), 0.0)
-    features: List[float] = []
-    usable_count = 0
-    ready_count = 0
-    affordable_count = 0
-    for slot_index in range(max(0, int(max_seed_slots))):
-        slot = slots[slot_index] if slot_index < len(slots) and isinstance(slots[slot_index], dict) else {}
-        present = 1.0 if slot else 0.0
-        usable = 1.0 if slot.get("usable") else 0.0
-        ready = 1.0 if slot.get("ready") else 0.0
-        cost = max(0.0, _safe_float(slot.get("seedCost"), 0.0))
-        affordable = 1.0 if slot and sun >= cost else 0.0
-        cooldown = _safe_float(slot.get("currentCooldown"), 0.0)
-        full = max(1e-6, _safe_float(slot.get("fullCooldown"), 0.0))
-        if usable:
-            usable_count += 1
-        if ready:
-            ready_count += 1
-        if affordable:
-            affordable_count += 1
-        features.extend(
-            [
-                present,
-                usable,
-                ready,
-                affordable,
-                _clip(cooldown / full),
-                _clip(cost / 500.0),
-            ]
-        )
-    denom = max(1.0, float(max_seed_slots or 1))
-    selected_count = len(slots)
-    legal_count = len(observation.get("legalActions", []) or [])
-    features.extend(
-        [
-            _clip(selected_count / denom),
-            _clip(usable_count / denom),
-            _clip(ready_count / denom),
-            _clip(affordable_count / denom),
-            _clip(legal_count / max(1.0, denom * 50.0 + 1.0)),
-            1.0 if observation.get("seedSelectionActive") else 0.0,
-            1.0 if observation.get("gameplayReady") else 0.0,
-            _clip(sun / 1000.0),
-        ]
-    )
-    return features
 
 
 def adventure_identity_feature_count(max_seed_slots: int) -> int:

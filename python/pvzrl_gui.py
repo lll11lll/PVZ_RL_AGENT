@@ -30,7 +30,6 @@ from pvzrl_assisted_coach import (
     queue_rows,
 )
 from pvzrl_gui_commands import (
-    ADVENTURE_GENERALIST_ACTION_SPACE_MODE,
     DEFAULT_INTERVENTION_LOG_PATH,
     STREAM_COACH_PLATFORMS,
     GuiCommandMixin,
@@ -73,16 +72,12 @@ DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
 DEFAULT_HUMAN_COACH_LOG_PATH = Path("runs") / "human_coach.jsonl"
 DEFAULT_STREAM_COACH_LOG_PATH = Path("runs") / "stream_coach.jsonl"
 _PLANT_REGISTRY = get_plant_registry()
-_FOUR_SLOT_CURRENT = _PLANT_REGISTRY.require_gui_preset("four_slot_current")
-_FOUR_SLOT_DUPLICATE = _PLANT_REGISTRY.require_gui_preset("four_slot_duplicate")
-ADVENTURE_DEFAULT_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
+_GENERALIST_INITIAL_LOADOUT = _PLANT_REGISTRY.require_gui_preset("adventure_generalist_initial_loadout")
 STRUCTURED_COACH_COMMANDS = tuple(command.value for command in AssistedCommandType)
 ASSISTED_EXECUTION_MODES = tuple(mode.value for mode in AssistedExecutionMode)
 LAB_MODES = ("Normal", "Assisted", "Fusion", "Curriculum")
-LEVEL3_SEED_LIST = _FOUR_SLOT_CURRENT.seed_csv
-LEVEL3_PLANT_TYPES = _FOUR_SLOT_CURRENT.plant_type_csv
 ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
-ADVENTURE_GENERALIST_INITIAL_LOADOUT = _FOUR_SLOT_DUPLICATE.seed_csv
+ADVENTURE_GENERALIST_INITIAL_LOADOUT = _GENERALIST_INITIAL_LOADOUT.seed_csv
 
 
 class _Tooltip:
@@ -122,49 +117,21 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.root.geometry("1180x780")
         self.root.minsize(980, 650)
 
-        default_model = self._find_newest_model_zip()
-        default_adventure_model = self._find_newest_usable_model_zip() or default_model
-        self.total_timesteps_var = tk.StringVar(value="250000")
+        default_generalist_model = self._find_newest_usable_model_zip()
         self.max_steps_var = tk.StringVar(value="1000")
         self.step_seconds_var = tk.StringVar(value="0.05")
         self.game_speed_var = tk.StringVar(value="4.0")
-        self.seed_list_var = tk.StringVar(value=_FOUR_SLOT_CURRENT.seed_csv)
-        self.model_path_var = tk.StringVar(value=str(default_model) if default_model else "")
+        self.seed_list_var = tk.StringVar(value=ADVENTURE_GENERALIST_INITIAL_LOADOUT)
         self.episodes_var = tk.StringVar(value="10")
-        self.run_dir_var = tk.StringVar(value="")
-        self.run_name_var = tk.StringVar(value="")
         self.start_sun_var = tk.StringVar(value="500")
         self.board_timeout_var = tk.StringVar(value="60")
         self.gameplay_ready_timeout_var = tk.StringVar(value="30")
-        self.checkpoint_freq_var = tk.StringVar(value="5000")
         self.fusion_policy_var = tk.StringVar(value="none")
         self.quick_wait_var = tk.BooleanVar(value=True)
         self.wait_gameplay_ready_var = tk.BooleanVar(value=True)
         self.auto_select_seeds_var = tk.BooleanVar(value=True)
         self.debug_perf_var = tk.BooleanVar(value=False)
         self.fast_only_var = tk.BooleanVar(value=False)
-        self.adventure_model_path_var = tk.StringVar(value=str(default_adventure_model) if default_adventure_model else "")
-        self.adventure_seed_list_var = tk.StringVar(value=_FOUR_SLOT_CURRENT.seed_csv)
-        self.adventure_plant_types_var = tk.StringVar(value=ADVENTURE_DEFAULT_PLANT_TYPES)
-        self.adventure_episodes_var = tk.StringVar(value="5")
-        self.adventure_max_levels_var = tk.StringVar(value="5")
-        self.adventure_max_attempts_var = tk.StringVar(value="10")
-        self.adventure_advance_wins_var = tk.StringVar(value="1")
-        self.adventure_game_speed_var = tk.StringVar(value="4.0")
-        self.adventure_step_seconds_var = tk.StringVar(value="0.05")
-        self.adventure_soft_max_steps_var = tk.StringVar(value="2000")
-        self.adventure_hard_max_steps_var = tk.StringVar(value="3500")
-        self.adventure_board_timeout_var = tk.StringVar(value="60")
-        self.adventure_eval_var = tk.BooleanVar(value=True)
-        self.adventure_advance_on_wins_var = tk.BooleanVar(value=True)
-        self.adventure_auto_select_seeds_var = tk.BooleanVar(value=True)
-        self.adventure_wait_gameplay_ready_var = tk.BooleanVar(value=True)
-        self.adventure_quick_wait_var = tk.BooleanVar(value=True)
-        self.adventure_final_wave_extension_var = tk.BooleanVar(value=True)
-        self.adventure_tactical_masks_var = tk.BooleanVar(value=True)
-        self.adventure_wallnut_mask_var = tk.BooleanVar(value=True)
-        self.adventure_cherrybomb_mask_var = tk.BooleanVar(value=True)
-        self.adventure_fusion_policy_var = tk.StringVar(value="none")
         self.generalist_total_timesteps_var = tk.StringVar(value="250000")
         self.generalist_checkpoint_freq_var = tk.StringVar(value="5000")
         self.generalist_initial_loadout_var = tk.StringVar(value=ADVENTURE_GENERALIST_INITIAL_LOADOUT)
@@ -185,8 +152,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.generalist_new_plant_prob_var = tk.StringVar(value="0.15")
         self.generalist_run_dir_var = tk.StringVar(value="")
         self.generalist_resume_model_path_var = tk.StringVar(value="")
-        self.generalist_eval_model_path_var = tk.StringVar(value=str(default_adventure_model) if default_adventure_model else "")
-        self.generalist_eval_episodes_var = tk.StringVar(value="5")
+        self.generalist_eval_model_path_var = tk.StringVar(value=str(default_generalist_model) if default_generalist_model else "")
         self.generalist_unlock_curriculum_var = tk.BooleanVar(value=True)
         self.generalist_replay_cleared_var = tk.BooleanVar(value=True)
         self.generalist_final_wave_extension_var = tk.BooleanVar(value=True)
@@ -202,20 +168,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.generalist_fusion_action_mask_eval_var = tk.BooleanVar(value=False)
         self.generalist_curriculum_var = tk.StringVar(value="conservative")
         self.generalist_randomize_seed_order_var = tk.BooleanVar(value=False)
-        self.level3_mode_var = tk.StringVar(value="train")
-        self.level3_target_level_var = tk.StringVar(value="3")
-        self.level3_model_path_var = tk.StringVar(value=str(default_model) if default_model else "")
-        self.level3_total_timesteps_var = tk.StringVar(value="750000")
-        self.level3_episodes_var = tk.StringVar(value="25")
-        self.level3_max_steps_var = tk.StringVar(value="1200")
-        self.level3_step_seconds_var = tk.StringVar(value="0.05")
-        self.level3_game_speed_var = tk.StringVar(value="4.0")
-        self.level3_board_timeout_var = tk.StringVar(value="90")
-        self.level3_seed_list_var = tk.StringVar(value=LEVEL3_SEED_LIST)
-        self.level3_plant_types_var = tk.StringVar(value=LEVEL3_PLANT_TYPES)
-        self.level3_tactical_masks_var = tk.BooleanVar(value=True)
-        self.level3_wallnut_mask_var = tk.BooleanVar(value=True)
-        self.level3_cherrybomb_mask_var = tk.BooleanVar(value=True)
         self.human_coach_enabled_var = tk.BooleanVar(value=False)
         self.human_coach_reward_var = tk.BooleanVar(value=False)
         self.human_coach_bonus_var = tk.StringVar(value="")
@@ -385,10 +337,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._append_log(f"[gui] polling diagnostics every {POLL_MS} ms\n")
         self._bind_command_preview_updates()
         self._update_command_previews()
-        if default_model is not None:
-            self._append_log(f"Selected default model path: {default_model}\n")
-        if default_adventure_model is not None and default_adventure_model != default_model:
-            self._append_log(f"Selected Adventure metadata-backed model path: {default_adventure_model}\n")
+        if default_generalist_model is not None:
+            self._append_log(f"Selected Adventure Generalist model path: {default_generalist_model}\n")
         self._poll()
         self._drain_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -419,28 +369,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         except (OSError, ValueError):
             return text
 
-    def _find_newest_model_zip(self) -> Optional[Path]:
-        runs_dir = self.repo_root / "runs"
-        if not runs_dir.exists():
-            return None
-        zips: List[Path] = []
-        for path in runs_dir.rglob("*.zip"):
-            try:
-                if not path.is_file() or path.stat().st_size <= 0:
-                    continue
-            except OSError:
-                continue
-            zips.append(path)
-        preferred = [
-            path
-            for path in zips
-            if path.name.lower() in MODEL_ZIP_NAMES or path.parent.name.lower() == "checkpoints"
-        ]
-        candidates = preferred or zips
-        if not candidates:
-            return None
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
     def _find_newest_usable_model_zip(self) -> Optional[Path]:
         runs_dir = self.repo_root / "runs"
         if not runs_dir.exists():
@@ -448,7 +376,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         zips: List[Path] = []
         for path in runs_dir.rglob("*.zip"):
             try:
-                if not path.is_file() or path.stat().st_size <= 0 or not self._has_canonical_model_metadata(path):
+                if not path.is_file() or path.stat().st_size <= 0 or not self._has_generalist_model_metadata(path):
                     continue
             except OSError:
                 continue
@@ -463,7 +391,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             return None
         return max(candidates, key=lambda path: path.stat().st_mtime)
 
-    def _has_canonical_model_metadata(self, model_path: Path) -> bool:
+    def _has_generalist_model_metadata(self, model_path: Path) -> bool:
         directories = [model_path.parent]
         if model_path.parent.name.lower() == "checkpoints":
             directories.append(model_path.parent.parent)
@@ -475,7 +403,16 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
                 payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if isinstance(payload, dict) and payload.get("metadata_version") is not None:
+            if (
+                isinstance(payload, dict)
+                and payload.get("metadata_version") is not None
+                and payload.get("model_family") == ADVENTURE_GENERALIST_MODEL_FAMILY
+                and payload.get("action_count") == 701
+                and payload.get("action_space_mode") == "adventure_14slot_identity"
+                and payload.get("action_decoder_version") == "seedslot14x50_plus_wait_v1"
+                and payload.get("observation_version") == "adventure_14slot_identity_v1"
+                and payload.get("max_seed_slots") == 14
+            ):
                 return True
         return False
 
@@ -601,7 +538,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         )
         self._add_labeled_entry(
             core, 0, 2, "Initial loadout", self.generalist_initial_loadout_var, width=42,
-            tooltip="Fixed bootstrap loadout used before Adventure unlocks expand the seed inventory.",
+            tooltip="Bootstrap loadout used before Adventure unlocks expand the seed inventory.",
         )
         self._add_labeled_entry(
             core, 1, 0, "Start level", self.generalist_start_level_var,
@@ -765,14 +702,13 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         settings.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
         for column in (1, 3):
             settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Episodes", self.generalist_eval_episodes_var)
-        self._add_labeled_entry(settings, 0, 2, "Initial loadout", self.generalist_initial_loadout_var, width=42)
-        self._add_labeled_entry(settings, 1, 0, "Start level", self.generalist_start_level_var)
-        self._add_labeled_entry(settings, 1, 2, "Max levels", self.generalist_max_levels_var)
-        self._add_labeled_entry(settings, 2, 0, "Max attempts", self.generalist_max_attempts_var)
-        self._add_labeled_entry(settings, 2, 2, "Game speed", self.generalist_game_speed_var)
-        self._add_labeled_entry(settings, 3, 0, "Step seconds", self.generalist_step_seconds_var)
-        self._add_labeled_entry(settings, 3, 2, "Board timeout", self.generalist_board_timeout_var)
+        self._add_labeled_entry(settings, 0, 0, "Initial loadout", self.generalist_initial_loadout_var, width=42)
+        self._add_labeled_entry(settings, 0, 2, "Start level", self.generalist_start_level_var)
+        self._add_labeled_entry(settings, 1, 0, "Max levels", self.generalist_max_levels_var)
+        self._add_labeled_entry(settings, 1, 2, "Max attempts", self.generalist_max_attempts_var)
+        self._add_labeled_entry(settings, 2, 0, "Game speed", self.generalist_game_speed_var)
+        self._add_labeled_entry(settings, 2, 2, "Step seconds", self.generalist_step_seconds_var)
+        self._add_labeled_entry(settings, 3, 0, "Board timeout", self.generalist_board_timeout_var)
         ttk.Checkbutton(settings, text="Wait for gameplay", variable=self.generalist_wait_gameplay_ready_var).grid(
             row=4, column=0, sticky="w", padx=6, pady=3
         )
@@ -1447,15 +1383,15 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         paths = ttk.LabelFrame(parent, text="Runs and Models")
         paths.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
         paths.columnconfigure(1, weight=1)
-        self._add_labeled_entry(paths, 0, 0, "Model .zip", self.model_path_var, width=56)
-        self._add_labeled_entry(paths, 1, 0, "Run dir", self.run_dir_var, width=56)
+        self._add_labeled_entry(paths, 0, 0, "Generalist model .zip", self.generalist_eval_model_path_var, width=56)
+        self._add_labeled_entry(paths, 1, 0, "Generalist run dir", self.generalist_run_dir_var, width=56)
 
         actions = ttk.Frame(parent)
         actions.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
-        ttk.Button(actions, text="Browse model.zip", command=self.browse_model).grid(row=0, column=0, sticky="w", padx=(0, 5))
+        ttk.Button(actions, text="Browse model.zip", command=self.browse_generalist_eval_model).grid(row=0, column=0, sticky="w", padx=(0, 5))
         ttk.Button(actions, text="Browse run folder", command=self.browse_run_folder).grid(row=0, column=1, sticky="w", padx=(0, 5))
         ttk.Button(actions, text="Open run folder", command=self.open_run_folder).grid(row=0, column=2, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Models", command=self.refresh_models).grid(row=0, column=3, sticky="w")
+        ttk.Button(actions, text="Refresh Models", command=self.refresh_generalist_models).grid(row=0, column=3, sticky="w")
 
         charts = ttk.LabelFrame(parent, text="Analyze / Charts")
         charts.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
@@ -1654,47 +1590,20 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
 
     def _bind_command_preview_updates(self) -> None:
         variables: List[Any] = [
-            self.total_timesteps_var,
             self.max_steps_var,
             self.step_seconds_var,
             self.game_speed_var,
             self.seed_list_var,
-            self.model_path_var,
             self.episodes_var,
-            self.run_dir_var,
-            self.run_name_var,
             self.start_sun_var,
             self.board_timeout_var,
             self.gameplay_ready_timeout_var,
-            self.checkpoint_freq_var,
             self.fusion_policy_var,
             self.quick_wait_var,
             self.wait_gameplay_ready_var,
             self.auto_select_seeds_var,
             self.debug_perf_var,
             self.fast_only_var,
-            self.adventure_model_path_var,
-            self.adventure_seed_list_var,
-            self.adventure_plant_types_var,
-            self.adventure_episodes_var,
-            self.adventure_max_levels_var,
-            self.adventure_max_attempts_var,
-            self.adventure_advance_wins_var,
-            self.adventure_game_speed_var,
-            self.adventure_step_seconds_var,
-            self.adventure_soft_max_steps_var,
-            self.adventure_hard_max_steps_var,
-            self.adventure_board_timeout_var,
-            self.adventure_eval_var,
-            self.adventure_advance_on_wins_var,
-            self.adventure_auto_select_seeds_var,
-            self.adventure_wait_gameplay_ready_var,
-            self.adventure_quick_wait_var,
-            self.adventure_final_wave_extension_var,
-            self.adventure_tactical_masks_var,
-            self.adventure_wallnut_mask_var,
-            self.adventure_cherrybomb_mask_var,
-            self.adventure_fusion_policy_var,
             self.generalist_total_timesteps_var,
             self.generalist_checkpoint_freq_var,
             self.generalist_initial_loadout_var,
@@ -1716,7 +1625,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.generalist_run_dir_var,
             self.generalist_resume_model_path_var,
             self.generalist_eval_model_path_var,
-            self.generalist_eval_episodes_var,
             self.generalist_unlock_curriculum_var,
             self.generalist_replay_cleared_var,
             self.generalist_final_wave_extension_var,
@@ -1728,20 +1636,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.generalist_fusion_action_mask_train_var,
             self.generalist_fusion_action_mask_eval_var,
             self.generalist_curriculum_var,
-            self.level3_mode_var,
-            self.level3_target_level_var,
-            self.level3_model_path_var,
-            self.level3_total_timesteps_var,
-            self.level3_episodes_var,
-            self.level3_max_steps_var,
-            self.level3_step_seconds_var,
-            self.level3_game_speed_var,
-            self.level3_board_timeout_var,
-            self.level3_seed_list_var,
-            self.level3_plant_types_var,
-            self.level3_tactical_masks_var,
-            self.level3_wallnut_mask_var,
-            self.level3_cherrybomb_mask_var,
             self.human_coach_enabled_var,
             self.human_coach_reward_var,
             self.human_coach_bonus_var,
@@ -1982,17 +1876,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._add_optional_value(command, "--board-timeout", self.board_timeout_var.get())
         self._add_optional_value(command, "--gameplay-ready-timeout", self.gameplay_ready_timeout_var.get())
 
-    def browse_model(self) -> None:
-        initial_dir = self.repo_root / "runs"
-        filename = filedialog.askopenfilename(
-            title="Select model.zip",
-            initialdir=str(initial_dir if initial_dir.exists() else self.repo_root),
-            filetypes=[("Zip models", "*.zip"), ("All files", "*.*")],
-        )
-        if filename:
-            self.model_path_var.set(filename)
-            self._append_log(f"Selected model path: {filename}\n")
-
     def browse_generalist_eval_model(self) -> None:
         initial_dir = self.repo_root / "runs"
         filename = filedialog.askopenfilename(
@@ -2022,7 +1905,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             initialdir=str(initial_dir if initial_dir.exists() else self.repo_root),
         )
         if dirname:
-            self.run_dir_var.set(dirname)
             self.generalist_run_dir_var.set(dirname)
             self._append_log(f"Selected run directory: {dirname}\n")
 
@@ -2034,14 +1916,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.generalist_eval_model_path_var.set(str(model))
         self.generalist_resume_model_path_var.set(str(model))
         self._append_log(f"Refresh Models: selected Adventure Generalist model: {model}\n")
-
-    def refresh_models(self) -> None:
-        model = self._find_newest_model_zip()
-        if model is None:
-            self._append_log("Refresh Models: no .zip models found under runs.\n")
-            return
-        self.model_path_var.set(str(model))
-        self._append_log(f"Refresh Models: selected newest model path: {model}\n")
 
     def refresh_generalist_eval_model(self) -> None:
         model = self._find_newest_usable_model_zip()
@@ -2078,16 +1952,10 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self._append_log(f"ERROR: Failed to open folder {path}: {exc}\n")
 
     def _selected_run_dir(self) -> Optional[Path]:
-        generalist_run_var = getattr(self, "generalist_run_dir_var", None)
-        generalist_eval_var = getattr(self, "generalist_eval_model_path_var", None)
-        generalist_resume_var = getattr(self, "generalist_resume_model_path_var", None)
-        run_dir = (
-            generalist_run_var.get().strip() if generalist_run_var is not None else ""
-        ) or self.run_dir_var.get().strip()
+        run_dir = self.generalist_run_dir_var.get().strip()
         model_path = (
-            (generalist_eval_var.get().strip() if generalist_eval_var is not None else "")
-            or (generalist_resume_var.get().strip() if generalist_resume_var is not None else "")
-            or self.model_path_var.get().strip()
+            self.generalist_eval_model_path_var.get().strip()
+            or self.generalist_resume_model_path_var.get().strip()
         )
         if run_dir:
             return self._resolve_text_path(run_dir)

@@ -189,7 +189,6 @@ class SeedSlotFact:
     full_cooldown: float
     seed_cost: int
     plant_type_name: str = ""
-    legacy_action_plant_type: int = -1
     cooldown_plant_type: int = -1
     cooldown_plant_type_name: str = ""
     card_instance_id: int = 0
@@ -360,7 +359,6 @@ def _seed_slot_fact(
         full_cooldown=_safe_float(raw.get("fullCooldown"), default=0.0),
         seed_cost=cost,
         plant_type_name=str(raw.get("plantTypeName") or raw.get("typeName") or ""),
-        legacy_action_plant_type=_safe_int(raw.get("plantType"), default=-1),
         cooldown_plant_type=_safe_int(
             raw.get("plantType"),
             default=configured_plant_type,

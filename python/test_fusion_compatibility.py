@@ -48,7 +48,7 @@ def board_observation(plant_at=None, sun: int = 500) -> Dict[str, Any]:
 
 
 def encode(slot_index: int, row: int, col: int) -> int:
-    """Fixed/identity placement encoding (1 + slot*cells + row*cols + col)."""
+    """Generalist identity placement encoding (1 + slot*cells + row*cols + col)."""
     return 1 + slot_index * CELLS + row * 10 + col
 
 

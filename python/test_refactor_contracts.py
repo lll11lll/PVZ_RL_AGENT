@@ -1,10 +1,4 @@
-"""Phase 0 compatibility locks for the repository-wide refinement.
-
-These snapshots describe the verified baseline.  They are compatibility
-contracts, not claims that every baseline behavior is intrinsically correct.
-Intentional contract changes must update the corresponding migration note and
-fixture together.
-"""
+"""Adventure Generalist compatibility locks for the maintained repository path."""
 
 from __future__ import annotations
 
@@ -17,20 +11,11 @@ import numpy as np
 
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
-    ACTION_SPACE_DYNAMIC_14,
-    ACTION_SPACE_FIXED,
     ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
     ADVENTURE_IDENTITY_OBSERVATION_VERSION,
-    DYNAMIC_ACTION_DECODER_VERSION,
-    DYNAMIC_OBSERVATION_VERSION,
-    FIXED_ACTION_DECODER_VERSION,
-    FIXED_OBSERVATION_VERSION,
     build_action_space_spec,
     decode_policy_action,
-    legacy_action_to_policy_action,
-    policy_action_to_legacy_action,
     structural_adventure_identity_mask,
-    structural_dynamic_mask,
 )
 from pvzrl_adventure import build_live_status
 from pvzrl_env import REWARD_COMPONENT_FIELDS
@@ -61,108 +46,73 @@ from test_refactor_support import (
 from train_ppo import EPISODE_METRIC_FIELDS, clean_episode_row
 
 
-FIXED_VECTOR_SHA = "a3b5d40b54118f77d607b6c9caf07cd3d89de32af626d2174e6e098574d235d5"
 IDENTITY_VECTOR_SHA = "1aece9569e5e4ab71b7e9c277a4649d7d08c3a10634a4c9088af98fc97504472"
-FIXED_MASK_SHA = "b8162a3a0d68495dd173f3665f8ecef6f330e8ed774fc1928b7c353404eeaf3f"
 IDENTITY_MASK_SHA = "e77f9e0e07daf76885f73facfa1ccdfb5effd02e952413d61f23b866cf1c9339"
 ALLOWED_FIXTURE_ACTIONS = [0, 1, 2, 10, 24, 101, 124, 150]
 REWARD_BREAKDOWN_SHA = "0dbceb5d5c57a4f4c7f37e535ef015af2b461061aa5323e9581bfad3676a8316"
 FUSION_CANDIDATES_SHA = "bac8d8a636a975bd8a1bf1ac5cd1c6a7daed1a1dd869dd676f8b7a0b589d29a1"
 REWARD_FIELDS_SHA = "b1ad4a442ba5c66d18deed257550d6cbdc05ee5af6c3d6325f770798825de184"
-EPISODE_FIELDS_SHA = "6d965a7482b710ef6481d581feac1baf94ba7e43fe1aec5618616c52d9331ba6"
+EPISODE_FIELDS_SHA = "febdb12c51516ce71749bb8ebbfa9afc71d4c0ffefa14984f3031992a1ef3e98"
 FUSION_FIELDS_SHA = "3fe73b60ad282971dd505f727b02808bd3ef48534498a1efd3a10da0eba95b2f"
-LIVE_TOP_LEVEL_KEYS_SHA = "7a6fd6af6f764b57688941f80df9aa3ca51a128eb82686fae613e7cf7dc27a0f"
+LIVE_TOP_LEVEL_KEYS_SHA = "2bc11e4be9ae2202cb139c52ed2b543f2c486c500d4310fb9127b50bce593b41"
 OBSERVATION_DTO_SHA = "72e380bceb9d78cd80310a275c6dd7a6cf208f600d48ac114aef7ccb90b957ae"
 
 
-def test_action_space_counts_versions_and_round_trips() -> None:
-    fixed = build_action_space_spec(mode=ACTION_SPACE_FIXED, plant_types=[1, 1, 0, 0], max_seed_slots=4)
-    dynamic = build_action_space_spec(mode=ACTION_SPACE_DYNAMIC_14, plant_types=[1, 1, 0, 0], max_seed_slots=14)
+def test_generalist_action_space_count_versions_and_decoder() -> None:
     identity = build_action_space_spec(
         mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
         plant_types=[1, 1, 0, 0],
         max_seed_slots=14,
     )
-    assert (fixed.action_count, fixed.wait_action, fixed.placement_action_min, fixed.placement_action_max) == (201, 0, 1, 200)
-    assert (dynamic.action_count, dynamic.wait_action, dynamic.placement_action_min, dynamic.placement_action_max) == (701, 700, 0, 699)
     assert (identity.action_count, identity.wait_action, identity.placement_action_min, identity.placement_action_max) == (701, 0, 1, 700)
-    assert (fixed.action_decoder_version, fixed.observation_version) == (
-        FIXED_ACTION_DECODER_VERSION,
-        FIXED_OBSERVATION_VERSION,
-    )
-    assert (dynamic.action_decoder_version, dynamic.observation_version) == (
-        DYNAMIC_ACTION_DECODER_VERSION,
-        DYNAMIC_OBSERVATION_VERSION,
-    )
     assert (identity.action_decoder_version, identity.observation_version) == (
         ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
         ADVENTURE_IDENTITY_OBSERVATION_VERSION,
     )
 
-    for spec in (fixed, dynamic, identity):
-        for action in range(spec.action_count):
-            legacy = policy_action_to_legacy_action(action, mode=spec.mode)
-            assert legacy_action_to_policy_action(legacy, mode=spec.mode) == action
-            decoded = decode_policy_action(
-                action,
-                mode=spec.mode,
-                plant_types=[1, 1, 0, 0],
-                max_seed_slots=spec.max_seed_slots,
-            )
-            if action == spec.wait_action:
-                assert decoded["kind"] == 0
-                continue
-            assert decoded["kind"] == 1
-            assert 0 <= decoded["slot_index"] < spec.max_seed_slots
-            assert 0 <= decoded["row"] < 5
-            assert 0 <= decoded["column"] < 10
+    for action in range(identity.action_count):
+        decoded = decode_policy_action(
+            action,
+            mode=identity.mode,
+            plant_types=[1, 1, 0, 0],
+            max_seed_slots=identity.max_seed_slots,
+        )
+        if action == identity.wait_action:
+            assert decoded["kind"] == 0
+            continue
+        assert decoded["kind"] == 1
+        assert 0 <= decoded["slot_index"] < identity.max_seed_slots
+        assert 0 <= decoded["row"] < 5
+        assert 0 <= decoded["column"] < 10
 
 
 def test_structural_masks_keep_wait_and_inactive_slots_stable() -> None:
-    dynamic = structural_dynamic_mask(4)
     identity = structural_adventure_identity_mask(4)
-    assert len(dynamic) == 701
     assert len(identity) == 701
-    assert sum(bool(value) for value in dynamic) == 201
     assert sum(bool(value) for value in identity) == 201
-    assert dynamic[700] and all(dynamic[index] for index in range(200))
-    assert not any(dynamic[index] for index in range(200, 700))
     assert identity[0] and all(identity[index] for index in range(1, 201))
     assert not any(identity[index] for index in range(201, 701))
 
 
-def test_fixed_and_identity_observation_vectors_are_exact() -> None:
-    fixed = make_wrapper(identity=False)
-    identity = make_wrapper(identity=True)
+def test_generalist_observation_vector_is_exact() -> None:
+    identity = make_wrapper()
     try:
-        fixed_observation = observation_for_wrapper(fixed)
         identity_observation = observation_for_wrapper(identity)
-        fixed_vector = fixed._encode_observation(fixed_observation)
         identity_vector = identity._encode_observation(identity_observation)
-        assert fixed_vector.shape == (357,)
         assert identity_vector.shape == (4297,)
-        assert fixed_vector.dtype == np.float32
         assert identity_vector.dtype == np.float32
-        assert array_sha256(fixed_vector) == FIXED_VECTOR_SHA
         assert array_sha256(identity_vector) == IDENTITY_VECTOR_SHA
     finally:
-        fixed.close()
         identity.close()
 
 
 def test_complete_fixture_masks_lock_sun_cooldown_occupancy_and_fusion() -> None:
-    fixed = make_wrapper(identity=False)
-    identity = make_wrapper(identity=True)
+    identity = make_wrapper()
     try:
-        fixed._last_observation = observation_for_wrapper(fixed)
         identity._last_observation = observation_for_wrapper(identity)
-        fixed_mask = fixed.action_masks()
         identity_mask = identity.action_masks()
-        assert fixed_mask.shape == (201,)
         assert identity_mask.shape == (701,)
-        assert np.flatnonzero(fixed_mask).tolist() == ALLOWED_FIXTURE_ACTIONS
         assert np.flatnonzero(identity_mask).tolist() == ALLOWED_FIXTURE_ACTIONS
-        assert mask_sha256(fixed_mask) == FIXED_MASK_SHA
         assert mask_sha256(identity_mask) == IDENTITY_MASK_SHA
         assert identity_mask[0]
         assert not identity_mask[51]  # duplicate SunFlower slot is cooling down
@@ -170,7 +120,6 @@ def test_complete_fixture_masks_lock_sun_cooldown_occupancy_and_fusion() -> None
         assert identity_mask[124]  # occupied Peashooter tile is a legal self-fusion
         assert not identity_mask[700]  # inactive slot 13 remains masked
     finally:
-        fixed.close()
         identity.close()
 
 
@@ -202,7 +151,7 @@ def test_fusion_recipes_reason_order_and_candidate_snapshot() -> None:
 
 
 def test_reward_components_and_total_are_numerically_locked() -> None:
-    wrapper = make_wrapper(identity=True)
+    wrapper = make_wrapper()
     try:
         previous = observation_for_wrapper(wrapper)
         current = copy.deepcopy(previous)
@@ -231,7 +180,7 @@ def test_episode_reward_fusion_and_live_status_schema_snapshots() -> None:
     assert json_sha256(sorted(default_fusion_diagnostics("observe"))) == FUSION_FIELDS_SHA
     assert list(clean_episode_row({}, fallback_episode=0)) == list(EPISODE_METRIC_FIELDS)
 
-    wrapper = make_wrapper(identity=True)
+    wrapper = make_wrapper()
     try:
         wrapper._last_observation = observation_for_wrapper(wrapper)
         payload = build_live_status(
@@ -276,12 +225,11 @@ def test_bridge_observation_dto_property_names_and_types_are_locked() -> None:
     assert ["long", "SunSpawnCompensationApplyCount"] in properties
 
 
-def test_protected_and_fixed_model_metadata_contract_fixtures() -> None:
+def test_protected_generalist_model_metadata_contract_fixture() -> None:
     contracts_path = ROOT / "python" / "fixtures" / "refactor_contracts" / "model_contracts.json"
     contracts = json.loads(contracts_path.read_text(encoding="utf-8"))
-    assert contracts["schema_version"] == 1
+    assert contracts["schema_version"] == 2
     protected = contracts["protected_generalist"]
-    fixed = contracts["fixed_control"]
     assert (
         protected["action_count"],
         protected["max_seed_slots"],
@@ -295,17 +243,5 @@ def test_protected_and_fixed_model_metadata_contract_fixtures() -> None:
     assert protected["identity_seed_slots"] is True
     assert protected["observation_shape"] == [4297]
     assert protected["num_timesteps"] == 370000
-    assert (
-        fixed["action_count"],
-        fixed["max_seed_slots"],
-        fixed["decoder_wait_action"],
-        fixed["placement_action_range"],
-        fixed["rows"],
-        fixed["cols"],
-    ) == (201, 4, 0, [1, 200], 5, 10)
-    assert fixed["action_decoder_version"] == FIXED_ACTION_DECODER_VERSION
-    assert fixed["observation_version"] == FIXED_OBSERVATION_VERSION
-    assert fixed["observation_shape"] == [357]
-    assert fixed["num_timesteps"] == 350368
-    assert fixed["seed_list"] == ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
-    assert fixed["plant_types"] == [1, 0, 3, 2]
+    assert protected["seed_list"] == ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+    assert protected["plant_types"] == [1, 1, 0, 0]

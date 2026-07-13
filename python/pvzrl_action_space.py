@@ -1,16 +1,15 @@
-"""Shared PvZRL action-space definitions.
+"""Adventure Generalist action-space contract.
 
-The fixed legacy decoder, experimental dynamic decoder, and permanent
-Adventure identity decoder intentionally keep their wait/action layouts
-explicit:
+Adventure Generalist is the sole maintained policy layout.  Its action space
+has one wait action followed by fourteen 5x10 seed-slot placement blocks:
 
-* fixed: action 0 waits, placements are 1..N
-* dynamic_14: placements are 0..699, action 700 waits
-* adventure_14slot_identity: action 0 waits, placements are 1..700
+* action ``0`` waits;
+* actions ``1..700`` place/fuse using seed-slot-major ordering;
+* decoder version ``seedslot14x50_plus_wait_v1`` is checkpoint semantics.
 
-Keeping those decoder versions explicit prevents 201-action fixed policies and
-701-action policies with different wait positions or observation schemas from
-being loaded into the wrong environment.
+The ``dynamic_seed_slots`` metadata key is retained because it is serialized in
+the protected Generalist checkpoint.  It describes the live seed inventory; it
+does not imply support for the removed ``dynamic_14`` policy decoder.
 """
 
 from __future__ import annotations
@@ -19,28 +18,18 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
-ACTION_SPACE_FIXED = "fixed"
-ACTION_SPACE_DYNAMIC_14 = "dynamic_14"
 ACTION_SPACE_ADVENTURE_14_IDENTITY = "adventure_14slot_identity"
-ACTION_SPACE_MODES = {ACTION_SPACE_FIXED, ACTION_SPACE_DYNAMIC_14, ACTION_SPACE_ADVENTURE_14_IDENTITY}
+ACTION_SPACE_MODES = {ACTION_SPACE_ADVENTURE_14_IDENTITY}
 
 DEFAULT_ROWS = 5
 DEFAULT_COLS = 10
 CELLS_PER_SLOT = DEFAULT_ROWS * DEFAULT_COLS
-DYNAMIC_MAX_SEED_SLOTS = 14
+ADVENTURE_IDENTITY_MAX_SEED_SLOTS = 14
 
-FIXED_OBSERVATION_VERSION = "fixed_slot_v1"
-DYNAMIC_OBSERVATION_VERSION = "seed_inventory_v2"
 ADVENTURE_IDENTITY_OBSERVATION_VERSION = "adventure_14slot_identity_v1"
-FIXED_ACTION_DECODER_VERSION = "fixed_slot_4x50_plus_wait_v1"
-DYNAMIC_ACTION_DECODER_VERSION = "max_seed_slots_14_v1"
 ADVENTURE_IDENTITY_ACTION_DECODER_VERSION = "seedslot14x50_plus_wait_v1"
-
-DYNAMIC_WAIT_ACTION = DYNAMIC_MAX_SEED_SLOTS * CELLS_PER_SLOT
-DYNAMIC_ACTION_COUNT = DYNAMIC_WAIT_ACTION + 1
 ADVENTURE_IDENTITY_WAIT_ACTION = 0
-ADVENTURE_IDENTITY_ACTION_COUNT = DYNAMIC_MAX_SEED_SLOTS * CELLS_PER_SLOT + 1
-FIXED_WAIT_ACTION = 0
+ADVENTURE_IDENTITY_ACTION_COUNT = ADVENTURE_IDENTITY_MAX_SEED_SLOTS * CELLS_PER_SLOT + 1
 
 
 @dataclass(frozen=True)
@@ -58,11 +47,13 @@ class ActionSpaceSpec:
 
     @property
     def dynamic_seed_slots(self) -> bool:
-        return self.mode in {ACTION_SPACE_DYNAMIC_14, ACTION_SPACE_ADVENTURE_14_IDENTITY}
+        """Return the serialized Generalist inventory-capability flag."""
+
+        return True
 
     @property
     def identity_seed_slots(self) -> bool:
-        return self.mode == ACTION_SPACE_ADVENTURE_14_IDENTITY
+        return True
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
@@ -82,83 +73,58 @@ class ActionSpaceSpec:
 
 
 def normalize_action_space_mode(value: Any) -> str:
-    mode = str(value or ACTION_SPACE_FIXED).strip().lower()
-    if mode in {"dynamic", "dynamic14", "dynamic_14"}:
-        return ACTION_SPACE_DYNAMIC_14
-    if mode in {
-        "adventure_14slot_identity",
-        "adventure_identity",
-        "identity_14",
-        "14slot_identity",
-        "adventure_generalist_14slot",
-    }:
+    mode = str(value or ACTION_SPACE_ADVENTURE_14_IDENTITY).strip().lower()
+    if mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
         return ACTION_SPACE_ADVENTURE_14_IDENTITY
-    if mode in {"fixed", "legacy", ""}:
-        return ACTION_SPACE_FIXED
-    raise ValueError(f"Unsupported action_space_mode: {value!r}")
+    raise ValueError(
+        f"Unsupported action_space_mode: {value!r}; "
+        f"expected {ACTION_SPACE_ADVENTURE_14_IDENTITY!r}"
+    )
+
+
+def _validate_board_geometry(rows: int, cols: int) -> None:
+    if int(rows) != DEFAULT_ROWS or int(cols) != DEFAULT_COLS:
+        raise ValueError(
+            "Adventure Generalist requires a 5x10 board: "
+            f"rows={rows}, cols={cols}"
+        )
 
 
 def build_action_space_spec(
     *,
-    mode: str = ACTION_SPACE_FIXED,
+    mode: str = ACTION_SPACE_ADVENTURE_14_IDENTITY,
     plant_types: Optional[List[int]] = None,
     max_seed_slots: Optional[int] = None,
     rows: int = DEFAULT_ROWS,
     cols: int = DEFAULT_COLS,
 ) -> ActionSpaceSpec:
-    normalized_mode = normalize_action_space_mode(mode)
-    plant_slot_count = len(plant_types or [])
-    cells = int(rows) * int(cols)
-    if cells <= 0:
-        raise ValueError(f"Invalid action-space board dimensions: rows={rows}, cols={cols}")
-
-    if normalized_mode == ACTION_SPACE_DYNAMIC_14:
-        return ActionSpaceSpec(
-            mode=ACTION_SPACE_DYNAMIC_14,
-            action_count=DYNAMIC_ACTION_COUNT,
-            max_seed_slots=DYNAMIC_MAX_SEED_SLOTS,
-            observation_version=DYNAMIC_OBSERVATION_VERSION,
-            action_decoder_version=DYNAMIC_ACTION_DECODER_VERSION,
-            wait_action=DYNAMIC_WAIT_ACTION,
-            placement_action_min=0,
-            placement_action_max=DYNAMIC_WAIT_ACTION - 1,
-            rows=int(rows),
-            cols=int(cols),
+    normalize_action_space_mode(mode)
+    _validate_board_geometry(rows, cols)
+    if max_seed_slots is not None and int(max_seed_slots) != ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
+        raise ValueError(
+            "Adventure Generalist requires exactly 14 seed slots: "
+            f"max_seed_slots={max_seed_slots}"
         )
-
-    if normalized_mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-        return ActionSpaceSpec(
-            mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
-            action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
-            max_seed_slots=DYNAMIC_MAX_SEED_SLOTS,
-            observation_version=ADVENTURE_IDENTITY_OBSERVATION_VERSION,
-            action_decoder_version=ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
-            wait_action=ADVENTURE_IDENTITY_WAIT_ACTION,
-            placement_action_min=1,
-            placement_action_max=ADVENTURE_IDENTITY_ACTION_COUNT - 1,
-            rows=int(rows),
-            cols=int(cols),
-        )
-
-    fixed_slots = int(max_seed_slots) if max_seed_slots is not None else plant_slot_count
-    fixed_slots = max(0, fixed_slots)
+    # ``plant_types`` describes the current live loadout and may contain fewer
+    # than fourteen entries.  It does not resize the checkpoint action space.
+    _ = plant_types
     return ActionSpaceSpec(
-        mode=ACTION_SPACE_FIXED,
-        action_count=1 + fixed_slots * cells,
-        max_seed_slots=fixed_slots,
-        observation_version=FIXED_OBSERVATION_VERSION,
-        action_decoder_version=FIXED_ACTION_DECODER_VERSION,
-        wait_action=FIXED_WAIT_ACTION,
+        mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
+        action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+        observation_version=ADVENTURE_IDENTITY_OBSERVATION_VERSION,
+        action_decoder_version=ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
+        wait_action=ADVENTURE_IDENTITY_WAIT_ACTION,
         placement_action_min=1,
-        placement_action_max=fixed_slots * cells,
-        rows=int(rows),
-        cols=int(cols),
+        placement_action_max=ADVENTURE_IDENTITY_ACTION_COUNT - 1,
+        rows=DEFAULT_ROWS,
+        cols=DEFAULT_COLS,
     )
 
 
 def spec_from_config(config: Dict[str, Any]) -> ActionSpaceSpec:
     return build_action_space_spec(
-        mode=str(config.get("action_space_mode", ACTION_SPACE_FIXED)),
+        mode=str(config.get("action_space_mode") or ACTION_SPACE_ADVENTURE_14_IDENTITY),
         plant_types=[int(value) for value in config.get("plant_types", [])],
         max_seed_slots=int(config["max_seed_slots"]) if config.get("max_seed_slots") is not None else None,
         rows=int(config.get("row_count", config.get("rows", DEFAULT_ROWS)) or DEFAULT_ROWS),
@@ -170,82 +136,24 @@ def action_count_for_config(config: Dict[str, Any]) -> int:
     return spec_from_config(config).action_count
 
 
-def fixed_action_to_slot_cell(action: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> Dict[str, int]:
-    action_id = int(action)
-    if action_id <= 0:
-        return {"kind": 0, "slot_index": -1, "row": -1, "column": -1}
-    cells = int(rows) * int(cols)
-    encoded = action_id - 1
-    return {
-        "kind": 1,
-        "slot_index": encoded // cells,
-        "row": (encoded % cells) // int(cols),
-        "column": encoded % int(cols),
-    }
-
-
-def dynamic_action_to_slot_cell(action: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> Dict[str, int]:
-    action_id = int(action)
-    if action_id == DYNAMIC_WAIT_ACTION:
-        return {"kind": 0, "slot_index": -1, "row": -1, "column": -1}
-    if action_id < 0 or action_id >= DYNAMIC_WAIT_ACTION:
-        return {"kind": -1, "slot_index": -1, "row": -1, "column": -1}
-    cells = int(rows) * int(cols)
-    return {
-        "kind": 1,
-        "slot_index": action_id // cells,
-        "row": (action_id % cells) // int(cols),
-        "column": action_id % int(cols),
-    }
-
-
-def adventure_identity_action_to_slot_cell(action: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> Dict[str, int]:
+def adventure_identity_action_to_slot_cell(
+    action: int,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
+) -> Dict[str, int]:
+    _validate_board_geometry(rows, cols)
     action_id = int(action)
     if action_id == ADVENTURE_IDENTITY_WAIT_ACTION:
         return {"kind": 0, "slot_index": -1, "row": -1, "column": -1}
     if action_id < 1 or action_id >= ADVENTURE_IDENTITY_ACTION_COUNT:
         return {"kind": -1, "slot_index": -1, "row": -1, "column": -1}
-    cells = int(rows) * int(cols)
     encoded = action_id - 1
     return {
         "kind": 1,
-        "slot_index": encoded // cells,
-        "row": (encoded % cells) // int(cols),
-        "column": encoded % int(cols),
+        "slot_index": encoded // CELLS_PER_SLOT,
+        "row": (encoded % CELLS_PER_SLOT) // DEFAULT_COLS,
+        "column": encoded % DEFAULT_COLS,
     }
-
-
-def policy_action_to_legacy_action(
-    action: int,
-    *,
-    mode: str,
-    rows: int = DEFAULT_ROWS,
-    cols: int = DEFAULT_COLS,
-) -> int:
-    normalized_mode = normalize_action_space_mode(mode)
-    action_id = int(action)
-    if normalized_mode in {ACTION_SPACE_FIXED, ACTION_SPACE_ADVENTURE_14_IDENTITY}:
-        return action_id
-    decoded = dynamic_action_to_slot_cell(action_id, rows=rows, cols=cols)
-    if int(decoded.get("kind", -1)) == 0:
-        return 0
-    if int(decoded.get("kind", -1)) != 1:
-        return 0
-    return 1 + action_id
-
-
-def legacy_action_to_policy_action(
-    action: int,
-    *,
-    mode: str,
-) -> int:
-    normalized_mode = normalize_action_space_mode(mode)
-    action_id = int(action)
-    if normalized_mode in {ACTION_SPACE_FIXED, ACTION_SPACE_ADVENTURE_14_IDENTITY}:
-        return action_id
-    if action_id <= 0:
-        return DYNAMIC_WAIT_ACTION
-    return action_id - 1
 
 
 def decode_policy_action(
@@ -258,16 +166,11 @@ def decode_policy_action(
     rows: int = DEFAULT_ROWS,
     cols: int = DEFAULT_COLS,
 ) -> Dict[str, int]:
+    normalize_action_space_mode(mode)
     obs = observation if isinstance(observation, dict) else {}
     obs_rows = int(obs.get("rowCount") or rows)
     obs_cols = int(obs.get("columnCount") or cols)
-    normalized_mode = normalize_action_space_mode(mode)
-    if normalized_mode == ACTION_SPACE_DYNAMIC_14:
-        decoded = dynamic_action_to_slot_cell(int(action), rows=obs_rows, cols=obs_cols)
-    elif normalized_mode == ACTION_SPACE_ADVENTURE_14_IDENTITY:
-        decoded = adventure_identity_action_to_slot_cell(int(action), rows=obs_rows, cols=obs_cols)
-    else:
-        decoded = fixed_action_to_slot_cell(int(action), rows=obs_rows, cols=obs_cols)
+    decoded = adventure_identity_action_to_slot_cell(int(action), rows=obs_rows, cols=obs_cols)
 
     plant_type = -1
     slot_index = int(decoded.get("slot_index", -1))
@@ -286,27 +189,19 @@ def decode_policy_action(
     return decoded
 
 
-def structural_dynamic_mask(active_seed_slots: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> List[bool]:
-    """Return the decoder-structural dynamic mask before live cooldown/cost filters."""
+def structural_adventure_identity_mask(
+    active_seed_slots: int,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
+) -> List[bool]:
+    """Return the Generalist decoder-structural mask before live filters."""
 
-    slots = max(0, min(DYNAMIC_MAX_SEED_SLOTS, int(active_seed_slots)))
-    cells = int(rows) * int(cols)
-    mask = [False] * DYNAMIC_ACTION_COUNT
-    for action in range(slots * cells):
-        mask[action] = True
-    mask[DYNAMIC_WAIT_ACTION] = True
-    return mask
-
-
-def structural_adventure_identity_mask(active_seed_slots: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> List[bool]:
-    """Return the decoder-structural 14-slot identity mask before live filters."""
-
-    slots = max(0, min(DYNAMIC_MAX_SEED_SLOTS, int(active_seed_slots)))
-    cells = int(rows) * int(cols)
+    _validate_board_geometry(rows, cols)
+    slots = max(0, min(ADVENTURE_IDENTITY_MAX_SEED_SLOTS, int(active_seed_slots)))
     mask = [False] * ADVENTURE_IDENTITY_ACTION_COUNT
     mask[ADVENTURE_IDENTITY_WAIT_ACTION] = True
     for slot_index in range(slots):
-        start = 1 + slot_index * cells
-        for action in range(start, start + cells):
+        start = 1 + slot_index * CELLS_PER_SLOT
+        for action in range(start, start + CELLS_PER_SLOT):
             mask[action] = True
     return mask

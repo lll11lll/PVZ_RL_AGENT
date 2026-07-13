@@ -1,8 +1,8 @@
 """Phase 3 compatibility contracts for the shared action/fusion pipeline.
 
 The assertions in this file intentionally use independent, exhaustive oracles
-where practical.  They protect the externally visible 201/701 action layouts,
-the complete mask (not a sampling of actions), fusion recipe/compatibility
+where practical.  They protect the sole maintained 701-action Generalist
+layout, the complete mask (not a sampling of actions), fusion recipe/compatibility
 semantics, rejection precedence, and one-event/one-count accounting while the
 runtime paths are consolidated.
 """
@@ -10,9 +10,7 @@ runtime paths are consolidated.
 from __future__ import annotations
 
 import copy
-from contextlib import redirect_stdout
 from dataclasses import replace
-from io import StringIO
 from itertools import product
 
 import numpy as np
@@ -21,14 +19,9 @@ import pvzrl_env
 
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
-    ACTION_SPACE_DYNAMIC_14,
-    ACTION_SPACE_FIXED,
     ADVENTURE_IDENTITY_ACTION_COUNT,
-    DYNAMIC_ACTION_COUNT,
     build_action_space_spec,
     decode_policy_action,
-    legacy_action_to_policy_action,
-    policy_action_to_legacy_action,
 )
 from pvzrl_actions import (
     ACTION_KIND_FUSION,
@@ -71,9 +64,7 @@ from pvzrl_fusion import (
     validate_fusion_intent,
 )
 from pvzrl_env import BridgeTimeoutError, PvZEnvConfig, PvZGymEnv
-from pvzrl_human_coach import parse_coach_command, validate_coach_command_for_env
-from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
-from test_refactor_support import STARTER_NAMES, STARTER_TYPES, load_observation_fixture, make_wrapper
+from test_refactor_support import STARTER_TYPES, load_observation_fixture, make_wrapper
 
 
 ROWS = 5
@@ -81,33 +72,19 @@ COLS = 10
 CELLS = ROWS * COLS
 
 
-def _expected_decode(action: int, *, mode: str) -> tuple[int, int, int, int]:
+def _expected_decode(action: int) -> tuple[int, int, int, int]:
     """Independent policy-action decoder oracle: kind, slot, row, column."""
 
-    if mode == ACTION_SPACE_DYNAMIC_14:
-        if action == 700:
-            return 0, -1, -1, -1
-        encoded = action
-    else:
-        if action == 0:
-            return 0, -1, -1, -1
-        encoded = action - 1
+    if action == 0:
+        return 0, -1, -1, -1
+    encoded = action - 1
     return 1, encoded // CELLS, (encoded % CELLS) // COLS, encoded % COLS
 
 
-@pytest.mark.parametrize(
-    ("mode", "slots", "action_count"),
-    (
-        (ACTION_SPACE_FIXED, 4, 201),
-        (ACTION_SPACE_DYNAMIC_14, 14, DYNAMIC_ACTION_COUNT),
-        (ACTION_SPACE_ADVENTURE_14_IDENTITY, 14, ADVENTURE_IDENTITY_ACTION_COUNT),
-    ),
-)
-def test_every_policy_action_round_trips_and_decodes_exactly(
-    mode: str,
-    slots: int,
-    action_count: int,
-) -> None:
+def test_every_generalist_policy_action_decodes_with_direct_bridge_identity() -> None:
+    mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
+    slots = 14
+    action_count = ADVENTURE_IDENTITY_ACTION_COUNT
     spec = build_action_space_spec(
         mode=mode,
         plant_types=list(STARTER_TYPES),
@@ -117,13 +94,6 @@ def test_every_policy_action_round_trips_and_decodes_exactly(
     )
     assert spec.action_count == action_count
     for policy_action in range(action_count):
-        legacy_action = policy_action_to_legacy_action(
-            policy_action,
-            mode=mode,
-            rows=ROWS,
-            cols=COLS,
-        )
-        assert legacy_action_to_policy_action(legacy_action, mode=mode) == policy_action
         decoded = decode_policy_action(
             policy_action,
             mode=mode,
@@ -132,10 +102,7 @@ def test_every_policy_action_round_trips_and_decodes_exactly(
             rows=ROWS,
             cols=COLS,
         )
-        expected_kind, expected_slot, expected_row, expected_column = _expected_decode(
-            policy_action,
-            mode=mode,
-        )
+        expected_kind, expected_slot, expected_row, expected_column = _expected_decode(policy_action)
         assert (
             decoded["kind"],
             decoded["slot_index"],
@@ -152,8 +119,8 @@ def _occupied_by_cell(observation: dict) -> dict[tuple[int, int], int]:
     }
 
 
-def _expected_legacy_mask(observation: dict, *, fusion_enabled: bool) -> list[bool]:
-    """Independent oracle for the complete legacy wait-plus-slot mask."""
+def _expected_generalist_mask(observation: dict, *, fusion_enabled: bool) -> list[bool]:
+    """Independent oracle for the complete Generalist wait-plus-slot mask."""
 
     rows = int(observation["rowCount"])
     cols = int(observation["columnCount"])
@@ -195,51 +162,24 @@ def _expected_legacy_mask(observation: dict, *, fusion_enabled: bool) -> list[bo
     return expected
 
 
-def _dynamic_wrapper() -> PvZMaskedPPOEnv:
-    config = PvZSB3Config(
-        plant_types=list(STARTER_TYPES),
-        seed_list=list(STARTER_NAMES),
-        action_space_mode=ACTION_SPACE_DYNAMIC_14,
-        max_seed_slots=14,
-        fusion_action_mask_enabled=True,
-    )
-    with redirect_stdout(StringIO()):
-        return PvZMaskedPPOEnv(config)
-
-
-def test_complete_701_entry_masks_match_independent_oracle_in_both_layouts() -> None:
+def test_complete_generalist_mask_matches_independent_oracle() -> None:
     observation = load_observation_fixture()
     observation["actionCount"] = 701
-    legacy_expected = _expected_legacy_mask(observation, fusion_enabled=True)
+    expected = _expected_generalist_mask(observation, fusion_enabled=True)
 
-    identity = make_wrapper(identity=True, fusion_enabled=True)
-    dynamic = _dynamic_wrapper()
+    identity = make_wrapper(fusion_enabled=True)
     try:
         identity._last_observation = copy.deepcopy(observation)
-        dynamic._last_observation = copy.deepcopy(observation)
         identity_mask = identity.action_masks()
-        dynamic_mask = dynamic.action_masks()
         assert identity_mask.shape == (701,)
-        assert dynamic_mask.shape == (701,)
-        assert identity_mask.tolist() == legacy_expected
+        assert identity_mask.tolist() == expected
 
-        expected_dynamic = [False] * 701
-        expected_dynamic[700] = legacy_expected[0]
-        for legacy_action in range(1, 701):
-            expected_dynamic[legacy_action - 1] = legacy_expected[legacy_action]
-        assert dynamic_mask.tolist() == expected_dynamic
-
-        # Every policy-visible mask bit must agree with the policy/legacy index
-        # adapter, not merely have the same number of enabled entries.
+        # Every policy-visible mask bit must agree with the bridge action
+        # identity, not merely have the same number of enabled entries.
         for policy_action in range(701):
-            legacy_action = policy_action_to_legacy_action(
-                policy_action,
-                mode=ACTION_SPACE_DYNAMIC_14,
-            )
-            assert bool(dynamic_mask[policy_action]) is bool(legacy_expected[legacy_action])
+            assert bool(identity_mask[policy_action]) is bool(expected[policy_action])
     finally:
         identity.close()
-        dynamic.close()
 
 
 def _validation_config(
@@ -264,11 +204,8 @@ def _validation_config(
     )
 
 
-@pytest.mark.parametrize(
-    "mode",
-    (ACTION_SPACE_DYNAMIC_14, ACTION_SPACE_ADVENTURE_14_IDENTITY),
-)
-def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask(mode: str) -> None:
+def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask() -> None:
+    mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
     observation = load_observation_fixture()
     observation["actionCount"] = 701
     bridge_actions = list(observation["legalActions"])
@@ -278,12 +215,8 @@ def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask(mode: s
         config=config,
         bridge_legal_actions=bridge_actions,
     )
-    expected_legacy = _expected_legacy_mask(observation, fusion_enabled=True)
-    expected_policy = [False] * 701
-    for policy_action in range(701):
-        legacy_action = policy_action_to_legacy_action(policy_action, mode=mode)
-        expected_policy[policy_action] = expected_legacy[legacy_action]
-    assert list(cache.mask) == expected_policy
+    expected_mask = _expected_generalist_mask(observation, fusion_enabled=True)
+    assert list(cache.mask) == expected_mask
     assert len(cache.decisions) == 701
 
     # Independently rebuild every intent and validate it against the same
@@ -310,144 +243,6 @@ def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask(mode: s
         assert cached.rejection_reason == direct.rejection_reason
         assert cached.resolved_action_kind == direct.resolved_action_kind
         assert cached.bridge_action == direct.bridge_action
-
-
-def test_nonstandard_board_dimensions_use_exact_rows_columns_and_cell_stride() -> None:
-    observation = {
-        "frameCount": 77,
-        "rowCount": 3,
-        "columnCount": 4,
-        "actionCount": 25,
-        "gameplayReady": True,
-        "boardFound": True,
-        "canReadBoard": True,
-        "seedSelectionActive": False,
-        "sun": 500,
-        "seedSlots": [
-            {
-                "slotIndex": 0,
-                "plantType": 0,
-                "usable": True,
-                "disabled": False,
-                "ready": True,
-                "seedCost": 100,
-                "currentCooldown": 0.0,
-                "fullCooldown": 7.5,
-            },
-            {
-                "slotIndex": 1,
-                "plantType": 1,
-                "usable": True,
-                "disabled": False,
-                "ready": True,
-                "seedCost": 50,
-                "currentCooldown": 0.0,
-                "fullCooldown": 7.5,
-            },
-        ],
-        "plants": [{"row": 1, "column": 2, "type": 0}],
-        "visiblePlants": [],
-        "legalActions": [0, 1, 4, 9, 13, 16, 21],
-    }
-    config = ActionValidationConfig(
-        action_space_mode=ACTION_SPACE_FIXED,
-        plant_types=(0, 1),
-        max_seed_slots=2,
-        rows=3,
-        cols=4,
-        fusion_action_mask_enabled=True,
-        fusion_compatible_pairs=frozenset({(0, 0), (0, 1)}),
-        compatibility_version="nonstandard_board_v1",
-    )
-    assert config.spec.action_count == 25
-    cache = build_action_decision_cache(
-        observation,
-        config=config,
-        bridge_legal_actions=observation["legalActions"],
-    )
-    assert len(cache.decisions) == 25
-    for action in range(25):
-        intent = cache.decisions[action].intent
-        if action == 0:
-            assert (intent.action_kind, intent.seed_slot, intent.row, intent.column) == (
-                "wait",
-                -1,
-                -1,
-                -1,
-            )
-            continue
-        encoded = action - 1
-        assert (intent.seed_slot, intent.row, intent.column) == (
-            encoded // 12,
-            (encoded % 12) // 4,
-            encoded % 4,
-        )
-    occupied_action = 1 + (1 * 4 + 2)
-    assert occupied_action == 7
-    assert cache.decisions[occupied_action].legal
-    assert cache.decisions[occupied_action].resolved_action_kind == ACTION_KIND_FUSION
-    assert cache.decisions[occupied_action].existing_plant_type == 0
-
-
-@pytest.mark.parametrize("observed_action_count", (10, 30))
-def test_observation_action_count_mismatch_is_bounded_and_never_exposes_extra_actions(
-    observed_action_count: int,
-) -> None:
-    observation = {
-        "frameCount": 78,
-        "rowCount": 3,
-        "columnCount": 4,
-        "actionCount": observed_action_count,
-        "gameplayReady": True,
-        "boardFound": True,
-        "canReadBoard": True,
-        "seedSelectionActive": False,
-        "sun": 500,
-        "seedSlots": [
-            {
-                "slotIndex": 0,
-                "plantType": 0,
-                "usable": True,
-                "disabled": False,
-                "ready": True,
-                "seedCost": 100,
-            },
-            {
-                "slotIndex": 1,
-                "plantType": 1,
-                "usable": True,
-                "disabled": False,
-                "ready": True,
-                "seedCost": 50,
-            },
-        ],
-        "plants": [],
-        "visiblePlants": [],
-        "legalActions": list(range(25)),
-    }
-    config = ActionValidationConfig(
-        action_space_mode=ACTION_SPACE_FIXED,
-        plant_types=(0, 1),
-        max_seed_slots=2,
-        rows=3,
-        cols=4,
-    )
-    assert config.spec.action_count == 25
-    cache = build_action_decision_cache(
-        observation,
-        config=config,
-        bridge_legal_actions=observation["legalActions"],
-    )
-    assert len(cache.decisions) == observed_action_count
-    assert len(cache.mask) == observed_action_count
-    assert cache.context.action_count == observed_action_count
-    if observed_action_count < config.spec.action_count:
-        assert all(cache.decisions[action].legal for action in range(observed_action_count))
-    else:
-        assert all(cache.decisions[action].legal for action in range(config.spec.action_count))
-        for action in range(config.spec.action_count, observed_action_count):
-            assert not cache.decisions[action].legal
-            assert cache.decisions[action].rejection_reason == "invalid_action_decode"
 
 
 def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> None:
@@ -489,7 +284,6 @@ def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> N
             decision.legal,
             decision.rejection_reason,
             decision.policy_action,
-            decision.legacy_action,
             decision.bridge_action,
             decision.resolved_action_kind,
             decision.selected_plant_type,
@@ -503,7 +297,6 @@ def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> N
     assert set(intent_payload) == {
         "source",
         "policy_action",
-        "legacy_action",
         "bridge_action",
         "action_kind",
         "seed_slot",
@@ -518,7 +311,6 @@ def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> N
         "intent",
         "source",
         "policy_action",
-        "legacy_action",
         "bridge_action",
         "action_kind",
         "legal",
@@ -654,7 +446,7 @@ def test_action_cache_key_reuses_only_a_demonstrably_identical_frame_and_config(
 
 
 def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_change() -> None:
-    wrapper = make_wrapper(identity=True, fusion_enabled=True)
+    wrapper = make_wrapper(fusion_enabled=True)
     try:
         base = wrapper.base
         observation = load_observation_fixture()
@@ -707,27 +499,27 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
 
 
 def test_environment_execution_safeguard_matches_all_701_cached_mask_bits() -> None:
-    wrapper = make_wrapper(identity=True, fusion_enabled=True)
+    wrapper = make_wrapper(fusion_enabled=True)
     try:
         observation = load_observation_fixture()
         observation["actionCount"] = 701
         mask = wrapper.base.action_mask(observation)
         assert len(mask) == 701
-        for legacy_action, allowed in enumerate(mask):
+        for action, allowed in enumerate(mask):
             decision = wrapper.base.action_decision(
-                legacy_action,
+                action,
                 observation,
                 source="execution_contract",
             )
-            assert decision.bridge_action == legacy_action
-            assert decision.legacy_action == legacy_action
+            assert decision.policy_action == action
+            assert decision.bridge_action == action
             assert decision.legal is bool(allowed)
             assert decision.cache_reused
     finally:
         wrapper.close()
 
 
-def test_environment_execution_preserves_legacy_result_and_adds_structured_source_contract() -> None:
+def test_environment_execution_preserves_bridge_result_and_adds_structured_source_contract() -> None:
     class FakeClient:
         def __init__(self, next_observation: dict) -> None:
             self.next_observation = next_observation
@@ -752,7 +544,7 @@ def test_environment_execution_preserves_legacy_result_and_adds_structured_sourc
         def close(self) -> None:
             return None
 
-    wrapper = make_wrapper(identity=True, fusion_enabled=True)
+    wrapper = make_wrapper(fusion_enabled=True)
     base = wrapper.base
     observation = load_observation_fixture()
     observation["actionCount"] = 701
@@ -806,7 +598,7 @@ def test_terminal_and_timeout_results_keep_the_structured_action_contract() -> N
         def close(self) -> None:
             return None
 
-    wrapper = make_wrapper(identity=True, fusion_enabled=True)
+    wrapper = make_wrapper(fusion_enabled=True)
     base = wrapper.base
     base.config.step_seconds = 0.0
     base.config.seed_screen_check_interval = 10_000
@@ -850,54 +642,6 @@ def test_terminal_and_timeout_results_keep_the_structured_action_contract() -> N
         assert timeout_result["actionIntent"]["source"] == "random"
         assert timeout_result["structuredActionResult"]["executed"] is True
         assert timeout_result["structuredActionResult"]["bridge_accepted"] is None
-    finally:
-        wrapper.close()
-
-
-def test_dynamic_coach_adapter_preserves_policy_and_legacy_action_identities() -> None:
-    observation = load_observation_fixture()
-    observation["actionCount"] = 701
-    wrapper = _dynamic_wrapper()
-    try:
-        wrapper._last_observation = copy.deepcopy(observation)
-        wrapper.base.previous_observation = copy.deepcopy(observation)
-        action_mask = wrapper.action_masks()
-
-        # Legacy bridge action 2 is dynamic policy action 1.  Passing policy 1
-        # directly into the base cache would incorrectly validate bridge action
-        # 1 and reject this command.
-        plant = validate_coach_command_for_env(
-            parse_coach_command("plant 0 0 1", source="gui"),
-            wrapper,
-            observation=observation,
-            action_mask=action_mask,
-        )
-        assert plant.legal
-        assert plant.policy_action == 1
-        assert plant.decoded["slot_index"] == 0
-        assert plant.decoded["row"] == 0
-        assert plant.decoded["column"] == 1
-
-        # Dynamic wait 700 must resolve to legacy bridge wait 0 rather than the
-        # last legacy placement identity.
-        wait = validate_coach_command_for_env(
-            parse_coach_command("wait", source="stream"),
-            wrapper,
-            observation=observation,
-            action_mask=action_mask,
-        )
-        assert wait.legal
-        assert wait.policy_action == 700
-        assert wait.decoded["kind"] == 0
-
-        occupied_plant = validate_coach_command_for_env(
-            parse_coach_command("plant 2 2 3", source="gui"),
-            wrapper,
-            observation=observation,
-            action_mask=action_mask,
-        )
-        assert not occupied_plant.legal
-        assert occupied_plant.rejected_reason == "occupied_cell"
     finally:
         wrapper.close()
 
@@ -993,7 +737,7 @@ def test_live_fusion_probe_empty_or_unrelated_board_requires_peashooter_setup() 
     assert count == 1
 
 
-def test_recipe_registry_is_immutable_directional_and_derives_legacy_views() -> None:
+def test_recipe_registry_is_immutable_directional_and_derives_mapping_views() -> None:
     assert isinstance(FUSION_RECIPES, tuple)
     assert tuple(recipe.pair for recipe in FUSION_RECIPES) == tuple(FUSION_RECIPES_BY_PAIR)
     assert {
@@ -1008,11 +752,11 @@ def test_recipe_registry_is_immutable_directional_and_derives_legacy_views() -> 
     for pair, recipe in FUSION_RECIPES_BY_PAIR.items():
         assert fusion_recipe(*pair) is recipe
         assert fusion_compatibility_kind(*pair) == "recipe"
-        legacy = FUSION_RULES[pair]
-        assert legacy["predicted_result_type"] == recipe.result_plant_type
-        assert legacy["predicted_result_name"] == recipe.result_plant_name
-        assert legacy["scripted_enabled"] is recipe.scripted_enabled
-        assert set(legacy) == {
+        rule_view = FUSION_RULES[pair]
+        assert rule_view["predicted_result_type"] == recipe.result_plant_type
+        assert rule_view["predicted_result_name"] == recipe.result_plant_name
+        assert rule_view["scripted_enabled"] is recipe.scripted_enabled
+        assert set(rule_view) == {
             "predicted_result_name",
             "predicted_result_type",
             "reason",

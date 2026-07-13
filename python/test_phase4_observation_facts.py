@@ -35,7 +35,7 @@ def _observation() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
-def _legacy_occupancy(observation: dict) -> tuple[tuple[int, int, int], ...]:
+def _expected_occupancy(observation: dict) -> tuple[tuple[int, int, int], ...]:
     occupied: dict[tuple[int, int], int] = {}
     for key in ("plants", "visiblePlants"):
         values = observation.get(key, [])
@@ -111,7 +111,7 @@ def test_primary_counts_and_visible_fallback_occupancy_are_separate() -> None:
     assert facts.occupant_by_cell[(1, 1)].plant_type == 5
     assert (1, 2) not in facts.occupied_cells and (1, 3) not in facts.occupied_cells
     assert facts.safety.duplicate_primary_cells == ((0, 0),)
-    assert facts.occupancy == _legacy_occupancy(observation)
+    assert facts.occupancy == _expected_occupancy(observation)
 
     col_alias = {"plants": [{"row": 2, "col": 3, "type": 8}]}
     alias_facts = build_step_facts(col_alias)
@@ -211,12 +211,12 @@ def test_identity_changes_for_nested_content_even_when_frame_is_unchanged() -> N
     assert before.content_digest != after.content_digest
 
 
-def test_action_context_reuses_snapshot_and_matches_legacy_views() -> None:
+def test_generalist_action_context_reuses_snapshot_and_matches_fact_views() -> None:
     observation = _observation()
     fallback = (1, 1, 0, 0)
     facts = build_step_facts(observation, fallback)
     config = ActionValidationConfig(
-        action_space_mode="fixed",
+        action_space_mode="adventure_14slot_identity",
         plant_types=fallback,
         max_seed_slots=14,
         rows=5,
@@ -229,8 +229,9 @@ def test_action_context_reuses_snapshot_and_matches_legacy_views() -> None:
         facts=facts,
     )
     assert context.facts is facts
+    assert context.action_count == 701
     assert context.seed_slots is facts.seed_slots
-    assert context.occupancy == _legacy_occupancy(observation)
+    assert context.occupancy == _expected_occupancy(observation)
 
 
 def test_fusion_helpers_accept_one_snapshot_with_byte_equivalent_results() -> None:
@@ -268,7 +269,7 @@ def test_fusion_validation_with_facts_never_rebuilds_snapshot(monkeypatch: pytes
     validate_fusion_intent(intent, observation, facts=facts)
 
 
-def test_localized_tough_zombie_names_match_legacy_and_fact_paths() -> None:
+def test_localized_tough_zombie_names_match_raw_and_fact_paths() -> None:
     observation = {
         "rowCount": 2,
         "columnCount": 10,
@@ -294,11 +295,11 @@ def test_tactical_mask_hashes_observation_once_at_owner_boundary(
         "frameCount": 11,
         "rowCount": 5,
         "columnCount": 10,
-        "actionCount": 201,
+        "actionCount": 701,
         "gameplayReady": True,
         "boardFound": True,
         "sun": 500,
-        "legalActions": list(range(201)),
+        "legalActions": list(range(701)),
         "seedSlots": [
             {
                 "slotIndex": index,
@@ -339,7 +340,7 @@ def test_tactical_mask_hashes_observation_once_at_owner_boundary(
     )
     try:
         mask = env.action_mask(observation)
-        assert len(mask) == 201
+        assert len(mask) == 701
         assert calls == 1
         monkeypatch.setattr(
             pvzrl_actions.ActionDecisionCache,
@@ -384,7 +385,7 @@ def test_malformed_entries_and_explicit_slot_index_fallback_are_stable() -> None
     assert facts.mower.active_rows == frozenset({0, 3})
 
 
-def test_fusion_legacy_defaults_survive_typed_plant_and_zombie_facts() -> None:
+def test_fusion_fallback_defaults_survive_typed_plant_and_zombie_facts() -> None:
     observation = {
         "rowCount": 5,
         "columnCount": 10,

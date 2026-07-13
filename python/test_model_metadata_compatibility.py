@@ -1,9 +1,4 @@
-"""Lightweight compatibility checks for PvZRL model metadata.
-
-This test intentionally avoids loading PPO weights or starting the game. It
-creates temporary run folders with model_metadata.json and validates the safety
-rules that prevent same-action-count seed-slot drift.
-"""
+"""Bridge-free compatibility checks for Adventure Generalist metadata."""
 
 from __future__ import annotations
 
@@ -20,28 +15,23 @@ from pvzrl_model_metadata import (
 )
 
 
-CONSERVATIVE_SEEDS = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
-CONSERVATIVE_PLANT_TYPES = [1, 1, 0, 0]
-EXPANDED_SEEDS = ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
-EXPANDED_PLANT_TYPES = [1, 0, 3, 2]
+MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
+INITIAL_SEEDS = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
+INITIAL_PLANT_TYPES = [1, 1, 0, 0]
 
 
-def model_family(seed_list: List[str]) -> str:
-    unique_parts: List[str] = []
-    for seed in seed_list:
-        part = "".join(ch.lower() if ch.isalnum() else "_" for ch in seed).strip("_")
-        if part not in unique_parts:
-            unique_parts.append(part)
-    return f"ppo_{len(seed_list)}slot_{'_'.join(unique_parts)}"
-
-
-def config(seed_list: List[str], plant_types: List[int]) -> Dict[str, Any]:
+def config(
+    seed_list: List[str] = INITIAL_SEEDS,
+    plant_types: List[int] = INITIAL_PLANT_TYPES,
+    *,
+    model_family: str = MODEL_FAMILY,
+) -> Dict[str, Any]:
     return {
-        "model_family": model_family(seed_list),
+        "model_family": model_family,
         "seed_list": list(seed_list),
         "plant_types": list(plant_types),
-        "action_space_mode": "fixed",
-        "max_seed_slots": len(seed_list),
+        "action_space_mode": "adventure_14slot_identity",
+        "max_seed_slots": 14,
         "row_count": 5,
         "column_count": 10,
         "total_timesteps": 123,
@@ -54,12 +44,25 @@ def fake_model(run_root: Path, name: str, metadata_config: Optional[Dict[str, An
     model_path = run_dir / "model.zip"
     model_path.write_bytes(b"fake ppo zip placeholder")
     if metadata_config is not None:
-        write_model_metadata(run_dir, metadata_config, model_path=model_path, config_path=run_dir / "resolved_config.json")
+        write_model_metadata(
+            run_dir,
+            metadata_config,
+            model_path=model_path,
+            config_path=run_dir / "resolved_config.json",
+        )
     return model_path
 
 
-def assert_case(name: str, actual_ok: bool, actual_reason: Optional[str], expected_ok: bool, expected_reason: Optional[str]) -> Dict[str, Any]:
-    passed = actual_ok == expected_ok and (expected_reason is None or actual_reason == expected_reason)
+def assert_case(
+    name: str,
+    actual_ok: bool,
+    actual_reason: Optional[str],
+    expected_ok: bool,
+    expected_reason: Optional[str],
+) -> Dict[str, Any]:
+    passed = actual_ok == expected_ok and (
+        expected_reason is None or actual_reason == expected_reason
+    )
     return {
         "case": name,
         "passed": passed,
@@ -71,71 +74,107 @@ def assert_case(name: str, actual_ok: bool, actual_reason: Optional[str], expect
 
 
 def main() -> int:
-    conservative_config = config(CONSERVATIVE_SEEDS, CONSERVATIVE_PLANT_TYPES)
-    expanded_config = config(EXPANDED_SEEDS, EXPANDED_PLANT_TYPES)
+    initial_config = config()
+    # Seed inventory may grow/change across Adventure progression without
+    # changing identity-slot action meanings.
+    progressed_config = config(
+        ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
+        [1, 0, 3, 2],
+    )
+    wrong_family_config = config(model_family="obsolete-specialist")
     results: List[Dict[str, Any]] = []
-    examples: Dict[str, Any] = {}
 
     with tempfile.TemporaryDirectory(prefix="pvzrl_metadata_test_") as temp_dir:
         root = Path(temp_dir)
-        conservative_model = fake_model(root, "conservative", conservative_config)
-        expanded_model = fake_model(root, "expanded", expanded_config)
+        generalist_model = fake_model(root, "generalist", initial_config)
         missing_model = fake_model(root, "missing_metadata", None)
 
         checks = [
             (
-                "A conservative model + conservative seed list passes",
-                validate_model_metadata(conservative_model, conservative_config, model_action_count=201),
+                "A Generalist model and canonical contract pass",
+                validate_model_metadata(
+                    generalist_model,
+                    initial_config,
+                    model_action_count=701,
+                    model_observation_shape=(4297,),
+                ),
                 True,
                 None,
             ),
             (
-                "B conservative model + expanded seed list fails",
-                validate_model_metadata(conservative_model, expanded_config, model_action_count=201),
-                False,
-                "seed_list_mismatch",
-            ),
-            (
-                "C expanded model + expanded seed list passes",
-                validate_model_metadata(expanded_model, expanded_config, model_action_count=201),
+                "B progression loadout changes preserve identity compatibility",
+                validate_model_metadata(
+                    generalist_model,
+                    progressed_config,
+                    model_action_count=701,
+                    model_observation_shape=(4297,),
+                ),
                 True,
                 None,
             ),
             (
-                "D expanded model + conservative seed list fails",
-                validate_model_metadata(expanded_model, conservative_config, model_action_count=201),
+                "C obsolete model family fails",
+                validate_model_metadata(
+                    generalist_model,
+                    wrong_family_config,
+                    model_action_count=701,
+                    model_observation_shape=(4297,),
+                ),
                 False,
-                "seed_list_mismatch",
+                "model_family_mismatch",
             ),
             (
-                "E missing metadata fails cleanly",
-                validate_model_metadata(missing_model, conservative_config, model_action_count=201),
+                "D missing canonical metadata fails",
+                validate_model_metadata(
+                    missing_model,
+                    initial_config,
+                    model_action_count=701,
+                    model_observation_shape=(4297,),
+                ),
                 False,
                 "missing_model_metadata",
             ),
             (
-                "F action_count mismatch fails cleanly",
-                validate_model_metadata(expanded_model, expanded_config, model_action_count=202),
+                "E loaded action count mismatch fails",
+                validate_model_metadata(
+                    generalist_model,
+                    initial_config,
+                    model_action_count=700,
+                    model_observation_shape=(4297,),
+                ),
                 False,
                 "action_count_mismatch",
             ),
         ]
 
         for name, report, expected_ok, expected_reason in checks:
-            results.append(assert_case(name, report.ok, report.blocked_reason, expected_ok, expected_reason))
+            results.append(
+                assert_case(
+                    name,
+                    report.ok,
+                    report.blocked_reason,
+                    expected_ok,
+                    expected_reason,
+                )
+            )
 
         pass_report = checks[0][1]
-        failure_report = checks[1][1]
+        family_failure = checks[2][1]
         live_status = model_compatibility_live_status(pass_report)
         results.append(
             assert_case(
-                "G live_status model_compatibility includes core fields",
+                "F live status exposes the exact Generalist contract",
                 bool(
                     live_status.get("compatible") is True
-                    and live_status.get("model_seed_list") == CONSERVATIVE_SEEDS
-                    and live_status.get("env_seed_list") == CONSERVATIVE_SEEDS
-                    and live_status.get("model_action_count") == 201
-                    and live_status.get("env_action_count") == 201
+                    and live_status.get("model_action_count") == 701
+                    and live_status.get("env_action_count") == 701
+                    and live_status.get("action_space_mode") == "adventure_14slot_identity"
+                    and live_status.get("action_decoder_version")
+                    == "seedslot14x50_plus_wait_v1"
+                    and live_status.get("observation_version")
+                    == "adventure_14slot_identity_v1"
+                    and live_status.get("model_observation_shape") == [4297]
+                    and live_status.get("env_observation_shape") == [4297]
                 ),
                 None,
                 True,
@@ -143,11 +182,15 @@ def main() -> int:
             )
         )
         examples = {
-            "compatibility_pass": model_compatibility_live_status(pass_report),
-            "compatibility_failure_text": format_compatibility_failure(failure_report),
+            "compatibility_pass": live_status,
+            "compatibility_failure_text": format_compatibility_failure(family_failure),
         }
 
-    payload = {"ok": all(result["passed"] for result in results), "results": results, "examples": examples}
+    payload = {
+        "ok": all(result["passed"] for result in results),
+        "results": results,
+        "examples": examples,
+    }
     print(json.dumps(payload, indent=2))
     return 0 if payload["ok"] else 1
 

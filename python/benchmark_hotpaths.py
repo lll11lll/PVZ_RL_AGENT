@@ -162,23 +162,19 @@ class _BenchmarkText:
 
 
 def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
-    fixed = make_wrapper(identity=False, fusion_enabled=True)
-    identity = make_wrapper(identity=True, fusion_enabled=True)
-    identity_low_sun_wrapper = make_wrapper(identity=True, fusion_enabled=True)
-    identity_cooldown_wrapper = make_wrapper(identity=True, fusion_enabled=True)
-    identity_no_fusion = make_wrapper(identity=True, fusion_enabled=False)
+    identity = make_wrapper(fusion_enabled=True)
+    identity_low_sun_wrapper = make_wrapper(fusion_enabled=True)
+    identity_cooldown_wrapper = make_wrapper(fusion_enabled=True)
+    identity_no_fusion = make_wrapper(fusion_enabled=False)
     gui_default_generalist = make_wrapper(
-        identity=True,
         fusion_enabled=True,
         tactical_masks=True,
         wallnut_tactical_mask=True,
         cherrybomb_tactical_mask=True,
     )
-    fixed_dense = dense_observation(slot_count=4)
     identity_dense = dense_observation(slot_count=14)
     identity_low_sun = low_sun_variant(identity_dense)
     identity_cooldown = cooldown_variant(identity_dense)
-    fixed._adopt_observation(fixed_dense, source="benchmark_fixed_dense")
     identity._adopt_observation(identity_dense, source="benchmark_identity_dense")
     identity_low_sun_wrapper._adopt_observation(
         identity_low_sun,
@@ -197,7 +193,6 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         source="benchmark_gui_default_generalist",
     )
 
-    sparse_fixed = observation_for_wrapper(fixed)
     sparse_identity = observation_for_wrapper(identity)
     reward_previous = copy.deepcopy(identity_dense)
     reward_current = copy.deepcopy(identity_dense)
@@ -209,7 +204,6 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         for slot in identity_dense.get("seedSlots", [])
         if isinstance(slot, dict)
     )
-    sparse_fixed_facts = build_step_facts(sparse_fixed, fixed.config.plant_types)
     sparse_identity_facts = build_step_facts(sparse_identity, identity.config.plant_types)
     reward_previous_facts = build_step_facts(reward_previous, identity.config.plant_types)
     reward_current_facts = build_step_facts(reward_current, identity.config.plant_types)
@@ -218,7 +212,6 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
 
     results: Dict[str, Any] = {}
     try:
-        results["action_mask_fixed_dense"] = measure(fixed.action_masks, samples=samples, rounds=rounds)
         results["action_mask_identity_dense"] = measure(identity.action_masks, samples=samples, rounds=rounds)
 
         results["action_mask_identity_low_sun"] = measure(
@@ -252,11 +245,6 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
         gui_default_generalist.action_masks()
         results["mask_diagnostics_gui_default_generalist_dense"] = measure(
             lambda: gui_default_generalist.base.mask_diagnostics(identity_dense),
-            samples=samples,
-            rounds=rounds,
-        )
-        results["observation_encode_fixed_sparse"] = measure(
-            lambda: fixed._encode_observation(sparse_fixed, facts=sparse_fixed_facts),
             samples=samples,
             rounds=rounds,
         )
@@ -523,7 +511,7 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
                     "filesystem results depend on Windows cache and device state",
                 ],
                 "gui_default_generalist_configuration": {
-                    "action_space_mode": "adventure_14_identity",
+                    "action_space_mode": "adventure_14slot_identity",
                     "fusion_action_mask_enabled": True,
                     "tactical_masks": True,
                     "wallnut_tactical_mask": True,
@@ -562,7 +550,6 @@ def run_benchmarks(*, samples: int, rounds: int) -> Dict[str, Any]:
             "results": results,
         }
     finally:
-        fixed.close()
         identity.close()
         identity_low_sun_wrapper.close()
         identity_cooldown_wrapper.close()

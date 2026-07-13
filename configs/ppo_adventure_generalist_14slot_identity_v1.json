@@ -42,7 +42,6 @@
   "enable_action_watchdog": true,
   "action_timeout_seconds": 10.0,
   "save_freeze_debug_bundle": true,
-  "enable_fusion_diagnostics": true,
   "fusion_action_mask_enabled": true,
   "enable_board_plant_identity": true,
   "enable_fusion_chain_rewards": true,
@@ -60,7 +59,6 @@
   "later_plant_curriculum_prob": 0.10,
   "coach_fusion_prob": 0.10,
   "checkpoint_warm_start": false,
-  "checkpoint_warm_start_reason": "new_incompatible_architecture",
-  "scratch_initialization": true,
-  "incompatible_with_4slot_specialist": true
+  "checkpoint_warm_start_reason": "scratch_initialization",
+  "scratch_initialization": true
 }

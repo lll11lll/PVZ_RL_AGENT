@@ -46,10 +46,10 @@ class ProcessLogMixin:
             self._append_log(f"Selected run directory: {run_dir}\n")
             self.active_run_path = str(self._resolve_text_path(run_dir))
             self.active_run_var.set(f"Active run: {self.active_run_path}")
-        elif ("--adventure-eval" in command or "--adventure-generalist-eval" in command) and model_path:
+        elif "--adventure-generalist-eval" in command and model_path:
             self.active_run_path = str(self._resolve_text_path(model_path).parent)
             self.active_run_var.set(f"Active run: {self.active_run_path}")
-            self._append_log(f"Inferred Adventure run directory: {self.active_run_path}\n")
+            self._append_log(f"Inferred Adventure Generalist run directory: {self.active_run_path}\n")
         else:
             self.active_run_path = ""
             self.active_run_var.set("Active run: unknown")
