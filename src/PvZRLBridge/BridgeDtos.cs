@@ -549,7 +549,7 @@ internal sealed class SeedRuntimeSnapshot
             BlockingRewardUiActive = probe.BlockingRewardUiActive,
             ActiveGameplayCardBankCount = probe.ActiveGameplayCardBankCards.Count
         };
-        foreach (var pair in BridgeModVisibleHelpers.BuildTypeCountsForRuntime(probe.ActiveGameplayCardBankCards.Select(card => card.PlantType)))
+        foreach (var pair in BridgeMod.BuildTypeCounts(probe.ActiveGameplayCardBankCards.Select(card => card.PlantType)))
         {
             snapshot.ActiveGameplayTypeCounts[pair.Key] = pair.Value;
         }
@@ -624,21 +624,6 @@ internal sealed class SeedSlotCacheEntry
     public int SlotIndex { get; set; }
     public int CardInstanceId { get; set; }
     public CardUI? Card { get; set; }
-}
-
-internal static class BridgeModVisibleHelpers
-{
-    public static Dictionary<int, int> BuildTypeCountsForRuntime(IEnumerable<int> plantTypes)
-    {
-        var counts = new Dictionary<int, int>();
-        foreach (var plantType in plantTypes)
-        {
-            counts.TryGetValue(plantType, out var current);
-            counts[plantType] = current + 1;
-        }
-
-        return counts;
-    }
 }
 
 internal sealed class PlantTypeCountDto

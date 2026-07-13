@@ -1939,7 +1939,7 @@ public sealed partial class BridgeMod
         return true;
     }
 
-    private static Dictionary<int, int> BuildTypeCounts(IEnumerable<int> plantTypes)
+    internal static Dictionary<int, int> BuildTypeCounts(IEnumerable<int> plantTypes)
     {
         var counts = new Dictionary<int, int>();
         foreach (var plantType in plantTypes)
