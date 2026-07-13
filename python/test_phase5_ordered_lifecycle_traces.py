@@ -1,4 +1,4 @@
-"""Ordered transition evidence for the Phase 5 lifecycle shadow classifier."""
+"""Ordered transition evidence for the shared lifecycle classifier."""
 
 from __future__ import annotations
 

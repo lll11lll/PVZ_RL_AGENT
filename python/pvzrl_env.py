@@ -68,6 +68,26 @@ from pvzrl_diagnostics import (
     compose_environment_safety_diagnostics,
 )
 from pvzrl_lane_diagnostics import LaneDiagnosticsInput, compose_lane_diagnostics
+from pvzrl_lifecycle import (
+    LIFECYCLE_ACTIVE_GAMEPLAY,
+    LIFECYCLE_LOSS_PENDING,
+    LIFECYCLE_POST_WIN_PENDING,
+    LIFECYCLE_READY,
+    LIFECYCLE_RESETTING,
+    LIFECYCLE_UNKNOWN,
+    active_gameplay_progress,
+    cleanup_signal_active,
+    confirmed_active_gameplay,
+    confirmed_loss,
+    confirmed_post_win,
+    dirty_active_board,
+    fresh_playable_board,
+    legacy_done_reason,
+    legacy_lifecycle_state,
+    live_board_progress,
+    seed_selection_visible,
+    stale_cleanup_ui,
+)
 from pvzrl_runtime_state import ResetRuntimeState
 from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
@@ -96,13 +116,6 @@ LEVEL3_SPECIALIST_PLANT_TYPES = [1, 0, 3, 2]
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLANT_REGISTRY_PATH = DEFAULT_PLANT_REGISTRY_PATH
 LAWN_STRINGS_PATH = PROJECT_ROOT / "Game Files" / "Mods" / "PvZ_Fusion_Translator" / "Dumps" / "LawnStrings.json"
-LIFECYCLE_ACTIVE_GAMEPLAY = "active_gameplay"
-LIFECYCLE_POST_WIN_PENDING = "post_win_pending"
-LIFECYCLE_LOSS_PENDING = "loss_pending"
-LIFECYCLE_RESETTING = "resetting"
-LIFECYCLE_READY = "ready"
-LIFECYCLE_ENV_CORRUPTION = "env_corruption"
-LIFECYCLE_UNKNOWN = "unknown"
 RUN_MODE_FIXED_TRAIN = "fixed_train"
 RUN_MODE_FIXED_EVAL = "fixed_eval"
 RUN_MODE_ADVENTURE_EVAL = "adventure_eval"
@@ -2499,116 +2512,25 @@ class PvZGymEnv:
         )
 
     def _cleanup_signal_active(self, observation: Dict[str, Any]) -> bool:
-        screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-        return bool(
-            observation.get("nextStep") == "cleanup_reward_ui"
-            or observation.get("blockingRewardUiActive")
-            or screen_state in {"reward_unlock", "reward_screen", "level_complete_trophy"}
-        )
+        return cleanup_signal_active(observation)
 
     def _stale_cleanup_ui_after_reset(self, observation: Dict[str, Any]) -> bool:
-        if not self._cleanup_signal_active(observation):
-            return False
-        if bool(observation.get("done")) or bool(observation.get("over")):
-            return False
-        if self._seed_selection_visible(observation):
-            return False
-        if self._has_active_gameplay_progress(observation):
-            return False
-        return bool(observation.get("boardFound"))
+        return stale_cleanup_ui(observation)
 
     def _confirmed_post_win_ui(self, observation: Dict[str, Any]) -> bool:
-        screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-        terminal_hint = str(observation.get("terminalHint") or "")
-        explicit_post_win_ui = bool(
-            observation.get("trophyVisible")
-            or observation.get("levelCompleteTrophyVisible")
-            or observation.get("postWinClickRequired")
-            or observation.get("rewardObjectVisible")
-            or observation.get("rewardScreenVisible")
-            or observation.get("unlockScreenVisible")
-            or observation.get("newPlantUnlockedVisible")
-        )
-        derived_post_win_ui = bool(
-            observation.get("isRewardScreen")
-            or observation.get("isNewPlantUnlockedScreen")
-            or observation.get("levelCompleteScreenVisible")
-            or screen_state in {"level_complete_trophy", "reward_unlock", "reward_screen"}
-        )
-        if not (explicit_post_win_ui or derived_post_win_ui):
-            return False
-        if self._has_live_board_progress(observation):
-            return False
-        if not explicit_post_win_ui and terminal_hint == "running":
-            return False
-        return True
+        return confirmed_post_win(observation)
 
     def _confirmed_loss_ui(self, observation: Dict[str, Any]) -> bool:
-        if self._confirmed_post_win_ui(observation):
-            return False
-        screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-        return bool(
-            observation.get("gameOverRestartScreenVisible")
-            or observation.get("loseMenuVisible")
-            or observation.get("lossMenuActive")
-            or observation.get("gameOverTextVisible")
-            or observation.get("onGameOverScreen")
-            or observation.get("onLossScreen")
-            or (
-                (observation.get("restartButtonVisible") or observation.get("restartButtonActive") or observation.get("onRestartScreen"))
-                and not self._confirmed_post_win_ui(observation)
-                and bool(observation.get("gameOverTextVisible"))
-            )
-            or observation.get("nextStep") == "click_restart"
-            or (
-                screen_state in {"game_over", "game_over_restart_screen"}
-                and bool(
-                    observation.get("gameOverTextVisible")
-                    or observation.get("onGameOverScreen")
-                    or observation.get("onLossScreen")
-                    or observation.get("lossMenuActive")
-                    or observation.get("nextStep") == "click_restart"
-                )
-            )
-        )
+        return confirmed_loss(observation)
 
     def _seed_selection_visible(self, observation: Dict[str, Any]) -> bool:
-        screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-        return bool(
-            observation.get("seedSelectionScreenVisible")
-            or observation.get("isSeedSelectionScreen")
-            or observation.get("seedSelectionActive")
-            or observation.get("seedSelectionPanelActive")
-            or observation.get("onSeedSelectionScreen")
-            or screen_state == "seed_selection"
-        )
+        return seed_selection_visible(observation)
 
     def _confirmed_active_gameplay(self, observation: Dict[str, Any]) -> bool:
-        if not bool(observation.get("gameplayReady")):
-            return False
-        if bool(observation.get("done")) or bool(observation.get("over")):
-            return False
-        if self._seed_selection_visible(observation):
-            return False
-        return not (self._confirmed_post_win_ui(observation) or self._confirmed_loss_ui(observation))
+        return confirmed_active_gameplay(observation)
 
     def _has_live_board_progress(self, observation: Dict[str, Any]) -> bool:
-        if not bool(observation.get("boardFound")):
-            return False
-        if bool(observation.get("done")) or bool(observation.get("over")):
-            return False
-        if str(observation.get("terminalHint") or "") != "running":
-            return False
-        if bool(observation.get("seedSelectionActive")):
-            return False
-        return bool(
-            self._safe_int(observation.get("wave"), default=0) > 0
-            or self._safe_int(observation.get("plantCount"), default=0) > 0
-            or self._safe_int(observation.get("visiblePlantObjectCount"), default=0) > 0
-            or self._safe_int(observation.get("zombieCount"), default=0) > 0
-            or self._safe_int(observation.get("bulletCount"), default=0) > 0
-            or self._safe_int(observation.get("killCount"), default=0) > 0
-        )
+        return live_board_progress(observation)
 
     def _timeout_reset_requires_full_seed_flow(self, observation: Dict[str, Any]) -> bool:
         if not isinstance(observation, dict):
@@ -2646,127 +2568,24 @@ class PvZGymEnv:
         )
 
     def _is_fresh_playable_reset_board(self, observation: Dict[str, Any]) -> bool:
-        if not isinstance(observation, dict):
-            return False
-        if not bool(observation.get("gameplayReady")):
-            return False
-        if not bool(observation.get("actualGameplayReady", observation.get("gameplayReady"))):
-            return False
-        if bool(observation.get("done")) or bool(observation.get("over")):
-            return False
-        screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-        if screen_state and screen_state != "gameplay":
-            return False
-        if self._seed_selection_visible(observation):
-            return False
-        if bool(observation.get("seedSelectionPanelActive")):
-            return False
-        if bool(observation.get("isSeedSelectionScreen")):
-            return False
-        if bool(observation.get("blockingRewardUiActive")):
-            return False
-        if bool(observation.get("trophyVisible")):
-            return False
-        if bool(observation.get("levelCompleteTrophyVisible")):
-            return False
-        if bool(observation.get("postWinClickRequired")):
-            return False
-        if bool(observation.get("rewardScreenVisible")):
-            return False
-        if bool(observation.get("unlockScreenVisible")):
-            return False
-        if bool(observation.get("newPlantUnlockedVisible")):
-            return False
-        if bool(observation.get("onGameOverScreen")):
-            return False
-        if bool(observation.get("lossMenuActive")):
-            return False
-        if bool(observation.get("onRestartScreen")):
-            return False
-        if self._safe_int(observation.get("wave"), default=0) != 0:
-            return False
-        if self._safe_int(observation.get("killCount"), default=0) != 0:
-            return False
-        if self._safe_int(observation.get("plantCount"), default=0) != 0:
-            return False
-        if self._safe_int(observation.get("visiblePlantObjectCount"), default=0) != 0:
-            return False
-        if self._safe_int(observation.get("zombieCount"), default=0) != 0:
-            return False
-        if self._safe_int(observation.get("bulletCount"), default=0) != 0:
-            return False
-        expected_mowers = max(1, self._safe_int(observation.get("rowCount"), default=self.config.row_count))
-        logical_mowers = self._safe_int(observation.get("logicalMowerCount"), default=expected_mowers)
-        if logical_mowers != expected_mowers:
-            return False
-        if self._safe_int(observation.get("duplicateMowerRowCount"), default=0) != 0:
-            return False
-        seed_slot_count = self._safe_int(observation.get("seedSlotCount"), default=-1)
-        if seed_slot_count <= 0:
-            slots = observation.get("seedSlots", [])
-            if isinstance(slots, list):
-                seed_slot_count = len(slots)
-        if seed_slot_count <= 0:
-            return False
-        active_bank_count = self._safe_int(observation.get("activeGameplayCardBankCount"), default=0)
-        if active_bank_count <= 0:
-            _, active_total = active_gameplay_bank_state(observation)
-            active_bank_count = int(active_total)
-        if active_bank_count <= 0:
-            return False
-        legal_action_count = self._safe_int(observation.get("legalActionCount"), default=0)
-        if legal_action_count <= 0:
-            legal_actions = observation.get("legalActions", [])
-            if isinstance(legal_actions, list):
-                legal_action_count = len(legal_actions)
-        if legal_action_count <= 0:
-            return False
-        next_step = observation.get("nextStep") or observation.get("next_step")
-        if next_step not in (None, "", "play"):
-            if not (isinstance(next_step, str) and next_step.lower() == "play"):
-                return False
-        return True
+        return fresh_playable_board(
+            observation,
+            fallback_rows=self.config.row_count,
+        )
 
     def _is_dirty_active_gameplay_board(self, observation: Dict[str, Any]) -> bool:
-        if not (self._confirmed_active_gameplay(observation) or self._has_live_board_progress(observation)):
-            return False
-        if self._is_fresh_playable_reset_board(observation):
-            return False
-        wave = self._safe_int(observation.get("wave"), default=0)
-        expected_mowers = max(1, self._safe_int(observation.get("rowCount"), default=self.config.row_count))
-        logical_mowers = self._safe_int(observation.get("logicalMowerCount"), default=expected_mowers)
-        visible_mowers = self._safe_int(observation.get("visibleMowerObjectCount"), default=expected_mowers)
-        start_sun = self.config.start_sun if self.config.start_sun is not None else 500
-        sun = self._safe_int(observation.get("sun"), default=start_sun if start_sun is not None else 0)
-        sun_drift = start_sun is not None and wave > 0 and sun != start_sun
-        return any(
-            (
-                wave > 0,
-                self._safe_int(observation.get("killCount"), default=0) > 0,
-                self._safe_int(observation.get("plantCount"), default=0) > 0,
-                self._safe_int(observation.get("visiblePlantObjectCount"), default=0) > 0,
-                self._safe_int(observation.get("zombieCount"), default=0) > 0,
-                self._safe_int(observation.get("bulletCount"), default=0) > 0,
-                logical_mowers < expected_mowers,
-                visible_mowers < expected_mowers,
-                sun_drift,
-            )
+        return dirty_active_board(
+            observation,
+            fallback_rows=self.config.row_count,
+            start_sun=self.config.start_sun,
         )
 
     def _classify_lifecycle_state(self, observation: Dict[str, Any]) -> str:
-        if self._has_live_board_progress(observation):
-            return LIFECYCLE_ACTIVE_GAMEPLAY
-        if self._confirmed_post_win_ui(observation):
-            return LIFECYCLE_POST_WIN_PENDING
-        if self._confirmed_loss_ui(observation):
-            return LIFECYCLE_LOSS_PENDING
-        if self._confirmed_active_gameplay(observation):
-            if self._is_dirty_active_gameplay_board(observation):
-                return LIFECYCLE_ACTIVE_GAMEPLAY
-            return LIFECYCLE_READY
-        if self._seed_selection_visible(observation) or self._stale_cleanup_ui_after_reset(observation):
-            return LIFECYCLE_RESETTING
-        return LIFECYCLE_UNKNOWN
+        return legacy_lifecycle_state(
+            observation,
+            fallback_rows=self.config.row_count,
+            start_sun=self.config.start_sun,
+        )
 
     def _is_confirmed_post_game_ui(self, observation: Dict[str, Any]) -> bool:
         return self._confirmed_post_win_ui(observation) or self._confirmed_loss_ui(observation)
@@ -2786,25 +2605,7 @@ class PvZGymEnv:
         )
 
     def _has_active_gameplay_progress(self, observation: Dict[str, Any]) -> bool:
-        if bool(observation.get("gameplayReady")) or bool(observation.get("actualGameplayReady")):
-            return True
-        for key in (
-            "wave",
-            "killCount",
-            "plantCount",
-            "visiblePlantObjectCount",
-            "zombieCount",
-            "logicalZombieCount",
-            "sceneZombieObjectCount",
-            "bulletCount",
-            "logicalBulletCount",
-            "sceneBulletObjectCount",
-            "seedSlotCount",
-            "activeGameplayCardBankCount",
-        ):
-            if self._safe_int(observation.get(key), default=0) > 0:
-                return True
-        return False
+        return active_gameplay_progress(observation)
 
     def _suspicious_cleanup_signal_during_gameplay(self, observation: Dict[str, Any]) -> bool:
         if not self._cleanup_signal_active(observation):
@@ -6340,41 +6141,7 @@ def verify_teacher_action_legal(env: PvZGymEnv, observation: Dict[str, Any]) -> 
 
 def classify_done_reason(observation: Dict[str, Any]) -> str:
     """Map bridge terminal hints onto the small runner reason set."""
-    terminal_hint = str(observation.get("terminalHint", ""))
-    screen_state = str(observation.get("screenState") or observation.get("screen_state") or "")
-    live_board_progress = bool(
-        observation.get("boardFound")
-        and not bool(observation.get("done"))
-        and not bool(observation.get("over"))
-        and terminal_hint == "running"
-        and not bool(observation.get("seedSelectionActive"))
-        and (
-            int(observation.get("wave", 0) or 0) > 0
-            or int(observation.get("plantCount", 0) or 0) > 0
-            or int(observation.get("visiblePlantObjectCount", 0) or 0) > 0
-            or int(observation.get("zombieCount", 0) or 0) > 0
-            or int(observation.get("bulletCount", 0) or 0) > 0
-            or int(observation.get("killCount", 0) or 0) > 0
-        )
-    )
-    post_win_ui = bool(
-        observation.get("trophyVisible")
-        or observation.get("levelCompleteTrophyVisible")
-        or observation.get("postWinClickRequired")
-        or observation.get("rewardObjectVisible")
-        or observation.get("rewardScreenVisible")
-        or observation.get("unlockScreenVisible")
-        or observation.get("newPlantUnlockedVisible")
-        or observation.get("isRewardScreen")
-        or observation.get("isNewPlantUnlockedScreen")
-        or observation.get("levelCompleteScreenVisible")
-        or (screen_state in {"level_complete_trophy", "reward_unlock", "reward_screen"} and terminal_hint != "running")
-    )
-    if post_win_ui and not live_board_progress:
-        return "win"
-    if is_restart_screen_observation(observation):
-        return "loss"
-    return "none"
+    return legacy_done_reason(observation)
 
 
 def smoke_test(

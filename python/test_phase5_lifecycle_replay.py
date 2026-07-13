@@ -1,4 +1,4 @@
-"""Recorded trace and differential contracts for the Phase 5 shadow lifecycle."""
+"""Recorded trace and differential contracts for shared lifecycle authority."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def legacy_env() -> PvZGymEnv:
 
 
 @pytest.mark.parametrize("trace", _fixture()["traces"], ids=lambda trace: trace["name"])
-def test_shadow_lifecycle_replays_current_behavior(
+def test_lifecycle_authority_replays_captured_behavior(
     trace: dict[str, Any],
     legacy_env: PvZGymEnv,
 ) -> None:

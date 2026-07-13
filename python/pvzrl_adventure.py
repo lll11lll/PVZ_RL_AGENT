@@ -27,6 +27,12 @@ from pvzrl_env import (
 from pvzrl_rewards import REWARD_EPISODE_TOTAL_FIELDS
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields
 from pvzrl_human_coach import human_coach_live_status_from_hook
+from pvzrl_lifecycle import (
+    adventure_gameplay_ready_visible,
+    adventure_seed_selection_visible,
+    adventure_startup_visible,
+    screen_state as lifecycle_screen_state,
+)
 from pvzrl_model_router import ModelRouter
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_seed_inventory import inventory_from_runtime_sources
@@ -895,25 +901,15 @@ def _first_positive_int(state: Dict[str, Any], keys: Tuple[str, ...]) -> Optiona
 
 
 def adventure_screen_state_name(state: Dict[str, Any]) -> str:
-    return str(state.get("screenState") or state.get("screen_state") or "")
+    return lifecycle_screen_state(state)
 
 
 def adventure_seed_selection_detected(state: Dict[str, Any]) -> bool:
-    screen_state = adventure_screen_state_name(state)
-    return bool(
-        state.get("isSeedSelectionScreen")
-        or state.get("seedSelectionActive")
-        or state.get("seedSelectionPanelActive")
-        or screen_state == "seed_selection"
-    )
+    return adventure_seed_selection_visible(state)
 
 
 def adventure_gameplay_ready_detected(state: Dict[str, Any]) -> bool:
-    screen_state = adventure_screen_state_name(state)
-    return bool(
-        (state.get("isGameplayReady") or state.get("gameplayReady") or screen_state == "gameplay")
-        and not adventure_seed_selection_detected(state)
-    )
+    return adventure_gameplay_ready_visible(state)
 
 
 def adventure_bridge_detected_level(state: Dict[str, Any]) -> Optional[int]:
@@ -1102,8 +1098,7 @@ def replay_current_level_after_validation_win(
             return False, ""
         return True, f"same_level_replay_advanced_to_unexpected_level:{actual_level}!={expected_level_int}"
 
-    def screen_state_name(state: Dict[str, Any]) -> str:
-        return str(state.get("screenState") or state.get("screen_state") or "")
+    screen_state_name = adventure_screen_state_name
 
     def raw_level_text(state: Dict[str, Any]) -> str:
         raw_level = state.get("currentAdventureLevel")
@@ -1122,12 +1117,7 @@ def replay_current_level_after_validation_win(
             and not seed_selection_visible(state)
         )
 
-    def startup_popup_visible(state: Dict[str, Any]) -> bool:
-        return bool(
-            state.get("startupPopupVisible")
-            or state.get("startupOkButtonVisible")
-            or screen_state_name(state) == "startup_popup"
-        )
+    startup_popup_visible = adventure_startup_visible
 
     def actual_adventure_menu_visible(state: Dict[str, Any]) -> bool:
         screen_state = screen_state_name(state)

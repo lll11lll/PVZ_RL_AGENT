@@ -1,9 +1,10 @@
-"""Pure lifecycle classification and immutable Phase 5 runtime state records.
+"""Pure lifecycle classification shared by runtime and trace contracts.
 
-The bridge observation remains authoritative.  This module is initially a
-shadow representation: it classifies observations and recommends a category
-of next transition, but it performs no clicks, resets, bridge requests, file
-writes, or progression mutations.
+The bridge observation remains authoritative.  This module owns the common
+side-effect-free reset/lifecycle predicates used by the environment and the
+richer transition classification used by recorded compatibility traces.  It
+performs no clicks, resets, bridge requests, file writes, or progression
+mutations.
 """
 
 from __future__ import annotations
@@ -347,15 +348,18 @@ def _dirty_active_board(
     )
 
 
-def _stale_cleanup_ui(observation: Mapping[str, Any]) -> bool:
-    cleanup = bool(
+def cleanup_signal_active(observation: Mapping[str, Any]) -> bool:
+    return bool(
         observation.get("nextStep") == "cleanup_reward_ui"
         or observation.get("blockingRewardUiActive")
         or _screen_state(observation)
         in {"reward_unlock", "reward_screen", "level_complete_trophy"}
     )
+
+
+def _stale_cleanup_ui(observation: Mapping[str, Any]) -> bool:
     return bool(
-        cleanup
+        cleanup_signal_active(observation)
         and not observation.get("done")
         and not observation.get("over")
         and not seed_selection_visible(observation)
@@ -599,9 +603,30 @@ def classify_lifecycle(
     )
 
 
+# Public pure predicates used by the production environment.  The underscored
+# implementations remain local so the classifier reads as one cohesive unit;
+# these aliases make that same logic the authority for reset/runtime callers.
+active_gameplay_progress = _active_gameplay_progress
+confirmed_active_gameplay = _confirmed_active_gameplay
+confirmed_loss = _confirmed_loss
+confirmed_post_win = _confirmed_post_win
+dirty_active_board = _dirty_active_board
+fresh_playable_board = _fresh_playable_board
+live_board_progress = _live_board_progress
+screen_state = _screen_state
+stale_cleanup_ui = _stale_cleanup_ui
+
+
 __all__ = [
     "LifecycleClassification",
     "LifecycleContext",
+    "LIFECYCLE_ACTIVE_GAMEPLAY",
+    "LIFECYCLE_LOSS_PENDING",
+    "LIFECYCLE_POST_WIN_PENDING",
+    "LIFECYCLE_READY",
+    "LIFECYCLE_RESETTING",
+    "LIFECYCLE_UNKNOWN",
+    "active_gameplay_progress",
     "adventure_gameplay_ready_visible",
     "adventure_loss_visible",
     "adventure_menu_visible",
@@ -609,7 +634,16 @@ __all__ = [
     "adventure_seed_selection_visible",
     "adventure_startup_visible",
     "classify_lifecycle",
+    "cleanup_signal_active",
+    "confirmed_active_gameplay",
+    "confirmed_loss",
+    "confirmed_post_win",
+    "dirty_active_board",
+    "fresh_playable_board",
     "legacy_done_reason",
     "legacy_lifecycle_state",
+    "live_board_progress",
+    "screen_state",
     "seed_selection_visible",
+    "stale_cleanup_ui",
 ]
