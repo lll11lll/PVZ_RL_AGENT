@@ -1,6 +1,6 @@
 # PvZRL Repository Refinement Plan
 
-Status: in progress
+Status: Phase 8 available validation complete; overall acceptance incomplete because live-game, cross-run performance, and net runtime-volume gates remain unmet
 Plan date: 2026-07-11
 Verified baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
 
@@ -17,13 +17,13 @@ The supplied `PvZRL Internal Architecture Refinement Plan` is the initial roadma
 | Area | Current owner and boundary |
 | --- | --- |
 | Game state | Plants vs. Zombies owns authoritative plants, zombies, waves, cooldowns, sun, progression, and spawning. Unity objects are read or mutated only from the bridge's Melon `OnUpdate` thread. |
-| Bridge request state | `src/PvZRLBridge/BridgeMod.cs` owns the localhost TCP server, request queue, Unity-thread dispatch, configuration, observation DTOs, UI/seed caches, placement, fusion, reset, and speed control. |
-| Base environment | `python/pvzrl_env.py` owns bridge calls, lifecycle/reset acceptance, Python legality safeguards, rewards, corruption detection, fusion accounting, and terminal classification. |
+| Bridge request state | `BridgeServerTypes.cs` owns request/client state; `BridgeDtos.cs` owns wire DTOs; the `BridgeMod.*.cs` partials own server dispatch, commands, observation, placement, fusion, reset, Adventure UI, seed/UI caches, and runtime control. Unity access remains on Melon's `OnUpdate` thread. |
+| Base environment | `python/pvzrl_env.py` owns bridge orchestration, reset acceptance, Python execution safeguards, corruption recovery, fusion accounting, and terminal handoff. `pvzrl_observation_facts.py`, `pvzrl_rewards.py`, `pvzrl_lane_diagnostics.py`, `pvzrl_diagnostics.py`, and `pvzrl_lifecycle.py` own the pure facts/reward/diagnostic/classification projections. |
 | Action decisions | `python/pvzrl_actions.py` owns immutable policy/legacy/bridge action intents, pure Python legality decisions, frame/config cache proofs, and structured execution results. The base environment owns the cache and the bridge remains final authority. |
 | RL adapter | `python/pvzrl_sb3.py` owns numeric observation encoding, policy-action translation, MaskablePPO masks, coach arbitration, watchdog diagnostics, episode counters, and summaries. |
-| Adventure | `python/pvzrl_adventure.py` owns inference progression and transitions. `python/pvzrl_adventure_generalist.py` owns training curriculum, replay/frontier decisions, unlock state, loadouts, and strict startup identity. |
-| GUI | `python/pvzrl_gui.py` owns Tk state, command construction, subprocess control, log display, live-status reading/rendering, and local moderation UI. It does not own gameplay state. |
-| Coach inputs | `python/pvzrl_human_coach.py`, `python/pvzrl_stream_coach.py`, and `python/pvzrl_assisted_coach.py` own local parsing, validation, queueing, aggregation, and intervention records. Human coach precedence is intentional. |
+| Adventure | `python/pvzrl_adventure.py` owns inference transitions. `python/pvzrl_adventure_generalist.py` owns runtime curriculum/effects, while `pvzrl_generalist_progression.py` owns the pure frontier/replay/unlock reducer. |
+| GUI | `python/pvzrl_gui.py` owns Tk state/layout. `pvzrl_gui_commands.py`, `pvzrl_gui_process.py`, `pvzrl_gui_status.py`, `pvzrl_gui_view.py`, and `pvzrl_gui_coach.py` own command serialization, subprocess/log control, normalized status reads, rendering, and local queue writes respectively. The GUI does not own gameplay state. |
+| Coach inputs | `python/pvzrl_human_coach.py`, `python/pvzrl_stream_coach.py`, and `python/pvzrl_assisted_coach.py` own local parsing, validation, aggregation, and intervention records; `pvzrl_file_tail.py` owns partial-record-safe JSONL tailing. Human coach precedence is intentional. |
 | Configuration | CLI and JSON flow through `ConfigResolver` into a deeply immutable typed `ResolvedRunConfig`; `build_config()` provides the flat compatibility adapter for runtime dictionaries, metadata, bridge configuration, and GUI-launched commands. |
 | Artifacts | Trainer and Adventure writers emit live status, episode JSONL/CSV, progress, TensorBoard, metadata, checkpoints, and watchdog bundles. GUI consumes a compatibility-heavy view of live status. |
 
@@ -98,7 +98,7 @@ Unless a separately documented defect correction has focused regression coverage
 | 5 | Explicit episode/reset/progression/watchdog state and shadow lifecycle classification | Complete (automated; live game unavailable) | Recorded lifecycle equivalence, state/schema parity, all automated gates, and exact final-live omissions recorded |
 | 6 | Move-only bridge decomposition, then observation/occupancy/lane optimization | Complete (automated; live game unavailable) | Build after every split, DTO snapshots, zero warnings, live placement/fusion/reset/seed checks |
 | 7 | GUI/process/status/coach separation and polling/log-drain optimization | Complete (automated and local Tk; live game unavailable) | Command snapshots, malformed/stale/unchanged status, bounded logs, callback/process lifecycle, interactive smoke |
-| 8 | Full validation, independent reviews, final benchmarks/statistics/report | In progress | Every automated gate green; environment-specific omissions documented with exact commands |
+| 8 | Full validation, independent reviews, final benchmarks/statistics/report | Complete for available automated/local-Tk validation; overall acceptance gaps recorded | Every automated gate green; environment-specific omissions documented with exact commands |
 
 ## Risk controls and rollback boundaries
 

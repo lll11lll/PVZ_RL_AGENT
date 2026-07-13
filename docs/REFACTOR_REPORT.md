@@ -1,14 +1,14 @@
 # PvZRL Refactor Execution Report
 
-Status: in progress
+Status: available Phase 8 validation complete; overall goal acceptance remains incomplete
 Report started: 2026-07-11
 Baseline commit: `0cbc4d90ff68b31f5a0fed92d7508243c1d0293f`
 
 ## Executive status
 
-The repository-wide refinement is active. The initial audit has been checked against the live checkout by separate architecture, compatibility, bridge/concurrency, GUI/process, and performance investigations. Phase 0 behavior locks and benchmark tooling are complete; production behavior changes begin in Phase 1.
+The repository-wide implementation and every available bridge-free/local-Tk validation phase are complete. Separate compatibility, concurrency, refactoring-quality, performance, and final-diff reviews were run, and their high-confidence findings were resolved where the environment allowed.
 
-Automated baseline status is green. Live-game behavior has not yet been claimed as verified because the game/bridge were not running during baseline capture and the DLL installed under `Game Files/Mods` predates the current source build.
+The overall goal is not labeled complete: no game/bridge process was available for the required real-game traces, training/resume, or evaluation, and first-party runtime code increased from 48,127 to 55,318 physical lines instead of achieving a net reduction. The report preserves these as acceptance gaps rather than converting strong automated coverage into unsupported live or code-volume claims.
 
 ## Baseline repository state
 
@@ -57,7 +57,7 @@ Largest verified units:
 - `python/pvzrl_adventure.py`: `run_adventure_eval()` 588; `build_live_status()` 539.
 - `python/pvzrl_sb3.py`: `step()` 703.
 
-Final added/removed/net runtime lines, test lines, documentation lines, functions/classes removed, duplicate blocks consolidated, wrappers remaining, files split/deleted, and moved-versus-eliminated code will be recorded after Phase 8.
+Final added/removed/net runtime lines, test lines, documentation lines, functions/classes removed, duplicate families consolidated, wrappers remaining, files split/deleted, and moved-versus-eliminated code are recorded in the Phase 8 statistics below.
 
 ## Baseline commands and results
 
@@ -203,7 +203,7 @@ Implemented:
 - Rebuilt seed-slot placement lookup by explicit `SlotIndex`, rejected missing/stale/null cached cards after one authoritative probe rebuild, and removed both nullable `CardUI` compiler paths.
 - Retained `sunSpawnCompensationApplyCount` as an explicit deprecated constant-zero compatibility field, eliminating the dead-field warning without changing its serialized value.
 - Added one bounded binary incremental line tailer shared by human and mock-stream coach sources. It separates committed and read offsets, retains incomplete UTF-8/CRLF records, resumes them exactly once, skips complete malformed records with diagnostics, detects replacement/truncation/same-inode rewrite, preserves clear/start-at-end behavior, and bounds reads and oversized pending records.
-- Unified GUI explicit-stop and window-close process handling. Close cancels tracked Tk callbacks, requests terminate, waits without blocking Tk, escalates to kill only after the grace period, drains remaining output, joins reader/stopper threads briefly, and destroys the root only after the child is gone.
+- Unified GUI explicit-stop and window-close process handling. Close cancels tracked Tk callbacks, requests terminate, waits without blocking Tk, escalates after the grace period, and enforces one hard deadline. At that deadline it makes a final kill attempt, records a still-alive failure, then completes bounded thread/log cleanup and destroys the Tk root instead of waiting forever.
 - Bounded the GUI producer queue, per-tick drain count/time, retained log lines/chars, and visible drop accounting. Unchanged live-status files now reuse parsed payloads by file signature, while missing/malformed/replaced files recover normally.
 - Made live-status age authoritative over old `blocked_reason` values, so stale/dead writers can no longer remain indefinitely `BLOCKED_*`.
 - Passed CherryBomb delayed event diagnostics explicitly from reward calculation into lane diagnostics; delayed kills, zero-kill expiry, buckethead credit, and conehead credit no longer serialize as unconditional zero.
@@ -451,3 +451,125 @@ Measured deviation and residual boundary:
 - No `PlantsVsZombiesRH`/MelonLoader process or bridge listener was available. Current source was not copied to `Game Files/Mods`, so live GUI connection, observation, placement, fusion, reset, transitions, short train/resume, and evaluation are not claimed here.
 
 Rollback boundaries, in order: `14e1a3d` status reader; `6373f82` command snapshots; `b066a31` command construction; `943da70` command-module cleanup; `ec9cea3` process edge contracts; `29a2e50` process control; `26d654b` bounded logs; `c3d2f0b` normalized status index; `755c481` coach queue writes; `8fa20c3` coach command metadata; `1c80881` diagnostics view; `ed199e2` GUI benchmarks; `b8048bd` oversized-log retention; `d3389c4` partial-line rollover and status-write parity.
+
+### Phase 8 - full validation and independent review
+
+Status: complete for every available automated and local-Tk gate. Overall goal acceptance remains incomplete because the required live-game checks could not run, the repeat benchmark did not close the cross-run 5% policy gate, and physical runtime volume increased rather than decreased.
+
+Final implementation and review fixes:
+
+- The concurrency review found that a child which continued to report alive after `kill()` could renew the GUI close deadline indefinitely. Commit `34dabc1` makes the deadline hard: one final kill attempt is followed by an actionable still-alive record, bounded 0.2-second thread joins, bounded log drain, callback cancellation, and root destruction. A `NeverExitProcess` regression locks the behavior.
+- The refactoring-quality review found 260 lines of unmounted GUI tab builders/options, an expired private action-filter adapter, four additional private Python helpers, and a 300-line dead C# mix/reflection/reset/seed/observation helper graph. Tests now inspect the mounted Training tab and call the canonical action decision/status health paths. Commits `409138a` and `80376cf` remove 636 runtime lines and add one, net `-635`; full Python, bridge, script, and real-Tk gates remain green.
+- The final ownership map now names the split bridge, pure facts/reward/lifecycle modules, Generalist reducer, GUI command/process/status/view/queue modules, and shared file tailer rather than attributing those systems to their former monoliths.
+- No further high-confidence bulk deletion remains. Python production imports are acyclic; no private Python no-caller helper or C# private identifier-singleton helper remains. Closing the overall volume gap would require another substantive redesign of live-compatible state schemas and large reset/step loops, not safe dead-code cleanup.
+
+Final automated and compatibility evidence:
+
+- Dependency readiness and `compileall`: PASS. Full pytest: PASS, 293 tests plus 10 subtests. All nine retained standalone regression entrypoints exit zero after the final code cleanup.
+- Bridge build: PASS with zero warnings. Three consecutive final-source builds are byte-identical. Final DLL SHA-256 is `f6be2f86b9c001b15f88ac5637853a3f8a6eda2f103ef06a67a43e2a632c187a`; PDB SHA-256 is `86b89424d889dc75e42ed7344bc586c236b741618634c5317542569280ba5934`. The lifecycle harness passes 58,553 checks.
+- A withdrawn real `tk.Tk()` dashboard builds the mounted Training, Evaluation, Coach, Diagnostics, Runs/Models, status, and log surfaces, schedules both pollers, processes an event cycle, and closes through the production callback. Command, status, queue, process, rollover, and never-exits lifecycle coverage remains green.
+- Both protected metadata dry-runs return `compatible=true`, `ok=true`, no warnings, and no blocked reason. Actual CPU loads remain Generalist `(701, (4297,), 370000)` and fixed `(201, (357,), 350368)`. The June 21 Generalist control also remains loadable.
+- All six protected model/metadata sizes, mtimes, and SHA-256 values exactly match the Phase 5 table. The installed recovery DLL remains untouched at `5643ec37984762ab72fea3c50e87fcc466b905c5cf046c307fdaa6e0ce42a0f4`; current source was not copied into `Game Files/Mods`.
+- Deterministic Python contracts remain exact: dense observation `8d0260e4...`; identity mask `80f460d9...` with 433 legal actions; identity vector `8c2d3547...` at width 4,297; GUI tactical mask `661d4005...` with 414 legal actions; tactical diagnostics `bbdc7ea9...`; recursive live-status schema `53e6489a...`; GUI alias projection `400cd2f1...`. Bridge top-level observation and recursive nested DTO contracts remain 122 properties and `c0d34a11...`.
+
+Independent review disposition:
+
+- Compatibility reviewer: no blocker after 242 focused tests plus 10 subtests, protected loads/dry-runs/hashes, fusion/reward/schema coverage, and the 58,553-check bridge harness.
+- Concurrency reviewer: the unbounded GUI close finding was fixed; 65 focused deadline, queue, tailer, process, callback, and shutdown tests plus the bridge harness leave no high-confidence concurrency blocker. One arbitrarily large newline-free child record can still make a single Tk drain item exceed the nominal time budget, so no strict total-tick claim is made.
+- Refactoring-quality reviewer: code ownership, import direction, pure calculation boundaries, bridge partials, and focused GUI mixins pass; no service/factory/web proliferation or commented superseded body remains. The review explicitly rejects a full-goal claim because net runtime volume increased.
+- Performance reviewer: targeted GUI and C# improvements are credible and every deterministic contract matches, but the repository-wide no-regression gate is not closed. Two quiet-intent same-source Phase 8 runs still show broad, inconsistent host-level slowdowns on paths untouched by Phase 7/8.
+- Final-diff reviewer: changed files remain inside the planned config/docs/Python/test/build/bridge surfaces. No binary diff, tracked run/model/checkpoint/build/cache artifact, credential pattern, URL, email, user-specific path, dependency/environment/deployment change, deleted test file, merge, or history rewrite was found. Protected hashes and the installed recovery DLL are exact; `git diff --check` is clean.
+
+Final performance record:
+
+- Durable repeat artifacts are `runs/benchmarks/phase8_python_final_run1.json` and `runs/benchmarks/phase8_python_final.json`, each 50 samples by five rounds. Their deterministic hashes and 49 writes/451 suppressions plus one forced final write match exactly.
+- GUI case-insensitive status lookup measures 200 mixed-case alias lookups per operation with index construction outside timing. Across the two repeats, the legacy repeated-map surrogate is `10.40030/13.70210` and `11.46040/19.79760 ms` median/p95; the hot cached index is `0.16425/0.16760` and `0.19930/0.20720 ms`, a 57.5-63.3x median improvement.
+- The 5,000-line no-op-widget log surrogate is `0.04610/0.05500 -> 0.00450/0.00480 ms` in run 1 and `0.05940/0.08640 -> 0.00550/0.00610 ms` in run 2, a 10.2-10.8x median improvement. Same-object render-key checks are `0.00030 ms`; equal fresh payload comparisons are `0.48155/0.55820` and `0.59505/0.64550 ms`.
+- The final C# pure-helper benchmark remains exact and unaffected by dead-code removal: indexed occupancy including set construction improves 75.1x/108.5x median/p95, and one-pass lanes improve 4.9x/5.0x. It excludes Unity scans, `CheckBox`, IL2CPP lifetime, sockets, and live bridge latency.
+- The two Python repeats do not prove repository-wide no-regression. Against the mean of the two stable Phase 6 runs, their mean medians are slower by 17.1% fixed mask, 14.4% dense identity mask, 27.4% identity cooldown, 25.6% identity encoding, 23.8% reward composition, 17.4% facts build, 97.1% unchanged-status read, 126.8% status signature, and 43.9% atomic write. The Phase 8 repeats also disagree materially on several p95/filesystem/status values. Phase 7/8 did not change the non-GUI timed implementations, so the broad movement is consistent with host/cache/load drift, but the fixed-order benchmark lacks interleaving, confidence intervals, and power-state metadata needed to establish causality. The requested approximately-5% cross-run performance acceptance is therefore recorded as unmet rather than explained away.
+- No benchmark includes full Tk rendering, Unity/IL2CPP, live bridge/environment-step latency, PPO inference, rollout SPS, or actual game `CheckBox` timing.
+
+Final code statistics, using the exact baseline exclusions:
+
+| Measure | Baseline | Final | Change |
+| --- | ---: | ---: | ---: |
+| Runtime files | 17 | 47 | +30 |
+| Runtime physical lines | 48,127 | 55,318 | +7,191 (+14.94%) |
+| Python runtime lines | 36,562 | 43,137 | +6,575 |
+| C# runtime lines, excluding generated registry | 11,488 | 12,085 | +597 |
+| Build-script lines | 77 | 96 | +19 |
+| Raw runtime diff | - | +25,032 / -17,841 | +7,191 |
+| Python test files | 9 | 32 | +23 |
+| Python test physical lines | 6,154 | 13,974 | +7,820 |
+| Raw Python test diff | - | +7,851 / -31 | +7,820 |
+| Documentation diff | - | +773 / -0 | +773 |
+| Python function definitions | 1,043 | 1,311 | +268 |
+| Python class definitions | 59 | 135 | +76 |
+| Confirmed function/method names removed | - | 81 | 68 Python + 13 C# |
+| Confirmed class names removed | - | 0 | 0 |
+| Subsystem duplicate families consolidated | - | 18 | semantic count; no textual-clone claim |
+| Explicit compatibility wrapper/view/projection surfaces remaining | - | 12 | retained where consumers cannot be proven migrated |
+| Source units split | - | 2 | bridge monolith and GUI dashboard |
+| Runtime files deleted | - | 0 | source was split/additive; dead bodies were removed in place |
+
+The raw removal count is not a code-reduction claim: 10,742 C# method-body lines were moved during the bridge split, and most of Phase 7's 1,862-line GUI deletion was relocated into focused modules. The final physical total is authoritative. The 18 consolidated duplicate families cover request ownership, JSONL tailing, registry/configuration, action decisions, fusion validation/execution, per-observation facts, rewards, lane/safety diagnostics, episode telemetry, live-status writing, lifecycle classification, Generalist progression, bridge occupancy/lanes/cards, GUI status/commands/process/logs, and coach queue/aliases. The 12 narrowly counted compatibility surfaces are four registry projections, reward/reset adapters, two deprecated fusion views, three SB3 state projections, and the compatibility fusion-candidate factory.
+
+Measured acceptance deviation:
+
+- The initial audit expected 5,000-8,000 fewer runtime lines and named 4,800 lines/10% as its completion threshold. The final repository instead has 7,191 more runtime lines. This is not relabeled as reduction. The refactor deleted large duplicated bodies and improved ownership, but immutable schemas, pure compositors, compatibility projections, split scaffolding, stronger state models, and runtime diagnostics outweighed those deletions physically.
+- The coordinating goal text says not to sacrifice correctness, compatibility, diagnostics, or readability to hit an arbitrary deletion target. After the independent dead-code sweep, no further high-confidence bulk deletion remains. Meeting the original numeric target now would require a new, high-risk redesign rather than evidence-backed cleanup.
+- Large residual units remain: `pvzrl_env.py` is 10,225 lines, its reset state machine is about 988 lines, both environment/SB3 step methods exceed 700 lines, and bridge Seed/UI and Reset remain above 2,800 and 2,100 lines. `pvzrl_lifecycle.py` remains a 615-line shadow/contract artifact. Numeric coercion and compatibility-heavy live-status emission remain distributed.
+
+Exact remaining live-game validation commands:
+
+The commands below are deliberately not run automatically while the installed recovery DLL is the only known-good live install. They preserve it first, install the deterministic final build, and write new outputs under a timestamped validation directory rather than protected runs.
+
+```powershell
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$manualRoot = Join-Path 'runs/manual_phase8' $tag
+New-Item -ItemType Directory -Force $manualRoot | Out-Null
+$installed = 'Game Files/Mods/PvZRLBridge.dll'
+$backup = Join-Path $manualRoot 'PvZRLBridge.recovery.dll'
+Copy-Item -LiteralPath $installed -Destination $backup
+.\scripts\build_bridge.ps1 -CopyToMods
+Start-Process -FilePath '.\Game Files\PlantsVsZombiesRH.exe'
+Test-NetConnection 127.0.0.1 -Port 32323
+```
+
+Expected: the installed DLL hashes to `f6be2f86...`, MelonLoader reports a zero-error PvZRLBridge load, and `TcpTestSucceeded` is `True`. Preserve `$backup` until every command below passes.
+
+```powershell
+python .\python\pvzrl_env.py --smoke-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
+python .\python\pvzrl_env.py --fusion-semantics-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
+python .\python\pvzrl_env.py --coach-fusion-scope-test --wait-for-board --wait-gameplay-ready --quick-wait --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --start-sun 9990
+python .\python\pvzrl_env.py --reset-state-machine-test --auto-select-seeds --seed-list SunFlower,Peashooter,WallNut,CherryBomb --quick-wait
+python .\python\pvzrl_env.py --auto-select-seeds-test --episodes 2 --seed-list SunFlower,Peashooter,WallNut,CherryBomb --quick-wait
+```
+
+Expected: every smoke row reports PASS; observations and legal actions are structured; wait advances; a normal plant changes only the requested tile; invalid/empty/incompatible fusions retain their exact reasons; legal self/recursive fusions report one tile-scoped mutation and one event; reset returns a clean playable observation; two seed selections complete without unsafe gameplay-before-selection.
+
+```powershell
+$fixedRun = Join-Path $manualRoot 'fixed_fresh'
+$resumeRun = Join-Path $manualRoot 'fixed_resume'
+python .\python\train_ppo.py --run-mode fixed_train --config configs\ppo_sunflower_peashooter_wallnut_cherrybomb.json --run-dir $fixedRun --total-timesteps 512 --n-steps 128 --batch-size 64 --checkpoint-freq 128 --quick-wait --wait-gameplay-ready
+python .\python\train_ppo.py --run-mode fixed_train --config configs\ppo_sunflower_peashooter_wallnut_cherrybomb.json --resume-model-path (Join-Path $fixedRun 'model.zip') --run-dir $resumeRun --total-timesteps 512 --n-steps 128 --batch-size 64 --checkpoint-freq 128 --quick-wait --wait-gameplay-ready
+python .\python\train_ppo.py --level3-eval --target-level 3 --model-path python\runs\ppo_4slot_sunflower_peashooter_wallnut_cherrybomb_20260507_130623\model.zip --episodes 1 --seed-list SunFlower,Peashooter,WallNut,CherryBomb --plant-types 1,0,3,2 --fusion-policy none --tactical-masks --wallnut-tactical-mask --cherrybomb-tactical-mask --quick-wait --wait-gameplay-ready
+```
+
+Expected: fresh training collects at least one rollout and writes new checkpoint/model/metadata files under `$fixedRun`; resume loads that new model into `$resumeRun`, advances `num_timesteps` beyond 512 without changing action/observation metadata, and never writes the source model; fixed evaluation completes one real terminal episode.
+
+```powershell
+python .\python\pvzrl_env.py --adventure-state-smoke --duration-seconds 180 --auto-select-seeds --seed-list SunFlower,SunFlower,Peashooter,Peashooter --quick-wait
+python .\python\train_ppo.py --adventure-generalist-eval --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip --episodes 1 --seed-list SunFlower,SunFlower,Peashooter,Peashooter --initial-loadout SunFlower,SunFlower,Peashooter,Peashooter --plant-types 1,1,0,0 --action-space-mode adventure_14slot_identity --max-seed-slots 14 --max-adventure-levels 10 --max-attempts-per-level 10 --quick-wait --wait-gameplay-ready
+python .\python\pvzrl_gui.py --live-status-path runs\live_status.json
+```
+
+Expected: Adventure smoke observes valid menu/seed/gameplay/post-win states without bridge errors; Generalist evaluation loads 701 actions/4,297 observations and completes one real episode while preserving startup identity, unlock, replay, and advancement state; the GUI starts, renders live health/status, submits local coach/mock commands, launches/stops a validation process, and closes within the hard deadline. Win, loss, timeout, reward/unlock, same-level replay, and Adventure advancement must each be retained as inspectable live-status/progress traces before accepting the new DLL.
+
+If any live check fails, stop the game and restore the preserved install before further diagnosis:
+
+```powershell
+Copy-Item -LiteralPath $backup -Destination $installed -Force
+```
+
+Final rollback boundaries added in Phase 8: `34dabc1` bounded hard close; `409138a` dead GUI/Python/C# compatibility paths; `80376cf` expired helper adapters. The earlier phase rollback commits remain listed in their phase sections.
