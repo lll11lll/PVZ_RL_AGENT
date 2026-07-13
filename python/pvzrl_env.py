@@ -6574,20 +6574,95 @@ def _select_live_fusion_probe_candidates(
     return first_legal, pea_sun_legal, len(candidates)
 
 
+def _live_test_value_int(payload: Dict[str, Any], *keys: str, default: int = -1) -> int:
+    for key in keys:
+        try:
+            if key in payload:
+                return int(payload.get(key))
+        except (TypeError, ValueError):
+            continue
+    return int(default)
+
+
+def _live_test_slot_for_plant_type(obs_payload: Dict[str, Any], plant_type: int) -> Optional[Dict[str, Any]]:
+    for slot_item in obs_payload.get("seedSlots", []) or []:
+        if not isinstance(slot_item, dict):
+            continue
+        if int(slot_item.get("plantType", -1)) != int(plant_type):
+            continue
+        if not bool(slot_item.get("usable", True)):
+            continue
+        if bool(slot_item.get("disabled", False)):
+            continue
+        return slot_item
+    return None
+
+
+def _live_test_plant_at_cell(obs_payload: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
+    for plant_item in obs_payload.get("plants", []) or []:
+        if not isinstance(plant_item, dict):
+            continue
+        if int(plant_item.get("row", -1)) == int(row) and int(plant_item.get("column", -1)) == int(col):
+            return plant_item
+    return None
+
+
+def _live_test_first_empty_cells(env: PvZGymEnv, obs_payload: Dict[str, Any], count: int) -> List[Tuple[int, int]]:
+    rows = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+    cols = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+    occupied = set()
+    for plant in obs_payload.get("plants", []) or []:
+        if not isinstance(plant, dict):
+            continue
+        occupied.add((int(plant.get("row", -1)), int(plant.get("column", -1))))
+    selected: List[Tuple[int, int]] = []
+    for row in range(rows):
+        for col in range(cols):
+            if (row, col) in occupied:
+                continue
+            selected.append((row, col))
+            if len(selected) >= int(count):
+                return selected
+    return selected
+
+
+def _live_test_placement_action(env: PvZGymEnv, slot_index: int, row: int, col: int, obs_payload: Dict[str, Any]) -> int:
+    rows = int(obs_payload.get("rowCount") or env.config.row_count or 5)
+    cols = int(obs_payload.get("columnCount") or env.config.column_count or 10)
+    return int(1 + int(slot_index) * rows * cols + int(row) * cols + int(col))
+
+
+def _live_test_wait_until_slot_ready(
+    env: PvZGymEnv,
+    slot_index: int,
+    min_sun: int,
+    max_wait_steps: int = 600,
+) -> Tuple[Dict[str, Any], int, str]:
+    current_observation = env.observe()
+    for step_index in range(int(max_wait_steps) + 1):
+        selected_slot = None
+        for slot in current_observation.get("seedSlots", []) or []:
+            if not isinstance(slot, dict):
+                continue
+            if int(slot.get("slotIndex", -1)) == int(slot_index):
+                selected_slot = slot
+                break
+        ready = bool(selected_slot and selected_slot.get("ready", False))
+        usable = bool(selected_slot and selected_slot.get("usable", True) and not selected_slot.get("disabled", False))
+        sun_ok = int(current_observation.get("sun", 0) or 0) >= int(min_sun)
+        if ready and usable and sun_ok:
+            return current_observation, step_index, ""
+        current_observation, _, _, _, _ = env.step(0)
+    return current_observation, int(max_wait_steps), "timeout"
+
+
 def fusion_semantics_test(env: PvZGymEnv) -> bool:
     checks: List[Tuple[str, bool, str]] = []
 
     def record(name: str, ok: bool, message: str = "") -> None:
         checks.append((name, ok, message))
 
-    def value_int(payload: Dict[str, Any], *keys: str, default: int = -1) -> int:
-        for key in keys:
-            try:
-                if key in payload:
-                    return int(payload.get(key))
-            except (TypeError, ValueError):
-                continue
-        return int(default)
+    value_int = _live_test_value_int
 
     def value_bool(payload: Dict[str, Any], *keys: str) -> bool:
         for key in keys:
@@ -6595,67 +6670,17 @@ def fusion_semantics_test(env: PvZGymEnv) -> bool:
                 return bool(payload.get(key))
         return False
 
-    def slot_for_plant_type(obs_payload: Dict[str, Any], plant_type: int) -> Optional[Dict[str, Any]]:
-        for slot_item in obs_payload.get("seedSlots", []) or []:
-            if not isinstance(slot_item, dict):
-                continue
-            if int(slot_item.get("plantType", -1)) != int(plant_type):
-                continue
-            if not bool(slot_item.get("usable", True)):
-                continue
-            if bool(slot_item.get("disabled", False)):
-                continue
-            return slot_item
-        return None
-
-    def plant_at_cell(obs_payload: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
-        for plant_item in obs_payload.get("plants", []) or []:
-            if not isinstance(plant_item, dict):
-                continue
-            if int(plant_item.get("row", -1)) == int(row) and int(plant_item.get("column", -1)) == int(col):
-                return plant_item
-        return None
+    slot_for_plant_type = _live_test_slot_for_plant_type
+    plant_at_cell = _live_test_plant_at_cell
 
     def first_empty_cells(obs_payload: Dict[str, Any], count: int) -> List[Tuple[int, int]]:
-        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
-        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
-        occupied_cells = set()
-        for plant_item in obs_payload.get("plants", []) or []:
-            if not isinstance(plant_item, dict):
-                continue
-            occupied_cells.add((int(plant_item.get("row", -1)), int(plant_item.get("column", -1))))
-        selected: List[Tuple[int, int]] = []
-        for row_index in range(rows_local):
-            for col_index in range(cols_local):
-                if (row_index, col_index) in occupied_cells:
-                    continue
-                selected.append((row_index, col_index))
-                if len(selected) >= int(count):
-                    return selected
-        return selected
+        return _live_test_first_empty_cells(env, obs_payload, count)
 
     def placement_action_for(slot_index: int, row: int, col: int, obs_payload: Dict[str, Any]) -> int:
-        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
-        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
-        return int(1 + int(slot_index) * rows_local * cols_local + int(row) * cols_local + int(col))
+        return _live_test_placement_action(env, slot_index, row, col, obs_payload)
 
     def wait_until_slot_ready(slot_index: int, min_sun: int, max_wait_steps: int = 600) -> Tuple[Dict[str, Any], int, str]:
-        current_observation = env.observe()
-        for step_index in range(int(max_wait_steps) + 1):
-            selected_slot = None
-            for slot_item in current_observation.get("seedSlots", []) or []:
-                if not isinstance(slot_item, dict):
-                    continue
-                if int(slot_item.get("slotIndex", -1)) == int(slot_index):
-                    selected_slot = slot_item
-                    break
-            ready = bool(selected_slot and selected_slot.get("ready", False))
-            usable = bool(selected_slot and selected_slot.get("usable", True) and not selected_slot.get("disabled", False))
-            sun_ok = int(current_observation.get("sun", 0) or 0) >= int(min_sun)
-            if ready and usable and sun_ok:
-                return current_observation, step_index, ""
-            current_observation, _, _, _, _ = env.step(0)
-        return current_observation, int(max_wait_steps), "timeout"
+        return _live_test_wait_until_slot_ready(env, slot_index, min_sun, max_wait_steps)
 
     try:
         env.configure()
@@ -7129,76 +7154,18 @@ def coach_fusion_scope_test(env: PvZGymEnv) -> bool:
     def record(name: str, ok: bool, message: str = "") -> None:
         checks.append((name, ok, message))
 
-    def value_int(payload: Dict[str, Any], *keys: str, default: int = -1) -> int:
-        for key in keys:
-            try:
-                if key in payload:
-                    return int(payload.get(key))
-            except (TypeError, ValueError):
-                continue
-        return int(default)
-
-    def slot_for_plant_type(obs_payload: Dict[str, Any], plant_type: int) -> Optional[Dict[str, Any]]:
-        for slot_item in obs_payload.get("seedSlots", []) or []:
-            if not isinstance(slot_item, dict):
-                continue
-            if int(slot_item.get("plantType", -1)) != int(plant_type):
-                continue
-            if not bool(slot_item.get("usable", True)):
-                continue
-            if bool(slot_item.get("disabled", False)):
-                continue
-            return slot_item
-        return None
-
-    def plant_at_cell(obs_payload: Dict[str, Any], row: int, col: int) -> Optional[Dict[str, Any]]:
-        for plant_item in obs_payload.get("plants", []) or []:
-            if not isinstance(plant_item, dict):
-                continue
-            if int(plant_item.get("row", -1)) == int(row) and int(plant_item.get("column", -1)) == int(col):
-                return plant_item
-        return None
+    value_int = _live_test_value_int
+    slot_for_plant_type = _live_test_slot_for_plant_type
+    plant_at_cell = _live_test_plant_at_cell
 
     def first_empty_cells(obs_payload: Dict[str, Any], count: int) -> List[Tuple[int, int]]:
-        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
-        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
-        occupied_cells = set()
-        for plant_item in obs_payload.get("plants", []) or []:
-            if not isinstance(plant_item, dict):
-                continue
-            occupied_cells.add((int(plant_item.get("row", -1)), int(plant_item.get("column", -1))))
-        selected: List[Tuple[int, int]] = []
-        for row_index in range(rows_local):
-            for col_index in range(cols_local):
-                if (row_index, col_index) in occupied_cells:
-                    continue
-                selected.append((row_index, col_index))
-                if len(selected) >= int(count):
-                    return selected
-        return selected
+        return _live_test_first_empty_cells(env, obs_payload, count)
 
     def placement_action_for(slot_index: int, row: int, col: int, obs_payload: Dict[str, Any]) -> int:
-        rows_local = int(obs_payload.get("rowCount") or env.config.row_count or 5)
-        cols_local = int(obs_payload.get("columnCount") or env.config.column_count or 10)
-        return int(1 + int(slot_index) * rows_local * cols_local + int(row) * cols_local + int(col))
+        return _live_test_placement_action(env, slot_index, row, col, obs_payload)
 
     def wait_until_slot_ready(slot_index: int, min_sun: int, max_wait_steps: int = 600) -> Tuple[Dict[str, Any], int, str]:
-        current_observation = env.observe()
-        for step_index in range(int(max_wait_steps) + 1):
-            selected_slot = None
-            for slot_item in current_observation.get("seedSlots", []) or []:
-                if not isinstance(slot_item, dict):
-                    continue
-                if int(slot_item.get("slotIndex", -1)) == int(slot_index):
-                    selected_slot = slot_item
-                    break
-            ready = bool(selected_slot and selected_slot.get("ready", False))
-            usable = bool(selected_slot and selected_slot.get("usable", True) and not selected_slot.get("disabled", False))
-            sun_ok = int(current_observation.get("sun", 0) or 0) >= int(min_sun)
-            if ready and usable and sun_ok:
-                return current_observation, step_index, ""
-            current_observation, _, _, _, _ = env.step(0)
-        return current_observation, int(max_wait_steps), "timeout"
+        return _live_test_wait_until_slot_ready(env, slot_index, min_sun, max_wait_steps)
 
     try:
         env.configure()
