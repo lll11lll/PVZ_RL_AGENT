@@ -1977,21 +1977,34 @@ class EpisodeMetricWriter:
         return rows
 
 
-def sum_count_dicts_from_rows(rows: List[Dict[str, Any]], field_name: str) -> Dict[str, int]:
+def _dict_field(record: Any, field_name: str, normalizer: Any) -> Dict[Any, Any]:
+    if isinstance(record, dict):
+        return normalizer(record.get(field_name))
+    value = getattr(record, field_name, {})
+    return value if isinstance(value, dict) else {}
+
+
+def sum_count_dicts_from_rows(rows: List[Any], field_name: str) -> Dict[str, int]:
     totals: Counter[str] = Counter()
     for row in rows:
-        values = normalize_count_dict(row.get(field_name))
+        values = _dict_field(row, field_name, normalize_count_dict)
         for key, value in values.items():
-            totals[str(key)] += int(value)
+            try:
+                totals[str(key)] += int(value)
+            except (TypeError, ValueError):
+                continue
     return dict(sorted(totals.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])))
 
 
-def max_count_dicts_from_rows(rows: List[Dict[str, Any]], field_name: str) -> Dict[str, int]:
+def max_count_dicts_from_rows(rows: List[Any], field_name: str) -> Dict[str, int]:
     totals: Counter[str] = Counter()
     for row in rows:
-        values = normalize_count_dict(row.get(field_name))
+        values = _dict_field(row, field_name, normalize_count_dict)
         for key, value in values.items():
-            totals[str(key)] = max(int(totals.get(str(key), 0)), int(value))
+            try:
+                totals[str(key)] = max(int(totals.get(str(key), 0)), int(value))
+            except (TypeError, ValueError):
+                continue
     return dict(sorted(totals.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])))
 
 
@@ -2027,17 +2040,21 @@ def weighted_average_from_rows(rows: List[Dict[str, Any]], field_name: str, weig
     return weighted_total / weight_total if weight_total > 0.0 else 0.0
 
 
-def weighted_average_dict_from_rows(rows: List[Dict[str, Any]], field_name: str, weight_field: str) -> Dict[str, float]:
+def weighted_average_dict_from_rows(rows: List[Any], field_name: str, weight_field: str) -> Dict[str, float]:
     totals: Counter[str] = Counter()
     weights: Counter[str] = Counter()
     for row in rows:
-        values = normalize_float_dict(row.get(field_name))
-        row_weights = normalize_count_dict(row.get(weight_field))
-        for key, value in values.items():
-            weight = int(row_weights.get(str(key), 0) or 0)
+        values = _dict_field(row, field_name, normalize_float_dict)
+        row_weights = _dict_field(row, weight_field, normalize_count_dict)
+        for key, raw_value in values.items():
+            try:
+                value = float(raw_value)
+                weight = int(row_weights.get(str(key), 0) or 0)
+            except (TypeError, ValueError):
+                continue
             if weight <= 0:
                 continue
-            totals[str(key)] += float(value) * weight
+            totals[str(key)] += value * weight
             weights[str(key)] += weight
     keys = sorted(set(totals.keys()) | set(weights.keys()), key=lambda item: (0, int(item)) if item.isdigit() else (1, item))
     return {
@@ -2048,11 +2065,12 @@ def weighted_average_dict_from_rows(rows: List[Dict[str, Any]], field_name: str,
     }
 
 
-def average_positive_from_rows(rows: List[Dict[str, Any]], field_name: str) -> float:
+def average_positive_from_rows(rows: List[Any], field_name: str) -> float:
     values: List[float] = []
     for row in rows:
         try:
-            value = float(row.get(field_name, 0.0) or 0.0)
+            raw_value = row.get(field_name, 0.0) if isinstance(row, dict) else getattr(row, field_name, 0.0)
+            value = float(raw_value or 0.0)
         except (TypeError, ValueError):
             continue
         if value > 0.0:
@@ -2060,14 +2078,18 @@ def average_positive_from_rows(rows: List[Dict[str, Any]], field_name: str) -> f
     return sum(values) / len(values) if values else 0.0
 
 
-def average_positive_step_dict_from_rows(rows: List[Dict[str, Any]], field_name: str) -> Dict[str, float]:
+def average_positive_step_dict_from_rows(rows: List[Any], field_name: str) -> Dict[str, float]:
     totals: Counter[str] = Counter()
     counts: Counter[str] = Counter()
     for row in rows:
-        values = normalize_count_dict(row.get(field_name))
-        for key, value in values.items():
+        values = _dict_field(row, field_name, normalize_count_dict)
+        for key, raw_value in values.items():
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                continue
             if int(value) > 0:
-                totals[str(key)] += int(value)
+                totals[str(key)] += value
                 counts[str(key)] += 1
     keys = sorted(set(totals.keys()) | set(counts.keys()), key=lambda item: (0, int(item)) if item.isdigit() else (1, item))
     return {
@@ -3646,15 +3668,16 @@ def print_eval_table(results: Dict[str, List[EvalLog]]) -> None:
 
 def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
     count = max(1, len(logs))
+    rows: List[Any] = logs
     total_steps = sum(log.episode_length for log in logs)
     wait_actions = sum(log.wait_actions for log in logs)
     plant_actions = sum(log.plant_actions for log in logs)
-    threat_steps = sum_eval_count_dicts(logs, "threat_steps_by_row")
-    undefended_steps = sum_eval_count_dicts(logs, "undefended_threat_steps_by_row")
-    threatened_zero_defender_steps = sum_eval_count_dicts(logs, "threatened_rows_with_zero_defender_steps_by_row")
-    row_defense_opportunities = sum_eval_count_dicts(logs, "row_defense_opportunities_by_row")
-    row_defense_responses = sum_eval_count_dicts(logs, "row_defense_responses_by_row")
-    peashooter_placements = sum_eval_count_dicts(logs, "peashooter_placements_by_row")
+    threat_steps = sum_count_dicts_from_rows(rows, "threat_steps_by_row")
+    undefended_steps = sum_count_dicts_from_rows(rows, "undefended_threat_steps_by_row")
+    threatened_zero_defender_steps = sum_count_dicts_from_rows(rows, "threatened_rows_with_zero_defender_steps_by_row")
+    row_defense_opportunities = sum_count_dicts_from_rows(rows, "row_defense_opportunities_by_row")
+    row_defense_responses = sum_count_dicts_from_rows(rows, "row_defense_responses_by_row")
+    peashooter_placements = sum_count_dicts_from_rows(rows, "peashooter_placements_by_row")
     plant_weight_total = sum(max(0, log.plants_placed) for log in logs)
     full_coverage_sunflower_counts = [
         log.sunflower_count_when_first_full_coverage
@@ -3689,21 +3712,21 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "plant_actions": plant_actions,
         "wait_action_percent": 100.0 * wait_actions / max(1, total_steps),
         "plant_action_percent": 100.0 * plant_actions / max(1, total_steps),
-        "plants_by_row": sum_eval_count_dicts(logs, "plants_by_row"),
-        "peashooters_by_row": sum_eval_count_dicts(logs, "peashooters_by_row"),
-        "sunflowers_by_row": sum_eval_count_dicts(logs, "sunflowers_by_row"),
+        "plants_by_row": sum_count_dicts_from_rows(rows, "plants_by_row"),
+        "peashooters_by_row": sum_count_dicts_from_rows(rows, "peashooters_by_row"),
+        "sunflowers_by_row": sum_count_dicts_from_rows(rows, "sunflowers_by_row"),
         "threat_steps_by_row": threat_steps,
         "undefended_threat_steps_by_row": undefended_steps,
         "undefended_threat_ratio_by_row": ratio_dict(undefended_steps, threat_steps),
-        "undefended_threat_age_avg_by_row": weighted_average_dict_from_logs(
-            logs,
+        "undefended_threat_age_avg_by_row": weighted_average_dict_from_rows(
+            rows,
             "undefended_threat_age_avg_by_row",
             "threatened_rows_with_zero_defender_steps_by_row",
         ),
-        "undefended_threat_age_max_by_row": max_eval_count_dicts(logs, "undefended_threat_age_max_by_row"),
+        "undefended_threat_age_max_by_row": max_count_dicts_from_rows(rows, "undefended_threat_age_max_by_row"),
         "threatened_rows_with_zero_defender_steps_by_row": threatened_zero_defender_steps,
         "peashooters_per_threat_step_by_row": ratio_dict(peashooter_placements, threat_steps),
-        "first_defense_step_by_row": average_positive_step_dict_from_logs(logs, "first_defense_step_by_row"),
+        "first_defense_step_by_row": average_positive_step_dict_from_rows(rows, "first_defense_step_by_row"),
         "plants_in_threatened_row_ratio": (
             sum(log.plants_in_threatened_row_ratio * max(0, log.plants_placed) for log in logs) / plant_weight_total
             if plant_weight_total > 0
@@ -3717,10 +3740,8 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "overdefended_while_undefended_count": sum(log.overdefended_while_undefended_count for log in logs),
         "least_defended_threatened_row_plant_count": sum(log.least_defended_threatened_row_plant_count for log in logs),
         "rows_with_peashooter_count": sum(log.rows_with_peashooter_count for log in logs) / count,
-        "all_rows_peashooter_covered_step": average_positive_values(
-            [float(log.all_rows_peashooter_covered_step) for log in logs]
-        ),
-        "first_peashooter_by_row_step": average_positive_step_dict_from_logs(logs, "first_peashooter_by_row_step"),
+        "all_rows_peashooter_covered_step": average_positive_from_rows(rows, "all_rows_peashooter_covered_step"),
+        "first_peashooter_by_row_step": average_positive_step_dict_from_rows(rows, "first_peashooter_by_row_step"),
         "sunflower_count_when_first_full_coverage": (
             sum(full_coverage_sunflower_counts) / len(full_coverage_sunflower_counts)
             if full_coverage_sunflower_counts
@@ -3731,20 +3752,20 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "peashooter_coverage_rate_by_step": (
             sum(log.peashooter_coverage_rate_by_step * log.episode_length for log in logs) / max(1, total_steps)
         ),
-        "mower_losses_by_row": sum_eval_count_dicts(logs, "mower_losses_by_row"),
+        "mower_losses_by_row": sum_count_dicts_from_rows(rows, "mower_losses_by_row"),
         "wait_under_threat_count": sum(log.wait_under_threat_count for log in logs),
         "close_zombie_undefended_count": sum(log.close_zombie_undefended_count for log in logs),
-        "illegal_reason_counts": sum_eval_count_dicts(logs, "illegal_reason_counts"),
-        "legal_peashooter_actions_by_row": sum_eval_count_dicts(logs, "legal_peashooter_actions_by_row"),
-        "peashooter_available_but_waited_by_row": sum_eval_count_dicts(logs, "peashooter_available_but_waited_by_row"),
-        "peashooter_available_but_planted_elsewhere_by_row": sum_eval_count_dicts(
-            logs,
+        "illegal_reason_counts": sum_count_dicts_from_rows(rows, "illegal_reason_counts"),
+        "legal_peashooter_actions_by_row": sum_count_dicts_from_rows(rows, "legal_peashooter_actions_by_row"),
+        "peashooter_available_but_waited_by_row": sum_count_dicts_from_rows(rows, "peashooter_available_but_waited_by_row"),
+        "peashooter_available_but_planted_elsewhere_by_row": sum_count_dicts_from_rows(
+            rows,
             "peashooter_available_but_planted_elsewhere_by_row",
         ),
-        "sunflower_while_undefended_threat_by_row": sum_eval_count_dicts(logs, "sunflower_while_undefended_threat_by_row"),
-        "legal_actions_by_seed_slot": sum_eval_count_dicts(logs, "legal_actions_by_seed_slot"),
-        "bridge_legal_actions_by_seed_slot": sum_eval_count_dicts(logs, "bridge_legal_actions_by_seed_slot"),
-        "python_mask_block_reason_counts": sum_eval_count_dicts(logs, "python_mask_block_reason_counts"),
+        "sunflower_while_undefended_threat_by_row": sum_count_dicts_from_rows(rows, "sunflower_while_undefended_threat_by_row"),
+        "legal_actions_by_seed_slot": sum_count_dicts_from_rows(rows, "legal_actions_by_seed_slot"),
+        "bridge_legal_actions_by_seed_slot": sum_count_dicts_from_rows(rows, "bridge_legal_actions_by_seed_slot"),
+        "python_mask_block_reason_counts": sum_count_dicts_from_rows(rows, "python_mask_block_reason_counts"),
         "pre_step_mask_blocked_count": sum(log.pre_step_mask_blocked_count for log in logs),
         "cooldown_illegal_exposed_by_mask_count": sum(log.cooldown_illegal_exposed_by_mask_count for log in logs),
         "mask_bridge_disagreement_count": sum(log.mask_bridge_disagreement_count for log in logs),
@@ -3754,8 +3775,8 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "wait_while_cherrybomb_affordable_ready_count": sum(log.wait_while_cherrybomb_affordable_ready_count for log in logs),
         "active_threat_rows_without_peashooter_count": sum(log.active_threat_rows_without_peashooter_count for log in logs),
         "sunflower_greed_while_defense_missing_count": sum(log.sunflower_greed_while_defense_missing_count for log in logs),
-        "wallnut_placements_by_row": sum_eval_count_dicts(logs, "wallnut_placements_by_row"),
-        "wallnut_placements_by_col": sum_eval_count_dicts(logs, "wallnut_placements_by_col"),
+        "wallnut_placements_by_row": sum_count_dicts_from_rows(rows, "wallnut_placements_by_row"),
+        "wallnut_placements_by_col": sum_count_dicts_from_rows(rows, "wallnut_placements_by_col"),
         "wallnut_blocks_active_threat_count": sum(log.wallnut_blocks_active_threat_count for log in logs),
         "wallnut_low_value_placement_count": sum(log.wallnut_low_value_placement_count for log in logs),
         "wallnut_threatened_lane_placements": sum(log.wallnut_threatened_lane_placements for log in logs),
@@ -3778,8 +3799,8 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "cherrybomb_heavy_zombie_kills": sum(log.cherrybomb_heavy_zombie_kills for log in logs),
         "cherrybomb_used_under_threat_count": sum(log.cherrybomb_used_under_threat_count for log in logs),
         "cherrybomb_used_low_value_count": sum(log.cherrybomb_used_low_value_count for log in logs),
-        "mower_risk_steps_by_row": sum_eval_count_dicts(logs, "mower_risk_steps_by_row"),
-        "mower_saves_estimated_by_row": sum_eval_count_dicts(logs, "mower_saves_estimated_by_row"),
+        "mower_risk_steps_by_row": sum_count_dicts_from_rows(rows, "mower_risk_steps_by_row"),
+        "mower_saves_estimated_by_row": sum_count_dicts_from_rows(rows, "mower_saves_estimated_by_row"),
         "close_zombie_with_no_defense_count": sum(log.close_zombie_with_no_defense_count for log in logs),
         "undefended_threat_steps": sum(log.undefended_threat_steps for log in logs),
         "high_danger_unanswered_steps": sum(log.high_danger_unanswered_steps for log in logs),
@@ -3795,9 +3816,9 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "wallnut_actions_available": sum(log.wallnut_actions_available for log in logs),
         "cherrybomb_actions_available": sum(log.cherrybomb_actions_available for log in logs),
         "mask_all_but_wait_count": sum(log.mask_all_but_wait_count for log in logs),
-        "buckethead_count_by_row": sum_eval_count_dicts(logs, "buckethead_count_by_row"),
-        "conehead_count_by_row": sum_eval_count_dicts(logs, "conehead_count_by_row"),
-        "tough_zombie_count_by_row": sum_eval_count_dicts(logs, "tough_zombie_count_by_row"),
+        "buckethead_count_by_row": sum_count_dicts_from_rows(rows, "buckethead_count_by_row"),
+        "conehead_count_by_row": sum_count_dicts_from_rows(rows, "conehead_count_by_row"),
+        "tough_zombie_count_by_row": sum_count_dicts_from_rows(rows, "tough_zombie_count_by_row"),
         "tough_zombie_response_count": sum(log.tough_zombie_response_count for log in logs),
         "fusion_policy": logs[0].fusion_policy if logs else FUSION_POLICY_NONE,
         "fusion_candidate_count_total": fusion_candidate_count_total,
@@ -3806,16 +3827,16 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "fusion_success_count": fusion_success_count,
         "fusion_failed_count": sum(log.fusion_failed_count for log in logs),
         "fusion_rejected_count": sum(log.fusion_rejected_count for log in logs),
-        "fusion_rejected_reasons": sum_eval_count_dicts(logs, "fusion_rejected_reasons"),
-        "fusion_by_result_type": sum_eval_count_dicts(logs, "fusion_by_result_type"),
-        "fusion_by_source_type": sum_eval_count_dicts(logs, "fusion_by_source_type"),
-        "fusion_by_row": sum_eval_count_dicts(logs, "fusion_by_row"),
-        "plant_action_counts": sum_eval_count_dicts(logs, "plant_action_counts"),
-        "successful_placements_by_plant": sum_eval_count_dicts(logs, "successful_placements_by_plant"),
-        "invalid_actions_by_plant": sum_eval_count_dicts(logs, "invalid_actions_by_plant"),
-        "fusion_attempts_by_pair": sum_eval_count_dicts(logs, "fusion_attempts_by_pair"),
-        "fusion_successes_by_pair": sum_eval_count_dicts(logs, "fusion_successes_by_pair"),
-        "fusion_depth_counts": sum_eval_count_dicts(logs, "fusion_depth_counts"),
+        "fusion_rejected_reasons": sum_count_dicts_from_rows(rows, "fusion_rejected_reasons"),
+        "fusion_by_result_type": sum_count_dicts_from_rows(rows, "fusion_by_result_type"),
+        "fusion_by_source_type": sum_count_dicts_from_rows(rows, "fusion_by_source_type"),
+        "fusion_by_row": sum_count_dicts_from_rows(rows, "fusion_by_row"),
+        "plant_action_counts": sum_count_dicts_from_rows(rows, "plant_action_counts"),
+        "successful_placements_by_plant": sum_count_dicts_from_rows(rows, "successful_placements_by_plant"),
+        "invalid_actions_by_plant": sum_count_dicts_from_rows(rows, "invalid_actions_by_plant"),
+        "fusion_attempts_by_pair": sum_count_dicts_from_rows(rows, "fusion_attempts_by_pair"),
+        "fusion_successes_by_pair": sum_count_dicts_from_rows(rows, "fusion_successes_by_pair"),
+        "fusion_depth_counts": sum_count_dicts_from_rows(rows, "fusion_depth_counts"),
         "recursive_fusion_count": sum(log.recursive_fusion_count for log in logs),
         "highest_fusion_tier": max((log.highest_fusion_tier for log in logs), default=0),
         "action_freeze_count": sum(log.action_freeze_count for log in logs),
@@ -3834,12 +3855,12 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         ),
         "fusion_bridge_error_count": sum(log.fusion_bridge_error_count for log in logs),
         "fusion_unsafe_state_block_count": sum(log.fusion_unsafe_state_block_count for log in logs),
-        "plant_actions_by_row": sum_eval_count_dicts(logs, "plant_actions_by_row"),
-        "peashooter_actions_by_row": sum_eval_count_dicts(logs, "peashooter_actions_by_row"),
-        "sunflower_actions_by_row": sum_eval_count_dicts(logs, "sunflower_actions_by_row"),
-        "plant_placements_by_row": sum_eval_count_dicts(logs, "plant_placements_by_row"),
-        "peashooter_placements_by_row": sum_eval_count_dicts(logs, "peashooter_placements_by_row"),
-        "sunflower_placements_by_row": sum_eval_count_dicts(logs, "sunflower_placements_by_row"),
+        "plant_actions_by_row": sum_count_dicts_from_rows(rows, "plant_actions_by_row"),
+        "peashooter_actions_by_row": sum_count_dicts_from_rows(rows, "peashooter_actions_by_row"),
+        "sunflower_actions_by_row": sum_count_dicts_from_rows(rows, "sunflower_actions_by_row"),
+        "plant_placements_by_row": sum_count_dicts_from_rows(rows, "plant_placements_by_row"),
+        "peashooter_placements_by_row": sum_count_dicts_from_rows(rows, "peashooter_placements_by_row"),
+        "sunflower_placements_by_row": sum_count_dicts_from_rows(rows, "sunflower_placements_by_row"),
         "row_defense_opportunities_by_row": row_defense_opportunities,
         "row_defense_responses_by_row": row_defense_responses,
         "row_defense_response_rate_by_row": ratio_dict(row_defense_responses, row_defense_opportunities),
@@ -3860,90 +3881,6 @@ def summarize_eval_logs(logs: List[EvalLog]) -> Dict[str, Any]:
         "fusion_last_source": str(logs[-1].fusion_last_source) if logs else "",
         "reward_component_totals": reward_component_totals,
         "reward_component_avgs": {field: value / count for field, value in reward_component_totals.items()},
-    }
-
-
-def sum_eval_count_dicts(logs: List[EvalLog], field_name: str) -> Dict[str, int]:
-    totals: Counter[str] = Counter()
-    for log in logs:
-        values = getattr(log, field_name, {})
-        if not isinstance(values, dict):
-            continue
-        for key, value in values.items():
-            try:
-                totals[str(key)] += int(value)
-            except (TypeError, ValueError):
-                continue
-    return dict(sorted(totals.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])))
-
-
-def max_eval_count_dicts(logs: List[EvalLog], field_name: str) -> Dict[str, int]:
-    totals: Counter[str] = Counter()
-    for log in logs:
-        values = getattr(log, field_name, {})
-        if not isinstance(values, dict):
-            continue
-        for key, value in values.items():
-            try:
-                totals[str(key)] = max(int(totals.get(str(key), 0)), int(value))
-            except (TypeError, ValueError):
-                continue
-    return dict(sorted(totals.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])))
-
-
-def weighted_average_dict_from_logs(logs: List[EvalLog], field_name: str, weight_field: str) -> Dict[str, float]:
-    totals: Counter[str] = Counter()
-    weights: Counter[str] = Counter()
-    for log in logs:
-        values = getattr(log, field_name, {})
-        row_weights = getattr(log, weight_field, {})
-        if not isinstance(values, dict) or not isinstance(row_weights, dict):
-            continue
-        for key, raw_value in values.items():
-            try:
-                value = float(raw_value)
-                weight = int(row_weights.get(str(key), 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if weight <= 0:
-                continue
-            totals[str(key)] += value * weight
-            weights[str(key)] += weight
-    keys = sorted(set(totals.keys()) | set(weights.keys()), key=lambda item: (0, int(item)) if item.isdigit() else (1, item))
-    return {
-        key: float(totals.get(key, 0.0)) / float(weights.get(key, 0))
-        if weights.get(key, 0) > 0
-        else 0.0
-        for key in keys
-    }
-
-
-def average_positive_values(values: List[float]) -> float:
-    positives = [float(value) for value in values if float(value) > 0.0]
-    return sum(positives) / len(positives) if positives else 0.0
-
-
-def average_positive_step_dict_from_logs(logs: List[EvalLog], field_name: str) -> Dict[str, float]:
-    totals: Counter[str] = Counter()
-    counts: Counter[str] = Counter()
-    for log in logs:
-        values = getattr(log, field_name, {})
-        if not isinstance(values, dict):
-            continue
-        for key, raw_value in values.items():
-            try:
-                value = int(raw_value)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                totals[str(key)] += value
-                counts[str(key)] += 1
-    keys = sorted(set(totals.keys()) | set(counts.keys()), key=lambda item: (0, int(item)) if item.isdigit() else (1, item))
-    return {
-        key: float(totals.get(key, 0)) / float(counts.get(key, 0))
-        if counts.get(key, 0) > 0
-        else 0.0
-        for key in keys
     }
 
 

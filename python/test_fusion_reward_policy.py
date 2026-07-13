@@ -349,6 +349,30 @@ class FusionRewardPolicyTests(unittest.TestCase):
         self.assertLess(delta, 0.0)
         self.assertLess(env._fusion_reward_live_fields()["fusion_bridge_error_penalty_total"], 0.0)
 
+    def test_eval_log_aggregation_uses_canonical_row_reducers(self) -> None:
+        first = EvalLog(policy="ppo", episode=1)
+        first.threat_steps_by_row = {"10": 2, "2": 3, "alpha": 1}
+        first.undefended_threat_age_avg_by_row = {"2": 2.0, "alpha": 5.0}
+        first.undefended_threat_age_max_by_row = {"2": 7, "alpha": 5}
+        first.threatened_rows_with_zero_defender_steps_by_row = {"2": 2, "alpha": 1}
+        first.first_defense_step_by_row = {"2": 5, "alpha": 0}
+        first.all_rows_peashooter_covered_step = 12
+
+        second = EvalLog(policy="ppo", episode=2)
+        second.threat_steps_by_row = {"2": 4, "alpha": 2, "bad": "not-a-count"}
+        second.undefended_threat_age_avg_by_row = {"2": 8.0, "alpha": 1.0}
+        second.undefended_threat_age_max_by_row = {"2": 4, "10": 9}
+        second.threatened_rows_with_zero_defender_steps_by_row = {"2": 1, "alpha": 3}
+        second.first_defense_step_by_row = {"2": 7, "10": 3, "alpha": -1}
+
+        summary = summarize_eval_logs([first, second])
+
+        self.assertEqual(summary["threat_steps_by_row"], {"2": 7, "10": 2, "alpha": 3})
+        self.assertEqual(summary["undefended_threat_age_max_by_row"], {"2": 7, "10": 9, "alpha": 5})
+        self.assertEqual(summary["undefended_threat_age_avg_by_row"], {"2": 4.0, "alpha": 2.0})
+        self.assertEqual(summary["first_defense_step_by_row"], {"2": 6.0, "10": 3.0})
+        self.assertEqual(summary["all_rows_peashooter_covered_step"], 12.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
