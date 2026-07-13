@@ -236,7 +236,6 @@ class JsonlCoachCommandSource:
     def __init__(self, path: Optional[Path], *, start_at_end: bool = True) -> None:
         self.path = path
         self._tail = IncrementalLineTailReader(path, start_at_end=start_at_end) if path is not None else None
-        self._offset = self._tail.offset if self._tail is not None else 0
         self._started = False
         self._sequence = 0
         self._messages_emitted = 0
@@ -306,7 +305,6 @@ class JsonlCoachCommandSource:
                 else:
                     parse_error = "json_not_object"
                     self._tail.note_malformed_record(parse_error)
-            self._offset = self._tail.offset
             self._last_error = parse_error or str(self._tail.last_error or "")
             return payloads
         except OSError as exc:
@@ -318,7 +316,6 @@ class JsonlCoachCommandSource:
             return 0
         try:
             skipped = self._tail.clear_to_end()
-            self._offset = self._tail.offset
             self._last_clear_count = int(skipped)
             return int(skipped)
         except OSError as exc:
@@ -733,7 +730,6 @@ class CrowdCoachAggregator:
         self._pending_vote_command: Optional[Dict[str, Any]] = None
         self._pending_vote_count: int = 0
         self._pending_vote_first_timestamp: float = 0.0
-        self._pending_vote_reason: str = ""
 
     def ingest_message(
         self,
@@ -1180,13 +1176,11 @@ class CrowdCoachAggregator:
         self._pending_vote_command = dict(vote.command)
         self._pending_vote_count = max(1, int(vote.vote_count))
         self._pending_vote_first_timestamp = float(vote.first_timestamp)
-        self._pending_vote_reason = str(reason or "")
 
     def _clear_pending_vote(self) -> None:
         self._pending_vote_command = None
         self._pending_vote_count = 0
         self._pending_vote_first_timestamp = 0.0
-        self._pending_vote_reason = ""
 
     def clear_pending_state(self) -> bool:
         stale_detected = bool(self._messages or self._pending_vote_command)

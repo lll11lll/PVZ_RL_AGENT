@@ -427,7 +427,6 @@ class FileCoachCommandSource:
     def __init__(self, path: Union[str, Path], *, start_at_end: bool = True) -> None:
         self.path = Path(path)
         self._tail = IncrementalLineTailReader(self.path, start_at_end=start_at_end)
-        self._offset = self._tail.offset
         self._last_error = ""
         self._queue: Deque[str] = deque()
 
@@ -458,7 +457,6 @@ class FileCoachCommandSource:
                     self._queue.append(_SourcedCoachCommandText(text, timestamp=timestamp, source=source))
                 else:
                     self._queue.append(text)
-        self._offset = self._tail.offset
         if not self._last_error and self._tail.last_error:
             self._last_error = self._tail.last_error
         if not self._queue:
@@ -475,7 +473,6 @@ class FileCoachCommandSource:
         self._tail.clear_to_end()
         if self._tail.last_clear_had_bytes:
             cleared += 1
-        self._offset = self._tail.offset
         return int(cleared)
 
 
@@ -516,7 +513,6 @@ class HumanCoachOverrideHook:
         self.stats.fusion_bridge_enabled = bool(fusion_enabled)
         self.logger = HumanCoachJSONLLogger(log_path)
         self._pending_command: Optional[CoachCommand] = None
-        self._pending_reason: str = ""
         self._issued_command_ids: Set[int] = set()
         self._accounted_fusion_event_ids: Set[str] = set()
 
@@ -577,7 +573,6 @@ class HumanCoachOverrideHook:
     ) -> bool:
         stale_detected = self._pending_command is not None or isinstance(self.stats.selected_bridge_command, dict)
         self._pending_command = None
-        self._pending_reason = ""
         self.stats.pending_coach_command = None
         self.stats.selected_bridge_command = None
         if clear_source and self.source is not None and not callable(self.source):
@@ -606,7 +601,6 @@ class HumanCoachOverrideHook:
         if latest_command is not None:
             command = latest_command
             self._pending_command = None
-            self._pending_reason = ""
         else:
             command = self._pending_command
         if command is None:
@@ -633,7 +627,6 @@ class HumanCoachOverrideHook:
         if command_id in self._issued_command_ids:
             reason = "coach_command_already_executed"
             self._pending_command = None
-            self._pending_reason = ""
             self.stats.pending_coach_command = None
             self.stats.selected_bridge_command = None
             self.stats.rejected_count += 1
@@ -674,7 +667,6 @@ class HumanCoachOverrideHook:
             reason = validation.rejected_reason or command.rejected_reason or "illegal_command"
             if _is_pending_retry_reason(command, reason):
                 self._pending_command = command
-                self._pending_reason = str(reason)
                 self.stats.pending_coach_command = command.to_dict()
                 self.stats.selected_bridge_command = None
                 wait_action = self._wait_action_for_env(env, observation=observation, fallback=ppo_action)
@@ -719,7 +711,6 @@ class HumanCoachOverrideHook:
                 )
 
             self._pending_command = None
-            self._pending_reason = ""
             self.stats.pending_coach_command = None
             self.stats.selected_bridge_command = None
             self.stats.rejected_count += 1
@@ -747,7 +738,6 @@ class HumanCoachOverrideHook:
             )
 
         self._pending_command = None
-        self._pending_reason = ""
         self.stats.pending_coach_command = None
         selected_action = int(validation.policy_action)
         selected_bridge_command = dict(validation.bridge_command) if isinstance(validation.bridge_command, dict) else None

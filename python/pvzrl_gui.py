@@ -155,7 +155,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.adventure_soft_max_steps_var = tk.StringVar(value="2000")
         self.adventure_hard_max_steps_var = tk.StringVar(value="3500")
         self.adventure_board_timeout_var = tk.StringVar(value="60")
-        self.adventure_live_status_var = tk.StringVar(value=self._path_for_command(self.live_status_path))
         self.adventure_eval_var = tk.BooleanVar(value=True)
         self.adventure_advance_on_wins_var = tk.BooleanVar(value=True)
         self.adventure_auto_select_seeds_var = tk.BooleanVar(value=True)
@@ -333,9 +332,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.log_text: Optional[scrolledtext.ScrolledText] = None
         self.train_preview: Optional[scrolledtext.ScrolledText] = None
         self.eval_preview: Optional[scrolledtext.ScrolledText] = None
-        self.adventure_preview: Optional[scrolledtext.ScrolledText] = None
-        self.generalist_preview: Optional[scrolledtext.ScrolledText] = None
-        self.level3_preview: Optional[scrolledtext.ScrolledText] = None
         self.adventure_status_text: Optional[tk.Text] = None
         self.generalist_status_text: Optional[tk.Text] = None
         self.train_advanced_frame: Optional[ttk.LabelFrame] = None
@@ -864,7 +860,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
 
         grid = ttk.Frame(parent)
         grid.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 6))
-        self.diagnostic_panel_container = grid
         for column in range(3):
             grid.columnconfigure(column, weight=1)
         for row in range(2):
@@ -1825,44 +1820,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
                 ]
             )
             self._set_text_widget(self.eval_preview, "\n".join(lines))
-        if self.adventure_preview is not None:
-            lines = [
-                "Start Adventure Eval:",
-                self._command_text(self._build_adventure_command()),
-            ]
-            if not self.adventure_eval_var.get():
-                lines.extend(["", "Note: --adventure-eval is required for this launch button."])
-            self._set_text_widget(self.adventure_preview, "\n".join(lines))
-        if self.generalist_preview is not None:
-            resume_model_path = self.generalist_resume_model_path_var.get().strip()
-            lines = [
-                "Adventure Generalist Train:",
-                self._command_text(self._build_adventure_generalist_command()),
-                "",
-                "Adventure Generalist Eval:",
-            ]
-            if self.generalist_eval_model_path_var.get().strip():
-                lines.append(self._command_text(self._build_adventure_generalist_eval_command()))
-            else:
-                lines.append("model_path is required for Adventure Generalist eval")
-            if resume_model_path:
-                lines.extend(["", f"Resume training model zip: {self._path_for_display(resume_model_path)}"])
-            else:
-                lines.extend(["", "Resume training model zip: (blank -> fresh model initialization)"])
-            lines.extend(
-                [
-                    "",
-                    f"Model family: {ADVENTURE_GENERALIST_MODEL_FAMILY}",
-                    "Resume supported via --resume-model-path; eval uses the separate Eval model .zip field.",
-                ]
-            )
-            self._set_text_widget(self.generalist_preview, "\n".join(lines))
-        if self.level3_preview is not None:
-            lines = [
-                "Start Level 3 Specialist:",
-                self._command_text(self._build_level3_command()),
-            ]
-            self._set_text_widget(self.level3_preview, "\n".join(lines))
 
     def _set_text_widget(self, widget: tk.Text, content: str) -> None:
         widget.configure(state="normal")
@@ -1924,11 +1881,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.human_coach_command_input_var.set("")
             self._structured_raw_copy_value = ""
 
-    def start_training(self) -> None:
-        if self.fast_only_var.get():
-            self._append_log("Note: --fast-only omitted from training; train_ppo.py does not support it.\n")
-        self.launch_process("Start Training", self._build_train_command(resume=False))
-
     def resume_training(self) -> None:
         raw_model_path = self.generalist_resume_model_path_var.get().strip()
         if not raw_model_path:
@@ -1939,53 +1891,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self._append_log(f"ERROR: Resume model does not exist: {model_path}\n")
             return
         self.start_adventure_generalist_train()
-
-    def run_eval(self) -> None:
-        self._launch_eval("Run Eval", self._build_eval_command())
-
-    def run_25_episode_eval(self) -> None:
-        self._launch_eval("Run 25-Episode Eval", self._build_eval_command(episodes_override="25"))
-
-    def start_level3_specialist(self) -> None:
-        if self.level3_mode_var.get().strip().lower() == "eval":
-            raw_model_path = self.level3_model_path_var.get().strip()
-            if not raw_model_path:
-                self._append_log("ERROR: Level 3 eval requires model_path.\n")
-                return
-            model_path = self._resolve_text_path(raw_model_path)
-            if not model_path.exists():
-                self._append_log(f"ERROR: Level 3 model does not exist: {model_path}\n")
-                return
-        self.launch_process("Start Level 3", self._build_level3_command())
-
-    def _launch_eval(self, name: str, command: List[str]) -> None:
-        raw_model_path = self.model_path_var.get().strip()
-        if not raw_model_path:
-            self._append_log("ERROR: Eval requires model_path.\n")
-            return
-        model_path = self._resolve_text_path(raw_model_path)
-        if not model_path.exists():
-            self._append_log(f"ERROR: Eval model does not exist: {model_path}\n")
-            return
-        if self.fast_only_var.get():
-            self._append_log("Note: --fast-only omitted from eval; train_ppo.py does not support it.\n")
-        self.launch_process(name, command)
-
-    def start_adventure_eval(self) -> None:
-        if not self.adventure_eval_var.get():
-            self._append_log("ERROR: Adventure launch requires --adventure-eval.\n")
-            return
-        raw_model_path = self.adventure_model_path_var.get().strip()
-        if not raw_model_path:
-            self._append_log("ERROR: Adventure eval requires model_path.\n")
-            return
-        model_path = self._resolve_text_path(raw_model_path)
-        if not model_path.exists():
-            self._append_log(f"ERROR: Adventure model does not exist: {model_path}\n")
-            return
-        if not self.adventure_advance_on_wins_var.get():
-            self._append_log("Note: --advance-on-wins omitted; train_ppo.py defaults to 1.\n")
-        self.launch_process("Start Adventure Eval", self._build_adventure_command())
 
     def start_adventure_generalist_train(self) -> None:
         if self.generalist_initial_loadout_var.get().strip() != ADVENTURE_GENERALIST_INITIAL_LOADOUT:
@@ -2088,17 +1993,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.model_path_var.set(filename)
             self._append_log(f"Selected model path: {filename}\n")
 
-    def browse_adventure_model(self) -> None:
-        initial_dir = self.repo_root / "runs"
-        filename = filedialog.askopenfilename(
-            title="Select Adventure model.zip",
-            initialdir=str(initial_dir if initial_dir.exists() else self.repo_root),
-            filetypes=[("Zip models", "*.zip"), ("All files", "*.*")],
-        )
-        if filename:
-            self.adventure_model_path_var.set(filename)
-            self._append_log(f"Selected Adventure model path: {filename}\n")
-
     def browse_generalist_eval_model(self) -> None:
         initial_dir = self.repo_root / "runs"
         filename = filedialog.askopenfilename(
@@ -2149,14 +2043,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.model_path_var.set(str(model))
         self._append_log(f"Refresh Models: selected newest model path: {model}\n")
 
-    def refresh_adventure_model(self) -> None:
-        model = self._find_newest_usable_model_zip()
-        if model is None:
-            self._append_log("Refresh Adventure model: no metadata-backed .zip models found under runs.\n")
-            return
-        self.adventure_model_path_var.set(str(model))
-        self._append_log(f"Refresh Adventure model: selected newest metadata-backed model path: {model}\n")
-
     def refresh_generalist_eval_model(self) -> None:
         model = self._find_newest_usable_model_zip()
         if model is None:
@@ -2205,33 +2091,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         )
         if run_dir:
             return self._resolve_text_path(run_dir)
-        if model_path:
-            return self._resolve_text_path(model_path).parent
-        runs_dir = self.repo_root / "runs"
-        return runs_dir if runs_dir.exists() else None
-
-    def open_adventure_run_folder(self) -> None:
-        path = self._selected_adventure_run_dir()
-        if path is None:
-            path = self.repo_root / "runs"
-        if not path.exists():
-            self._append_log(f"ERROR: Adventure folder does not exist: {path}\n")
-            return
-        try:
-            if os.name == "nt":
-                subprocess.Popen(["explorer", str(path)])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
-            self._append_log(f"Opened Adventure folder: {path}\n")
-        except OSError as exc:
-            self._append_log(f"ERROR: Failed to open Adventure folder {path}: {exc}\n")
-
-    def _selected_adventure_run_dir(self) -> Optional[Path]:
-        if self.active_run_path:
-            return self._resolve_text_path(self.active_run_path)
-        model_path = self.adventure_model_path_var.get().strip()
         if model_path:
             return self._resolve_text_path(model_path).parent
         runs_dir = self.repo_root / "runs"
