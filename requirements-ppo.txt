@@ -2,3 +2,4 @@ gymnasium
 numpy
 stable-baselines3
 sb3-contrib
+websockets>=16,<17

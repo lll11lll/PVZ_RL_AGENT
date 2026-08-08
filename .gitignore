@@ -7,6 +7,10 @@ docs/*
 !docs/REFACTOR_PLAN.md
 !docs/REFACTOR_REPORT.md
 !docs/CONFIGURATION.md
+!docs/STREAMER_MODE.md
+!docs/HUMAN_STREAM_COACH_GUIDE.md
+!docs/ASSISTED_STREAMER_MODE.md
+!docs/ADVENTURE_GENERALIST_COACH_QUICKSTART.md
 configs/ppo_adventure_generalist_14slot_identity_v1.json
 # Model checkpoints and artifacts
 model.zip

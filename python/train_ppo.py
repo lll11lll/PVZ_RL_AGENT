@@ -5,15 +5,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
+
+import numpy as np
 
 from pvzrl_adventure import (
     DEFAULT_ADVENTURE_HARD_MAX_STEPS,
@@ -68,9 +75,11 @@ from pvzrl_model_metadata import (
 )
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
+from pvzrl_streamer import EVALUATE, STREAM_TRAIN, run_streamer_cycles
 
 
 DEFAULT_CONFIG_PATH = Path("configs/ppo_adventure_generalist_14slot_identity_v1.json")
+STREAMER_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 LANE_DIAGNOSTIC_DICT_FIELDS = [
     "plants_by_row",
     "peashooters_by_row",
@@ -340,16 +349,76 @@ class TeeStream:
         return getattr(self.streams[0], name)
 
 
-class TeeOutput:
-    def __init__(self, path: Path):
+class RotatingTextStream:
+    """Small bounded file-like stream for long-running console capture."""
+
+    def __init__(self, path: Path, *, max_bytes: int, backup_count: int) -> None:
         self.path = path
+        self.max_bytes = max(1024, int(max_bytes))
+        self.backup_count = max(1, int(backup_count))
+        self._lock = threading.Lock()
+        if path.is_file() and path.stat().st_size >= self.max_bytes:
+            self._rotate_files()
+        self._handle: TextIO = path.open("a", encoding="utf-8")
+        self._size = int(path.stat().st_size) if path.is_file() else 0
+
+    def _rotate_files(self) -> None:
+        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backup_count - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            if source.is_file():
+                os.replace(source, self.path.with_name(f"{self.path.name}.{index + 1}"))
+        if self.path.is_file():
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+
+    def write(self, data: str) -> int:
+        encoded_size = len(str(data).encode("utf-8"))
+        with self._lock:
+            if self._size > 0 and self._size + encoded_size > self.max_bytes:
+                self._handle.close()
+                self._rotate_files()
+                self._handle = self.path.open("a", encoding="utf-8")
+                self._size = 0
+            written = self._handle.write(data)
+            self._size += encoded_size
+            return written
+
+    def flush(self) -> None:
+        with self._lock:
+            self._handle.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.close()
+
+
+class TeeOutput:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        rotate_max_bytes: Optional[int] = None,
+        rotate_backup_count: int = 3,
+    ):
+        self.path = path
+        self.rotate_max_bytes = rotate_max_bytes
+        self.rotate_backup_count = int(rotate_backup_count)
         self.handle: Optional[TextIO] = None
         self.old_stdout: Optional[TextIO] = None
         self.old_stderr: Optional[TextIO] = None
 
     def __enter__(self) -> "TeeOutput":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("a", encoding="utf-8")
+        self.handle = (
+            RotatingTextStream(
+                self.path,
+                max_bytes=int(self.rotate_max_bytes),
+                backup_count=self.rotate_backup_count,
+            )
+            if self.rotate_max_bytes is not None
+            else self.path.open("a", encoding="utf-8")
+        )
         self.old_stdout = sys.stdout
         self.old_stderr = sys.stderr
         sys.stdout = TeeStream(sys.stdout, self.handle)  # type: ignore[assignment]
@@ -807,6 +876,7 @@ def _build_config_mapping(
     coach_allow_fusion_planning = enabled("coach_allow_fusion_planning")
     fusion_bridge_enabled = enabled("fusion_bridge_enabled")
     human_coach_enabled = enabled("human_coach_enabled")
+    streamer_v1_enabled = enabled("streamer_v1_enabled")
     human_coach_command_mode = str(
         getattr(args, "human_coach_command_mode", None)
         or raw_config.get("human_coach_command_mode", "override")
@@ -876,8 +946,12 @@ def _build_config_mapping(
         "model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
         "total_timesteps": int(value("total_timesteps", 25000)),
         "learning_rate": float(value("learning_rate", 3e-4)),
-        "n_steps": int(value("n_steps", 512)),
-        "batch_size": int(value("batch_size", 64)),
+        "n_steps": int(
+            value("n_steps", 512, mode_default=500 if streamer_v1_enabled else CONFIG_UNSET)
+        ),
+        "batch_size": int(
+            value("batch_size", 64, mode_default=50 if streamer_v1_enabled else CONFIG_UNSET)
+        ),
         "gamma": float(value("gamma", 0.99)),
         "gae_lambda": float(value("gae_lambda", 0.95)),
         "ent_coef": float(value("ent_coef", 0.01)),
@@ -926,9 +1000,16 @@ def _build_config_mapping(
         ),
         "debug_sun_sample_interval": int(value("debug_sun_sample_interval", 25)),
         "fusion_policy": fusion_policy,
-        "fusion_action_mask_enabled": enabled("fusion_action_mask_enabled"),
+        "fusion_action_mask_enabled": enabled(
+            "fusion_action_mask_enabled",
+            mode_default=streamer_v1_enabled,
+        ),
         "enable_board_plant_identity": bool(
-            value("enable_board_plant_identity", False)
+            value(
+                "enable_board_plant_identity",
+                False,
+                mode_default=True if streamer_v1_enabled else CONFIG_UNSET,
+            )
         ),
         "enable_fusion_chain_rewards": bool(value("enable_fusion_chain_rewards", False)),
         "enable_recipe_discovery_reward": bool(value("enable_recipe_discovery_reward", False)),
@@ -1011,6 +1092,47 @@ def _build_config_mapping(
         "stream_coach_fusion_enabled": bool(stream_coach_fusion_enabled),
         "coach_allow_fusion_planning": bool(coach_allow_fusion_planning),
         "fusion_bridge_enabled": bool(fusion_bridge_enabled),
+        "streamer_v1_enabled": bool(streamer_v1_enabled),
+        "streamer_platform": str(value("streamer_platform", "twitch") or "twitch").strip().lower(),
+        "streamer_baseline_checkpoint": str(value("streamer_baseline_checkpoint", "") or "").strip(),
+        "streamer_intervention_interval_seconds": float(
+            value("streamer_intervention_interval_seconds", 2.0)
+        ),
+        "streamer_command_ttl_seconds": float(value("streamer_command_ttl_seconds", 10.0)),
+        "streamer_command_queue_capacity": int(value("streamer_command_queue_capacity", 256)),
+        "streamer_message_max_chars": int(value("streamer_message_max_chars", 256)),
+        "streamer_policy_steps_per_cycle": int(value("streamer_policy_steps_per_cycle", 25000)),
+        "streamer_checkpoint_policy_steps": int(
+            value("streamer_checkpoint_policy_steps", 5000)
+        ),
+        "streamer_evaluation_episodes": int(value("streamer_evaluation_episodes", 50)),
+        "streamer_max_cycles": int(value("streamer_max_cycles", 0)),
+        "streamer_endurance_hours": float(value("streamer_endurance_hours", 0.0)),
+        "streamer_bc_enabled": bool(value("streamer_bc_enabled", True)),
+        "streamer_bc_coefficient": float(value("streamer_bc_coefficient", 0.01)),
+        "streamer_demonstration_capacity": int(value("streamer_demonstration_capacity", 4096)),
+        "streamer_demonstration_persist_every": int(
+            value("streamer_demonstration_persist_every", 512)
+        ),
+        "streamer_bc_batch_size": int(value("streamer_bc_batch_size", 32)),
+        "streamer_bc_update_frequency": int(value("streamer_bc_update_frequency", 1)),
+        "streamer_bc_min_demonstrations": int(value("streamer_bc_min_demonstrations", 8)),
+        "streamer_twitch_client_id_env": str(
+            value("streamer_twitch_client_id_env", "PVZRL_TWITCH_CLIENT_ID") or ""
+        ).strip(),
+        "streamer_twitch_access_token_env": str(
+            value("streamer_twitch_access_token_env", "PVZRL_TWITCH_USER_ACCESS_TOKEN") or ""
+        ).strip(),
+        "streamer_twitch_broadcaster_id_env": str(
+            value("streamer_twitch_broadcaster_id_env", "PVZRL_TWITCH_BROADCASTER_USER_ID") or ""
+        ).strip(),
+        "streamer_twitch_user_id_env": str(
+            value("streamer_twitch_user_id_env", "PVZRL_TWITCH_EVENTSUB_USER_ID") or ""
+        ).strip(),
+        "streamer_viewer_hash_secret_env": str(
+            value("streamer_viewer_hash_secret_env", "PVZRL_TWITCH_VIEWER_HASH_SECRET") or ""
+        ).strip(),
+        "streamer_mock_script": str(value("streamer_mock_script", "") or "").strip(),
         "reward": build_reward_config(args, raw_config),
         "model_path": requested_model_path,
         "run_dir": run_dir,
@@ -1030,6 +1152,148 @@ def _build_config_mapping(
         "game_exe": str(value("game_exe", "") or ""),
     }
     config = apply_model_metadata_defaults(config)
+    if config["streamer_v1_enabled"]:
+        if run_mode != ADVENTURE_GENERALIST_RUN_MODE_TRAIN:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_run_mode: Streamer V1 is an overlay on Adventure Generalist training."
+            )
+        if config["streamer_platform"] not in {"twitch", "mock"}:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_platform: expected twitch or mock."
+            )
+        if not config["streamer_baseline_checkpoint"]:
+            raise SystemExit(
+                "blocked_reason=streamer_baseline_checkpoint_required: configure a repository-relative Generalist .zip path."
+            )
+        streamer_env_fields = {
+            "streamer_twitch_client_id_env": config["streamer_twitch_client_id_env"],
+            "streamer_twitch_access_token_env": config["streamer_twitch_access_token_env"],
+            "streamer_twitch_broadcaster_id_env": config[
+                "streamer_twitch_broadcaster_id_env"
+            ],
+            "streamer_twitch_user_id_env": config["streamer_twitch_user_id_env"],
+            "streamer_viewer_hash_secret_env": config["streamer_viewer_hash_secret_env"],
+        }
+        invalid_env_fields = [
+            name
+            for name, env_name in streamer_env_fields.items()
+            if env_name and STREAMER_ENV_NAME_PATTERN.fullmatch(str(env_name)) is None
+        ]
+        if config["streamer_platform"] == "twitch":
+            invalid_env_fields.extend(
+                name
+                for name in (
+                    "streamer_twitch_client_id_env",
+                    "streamer_twitch_access_token_env",
+                    "streamer_twitch_broadcaster_id_env",
+                    "streamer_viewer_hash_secret_env",
+                )
+                if not streamer_env_fields[name]
+            )
+        if invalid_env_fields:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_environment_variable_name: "
+                + ",".join(sorted(set(invalid_env_fields)))
+            )
+        positive_streamer_fields = {
+            "n_steps": config["n_steps"],
+            "batch_size": config["batch_size"],
+            "streamer_intervention_interval_seconds": config["streamer_intervention_interval_seconds"],
+            "streamer_command_ttl_seconds": config["streamer_command_ttl_seconds"],
+            "streamer_command_queue_capacity": config["streamer_command_queue_capacity"],
+            "streamer_message_max_chars": config["streamer_message_max_chars"],
+            "streamer_policy_steps_per_cycle": config["streamer_policy_steps_per_cycle"],
+            "streamer_checkpoint_policy_steps": config["streamer_checkpoint_policy_steps"],
+            "streamer_evaluation_episodes": config["streamer_evaluation_episodes"],
+            "streamer_demonstration_capacity": config["streamer_demonstration_capacity"],
+            "streamer_demonstration_persist_every": config[
+                "streamer_demonstration_persist_every"
+            ],
+            "streamer_bc_batch_size": config["streamer_bc_batch_size"],
+            "streamer_bc_update_frequency": config["streamer_bc_update_frequency"],
+            "streamer_bc_min_demonstrations": config["streamer_bc_min_demonstrations"],
+        }
+        invalid = [name for name, configured in positive_streamer_fields.items() if float(configured) <= 0]
+        if invalid:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: positive values required for " + ",".join(invalid)
+            )
+        finite_fields = {
+            "streamer_intervention_interval_seconds": config["streamer_intervention_interval_seconds"],
+            "streamer_command_ttl_seconds": config["streamer_command_ttl_seconds"],
+            "streamer_endurance_hours": config["streamer_endurance_hours"],
+            "streamer_bc_coefficient": config["streamer_bc_coefficient"],
+        }
+        if any(not math.isfinite(float(value)) for value in finite_fields.values()):
+            raise SystemExit("blocked_reason=invalid_streamer_config: finite numeric values required.")
+        if float(config["streamer_intervention_interval_seconds"]) < 0.1:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_intervention_interval: "
+                "expected a finite value in [0.1,3600]."
+            )
+        upper_bounds = {
+            "n_steps": 8_192,
+            "batch_size": 4_096,
+            "streamer_intervention_interval_seconds": 3600.0,
+            "streamer_command_ttl_seconds": 3600.0,
+            "streamer_command_queue_capacity": 4096,
+            "streamer_message_max_chars": 1024,
+            "streamer_policy_steps_per_cycle": 10_000_000,
+            "streamer_checkpoint_policy_steps": 10_000_000,
+            "streamer_evaluation_episodes": 10_000,
+            "streamer_demonstration_capacity": 16_384,
+            "streamer_demonstration_persist_every": 16_384,
+            "streamer_bc_batch_size": 4096,
+            "streamer_bc_update_frequency": 1_000_000,
+            "streamer_bc_min_demonstrations": 16_384,
+            "streamer_max_cycles": 1_000_000,
+            "streamer_endurance_hours": 168.0,
+        }
+        excessive = [
+            name
+            for name, maximum in upper_bounds.items()
+            if float(config[name]) > float(maximum)
+        ]
+        if excessive:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: resource ceiling exceeded for "
+                + ",".join(excessive)
+            )
+        if not 0.0 <= config["streamer_bc_coefficient"] <= 1.0:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_bc_coefficient: expected a finite value in [0,1]."
+            )
+        if config["streamer_max_cycles"] < 0 or config["streamer_endurance_hours"] < 0.0:
+            raise SystemExit("blocked_reason=invalid_streamer_duration: max cycles and endurance hours cannot be negative.")
+        if config["streamer_policy_steps_per_cycle"] % config["n_steps"] != 0:
+            raise SystemExit(
+                "blocked_reason=streamer_cycle_rollout_alignment: "
+                "streamer_policy_steps_per_cycle must be divisible by n_steps for exact policy-step cycles."
+            )
+        if config["n_steps"] % config["batch_size"] != 0:
+            raise SystemExit(
+                "blocked_reason=streamer_minibatch_alignment: n_steps must be divisible by batch_size."
+            )
+        if config["streamer_checkpoint_policy_steps"] > config["streamer_policy_steps_per_cycle"]:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: checkpoint interval cannot exceed cycle policy steps."
+            )
+        if config["streamer_demonstration_persist_every"] > config["streamer_demonstration_capacity"]:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: demonstration persist interval cannot exceed capacity."
+            )
+        if config["streamer_bc_batch_size"] > config["streamer_demonstration_capacity"]:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: BC batch size cannot exceed demonstration capacity."
+            )
+        if config["streamer_bc_min_demonstrations"] > config["streamer_demonstration_capacity"]:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_config: BC minimum cannot exceed demonstration capacity."
+            )
+        if stream_coach_enabled or human_coach_enabled:
+            raise SystemExit(
+                "blocked_reason=conflicting_coach_mode: Streamer V1 owns intervention collection; disable legacy coach overrides."
+            )
     if adventure_generalist_requested and action_count_for_config(config) != ADVENTURE_IDENTITY_ACTION_COUNT:
         raise SystemExit(
             "blocked_reason=invalid_adventure_generalist_action_count: "
@@ -1190,6 +1454,153 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
             *FUSION_REWARD_FLOAT_FIELDS,
             "fusion_reward_capped",
             *REWARD_EPISODE_TOTAL_FIELDS,
+        ),
+    )
+
+
+def make_streamer_v1_controller(config: Dict[str, Any]) -> Any:
+    """Build the source-neutral bounded controller without starting network I/O."""
+
+    from pvzrl_stream_commands import (
+        BoundedViewerCommandQueue,
+        ViewerCommandController,
+        ViewerCommandParser,
+    )
+
+    platform = str(config.get("streamer_platform", "twitch") or "twitch").lower()
+    capacity = int(config.get("streamer_command_queue_capacity", 256) or 256)
+    max_chars = int(config.get("streamer_message_max_chars", 256) or 256)
+    if platform == "twitch":
+        from pvzrl_twitch import TwitchCredentials, TwitchEventSubSource
+
+        env_names = {
+            "client_id": str(config.get("streamer_twitch_client_id_env") or ""),
+            "access_token": str(config.get("streamer_twitch_access_token_env") or ""),
+            "broadcaster_user_id": str(config.get("streamer_twitch_broadcaster_id_env") or ""),
+            "eventsub_user_id": str(config.get("streamer_twitch_user_id_env") or ""),
+            "viewer_hash_secret": str(config.get("streamer_viewer_hash_secret_env") or ""),
+        }
+        required = ("client_id", "access_token", "broadcaster_user_id", "viewer_hash_secret")
+        missing = [env_names[key] or f"<{key}_env>" for key in required if not env_names[key] or not os.environ.get(env_names[key])]
+        if missing:
+            raise SystemExit(
+                "blocked_reason=streamer_twitch_environment_missing: set " + ",".join(missing)
+            )
+        credentials = TwitchCredentials(
+            client_id=os.environ[env_names["client_id"]],
+            access_token=os.environ[env_names["access_token"]],
+            broadcaster_user_id=os.environ[env_names["broadcaster_user_id"]],
+            eventsub_user_id=(
+                os.environ.get(env_names["eventsub_user_id"], "")
+                if env_names["eventsub_user_id"]
+                else ""
+            ),
+            viewer_hash_secret=os.environ[env_names["viewer_hash_secret"]].encode("utf-8"),
+        )
+        source = TwitchEventSubSource(
+            credentials,
+            queue_capacity=capacity,
+            accepting=False,
+            max_command_chars=max_chars,
+        )
+    elif platform == "mock":
+        from pvzrl_streamer_source import (
+            DeterministicStreamCommandSource,
+            ScriptedStreamSourceRecord,
+        )
+
+        mock_path = Path(str(config.get("streamer_mock_script") or ""))
+        if not mock_path.is_file():
+            raise SystemExit(f"blocked_reason=streamer_mock_script_missing: {mock_path}")
+        max_mock_bytes = 16 * 1024 * 1024
+        if mock_path.stat().st_size > max_mock_bytes:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_mock_script: "
+                f"path={mock_path} reason=script_byte_limit_exceeded"
+            )
+        records = []
+        secret_env_name = str(config.get("streamer_viewer_hash_secret_env") or "")
+        secret_text = os.environ.get(secret_env_name, "") if secret_env_name else ""
+        try:
+            with mock_path.open("r", encoding="utf-8") as handle:
+                line_number = 0
+                while True:
+                    raw_line = handle.readline(4_097)
+                    if raw_line == "":
+                        break
+                    line_number += 1
+                    if line_number > 100_000:
+                        raise ValueError("script_record_limit_exceeded")
+                    if len(raw_line) > 4_096 or (
+                        len(raw_line) == 4_096 and not raw_line.endswith("\n")
+                    ):
+                        raise ValueError(f"line_{line_number}_too_long")
+                    stripped = raw_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    payload = json.loads(stripped)
+                    if not isinstance(payload, dict):
+                        raise ValueError(f"line_{line_number}_must_be_object")
+                    allowed = {
+                        "command",
+                        "viewer_hash",
+                        "local_viewer_id",
+                        "delivery_id",
+                        "event_id",
+                        "published_at",
+                    }
+                    unexpected = sorted(str(key) for key in payload if str(key) not in allowed)
+                    if unexpected:
+                        raise ValueError(
+                            f"line_{line_number}_unexpected_fields={','.join(unexpected)}"
+                        )
+                    command = payload.get("command")
+                    if not isinstance(command, str):
+                        raise ValueError(f"line_{line_number}_command_required")
+                    local_viewer_id = payload.get("local_viewer_id", "")
+                    viewer_hash = payload.get("viewer_hash", "")
+                    if local_viewer_id and not secret_text:
+                        raise ValueError(
+                            f"line_{line_number}_local_viewer_id_requires={secret_env_name or '<viewer_hash_secret_env>'}"
+                        )
+                    records.append(
+                        ScriptedStreamSourceRecord(
+                            command_text=command,
+                            viewer_hash=str(viewer_hash or ""),
+                            local_viewer_id=str(local_viewer_id or ""),
+                            delivery_id=str(payload.get("delivery_id") or ""),
+                            event_id=str(payload.get("event_id") or ""),
+                            published_at=(
+                                str(payload.get("published_at"))
+                                if payload.get("published_at") is not None
+                                else None
+                            ),
+                        )
+                    )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise SystemExit(
+                "blocked_reason=invalid_streamer_mock_script: "
+                f"path={mock_path} reason={exc}"
+            ) from exc
+        source = DeterministicStreamCommandSource(
+            records,
+            viewer_hash_secret=secret_text.encode("utf-8") if secret_text else None,
+            queue_capacity=capacity,
+            accepting=False,
+            max_command_chars=max_chars,
+        )
+    else:
+        raise SystemExit(f"blocked_reason=invalid_streamer_platform: {platform}")
+
+    return ViewerCommandController(
+        source=source,
+        parser=ViewerCommandParser(max_message_length=max_chars),
+        queue=BoundedViewerCommandQueue(
+            capacity=capacity,
+            ttl_seconds=float(config.get("streamer_command_ttl_seconds", 10.0) or 10.0),
+        ),
+        opportunity_interval_seconds=float(
+            config.get("streamer_intervention_interval_seconds", 2.0) or 2.0
         ),
     )
 
@@ -2024,6 +2435,73 @@ def coach_live_status_fields_from_summary(config: Dict[str, Any], summary: Optio
     return fields
 
 
+def streamer_live_status_fields(
+    config: Dict[str, Any],
+    summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return stable overlay-ready fields without copying observations."""
+
+    if not bool(config.get("streamer_v1_enabled", False)):
+        return {}
+    values = summary if isinstance(summary, dict) else {}
+    runtime = values.get("streamer_runtime")
+    runtime_fields = dict(runtime) if isinstance(runtime, dict) else {}
+    phase = str(config.get("streamer_phase") or runtime_fields.get("streamer_mode") or STREAM_TRAIN)
+    current_steps = int(
+        values.get(
+            "model_steps",
+            values.get(
+                "total_timesteps",
+                runtime_fields.get(
+                    "current_model_ppo_steps",
+                    config.get("streamer_current_model_steps", 0),
+                ),
+            ),
+        )
+        or 0
+    )
+    baseline_steps = int(config.get("streamer_baseline_model_steps", 0) or 0)
+    target = int(config.get("streamer_policy_steps_per_cycle", 0) or 0)
+    cycle_completed = int(
+        runtime_fields.get(
+            "cycle_policy_steps_completed",
+            values.get("ppo_policy_timesteps", 0),
+        )
+        or 0
+    )
+    fields = {
+        "streamer_v1_enabled": True,
+        "streamer_mode": phase,
+        "streamer_cycle": int(config.get("streamer_cycle", 0) or 0),
+        "streamer_platform": str(config.get("streamer_platform", "twitch") or "twitch"),
+        "current_model_ppo_steps": current_steps,
+        "baseline_model_ppo_steps": baseline_steps,
+        "cycle_policy_steps_completed": cycle_completed,
+        "next_evaluation_countdown": max(0, target - cycle_completed),
+        "evaluation_chat_control": False,
+        "bc_updates_enabled": bool(
+            phase == STREAM_TRAIN and config.get("streamer_bc_enabled", True)
+        ),
+        "bc_demonstration_count": int(
+            values.get(
+                "bc_demonstration_count",
+                runtime_fields.get("bc_demonstration_count", 0),
+            )
+            or 0
+        ),
+        "bc_loss": float(values.get("bc_loss", runtime_fields.get("bc_loss", 0.0)) or 0.0),
+        "bc_update_count": int(
+            values.get("bc_update_count", runtime_fields.get("bc_update_count", 0)) or 0
+        ),
+        "baseline_evaluation": config.get("streamer_baseline_evaluation", {}),
+        "current_evaluation": config.get("streamer_current_evaluation", {}),
+        "best_evaluation": config.get("streamer_best_evaluation", {}),
+        "best_model_steps": int(config.get("streamer_best_model_steps", 0) or 0),
+    }
+    fields.update(runtime_fields)
+    return fields
+
+
 def write_eval_live_status(
     live_status_path: Optional[Path],
     *,
@@ -2066,6 +2544,7 @@ def write_eval_live_status(
                 live_key = "fusion_candidate_count" if key == "fusion_candidate_count_total" else key
                 fusion_fields[live_key] = summary[key]
     coach_fields = coach_live_status_fields_from_summary(config, summary)
+    streamer_fields = streamer_live_status_fields(config, summary)
     payload = {
         "mode": mode,
         "run_mode": str(config.get("run_mode", mode)),
@@ -2093,6 +2572,7 @@ def write_eval_live_status(
         "human_coach": dict(coach_fields),
         **fusion_fields,
         **coach_fields,
+        **streamer_fields,
     }
     writer = status_writer or LiveStatusWriter(live_status_path, min_interval_seconds=0.0)
     writer.write(payload, force=status != "running" or status_writer is None)
@@ -2160,6 +2640,7 @@ def build_runtime_live_status_payload(
         if key in summary:
             reward[key] = summary[key]
     coach_fields = coach_live_status_fields_from_summary(config, summary)
+    streamer_fields = streamer_live_status_fields(config, summary)
     payload = {
         "mode": mode,
         "run_mode": str(config.get("run_mode", mode)),
@@ -2226,6 +2707,7 @@ def build_runtime_live_status_payload(
         "summary": summary,
         "eval": summary,
         **coach_fields,
+        **streamer_fields,
     }
     return payload
 
@@ -2271,8 +2753,88 @@ def write_runtime_live_status(
     )
 
 
-def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> None:
-    MaskablePPO = require_maskable_ppo()
+def finish_streamer_episode_boundary(
+    model: Any,
+    vec_env: Any,
+    *,
+    maximum_actions: int,
+    action_masks_fn: Optional[Any] = None,
+) -> int:
+    """Finish a partial episode without advancing PPO/BC training counters."""
+
+    episode_starts = np.asarray(
+        getattr(model, "_last_episode_starts", [False]), dtype=bool
+    ).reshape(-1)
+    if episode_starts.size and bool(episode_starts[0]):
+        return 0
+    observation = getattr(model, "_last_obs", None)
+    if observation is None:
+        raise RuntimeError("blocked_reason=streamer_phase_handoff_observation_missing")
+    if action_masks_fn is None:
+        from sb3_contrib.common.maskable.utils import get_action_masks
+
+        action_masks_fn = get_action_masks
+    for action_count in range(1, max(1, int(maximum_actions)) + 1):
+        masks = action_masks_fn(vec_env)
+        actions, _ = model.predict(
+            observation,
+            deterministic=True,
+            action_masks=masks,
+        )
+        observation, _, dones, _ = vec_env.step(actions)
+        done_values = np.asarray(dones, dtype=bool).reshape(-1)
+        if done_values.size and bool(done_values[0]):
+            model._last_obs = observation
+            model._last_episode_starts = done_values
+            return action_count
+    raise RuntimeError("blocked_reason=streamer_phase_handoff_action_limit")
+
+
+def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Dict[str, Any]:
+    streamer_v1_enabled = bool(config.get("streamer_v1_enabled", False))
+    demonstration_buffer = None
+    streamer_controller = None
+    streamer_model_kwargs: Dict[str, Any] = {}
+    if streamer_v1_enabled:
+        from pvzrl_demonstrations import DemonstrationBuffer
+        from pvzrl_streamer_ppo import StreamerMaskablePPO
+
+        MaskablePPO = StreamerMaskablePPO
+        experiment_dir = Path(str(config.get("streamer_experiment_dir") or config["run_dir"]))
+        demonstration_path = experiment_dir / "demonstrations" / "viewer_demonstrations.npz"
+        demonstration_capacity = int(config.get("streamer_demonstration_capacity", 4096) or 4096)
+        if demonstration_path.is_file():
+            demonstration_buffer = DemonstrationBuffer.load(
+                demonstration_path,
+                capacity=demonstration_capacity,
+                expected_observation_shape=(4297,),
+                expected_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+            )
+        else:
+            demonstration_buffer = DemonstrationBuffer(
+                demonstration_capacity,
+                observation_shape=(4297,),
+                action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                persist_path=demonstration_path,
+            )
+        streamer_model_kwargs = {
+            "demonstration_buffer": demonstration_buffer,
+            "demonstration_capacity": demonstration_capacity,
+            "demonstration_persist_path": demonstration_path,
+            "demonstration_persist_every": int(
+                config.get("streamer_demonstration_persist_every", 512) or 512
+            ),
+            "bc_enabled": bool(config.get("streamer_bc_enabled", True)),
+            "bc_coefficient": float(config.get("streamer_bc_coefficient", 0.01) or 0.0),
+            "bc_batch_size": int(config.get("streamer_bc_batch_size", 32) or 32),
+            "bc_update_frequency": int(config.get("streamer_bc_update_frequency", 1) or 1),
+            "bc_min_demonstrations": int(config.get("streamer_bc_min_demonstrations", 8) or 8),
+        }
+        if not bool(config.get("streamer_preserve_bc_rng_state", False)):
+            streamer_model_kwargs["bc_seed"] = int(config.get("seed", 0) or 0)
+        streamer_controller = make_streamer_v1_controller(config)
+    else:
+        MaskablePPO = require_maskable_ppo()
     BaseCallback, CallbackList, CheckpointCallback, DummyVecEnv, _ = require_sb3_callbacks()
 
     live_status_path = resolved_live_status_path(live_status_path)
@@ -2489,6 +3051,31 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
                     if isinstance(info, dict) and isinstance(info.get("episode_summary"), dict)
                 ]
             )
+            if streamer_v1_enabled and isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+                current_steps = int(getattr(self.model, "num_timesteps", 0) or 0)
+                cycle_steps = int(
+                    config.get("streamer_cycle_policy_steps_completed_before", 0) or 0
+                ) + max(0, current_steps - starting_model_steps)
+                pvz_env.update_streamer_v1_training_status(
+                    current_model_ppo_steps=current_steps,
+                    cycle_policy_steps_completed=cycle_steps,
+                    next_evaluation_countdown=max(
+                        0,
+                        int(config.get("streamer_policy_steps_per_cycle", 0) or 0)
+                        - cycle_steps,
+                    ),
+                    bc_demonstration_count=(
+                        len(demonstration_buffer) if demonstration_buffer is not None else 0
+                    ),
+                    bc_loss=float(getattr(self.model, "last_bc_loss", 0.0) or 0.0),
+                    bc_update_count=int(getattr(self.model, "bc_update_count", 0) or 0),
+                    total_environment_actions=int(
+                        getattr(self.model, "total_environment_actions", 0) or 0
+                    ),
+                    viewer_intervention_count=int(
+                        getattr(self.model, "viewer_interventions", 0) or 0
+                    ),
+                )
             return True
 
     vec_env = DummyVecEnv([lambda: make_monitored_env(config, run_dir / "monitor.csv", live_status_path=live_status_path)])
@@ -2510,6 +3097,15 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             str(initial_model_path),
             env=vec_env,
             tensorboard_log=str(run_dir / "tensorboard"),
+            **(
+                {
+                    "n_steps": int(config["n_steps"]),
+                    "batch_size": int(config["batch_size"]),
+                }
+                if streamer_v1_enabled
+                else {}
+            ),
+            **streamer_model_kwargs,
         )
         model.verbose = config["verbose"]
         validate_adventure_generalist_model_compatibility(
@@ -2539,19 +3135,130 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
             verbose=config["verbose"],
             seed=config["seed"],
             tensorboard_log=str(run_dir / "tensorboard"),
+            **streamer_model_kwargs,
         )
 
+    pvz_env = unwrap_pvz_env(runtime_env)
+    if streamer_v1_enabled and not isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+        vec_env.close()
+        raise SystemExit(
+            "blocked_reason=streamer_generalist_env_missing: expected AdventureGeneralistTrainingEnv."
+        )
+
+    starting_model_steps = int(getattr(model, "num_timesteps", 0) or 0)
+    starting_environment_actions = int(getattr(model, "total_environment_actions", 0) or 0)
+    starting_viewer_interventions = int(getattr(model, "viewer_interventions", 0) or 0)
+    starting_policy_transitions = int(getattr(model, "policy_transitions_collected", 0) or 0)
+    starting_bc_updates = int(getattr(model, "bc_update_count", 0) or 0)
+    starting_demonstrations_added = int(
+        getattr(demonstration_buffer, "total_added", 0) or 0
+    )
+    streamer_checkpoint_state = {
+        "write_count": 0,
+        "next_policy_step": starting_model_steps
+        + int(config.get("streamer_checkpoint_policy_steps", 5000) or 5000),
+    }
+    if streamer_v1_enabled:
+        from pvzrl_streamer import StreamerCheckpointManager
+
+        prior = config.get("streamer_cycle_prior_training_metrics")
+        prior_metrics = prior if isinstance(prior, dict) else {}
+
+        def persist_streamer_current(checkpoint_model: Any) -> None:
+            current_steps = int(getattr(checkpoint_model, "num_timesteps", 0) or 0)
+            if current_steps < int(streamer_checkpoint_state["next_policy_step"]):
+                return
+
+            def accumulated(name: str, current: int) -> int:
+                return int(prior_metrics.get(name, 0) or 0) + max(0, int(current))
+
+            temporary = run_dir / "checkpoints" / (
+                f".streamer-current-{os.getpid()}-{time.time_ns()}.zip"
+            )
+            cycle_before = int(
+                config.get("streamer_cycle_policy_steps_completed_before", 0) or 0
+            )
+            cycle_now = cycle_before + max(0, current_steps - starting_model_steps)
+            try:
+                checkpoint_model.save(str(temporary))
+                manager = StreamerCheckpointManager(
+                    Path(str(config.get("streamer_experiment_dir") or config["run_dir"])),
+                    Path(str(config["streamer_baseline_checkpoint"])),
+                )
+                manager.save_current(
+                    temporary,
+                    model_steps=current_steps,
+                    training_cycle=int(config.get("streamer_cycle", 0) or 0),
+                    training_metrics={
+                        "status": "in_progress",
+                        "cycle": int(config.get("streamer_cycle", 0) or 0),
+                        "cycle_start_model_steps": int(
+                            config.get("streamer_cycle_start_model_steps", starting_model_steps)
+                            or starting_model_steps
+                        ),
+                        "cycle_target_policy_steps": int(
+                            config.get("streamer_policy_steps_per_cycle", 0) or 0
+                        ),
+                        "next_adventure_level": int(
+                            getattr(pvz_env, "current_level", config.get("adventure_start_level", 1))
+                            or 1
+                        ),
+                        "ppo_policy_timesteps": cycle_now,
+                        "total_environment_actions": accumulated(
+                            "total_environment_actions",
+                            int(getattr(checkpoint_model, "total_environment_actions", 0) or 0)
+                            - starting_environment_actions,
+                        ),
+                        "viewer_interventions": accumulated(
+                            "viewer_interventions",
+                            int(getattr(checkpoint_model, "viewer_interventions", 0) or 0)
+                            - starting_viewer_interventions,
+                        ),
+                        "policy_transitions_collected": accumulated(
+                            "policy_transitions_collected",
+                            int(getattr(checkpoint_model, "policy_transitions_collected", 0) or 0)
+                            - starting_policy_transitions,
+                        ),
+                        "bc_demonstrations_added": accumulated(
+                            "bc_demonstrations_added",
+                            int(getattr(demonstration_buffer, "total_added", 0) or 0)
+                            - starting_demonstrations_added,
+                        ),
+                        "bc_update_count": accumulated(
+                            "bc_update_count",
+                            int(getattr(checkpoint_model, "bc_update_count", 0) or 0)
+                            - starting_bc_updates,
+                        ),
+                        "streamer_checkpoint_write_count": accumulated(
+                            "streamer_checkpoint_write_count",
+                            int(streamer_checkpoint_state["write_count"]) + 1,
+                        ),
+                    },
+                )
+            finally:
+                temporary.unlink(missing_ok=True)
+            streamer_checkpoint_state["write_count"] = int(
+                streamer_checkpoint_state["write_count"]
+            ) + 1
+            frequency = int(config.get("streamer_checkpoint_policy_steps", 5000) or 5000)
+            while int(streamer_checkpoint_state["next_policy_step"]) <= current_steps:
+                streamer_checkpoint_state["next_policy_step"] = int(
+                    streamer_checkpoint_state["next_policy_step"]
+                ) + frequency
+
+        model.set_streamer_checkpoint_hook(persist_streamer_current)
     experiment_callback = ExperimentCallback(run_dir / "episode_metrics.csv", run_dir / "episode_metrics.jsonl")
-    callbacks = CallbackList(
-        [
+    callback_items: List[Any] = [experiment_callback]
+    if not streamer_v1_enabled:
+        callback_items.insert(
+            0,
             CheckpointCallback(
                 save_freq=max(1, config["checkpoint_freq"]),
                 save_path=str(run_dir / "checkpoints"),
                 name_prefix="ppo_pvz",
             ),
-            experiment_callback,
-        ]
-    )
+        )
+    callbacks = CallbackList(callback_items)
     write_runtime_live_status(
         live_status_path,
         config=config,
@@ -2568,7 +3275,6 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         force=True,
     )
     if bool(config.get("adventure_generalist_strict_startup_validation", True)):
-        pvz_env = unwrap_pvz_env(runtime_env)
         if not isinstance(pvz_env, AdventureGeneralistTrainingEnv):
             vec_env.close()
             raise SystemExit(
@@ -2585,21 +3291,76 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         f"sb3_learn_reset_num_timesteps={'false' if continuing else 'true'}"
     )
     started = time.perf_counter()
+    streamer_runtime_status: Dict[str, Any] = {}
+    streamer_phase_handoff_actions = 0
     try:
+        if streamer_v1_enabled:
+            assert isinstance(pvz_env, AdventureGeneralistTrainingEnv)
+            assert streamer_controller is not None
+            experiment_dir = Path(
+                str(config.get("streamer_experiment_dir") or config["run_dir"])
+            )
+            pvz_env.attach_streamer_v1_controller(
+                streamer_controller,
+                event_log_path=experiment_dir / "logs" / "streamer_events.jsonl",
+                training_cycle=int(config.get("streamer_cycle", 0) or 0),
+                platform=str(config.get("streamer_platform", "twitch") or "twitch"),
+                training_status={
+                    "current_model_ppo_steps": int(getattr(model, "num_timesteps", 0) or 0),
+                    "baseline_model_ppo_steps": int(
+                        config.get("streamer_baseline_model_steps", 0) or 0
+                    ),
+                    "cycle_policy_steps_completed": int(
+                        config.get("streamer_cycle_policy_steps_completed_before", 0) or 0
+                    ),
+                    "next_evaluation_countdown": int(
+                        config.get("streamer_policy_steps_per_cycle", 0) or 0
+                    )
+                    - int(config.get("streamer_cycle_policy_steps_completed_before", 0) or 0),
+                    "bc_demonstration_count": (
+                        len(demonstration_buffer) if demonstration_buffer is not None else 0
+                    ),
+                    "bc_loss": float(getattr(model, "last_bc_loss", 0.0) or 0.0),
+                    "bc_update_count": int(getattr(model, "bc_update_count", 0) or 0),
+                },
+            )
         model.learn(
             total_timesteps=config["total_timesteps"],
             callback=callbacks,
             reset_num_timesteps=not continuing,
         )
+        if streamer_v1_enabled:
+            # Exact PPO accounting stops at the requested rollout boundary.  If
+            # that boundary is mid-episode, finish the episode autonomously with
+            # Twitch gated and without PPO/BC updates so evaluation starts clean.
+            assert streamer_controller is not None
+            streamer_controller.begin_phase("TRAIN_DRAIN", accepting=False)
+            streamer_phase_handoff_actions = finish_streamer_episode_boundary(
+                model,
+                vec_env,
+                maximum_actions=max(
+                    1, int(config.get("adventure_hard_max_steps", 20_000) or 20_000)
+                ),
+            )
+            if streamer_phase_handoff_actions:
+                model.total_environment_actions = int(
+                    getattr(model, "total_environment_actions", 0) or 0
+                ) + streamer_phase_handoff_actions
     finally:
+        if streamer_v1_enabled and isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+            streamer_runtime_status = pvz_env._streamer_v1_live_status()
+            streamer_runtime_status["next_adventure_level"] = int(pvz_env.current_level)
+            streamer_runtime_status["phase_handoff_actions"] = int(
+                streamer_phase_handoff_actions
+            )
         vec_env.close()
     elapsed = max(1e-6, time.perf_counter() - started)
     timesteps = int(getattr(model, "num_timesteps", config["total_timesteps"]))
-    fps_avg = timesteps / elapsed
+    fps_avg = max(0, timesteps - starting_model_steps) / elapsed
     model.save(str(run_dir / "model"))
     model_path = run_dir / "model.zip"
     final_model_path = run_dir / "final_model.zip"
-    if model_path.exists():
+    if model_path.exists() and not streamer_v1_enabled:
         shutil.copyfile(model_path, final_model_path)
     write_model_metadata(run_dir, config, model_path=model_path, config_path=config_path)
     summary = summarize_episode_rows(
@@ -2609,6 +3370,59 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
         model_path,
         fps_avg,
     )
+    summary["model_steps"] = timesteps
+    summary["ppo_policy_timesteps"] = max(0, timesteps - starting_model_steps)
+    summary["model_path"] = str(model_path)
+    if streamer_v1_enabled:
+        lifetime_environment_actions = int(getattr(model, "total_environment_actions", 0) or 0)
+        lifetime_viewer_interventions = int(getattr(model, "viewer_interventions", 0) or 0)
+        lifetime_policy_transitions = int(getattr(model, "policy_transitions_collected", 0) or 0)
+        lifetime_bc_updates = int(getattr(model, "bc_update_count", 0) or 0)
+        lifetime_demonstrations_added = int(
+            getattr(demonstration_buffer, "total_added", 0) or 0
+        )
+        summary.update(
+            {
+                "total_environment_actions": max(
+                    0, lifetime_environment_actions - starting_environment_actions
+                ),
+                "viewer_interventions": max(
+                    0, lifetime_viewer_interventions - starting_viewer_interventions
+                ),
+                "policy_transitions_collected": max(
+                    0, lifetime_policy_transitions - starting_policy_transitions
+                ),
+                "bc_demonstration_count": int(len(demonstration_buffer)) if demonstration_buffer is not None else 0,
+                "bc_demonstrations_added": max(
+                    0, lifetime_demonstrations_added - starting_demonstrations_added
+                ),
+                "bc_update_count": max(0, lifetime_bc_updates - starting_bc_updates),
+                "bc_loss": float(getattr(model, "last_bc_loss", 0.0) or 0.0),
+                "bc_policy_agreement": float(getattr(model, "last_bc_policy_agreement", 0.0) or 0.0),
+                "ppo_policy_loss": float(getattr(model, "last_policy_loss", 0.0) or 0.0),
+                "ppo_value_loss": float(getattr(model, "last_value_loss", 0.0) or 0.0),
+                "ppo_entropy_loss": float(getattr(model, "last_entropy_loss", 0.0) or 0.0),
+                "streamer_phase_handoff_actions": int(streamer_phase_handoff_actions),
+                "next_adventure_level": int(
+                    streamer_runtime_status.get(
+                        "next_adventure_level",
+                        config.get("adventure_start_level", 1),
+                    )
+                    or 1
+                ),
+                "streamer_lifetime_counters": {
+                    "total_environment_actions": lifetime_environment_actions,
+                    "viewer_interventions": lifetime_viewer_interventions,
+                    "policy_transitions_collected": lifetime_policy_transitions,
+                    "bc_demonstrations_added": lifetime_demonstrations_added,
+                    "bc_update_count": lifetime_bc_updates,
+                },
+                "streamer_runtime": streamer_runtime_status,
+            }
+        )
+        summary["streamer_checkpoint_write_count"] = int(
+            streamer_checkpoint_state["write_count"]
+        )
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     if config.get("debug_performance"):
         perf_summary = experiment_callback.performance.summary(fps_avg)
@@ -2625,12 +3439,14 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> No
     )
     print_validation_summary(summary)
     print(f"Saved final model to {model_path}")
-    print(f"Saved compatibility model copy to {final_model_path}")
+    if final_model_path.is_file():
+        print(f"Saved compatibility model copy to {final_model_path}")
     print(f"Saved monitor log to {run_dir / 'monitor.csv'}")
     print(f"Saved episode metrics to {run_dir / 'episode_metrics.csv'}")
+    return summary
 
 
-def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.Namespace) -> None:
+def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.Namespace) -> Dict[str, Any]:
     MaskablePPO = require_maskable_ppo()
     model = MaskablePPO.load(str(model_path))
     env_metadata = env_metadata_for_config(config)
@@ -2669,7 +3485,7 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
         f"observation={compatibility['observation_version']} "
         f"metadata={compatibility['metadata_path']}"
     )
-    run_adventure_eval(
+    payload = run_adventure_eval(
         config=config,
         env_config=make_env_config(config),
         model=model,
@@ -2684,12 +3500,272 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
         adventure_soft_max_steps=int(config.get("adventure_soft_max_steps", DEFAULT_ADVENTURE_SOFT_MAX_STEPS)),
         adventure_hard_max_steps=int(config.get("adventure_hard_max_steps", DEFAULT_ADVENTURE_HARD_MAX_STEPS)),
         adventure_final_wave_extension=bool(config.get("adventure_final_wave_extension", True)),
+        evaluation_episode_limit=(
+            int(config["streamer_evaluation_episode_limit"])
+            if config.get("streamer_evaluation_episode_limit") is not None
+            else None
+        ),
+        strict_level_identity=bool(config.get("streamer_v1_enabled", False)),
+    )
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    if isinstance(summary, dict):
+        summary["model_steps"] = int(getattr(model, "num_timesteps", 0) or 0)
+    return payload
+
+
+def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    """Run Streamer V1 as an overlay on the maintained train/eval entrypoints."""
+
+    baseline = Path(str(config.get("streamer_baseline_checkpoint") or ""))
+    if not baseline.is_absolute():
+        baseline = Path.cwd() / baseline
+    baseline = baseline.resolve()
+    if not baseline.is_file():
+        raise SystemExit(f"blocked_reason=streamer_baseline_checkpoint_missing: {baseline}")
+    config["streamer_baseline_checkpoint"] = str(baseline)
+
+    MaskablePPO = require_maskable_ppo()
+    baseline_model = MaskablePPO.load(str(baseline))
+    baseline_report = loaded_model_compatibility_report(
+        baseline_model,
+        baseline,
+        config,
+        env_metadata=env_metadata_for_config(config),
+    )
+    print_compatibility_report("[compat:Streamer V1 baseline]", baseline_report)
+    raise_if_incompatible(baseline_report)
+    config["streamer_baseline_model_steps"] = int(
+        getattr(baseline_model, "num_timesteps", 0) or 0
+    )
+    del baseline_model
+
+    status_writer = LiveStatusWriter(resolved_live_status_path(args.live_status_path))
+
+    def compact_evaluation(value: Any) -> Dict[str, Any]:
+        payload = value if isinstance(value, dict) else {}
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+        return {
+            key: summary[key]
+            for key in (
+                "episodes_completed",
+                "win_rate",
+                "avg_reward",
+                "avg_wave",
+                "avg_kills",
+                "avg_plants",
+                "avg_mowers_lost",
+                "illegal_actions",
+                "model_steps",
+            )
+            if key in summary
+        }
+
+    def read_object(path: Path) -> Dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    experiment_dir = Path(str(config["run_dir"]))
+
+    def experiment_status_context() -> Dict[str, Any]:
+        baseline_eval = read_object(
+            experiment_dir / "evaluations" / "baseline" / "evaluation.json"
+        )
+        state = read_object(experiment_dir / "streamer_state.json")
+        best = read_object(
+            experiment_dir / "checkpoints" / "best" / "streamer_checkpoint.json"
+        )
+        return {
+            "streamer_baseline_evaluation": compact_evaluation(baseline_eval),
+            "streamer_current_evaluation": compact_evaluation(
+                state.get("current_evaluation", {})
+            ),
+            "streamer_best_evaluation": compact_evaluation(best.get("evaluation", {})),
+            "streamer_best_model_steps": int(best.get("model_steps", 0) or 0),
+            "streamer_next_adventure_level": int(
+                state.get("next_adventure_level", baseline_eval.get("next_adventure_level", 0))
+                or 0
+            ),
+        }
+
+    def publish_status(payload: Any) -> None:
+        state = dict(payload) if isinstance(payload, dict) else {}
+        last_cycle = state.get("last_cycle") if isinstance(state.get("last_cycle"), dict) else {}
+        training = last_cycle.get("training") if isinstance(last_cycle.get("training"), dict) else {}
+        runtime = training.get("streamer_runtime") if isinstance(training.get("streamer_runtime"), dict) else {}
+        live_payload = {
+            "streamer_v1_enabled": True,
+            "mode": str(state.get("mode") or state.get("streamer_phase") or STREAM_TRAIN),
+            "streamer_mode": str(
+                state.get("streamer_phase") or state.get("mode") or STREAM_TRAIN
+            ),
+            "run_mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
+            "status": str(state.get("status") or "running"),
+            "health": "LIVE" if state.get("status") == "running" else "DEAD",
+            "updated_at": time.time(),
+            "active_run": str(config.get("run_dir", "")),
+            "streamer_platform": str(config.get("streamer_platform", "twitch") or "twitch"),
+            "streamer_cycle": int(
+                state.get("current_cycle", state.get("completed_cycle", 0)) or 0
+            ),
+            "current_model_ppo_steps": int(
+                state.get("current_model_steps", training.get("model_steps", 0)) or 0
+            ),
+            "baseline_model_ppo_steps": int(
+                config.get("streamer_baseline_model_steps", 0) or 0
+            ),
+            "ppo_policy_timesteps": int(state.get("ppo_policy_timesteps", 0) or 0),
+            "next_evaluation_countdown": int(
+                state.get("next_evaluation_policy_steps", 0) or 0
+            ),
+            "next_adventure_level": int(state.get("next_adventure_level", 0) or 0),
+            "viewer_command_queue_depth": int(
+                state.get("viewer_command_queue_depth", runtime.get("viewer_command_queue_depth", 0))
+                or 0
+            ),
+            "last_viewer_action": runtime.get("last_viewer_action", {}),
+            "last_action_source": runtime.get("last_action_source", "MODEL"),
+            "viewer_intervention_count": int(
+                training.get("viewer_interventions", runtime.get("viewer_intervention_count", 0))
+                or 0
+            ),
+            "evaluation_chat_control": False,
+            "bc_updates_enabled": bool(state.get("bc_updates_enabled", False)),
+            "ppo_updates_enabled": bool(
+                state.get("ppo_updates_enabled", state.get("mode") == STREAM_TRAIN)
+            ),
+            "bc_demonstration_count": int(training.get("bc_demonstration_count", 0) or 0),
+            "bc_loss": float(training.get("bc_loss", 0.0) or 0.0),
+            "bc_update_count": int(training.get("bc_update_count", 0) or 0),
+            "baseline_evaluation": compact_evaluation(state.get("baseline_evaluation", {})),
+            "current_evaluation": compact_evaluation(state.get("current_evaluation", {})),
+            "best_evaluation": compact_evaluation(state.get("best_evaluation", {})),
+            "best_model_steps": int(state.get("best_model_steps", 0) or 0),
+            "current_checkpoint": str(state.get("current_checkpoint") or ""),
+            "best_checkpoint": str(state.get("best_checkpoint") or ""),
+            "baseline_checkpoint": str(state.get("baseline_checkpoint") or baseline),
+            "action_count": int(
+                config.get("action_count", ADVENTURE_IDENTITY_ACTION_COUNT)
+            ),
+            "observation_version": str(config.get("observation_version", "")),
+        }
+        source_state = runtime.get("twitch_connection_state")
+        if source_state is not None:
+            live_payload["twitch_connection_state"] = source_state
+        status_writer.write(
+            live_payload,
+            force=live_payload["status"] in {"complete", "blocked", "error"},
+        )
+
+    def train_cycle(
+        start_model: Path,
+        cycle: int,
+        cycle_run_dir: Path,
+        policy_steps: int,
+        adventure_start_level: int,
+    ) -> Dict[str, Any]:
+        cycle_config = deepcopy(config)
+        source_record = read_object(start_model.parent / "streamer_checkpoint.json")
+        source_cycle = int(source_record.get("training_cycle", 0) or 0)
+        prior_training = (
+            source_record.get("training_metrics", {})
+            if source_cycle == int(cycle)
+            and isinstance(source_record.get("training_metrics"), dict)
+            else {}
+        )
+        source_model_steps = int(source_record.get("model_steps", 0) or 0)
+        cycle_start_model_steps = int(
+            prior_training.get("cycle_start_model_steps", source_model_steps) or source_model_steps
+        )
+        cycle_config.update(
+            {
+                "run_mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
+                "run_dir": str(cycle_run_dir),
+                "model_path": str(start_model),
+                "resume_model_path": str(start_model),
+                "resume_training": True,
+                "total_timesteps": int(policy_steps),
+                "adventure_start_level": int(adventure_start_level),
+                "streamer_cycle": int(cycle),
+                "streamer_phase": STREAM_TRAIN,
+                "streamer_experiment_dir": str(Path(str(config["run_dir"]))),
+                "streamer_preserve_bc_rng_state": bool(source_record),
+                "streamer_cycle_policy_steps_completed_before": int(
+                    prior_training.get("ppo_policy_timesteps", 0) or 0
+                ),
+                "streamer_cycle_prior_training_metrics": dict(prior_training),
+                "streamer_cycle_start_model_steps": cycle_start_model_steps,
+                **experiment_status_context(),
+            }
+        )
+        summary = train(cycle_config, args.live_status_path)
+        return {
+            **summary,
+            "cycle": int(cycle),
+            "ppo_policy_timesteps": int(summary.get("ppo_policy_timesteps", policy_steps) or 0),
+        }
+
+    def evaluate_checkpoint(
+        model_path: Path,
+        evaluation_dir: Path,
+        episodes: int,
+        adventure_start_level: int,
+    ) -> Dict[str, Any]:
+        evaluation_config = deepcopy(config)
+        checkpoint_record = read_object(model_path.parent / "streamer_checkpoint.json")
+        evaluation_config.update(
+            {
+                "run_mode": ADVENTURE_GENERALIST_RUN_MODE_EVAL,
+                "run_dir": str(evaluation_dir),
+                "model_path": str(model_path),
+                "streamer_phase": EVALUATE,
+                "streamer_evaluation_episode_limit": int(episodes),
+                "adventure_start_level": int(adventure_start_level),
+                "streamer_bc_enabled": False,
+                "human_coach_enabled": False,
+                "stream_coach_enabled": False,
+                "stream_coach_apply_enabled": False,
+                "streamer_current_model_steps": int(
+                    checkpoint_record.get("model_steps", 0) or 0
+                ),
+                **experiment_status_context(),
+                "max_adventure_levels": max(int(episodes), int(config.get("max_adventure_levels", 1) or 1)),
+                "max_attempts_per_level": max(int(episodes), int(config.get("max_attempts_per_level", 1) or 1)),
+            }
+        )
+        evaluation_args = argparse.Namespace(**vars(args))
+        evaluation_args.gui = False
+        evaluation_args.deterministic = True
+        payload = adventure_evaluate(evaluation_config, model_path, evaluation_args)
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        completed = int(summary.get("episodes_completed", 0) or 0) if isinstance(summary, dict) else 0
+        top_level_completed = int(payload.get("evaluation_episodes_completed", 0) or 0)
+        stop_reason = str(payload.get("stop_reason") or "")
+        if (
+            completed != int(episodes)
+            or top_level_completed != int(episodes)
+            or stop_reason != "evaluation_episode_limit_reached"
+        ):
+            raise RuntimeError(
+                "blocked_reason=streamer_evaluation_incomplete: "
+                f"requested={episodes} summary_completed={completed} "
+                f"top_level_completed={top_level_completed} stop_reason={stop_reason}"
+            )
+        return payload
+
+    return run_streamer_cycles(
+        config=config,
+        train_cycle=train_cycle,
+        evaluate_checkpoint=evaluate_checkpoint,
+        status_sink=publish_status,
     )
 
 
 def check_deps() -> int:
     missing: List[str] = []
-    for module in ("gymnasium", "numpy", "stable_baselines3", "sb3_contrib"):
+    for module in ("gymnasium", "numpy", "stable_baselines3", "sb3_contrib", "websockets"):
         try:
             __import__(module)
         except ImportError:
@@ -2700,7 +3776,7 @@ def check_deps() -> int:
         print("Install with: python -m pip install -r requirements-ppo.txt")
         return 1
     print("PPO readiness: YES")
-    print("MaskablePPO dependencies are installed.")
+    print("MaskablePPO and Streamer dependencies are installed.")
     return 0
 
 
@@ -2862,6 +3938,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adventure-maintenance-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-frontier-win-streak-required", type=int, default=None)
     parser.add_argument("--live-status-path", type=Path, default=Path("runs/live_status.json"))
+    parser.add_argument(
+        "--streamer-v1",
+        dest="streamer_v1_enabled",
+        action="store_true",
+        help="Run the FIFO Twitch/mock intervention, PPO+BC, and autonomous evaluation cycle overlay.",
+    )
+    parser.add_argument("--streamer-platform", choices=("twitch", "mock"), default=None)
+    parser.add_argument("--streamer-baseline-checkpoint", type=Path, default=None)
+    parser.add_argument("--streamer-intervention-interval-seconds", type=float, default=None)
+    parser.add_argument("--streamer-command-ttl-seconds", type=float, default=None)
+    parser.add_argument("--streamer-command-queue-capacity", type=int, default=None)
+    parser.add_argument("--streamer-message-max-chars", type=int, default=None)
+    parser.add_argument("--streamer-policy-steps-per-cycle", type=int, default=None)
+    parser.add_argument("--streamer-checkpoint-policy-steps", type=int, default=None)
+    parser.add_argument("--streamer-evaluation-episodes", type=int, default=None)
+    parser.add_argument("--streamer-max-cycles", type=int, default=None)
+    parser.add_argument("--streamer-endurance-hours", type=float, default=None)
+    parser.add_argument("--streamer-bc-enabled", dest="streamer_bc_enabled", action="store_true", default=None)
+    parser.add_argument("--no-streamer-bc", dest="streamer_bc_enabled", action="store_false")
+    parser.add_argument("--streamer-bc-coefficient", type=float, default=None)
+    parser.add_argument("--streamer-demonstration-capacity", type=int, default=None)
+    parser.add_argument("--streamer-bc-batch-size", type=int, default=None)
+    parser.add_argument("--streamer-bc-update-frequency", type=int, default=None)
+    parser.add_argument("--streamer-bc-min-demonstrations", type=int, default=None)
+    parser.add_argument("--streamer-twitch-client-id-env", default=None)
+    parser.add_argument("--streamer-twitch-access-token-env", default=None)
+    parser.add_argument("--streamer-twitch-broadcaster-id-env", default=None)
+    parser.add_argument("--streamer-twitch-user-id-env", default=None)
+    parser.add_argument("--streamer-viewer-hash-secret-env", default=None)
+    parser.add_argument("--streamer-mock-script", type=Path, default=None)
     parser.add_argument("--human-coach-enabled", action="store_true", help="Enable local/mock human coach action overrides.")
     parser.add_argument(
         "--human-coach-command-mode",
@@ -3025,6 +4131,16 @@ def main() -> int:
     if args.metadata_dry_run:
         model_path = args.model or Path(config["model_path"] or Path(config["run_dir"]) / "model.zip")
         return metadata_dry_run(config, model_path)
+    if bool(config.get("streamer_v1_enabled", False)):
+        run_dir = Path(config["run_dir"])
+        with TeeOutput(
+            run_dir / "streamer.log",
+            rotate_max_bytes=64 * 1024 * 1024,
+            rotate_backup_count=3,
+        ):
+            print(f"Streamer experiment directory: {run_dir}")
+            run_streamer_v1(config, args)
+        return 0
     execution_route = execution_route_for_config(config)
     if execution_route == "train":
         run_dir = Path(config["run_dir"])

@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,6 +64,7 @@ from pvzrl_runtime_state import EpisodeRuntimeState, WatchdogRuntimeState
 from pvzrl_seed_inventory import adventure_identity_features
 from pvzrl_stream_coach import StreamCoachController
 from pvzrl_assisted_coach import InterventionJSONLLogger
+from pvzrl_streamer_logging import BufferedStreamerEventLogger
 
 
 @dataclass
@@ -318,6 +319,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._reset_requires_seed_flow_next = False
         self.human_coach_hook: Optional[HumanCoachOverrideHook] = None
         self.stream_coach_controller: Optional[StreamCoachController] = None
+        self.streamer_v1_controller: Optional[Any] = None
+        self.streamer_v1_event_logger: Optional[BufferedStreamerEventLogger] = None
+        self.streamer_v1_cycle = 0
+        self.streamer_v1_platform = ""
+        self._streamer_v1_last_action: Optional[Dict[str, Any]] = None
+        self._streamer_v1_last_action_source = "MODEL"
+        self._streamer_v1_intervention_count = 0
+        self._streamer_v1_training_status: Dict[str, Any] = {}
+        self._streamer_v1_distinct_viewers: set[str] = set()
+        self._streamer_v1_distinct_viewer_capacity = 100_000
+        self._streamer_v1_distinct_viewers_saturated = False
         self.intervention_logger = InterventionJSONLLogger(
             Path(self.config.intervention_log_path or "logs/interventions/interventions.jsonl")
         )
@@ -376,6 +388,250 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             if self.config.stream_coach_mock_script:
                 print(f"[coach] mock stream script={self.config.stream_coach_mock_script}")
         self._reset_lane_episode_diagnostics({})
+
+    def attach_streamer_v1_controller(
+        self,
+        controller: Any,
+        *,
+        event_log_path: Path,
+        training_cycle: int,
+        platform: str,
+        training_status: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Attach the source-neutral FIFO controller to the canonical env path."""
+
+        if self.human_coach_hook is not None or self.stream_coach_controller is not None:
+            raise RuntimeError("Streamer V1 cannot run alongside legacy coach action overrides")
+        if self.streamer_v1_controller is not None:
+            raise RuntimeError("Streamer V1 controller is already attached")
+        self.streamer_v1_controller = controller
+        self.streamer_v1_event_logger = BufferedStreamerEventLogger(event_log_path)
+        self.streamer_v1_cycle = int(training_cycle)
+        self.streamer_v1_platform = str(platform or "stream")
+        self._streamer_v1_training_status = dict(training_status or {})
+        controller.begin_phase("STREAM_TRAIN", accepting=True)
+        try:
+            controller.start()
+        except Exception:
+            controller.begin_phase("START_FAILED", accepting=False)
+            controller.close(timeout_seconds=1.0)
+            self.streamer_v1_event_logger.close()
+            self.streamer_v1_event_logger = None
+            self.streamer_v1_controller = None
+            raise
+
+    def update_streamer_v1_training_status(self, **values: Any) -> None:
+        """Update lightweight model/BC counters consumed by live status."""
+
+        allowed = {
+            "current_model_ppo_steps",
+            "cycle_policy_steps_completed",
+            "next_evaluation_countdown",
+            "bc_demonstration_count",
+            "bc_loss",
+            "bc_update_count",
+            "total_environment_actions",
+            "viewer_intervention_count",
+        }
+        for key, value in values.items():
+            if key in allowed:
+                self._streamer_v1_training_status[key] = value
+
+    def _streamer_v1_live_status(self) -> Dict[str, Any]:
+        controller = self.streamer_v1_controller
+        if controller is None:
+            return {"streamer_v1_enabled": False}
+        try:
+            diagnostics = dict(controller.diagnostics())
+        except Exception as exc:
+            diagnostics = {"streamer_controller_error": type(exc).__name__}
+        source = getattr(controller, "source", None)
+        if source is not None:
+            try:
+                diagnostics.update(dict(source.get_diagnostics()))
+            except Exception as exc:
+                diagnostics["stream_source_diagnostics_error"] = type(exc).__name__
+        queue = diagnostics.get("streamer_command_queue")
+        queue_depth = int(queue.get("depth", 0) or 0) if isinstance(queue, dict) else 0
+        diagnostics.update(
+            {
+                "streamer_v1_enabled": True,
+                "streamer_mode": "STREAM_TRAIN",
+                "streamer_platform": self.streamer_v1_platform,
+                "streamer_cycle": int(self.streamer_v1_cycle),
+                "viewer_command_queue_depth": queue_depth,
+                "viewer_intervention_count": int(self._streamer_v1_intervention_count),
+                "last_viewer_action": dict(self._streamer_v1_last_action or {}),
+                "last_action_source": self._streamer_v1_last_action_source,
+                "distinct_hashed_viewer_count": len(self._streamer_v1_distinct_viewers),
+                "distinct_hashed_viewer_tracking_saturated": bool(
+                    self._streamer_v1_distinct_viewers_saturated
+                ),
+                "next_adventure_level": int(getattr(self, "current_level", 0) or 0),
+                **dict(self._streamer_v1_training_status),
+            }
+        )
+        return diagnostics
+
+    def _finalize_streamer_v1_step(
+        self,
+        *,
+        viewer_tick: Optional[Any],
+        viewer_selected: Optional[Any],
+        viewer_resolution: Optional[Any],
+        viewer_source_metadata: Dict[str, Any],
+        proposed_action: int,
+        executed_action: int,
+        pre_observation: Dict[str, Any],
+        post_observation: Dict[str, Any],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any],
+        environment_step: int,
+    ) -> None:
+        """Emit the explicit PPO ownership contract and compact Streamer logs."""
+
+        from pvzrl_streamer_logging import compact_observation_revision
+
+        logger = self.streamer_v1_event_logger
+        common = {
+            "cycle_id": int(self.streamer_v1_cycle),
+            "episode_id": int(self.episode_state.index),
+            "phase": "STREAM_TRAIN",
+            "observation_revision": compact_observation_revision(pre_observation),
+        }
+        if viewer_tick is not None:
+            for outcome in tuple(getattr(viewer_tick, "outcomes", ()) or ()):
+                viewer_hash = str(getattr(outcome, "viewer_hash", "") or "")
+                if viewer_hash and viewer_hash not in self._streamer_v1_distinct_viewers:
+                    if len(self._streamer_v1_distinct_viewers) < self._streamer_v1_distinct_viewer_capacity:
+                        self._streamer_v1_distinct_viewers.add(viewer_hash)
+                    else:
+                        self._streamer_v1_distinct_viewers_saturated = True
+                if logger is not None:
+                    logger.append({"event": "viewer_command", **common, **outcome.to_safe_dict()})
+
+        if viewer_selected is None or viewer_resolution is None:
+            info["action_source"] = "MODEL"
+            self._streamer_v1_last_action_source = "MODEL"
+            if logger is not None:
+                logger.append(
+                    {
+                        "event": "executed_decision",
+                        **common,
+                        "model_action": int(proposed_action),
+                        "viewer_action": None,
+                        "executed_action": int(executed_action),
+                        "action_source": "MODEL",
+                        "reward": float(reward),
+                        "reward_components": dict(info.get("reward_breakdown") or {}),
+                    },
+                    force=bool(terminated or truncated),
+                )
+            return
+
+        action_result = info.get("action_result")
+        result = action_result if isinstance(action_result, dict) else {}
+        placement = result.get("placement") if isinstance(result.get("placement"), dict) else {}
+        decision = getattr(viewer_resolution, "decision", None)
+        action_kind = str(getattr(decision, "resolved_action_kind", "") or "")
+        expected_action = int(getattr(viewer_resolution, "action_id", executed_action))
+        bridge_executed = self._safe_int_value(result.get("executedAction"), default=-1)
+        action_matched = bridge_executed == expected_action
+        accepted_effect = (
+            bool(result.get("fusionSucceeded"))
+            if action_kind == "fusion"
+            else bool(result.get("plantPlaced") or placement.get("success"))
+        )
+        execution_succeeded = bool(
+            action_matched
+            and accepted_effect
+            and not result.get("illegalAction")
+            and not result.get("bridgeTimeout")
+            and not info.get("bridge_error")
+        )
+        execution_status = (
+            "executed"
+            if execution_succeeded
+            else str(
+                result.get("illegalReason")
+                or result.get("fusionNoEffectReason")
+                or info.get("terminal_reason")
+                or "execution_not_proven"
+            )
+        )
+        structured_command = viewer_source_metadata.get("viewer_command")
+        demonstration = {
+            "observation_version": str(self.config.observation_version),
+            "observation_revision": compact_observation_revision(pre_observation),
+            "canonical_action_id": expected_action,
+            "resolved_action": {
+                "action_id": expected_action,
+                "action_kind": action_kind,
+                "frame_identity": str(getattr(viewer_resolution, "frame_identity", "") or ""),
+            },
+            "level": pre_observation.get("currentAdventureLevel", pre_observation.get("currentLevel")),
+            "episode_id": int(self.episode_state.index),
+            "environment_step": int(environment_step),
+            "training_cycle": int(self.streamer_v1_cycle),
+            "viewer_hash": str(viewer_source_metadata.get("viewer_hash") or ""),
+            "command_id": str(viewer_source_metadata.get("command_id") or ""),
+            "event_id": str(viewer_source_metadata.get("event_id") or ""),
+            "command_type": str(viewer_source_metadata.get("command_kind") or ""),
+            "structured_command": structured_command if isinstance(structured_command, dict) else {},
+            "executed_at_unix": time.time(),
+            "reward": float(reward),
+            "result": execution_status,
+        }
+        transition = {
+            "schema_version": 1,
+            "behavior_source": "viewer",
+            "viewer_controlled": True,
+            "proposed_policy_action": int(proposed_action),
+            "requested_action": expected_action,
+            "executed_action": bridge_executed,
+            "execution_succeeded": execution_succeeded,
+            "demo_eligible": execution_succeeded,
+            "execution_status": execution_status,
+            "demonstration": demonstration,
+        }
+        info["streamer_transition"] = transition
+        info["action_source"] = "TWITCH"
+        info["viewer_action"] = expected_action
+        info["model_action"] = int(proposed_action)
+        self._streamer_v1_last_action_source = "TWITCH"
+        self._streamer_v1_intervention_count += 1
+        self._streamer_v1_last_action = {
+            "action_id": expected_action,
+            "command_id": str(viewer_source_metadata.get("command_id") or ""),
+            "event_id": str(viewer_source_metadata.get("event_id") or ""),
+            "command_type": str(viewer_source_metadata.get("command_kind") or ""),
+            "execution_status": execution_status,
+            "observation_revision": demonstration["observation_revision"],
+        }
+        if logger is not None:
+            logger.append(
+                {
+                    "event": "executed_decision",
+                    **common,
+                    "viewer_hash": demonstration["viewer_hash"],
+                    "command_id": demonstration["command_id"],
+                    "event_id": demonstration["event_id"],
+                    "command_type": demonstration["command_type"],
+                    "parsed_fields": demonstration["structured_command"],
+                    "model_action": int(proposed_action),
+                    "viewer_action": expected_action,
+                    "executed_action": bridge_executed,
+                    "canonical_action_id": expected_action,
+                    "action_source": "TWITCH",
+                    "legal": bool(getattr(viewer_resolution, "legal", False)),
+                    "execution_status": execution_status,
+                    "reward": float(reward),
+                    "reward_components": dict(info.get("reward_breakdown") or {}),
+                },
+                force=bool(terminated or truncated),
+            )
 
     def _episode_runtime_state(self) -> EpisodeRuntimeState:
         state = getattr(self, "episode_state", None)
@@ -703,8 +959,57 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         stream_decision = None
         coach_context: Dict[str, Any] = {}
         selected_bridge_command: Optional[Dict[str, Any]] = None
+        viewer_tick: Optional[Any] = None
+        viewer_selected: Optional[Any] = None
+        viewer_resolution: Optional[Any] = None
+        viewer_source_metadata: Dict[str, Any] = {}
+        streamer_environment_step = int(self.episode_state.global_step_count)
 
-        if self.human_coach_hook is not None:
+        if self.streamer_v1_controller is not None:
+            from pvzrl_stream_actions import resolve_viewer_action
+            from pvzrl_stream_commands import safe_action_source_metadata
+
+            current_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
+            current_mask: Optional[np.ndarray] = None
+
+            def resolve_current_viewer_command(command: Any) -> Any:
+                nonlocal current_mask
+                if current_mask is None:
+                    current_mask = self.action_masks()
+                return resolve_viewer_action(
+                    command,
+                    action_mask=current_mask,
+                    action_decision=lambda action_id: self.base.action_decision(
+                        int(action_id),
+                        current_observation,
+                        source="twitch",
+                    ),
+                    source=self.streamer_v1_platform or "twitch",
+                )
+
+            viewer_tick = self.streamer_v1_controller.tick(resolve_current_viewer_command)
+            viewer_selected = viewer_tick.selected
+            viewer_resolution = viewer_tick.resolution
+            if viewer_selected is not None:
+                stale_outcome = self.streamer_v1_controller.validate_selected_for_execution(
+                    viewer_selected
+                )
+                if stale_outcome is not None:
+                    viewer_tick = replace(
+                        viewer_tick,
+                        outcomes=(*viewer_tick.outcomes, stale_outcome),
+                        selected=None,
+                        resolution=None,
+                    )
+                    viewer_selected = None
+                    viewer_resolution = None
+            if viewer_selected is not None and viewer_resolution is not None:
+                resolved_action = getattr(viewer_resolution, "action_id", None)
+                if resolved_action is not None:
+                    policy_action = int(resolved_action)
+                    viewer_source_metadata = dict(safe_action_source_metadata(viewer_selected))
+
+        if viewer_selected is None and self.human_coach_hook is not None:
             coach_decision = self.human_coach_hook.select_action(self, policy_action)
             policy_action = int(coach_decision.selected_action)
             selected_bridge_command = (
@@ -735,7 +1040,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 f"outcome={coach_decision.event} "
                 f"reason={coach_decision.rejected_reason!r}"
             )
-        elif self.stream_coach_controller is not None:
+        elif viewer_selected is None and self.stream_coach_controller is not None:
             observation_for_stream = self._last_observation if isinstance(self._last_observation, dict) else {}
             try:
                 action_mask = self.action_masks()
@@ -825,7 +1130,11 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         action_source = "model"
         raw_action_source = "model"
         source_platform = ""
-        if coach_decision is not None and (
+        if viewer_selected is not None:
+            action_source = "twitch"
+            raw_action_source = "viewer"
+            source_platform = self.streamer_v1_platform or "twitch"
+        elif coach_decision is not None and (
             bool(coach_decision.override_applied) or selected_bridge_command is not None
         ):
             raw_action_source = str(
@@ -852,6 +1161,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 or "stream"
             ).strip().lower()
             source_platform = str(self.config.stream_coach_platform or "mock")
+        intent_source_metadata = {
+            "ppo_action": int(ppo_action),
+            "selected_policy_action": int(policy_action),
+            "coach_event": str(coach_context.get("event") or ""),
+            "raw_source": raw_action_source,
+            "platform": source_platform,
+            "command_mode": str(self.config.human_coach_command_mode or ""),
+            "stream_mode": str(self.config.stream_coach_mode or ""),
+            **viewer_source_metadata,
+        }
         structured_intent = build_action_intent(
             policy_action,
             source=action_source,
@@ -862,15 +1181,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             rows=self.rows,
             cols=self.cols,
             bridge_command=selected_bridge_command,
-            source_metadata={
-                "ppo_action": int(ppo_action),
-                "selected_policy_action": int(policy_action),
-                "coach_event": str(coach_context.get("event") or ""),
-                "raw_source": raw_action_source,
-                "platform": source_platform,
-                "command_mode": str(self.config.human_coach_command_mode or ""),
-                "stream_mode": str(self.config.stream_coach_mode or ""),
-            },
+            source_metadata=intent_source_metadata,
         )
         action_exception = ""
         try:
@@ -1449,6 +1760,23 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 reason=f"adventure_terminal:{done_reason or terminal_reason or 'episode_end'}"
             )
 
+        if self.streamer_v1_controller is not None:
+            self._finalize_streamer_v1_step(
+                viewer_tick=viewer_tick,
+                viewer_selected=viewer_selected,
+                viewer_resolution=viewer_resolution,
+                viewer_source_metadata=viewer_source_metadata,
+                proposed_action=ppo_action,
+                executed_action=bridge_action,
+                pre_observation=pre_action_observation,
+                post_observation=observation,
+                reward=float(reward),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+                info=info,
+                environment_step=streamer_environment_step,
+            )
+
         facts = self.base._step_facts_cache.get_known(observation, self.config.plant_types)
         return self._encode_observation(observation, facts=facts), float(reward), terminated, truncated, info
 
@@ -1608,6 +1936,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         payload.setdefault("stream_fusion_last_post_result_type", -1)
         payload.setdefault("stream_fusion_last_post_result_name", "")
         payload.setdefault("stream_fusion_last_no_effect_reason", "")
+        payload.update(self._streamer_v1_live_status())
         return payload
 
     def action_masks(self) -> np.ndarray:
@@ -2257,8 +2586,32 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             return int(default)
 
     def close(self) -> None:
+        streamer_shutdown_error: Optional[RuntimeError] = None
+        if self.streamer_v1_controller is not None:
+            try:
+                self.streamer_v1_controller.begin_phase("STOPPED", accepting=False)
+            except Exception:
+                pass
+            try:
+                stopped = self.streamer_v1_controller.close(timeout_seconds=5.0)
+                if not stopped:
+                    streamer_shutdown_error = RuntimeError(
+                        "blocked_reason=streamer_source_shutdown_timeout"
+                    )
+            except Exception as exc:
+                streamer_shutdown_error = RuntimeError(
+                    "blocked_reason=streamer_source_shutdown_failed"
+                )
+            self.streamer_v1_controller = None
+        if self.streamer_v1_event_logger is not None:
+            try:
+                self.streamer_v1_event_logger.close()
+            finally:
+                self.streamer_v1_event_logger = None
         self.base.close()
         super().close()
+        if streamer_shutdown_error is not None:
+            raise streamer_shutdown_error
 
     def _reset_action_diagnostics(self) -> None:
         state = getattr(self, "watchdog_state", None)

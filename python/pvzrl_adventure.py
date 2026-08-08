@@ -1466,10 +1466,22 @@ def prepare_adventure_gameplay(
     seed_list: List[str],
     timeout: float,
     seed_selection_callback: Optional[Callable[[Dict[str, Any], List[str]], Tuple[List[str], str]]] = None,
+    expected_level: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
     deadline = time.monotonic() + max(1.0, timeout)
     last_state: Dict[str, Any] = {}
     active_seed_list = [str(seed).strip() for seed in seed_list if str(seed).strip()]
+
+    def level_identity_block(state: Dict[str, Any]) -> str:
+        if expected_level is None:
+            return ""
+        diagnostics = adventure_level_identity_diagnostics(state, int(expected_level))
+        if diagnostics.get("level_identity_reliable"):
+            return ""
+        reason = str(diagnostics.get("level_identity_reason") or "unreliable")
+        mismatches = ",".join(str(value) for value in diagnostics.get("level_identity_mismatches", []))
+        return f"adventure_level_identity_unreliable:{reason}:{mismatches}".rstrip(":")
+
     while time.monotonic() < deadline:
         state = env.base.adventure_screen_state()
         last_state = state
@@ -1483,6 +1495,9 @@ def prepare_adventure_gameplay(
             continue
 
         if state.get("isGameplayReady"):
+            identity_block = level_identity_block(state)
+            if identity_block:
+                return None, {"reset": {"ok": False, "methodUsed": "level_identity"}}, identity_block
             observation = env.base.wait_for_gameplay_ready(
                 timeout=max(1.0, min(timeout, deadline - time.monotonic() + 1.0)),
                 poll_seconds=env.config.poll_seconds,
@@ -1499,6 +1514,9 @@ def prepare_adventure_gameplay(
             continue
 
         if state.get("isSeedSelectionScreen"):
+            identity_block = level_identity_block(state)
+            if identity_block:
+                return None, {"reset": {"ok": False, "methodUsed": "level_identity"}}, identity_block
             if seed_selection_callback is not None:
                 try:
                     callback_seed_list, callback_blocked_reason = seed_selection_callback(state, list(active_seed_list))
@@ -1873,6 +1891,7 @@ def run_policy_attempt(
         context,
         selected_seeds,
         timeout=env.config.gameplay_ready_timeout,
+        expected_level=tracker_level,
     )
     if observation is None:
         log.result = "blocked"
@@ -2588,8 +2607,18 @@ def aggregate_level_metrics(level: AdventureLevelLog) -> None:
     level.undefended_threat_ratio_by_row = {key: value / count for key, value in sorted(undefended_totals.items())}
 
 
-def summarize_progress(levels: List[AdventureLevelLog]) -> Dict[str, Any]:
-    attempts = [attempt for level in levels for attempt in level.attempt_logs]
+def summarize_progress(
+    levels: List[AdventureLevelLog],
+    *,
+    terminal_episodes_only: bool = False,
+) -> Dict[str, Any]:
+    attempts = [
+        attempt
+        for level in levels
+        for attempt in level.attempt_logs
+        if not terminal_episodes_only
+        or attempt.get("result") in {"win", "loss", "timeout"}
+    ]
     count = max(1, len(attempts))
     timeout_classifications: Counter[str] = Counter(
         str(attempt.get("timeout_classification") or "none") for attempt in attempts
@@ -2630,6 +2659,8 @@ def run_adventure_eval(
     adventure_soft_max_steps: Optional[int] = None,
     adventure_hard_max_steps: Optional[int] = None,
     adventure_final_wave_extension: Optional[bool] = None,
+    evaluation_episode_limit: Optional[int] = None,
+    strict_level_identity: bool = False,
 ) -> Dict[str, Any]:
     advance_on_wins = max(1, int(advance_on_wins))
     max_adventure_levels = max(1, int(max_adventure_levels))
@@ -2654,6 +2685,15 @@ def run_adventure_eval(
     unlocked: Counter[str] = Counter({canonical_seed_name(seed): 1 for seed in BASE_UNLOCKED_SEEDS})
     levels: List[AdventureLevelLog] = []
     stop_reason = ""
+    episode_limit = (
+        max(1, int(evaluation_episode_limit))
+        if evaluation_episode_limit is not None
+        else None
+    )
+    episodes_completed = 0
+    episode_limit_reached = False
+    level_identity_start: Dict[str, Any] = {}
+    level_identity_end: Dict[str, Any] = {}
     def resolve_stop_reason(reason: str) -> str:
         return adventure_stop_reason(reason)
     context: Dict[str, Any] = {
@@ -2720,6 +2760,19 @@ def run_adventure_eval(
     )
     try:
         env.base.configure()
+        initial_state = env.base.adventure_screen_state()
+        level_identity_start = adventure_level_identity_diagnostics(
+            initial_state,
+            int(adventure_start_level),
+        )
+        context["level_identity_start"] = dict(level_identity_start)
+        if strict_level_identity and not level_identity_start.get("level_identity_reliable"):
+            raise RuntimeError(
+                "blocked_reason=streamer_evaluation_start_level_unreliable: "
+                f"expected={adventure_start_level} "
+                f"reason={level_identity_start.get('level_identity_reason', '')} "
+                f"mismatches={level_identity_start.get('level_identity_mismatches', [])}"
+            )
         for level_offset in range(max(0, max_adventure_levels)):
             tracker_level = int(adventure_start_level) + level_offset
             progression_index = level_offset + 1
@@ -2790,6 +2843,14 @@ def run_adventure_eval(
                     hard_max_steps=hard_max_steps,
                     final_wave_extension=final_wave_extension,
                 )
+                episode_counted = attempt.result in {"win", "loss", "timeout"}
+                if episode_counted:
+                    episodes_completed += 1
+                episode_limit_reached = bool(
+                    episode_limit is not None and episodes_completed >= episode_limit
+                )
+                context["evaluation_episode_limit"] = episode_limit
+                context["evaluation_episodes_completed"] = episodes_completed
                 level.attempts += 1
                 context["last_result"] = attempt.result
                 context["terminal_reason"] = attempt.terminal_reason or attempt.done_reason
@@ -2865,6 +2926,13 @@ def run_adventure_eval(
                         }
                     )
                     context["last_result"] = attempt.result
+                    if not episode_counted:
+                        episodes_completed += 1
+                        episode_counted = True
+                        episode_limit_reached = bool(
+                            episode_limit is not None and episodes_completed >= episode_limit
+                        )
+                        context["evaluation_episodes_completed"] = episodes_completed
 
                 if attempt.result == "win":
                     attempt.win_detected = True
@@ -2931,10 +2999,29 @@ def run_adventure_eval(
                         print(f"[adventure] next level={tracker_level + 1}")
                         level.attempt_logs.append(asdict(attempt))
                         break
+                    if episode_limit_reached:
+                        stop_reason = "evaluation_episode_limit_reached"
+                        replay_ok, replay_reason = replay_current_level_after_validation_win(
+                            env,
+                            writer,
+                            context,
+                            expected_level=tracker_level,
+                        )
+                        if not replay_ok:
+                            last_blocked_reason = replay_reason or "win_replay_reset_failed"
+                            attempt.blocked_reason = last_blocked_reason
+                            context["blocked_reason"] = last_blocked_reason
+                        level.attempt_logs.append(asdict(attempt))
+                        break
                     if attempt_index >= max_attempts_per_level:
                         level.attempt_logs.append(asdict(attempt))
                         break
-                    replay_ok, replay_reason = replay_current_level_after_validation_win(env, writer, context)
+                    replay_ok, replay_reason = replay_current_level_after_validation_win(
+                        env,
+                        writer,
+                        context,
+                        expected_level=tracker_level,
+                    )
                     if not replay_ok:
                         level.consecutive_wins = 0
                         last_blocked_reason = replay_reason or "win_replay_reset_failed"
@@ -2957,6 +3044,10 @@ def run_adventure_eval(
                     if attempt_index >= max_attempts_per_level:
                         level.attempt_logs.append(asdict(attempt))
                         break
+                    if episode_limit_reached:
+                        stop_reason = "evaluation_episode_limit_reached"
+                        level.attempt_logs.append(asdict(attempt))
+                        break
                     try_again = env.base.click_try_again_once()
                     context["last_ui_action"] = try_again
                     if not try_again.get("ok", False):
@@ -2971,10 +3062,45 @@ def run_adventure_eval(
                     level.attempt_logs.append(asdict(attempt))
                     continue
 
+                if attempt.result == "timeout":
+                    update_attempt_progress(attempt, level, context, advance_on_wins)
+                    writer.write(build_live_status(env, context))
+                    level.attempt_logs.append(asdict(attempt))
+                    timeout_boundary_reached = bool(
+                        episode_limit_reached or attempt_index >= max_attempts_per_level
+                    )
+                    if episode_limit_reached:
+                        stop_reason = "evaluation_episode_limit_reached"
+                    try:
+                        _, reset_info = env.base.reset(reset_reason="timeout")
+                        context["last_ui_action"] = (
+                            reset_info.get("reset", reset_info)
+                            if isinstance(reset_info, dict)
+                            else reset_info
+                        )
+                    except Exception as exc:
+                        last_blocked_reason = "timeout_reset_failed"
+                        attempt.blocked_reason = last_blocked_reason
+                        context["blocked_reason"] = last_blocked_reason
+                        context["last_error"] = str(exc)
+                        if strict_level_identity:
+                            raise RuntimeError(
+                                "blocked_reason=streamer_evaluation_timeout_reset_failed"
+                            ) from exc
+                        break
+                    time.sleep(max(0.5, env.config.poll_seconds))
+                    if timeout_boundary_reached:
+                        break
+                    continue
+
                 if attempt.result == "env_corruption":
                     update_attempt_progress(attempt, level, context, advance_on_wins)
                     writer.write(build_live_status(env, context))
                     if attempt_index >= max_attempts_per_level:
+                        level.attempt_logs.append(asdict(attempt))
+                        break
+                    if episode_limit_reached:
+                        stop_reason = "evaluation_episode_limit_reached"
                         level.attempt_logs.append(asdict(attempt))
                         break
                     context["state"] = "RESET_ENV_CORRUPTION"
@@ -3033,11 +3159,49 @@ def run_adventure_eval(
                 stop_reason = resolve_stop_reason(level.blocked_reason)
             context["unlocked_seeds"] = sorted(unlocked.keys())
             levels.append(level)
-            context["eval_summary"] = summarize_progress(levels)
+            context["eval_summary"] = summarize_progress(
+                levels,
+                terminal_episodes_only=evaluation_episode_limit is not None,
+            )
             if env is not None:
                 writer.write(build_live_status(env, context))
+            if episode_limit_reached:
+                stop_reason = "evaluation_episode_limit_reached"
+                break
             if not level.advanced:
                 break
+
+        next_adventure_level = int(adventure_start_level)
+        if levels:
+            final_level = levels[-1]
+            next_adventure_level = int(final_level.level) + (1 if final_level.advanced else 0)
+        if strict_level_identity:
+            handoff_observation, _, handoff_blocked_reason = prepare_adventure_gameplay(
+                env,
+                writer,
+                context,
+                list(config.get("seed_list", [])),
+                timeout=env.config.gameplay_ready_timeout,
+                expected_level=next_adventure_level,
+            )
+            if handoff_observation is None:
+                raise RuntimeError(
+                    "blocked_reason=streamer_evaluation_handoff_failed: "
+                    f"expected={next_adventure_level} reason={handoff_blocked_reason}"
+                )
+        end_state = env.base.adventure_screen_state()
+        level_identity_end = adventure_level_identity_diagnostics(
+            end_state,
+            next_adventure_level,
+        )
+        context["level_identity_end"] = dict(level_identity_end)
+        if strict_level_identity and not level_identity_end.get("level_identity_reliable"):
+            raise RuntimeError(
+                "blocked_reason=streamer_evaluation_end_level_unreliable: "
+                f"expected={next_adventure_level} "
+                f"reason={level_identity_end.get('level_identity_reason', '')} "
+                f"mismatches={level_identity_end.get('level_identity_mismatches', [])}"
+            )
 
     finally:
         if env is not None:
@@ -3063,7 +3227,16 @@ def run_adventure_eval(
         "advance_on_wins": int(advance_on_wins),
         "max_adventure_levels": int(max_adventure_levels),
         "max_attempts_per_level": int(max_attempts_per_level),
+        "evaluation_episode_limit": episode_limit,
+        "evaluation_episodes_completed": int(episodes_completed),
         "adventure_start_level": int(adventure_start_level),
+        "next_adventure_level": int(
+            levels[-1].level + (1 if levels[-1].advanced else 0)
+            if levels
+            else adventure_start_level
+        ),
+        "level_identity_start": level_identity_start,
+        "level_identity_end": level_identity_end,
         "adventure_start_level_label": adventure_level_metadata(adventure_start_level, 1)["adventure_level_label"],
         "soft_max_steps": int(soft_max_steps),
         "hard_max_steps": int(hard_max_steps),
@@ -3079,7 +3252,10 @@ def run_adventure_eval(
         "unlocked_seeds_final": sorted(unlocked.keys()),
         "bridge_errors": sum(int(attempt.get("bridge_errors", 0) or 0) for level in levels for attempt in level.attempt_logs),
         "reset_failures": sum(int(attempt.get("reset_failures", 0) or 0) for level in levels for attempt in level.attempt_logs),
-        "summary": summarize_progress(levels),
+        "summary": summarize_progress(
+            levels,
+            terminal_episodes_only=evaluation_episode_limit is not None,
+        ),
     }
     output_path = run_dir / "adventure_progression_results.json"
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

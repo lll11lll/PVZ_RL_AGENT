@@ -339,3 +339,67 @@ def test_tracked_generalist_config_preserves_protected_contract() -> None:
     assert config["observation_version"] == "adventure_14slot_identity_v1"
     assert config["identity_seed_slots"] is True
     assert "incompatible_with_4slot_specialist" not in config
+
+
+def _streamer_args(*extra: str) -> Namespace:
+    return build_arg_parser().parse_args(
+        [
+            "--streamer-v1",
+            "--streamer-platform",
+            "mock",
+            "--streamer-baseline-checkpoint",
+            "baseline.zip",
+            *extra,
+        ]
+    )
+
+
+def test_streamer_intervention_interval_has_a_practical_minimum() -> None:
+    with pytest.raises(SystemExit, match="invalid_streamer_intervention_interval"):
+        build_config(
+            _streamer_args("--streamer-intervention-interval-seconds", "0.099"),
+            {},
+        )
+    assert build_config(
+        _streamer_args("--streamer-intervention-interval-seconds", "0.1"),
+        {},
+    )["streamer_intervention_interval_seconds"] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    ("option", "field_name"),
+    [
+        ("--streamer-twitch-client-id-env", "streamer_twitch_client_id_env"),
+        ("--streamer-twitch-access-token-env", "streamer_twitch_access_token_env"),
+        ("--streamer-twitch-broadcaster-id-env", "streamer_twitch_broadcaster_id_env"),
+        ("--streamer-twitch-user-id-env", "streamer_twitch_user_id_env"),
+        ("--streamer-viewer-hash-secret-env", "streamer_viewer_hash_secret_env"),
+    ],
+)
+def test_streamer_env_fields_reject_literal_credential_shaped_values_without_echoing_them(
+    option: str,
+    field_name: str,
+) -> None:
+    literal = "oauth:literal-secret-must-not-escape"
+    with pytest.raises(SystemExit) as captured:
+        build_config(_streamer_args(option, literal), {})
+    message = str(captured.value)
+    assert "invalid_streamer_environment_variable_name" in message
+    assert field_name in message
+    assert literal not in message
+
+
+@pytest.mark.parametrize(
+    ("option", "field_name"),
+    [
+        ("--n-steps", "n_steps"),
+        ("--batch-size", "batch_size"),
+    ],
+)
+def test_streamer_rejects_nonpositive_rollout_dimensions(
+    option: str,
+    field_name: str,
+) -> None:
+    with pytest.raises(SystemExit) as captured:
+        build_config(_streamer_args(option, "0"), {})
+    assert field_name in str(captured.value)

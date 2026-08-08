@@ -4,6 +4,8 @@ Status: repository-wide removal and the final bridge-free/bridge verification ga
 
 Adventure Generalist is the sole maintained training and evaluation path. Legacy fixed/specialist mode was removed during the repository refactor.
 
+Streamer Mode V1 was added later as an overlay on this settled Generalist architecture. It does not reopen a fixed/specialist path or alter the protected 701-action / 4,297-observation contract. The 2026-07-13 counts and live evidence below remain historical refactor evidence; they do not include the later Streamer implementation.
+
 ## Executive result
 
 PvZRL now has one maintained policy surface:
@@ -21,6 +23,27 @@ PvZRL now has one maintained policy surface:
 | Protected timestep | 370000 |
 
 Shared environment, bridge, reset, masks, observation facts, fusion, rewards, progression, coaches, telemetry, diagnostics, and Tk infrastructure were retained. Product-specific dispatch, layouts, adapters, schedules, controls, fixtures, and documentation were removed instead of hidden behind deprecated switches.
+
+## Post-refactor Streamer V1 ownership update (2026-08-08)
+
+Streamer V1 reuses the maintained architecture rather than introducing a second training product:
+
+| Concern | Current owner and boundary |
+| --- | --- |
+| Train/evaluate loop | `pvzrl_streamer.py` coordinates existing `train_ppo.train` and `run_adventure_eval`; `STREAM_TRAIN`/`EVALUATE` are phases, not new run modes. |
+| Twitch input | `pvzrl_twitch.py` implements read-only EventSub WebSocket `channel.chat.message`; `pvzrl_streamer_source.py` keeps Twitch and deterministic mock sources interchangeable. |
+| Commands/actions | `pvzrl_stream_commands.py` owns strict parsing, bounded FIFO, TTL, cadence, dedupe, and phase generation. `pvzrl_stream_actions.py` resolves through the current canonical action-decision cache and mask. |
+| PPO/BC | `pvzrl_streamer_ppo.py` excludes viewer transitions/log probabilities from policy rollouts and cuts GAE at interventions. `pvzrl_demonstrations.py` owns bounded atomic observation/mask/action records and masked BC uses the existing policy/optimizer. |
+| Environment/bridge | `pvzrl_sb3.py` classifies the actual canonical execution. The existing `PvZGymEnv`, action/fusion code, reward composition, and C# protocol remain authoritative. |
+| Checkpoints | The configured 500k Generalist source is immutable BASELINE. CURRENT and BEST use immutable hash-addressed generations plus atomic role records and repairable aliases; protected BEST promotes by win rate then average reward only for same-start-level protocol-compatible evaluations, retaining ties. |
+| Progression | Baseline evaluation, cycle training, and current evaluation pass expected/next Adventure levels sequentially and retain strict live identity validation. This is not profile-restored same-level evaluation. |
+| Status/logging | Existing atomic live status receives compact Streamer/queue/Twitch/BC/evaluation/level fields. Streamer JSONL excludes raw chat identity and full observations; the bounded demonstration `.npz` separately stores learning inputs. |
+
+The existing local mock crowd-coach/voting path remains a separate legacy coach tool. Streamer V1 is FIFO with no voting and refuses simultaneous legacy action overrides.
+
+Bridge-free verification added focused EventSub, parser/FIFO, action/fusion resolution, intervention-aware PPO/GAE, BC persistence, cycle/checkpoint, resume, evaluation-isolation, and phase-race tests. The local June 21 500k baseline was actual-loaded on CPU during Streamer implementation with 701 actions, observation `(4297,)`, and `num_timesteps=500000`. That is a compatibility/load proof, not live Unity, Twitch delivery, or completed episode evidence.
+
+No full six-hour credentialed Twitch/game endurance result is claimed by this source update. `docs/STREAMER_MODE.md` provides both the bridge-free six-hour soak and exact live six-hour command, the artifacts/counters to inspect, and the sequential-evaluation limitation. OBS, game/process restart supervision, public services, and the future autonomous control arm remain out of scope.
 
 ## Scope inventory
 

@@ -2,11 +2,19 @@
 
 PvZRL supports one product path: Adventure Generalist training and evaluation.
 
-The canonical tracked configuration is:
+The canonical tracked Generalist configuration is:
 
 ```text
 configs/ppo_adventure_generalist_14slot_identity_v1.json
 ```
+
+Streamer Mode V1 is a Generalist-training overlay with a safe tracked example:
+
+```text
+configs/streamer_v1.example.json
+```
+
+The example contains environment-variable names but no Twitch credentials. See `docs/STREAMER_MODE.md` before a live run.
 
 ## Run modes
 
@@ -25,6 +33,8 @@ Use the matching CLI selectors:
 ```
 
 `--run-mode` accepts the same two values. Unsupported mode strings fail during resolution; there is no fallback into another trainer or evaluator.
+
+`--streamer-v1` does not add a third run mode. It is valid only with `adventure_generalist_14slot_train`; its cycle manager calls the existing Generalist trainer and evaluator for `STREAM_TRAIN` and `EVALUATE` phases.
 
 ## Resolution precedence
 
@@ -124,6 +134,51 @@ Status and diagnostics paths should normally live beneath the run directory. Wri
 
 Human coach and crowd coach use local command/log paths. Human coach takes precedence when both are enabled. Crowd coach is dry-run unless apply is explicitly enabled. Intervention logging and fusion probes remain local.
 
+### Streamer Mode V1
+
+Streamer V1 owns its intervention collector and therefore rejects simultaneous legacy human-coach or crowd-coach overrides.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `streamer_v1_enabled` | `false` | Enable the Streamer cycle overlay. |
+| `streamer_platform` | `twitch` | `twitch` EventSub or deterministic `mock` source. |
+| `streamer_baseline_checkpoint` | required | Repository-relative or runtime path to a compatible Generalist baseline. |
+| `streamer_intervention_interval_seconds` | `2.0` | Monotonic interval between opportunities; at most one viewer action per opportunity. Valid range: `0.1..3600` seconds. |
+| `streamer_command_ttl_seconds` | `10.0` | Time before a queued parsed command expires. |
+| `streamer_command_queue_capacity` | `256` | Bounded FIFO capacity; a full queue rejects the newest command. |
+| `streamer_message_max_chars` | `256` | Maximum parsed command length. |
+| `streamer_policy_steps_per_cycle` | `25000` | Policy-owned PPO transitions required before evaluation. |
+| `streamer_checkpoint_policy_steps` | `5000` | Safe post-optimizer CURRENT save interval. |
+| `streamer_evaluation_episodes` | `50` | Exact autonomous completed episodes per evaluation. |
+| `streamer_max_cycles` | `0` | Cycle limit; zero is unlimited. |
+| `streamer_endurance_hours` | `0.0` | Elapsed-time target checked at safe cycle boundaries; zero is unlimited. |
+| `streamer_bc_enabled` | `true` | Enable masked BC from proven viewer executions during training. |
+| `streamer_bc_coefficient` | `0.01` | Non-negative BC contribution to the minimized PPO loss. |
+| `streamer_demonstration_capacity` | `4096` | Maximum retained observation/mask/action demonstrations. |
+| `streamer_demonstration_persist_every` | `512` | New demonstrations accumulated before the bounded `.npz` is atomically rewritten; cannot exceed capacity. |
+| `streamer_bc_batch_size` | `32` | Demonstration samples per BC loss. |
+| `streamer_bc_update_frequency` | `1` | PPO training-call interval for BC. |
+| `streamer_bc_min_demonstrations` | `8` | Minimum retained demonstrations before BC starts. |
+| `streamer_mock_script` | empty | JSONL path required for `mock`; not consulted for Twitch. |
+
+Streamer mode defaults `n_steps=500` and `batch_size=50` when neither CLI nor JSON overrides them. `streamer_policy_steps_per_cycle` must be divisible by `n_steps`, and `n_steps` must be divisible by `batch_size`; this prevents Stable-Baselines3 from overshooting an exact cycle boundary.
+
+The default Twitch environment-variable-name settings are:
+
+```text
+streamer_twitch_client_id_env        = PVZRL_TWITCH_CLIENT_ID
+streamer_twitch_access_token_env     = PVZRL_TWITCH_USER_ACCESS_TOKEN
+streamer_twitch_broadcaster_id_env   = PVZRL_TWITCH_BROADCASTER_USER_ID
+streamer_twitch_user_id_env          = PVZRL_TWITCH_EVENTSUB_USER_ID
+streamer_viewer_hash_secret_env      = PVZRL_TWITCH_VIEWER_HASH_SECRET
+```
+
+Only names belong in configuration; secret values stay in the process environment. Client ID, user access token, broadcaster ID, and a 16–4,096-byte viewer-hash secret are required for Twitch. EventSub user ID is optional and otherwise resolves from token validation. The token must include `user:read:chat`.
+
+The baseline is actual-loaded and checked against the permanent contract before any evaluation or training. Its SHA-256 is pinned to the experiment directory. Reusing an experiment directory with another baseline, a changed baseline-evaluation protocol, missing CURRENT/state, incompatible demonstration data, or contradictory cycle metadata fails closed. CURRENT and BEST use immutable hash-addressed generations plus atomic role records; their conventional `model.zip` files are repairable aliases and only the active and immediately prior generations are retained.
+
+Adventure progression remains sequential across the baseline evaluation, train cycle, and current evaluation. `adventure_start_level` is the initial expected live level; each phase persists and hands forward `next_adventure_level`. Strict profile/UI/bridge validation remains authoritative, including on resume. Evaluations starting at different Adventure levels are recorded as `UNKNOWN` comparisons and cannot promote BEST.
+
 ## Command forms
 
 Check dependencies:
@@ -172,8 +227,21 @@ python .\python\train_ppo.py `
 
 Use `python .\python\train_ppo.py --help` as the executable authority for optional tuning flags.
 
+Start Streamer V1 from the safe example:
+
+```powershell
+python .\python\train_ppo.py `
+  --config .\configs\streamer_v1.example.json `
+  --streamer-v1 `
+  --run-dir .\runs\streamer_v1\live `
+  --live-status-path .\runs\streamer_v1\live\live_status.json `
+  --quick-wait --wait-gameplay-ready
+```
+
+Set Twitch credential values in the named environment variables first. For a one-cycle local smoke, add `--streamer-max-cycles 1`. To resume, use the same experiment directory and baseline; the Streamer state/CURRENT records replace the ordinary `--resume-model-path` handoff.
+
 ## Artifacts
 
-Each run should contain its own resolved configuration, model metadata, logs, progress metrics, checkpoints/model, live status, and diagnostics as applicable. Most run artifacts are intentionally ignored. Treat models, profiles, installed bridge DLLs, and live logs as user data.
+Each run should contain its own resolved configuration, model metadata, logs, progress metrics, checkpoints/model, live status, and diagnostics as applicable. A Streamer experiment additionally owns `streamer_state.json`, `streamer_cycles.jsonl`, BASELINE/CURRENT/BEST records, per-cycle train/evaluation directories, compact Streamer events, and the bounded demonstration `.npz`. Most run artifacts are intentionally ignored. Treat models, profiles, installed bridge DLLs, demonstrations, and live logs as user data.
 
 Before protected live work, record hashes for the source checkpoint/metadata, installed DLL, and profile. Confirm them again after the run.

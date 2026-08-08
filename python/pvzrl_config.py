@@ -358,6 +358,37 @@ class CoachConfig:
 
 
 @dataclass(frozen=True)
+class StreamerV1Config:
+    """Typed Streamer overlay configuration for the maintained Generalist path."""
+
+    enabled: bool
+    platform: str
+    baseline_checkpoint: str
+    intervention_interval_seconds: float
+    command_ttl_seconds: float
+    command_queue_capacity: int
+    message_max_chars: int
+    policy_steps_per_cycle: int
+    checkpoint_policy_steps: int
+    evaluation_episodes: int
+    max_cycles: int
+    endurance_hours: float
+    bc_enabled: bool
+    bc_coefficient: float
+    demonstration_capacity: int
+    demonstration_persist_every: int
+    bc_batch_size: int
+    bc_update_frequency: int
+    bc_min_demonstrations: int
+    twitch_client_id_env: str
+    twitch_access_token_env: str
+    twitch_broadcaster_id_env: str
+    twitch_user_id_env: str
+    viewer_hash_secret_env: str
+    mock_script: str
+
+
+@dataclass(frozen=True)
 class DiagnosticsConfig:
     debug_performance: bool
     debug_observation: bool
@@ -413,6 +444,7 @@ class ResolvedRunConfig:
     adventure: AdventureConfig
     fusion: FusionConfig
     coach: CoachConfig
+    streamer_v1: StreamerV1Config
     diagnostics: DiagnosticsConfig
     artifacts: ArtifactConfig
     bridge: BridgeConfig
@@ -545,6 +577,33 @@ class ResolvedRunConfig:
                 stream_coach_fusion_enabled=bool(flat["stream_coach_fusion_enabled"]),
                 coach_allow_fusion_planning=bool(flat["coach_allow_fusion_planning"]),
                 fusion_bridge_enabled=bool(flat["fusion_bridge_enabled"]),
+            ),
+            streamer_v1=StreamerV1Config(
+                enabled=bool(flat["streamer_v1_enabled"]),
+                platform=str(flat["streamer_platform"]),
+                baseline_checkpoint=str(flat["streamer_baseline_checkpoint"]),
+                intervention_interval_seconds=float(flat["streamer_intervention_interval_seconds"]),
+                command_ttl_seconds=float(flat["streamer_command_ttl_seconds"]),
+                command_queue_capacity=int(flat["streamer_command_queue_capacity"]),
+                message_max_chars=int(flat["streamer_message_max_chars"]),
+                policy_steps_per_cycle=int(flat["streamer_policy_steps_per_cycle"]),
+                checkpoint_policy_steps=int(flat["streamer_checkpoint_policy_steps"]),
+                evaluation_episodes=int(flat["streamer_evaluation_episodes"]),
+                max_cycles=int(flat["streamer_max_cycles"]),
+                endurance_hours=float(flat["streamer_endurance_hours"]),
+                bc_enabled=bool(flat["streamer_bc_enabled"]),
+                bc_coefficient=float(flat["streamer_bc_coefficient"]),
+                demonstration_capacity=int(flat["streamer_demonstration_capacity"]),
+                demonstration_persist_every=int(flat["streamer_demonstration_persist_every"]),
+                bc_batch_size=int(flat["streamer_bc_batch_size"]),
+                bc_update_frequency=int(flat["streamer_bc_update_frequency"]),
+                bc_min_demonstrations=int(flat["streamer_bc_min_demonstrations"]),
+                twitch_client_id_env=str(flat["streamer_twitch_client_id_env"]),
+                twitch_access_token_env=str(flat["streamer_twitch_access_token_env"]),
+                twitch_broadcaster_id_env=str(flat["streamer_twitch_broadcaster_id_env"]),
+                twitch_user_id_env=str(flat["streamer_twitch_user_id_env"]),
+                viewer_hash_secret_env=str(flat["streamer_viewer_hash_secret_env"]),
+                mock_script=str(flat["streamer_mock_script"]),
             ),
             diagnostics=DiagnosticsConfig(
                 debug_performance=bool(flat["debug_performance"]),
