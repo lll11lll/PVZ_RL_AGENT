@@ -2751,11 +2751,19 @@ class PvZGymEnv:
         )
         message = "Requested seeds selected with paced UI verification."
         if start_level:
-            message = (
-                "Requested seeds selected and gameplayReady verified."
-                if ok
-                else "Paced seed selection/start failed; do not start training."
-            )
+            if ok:
+                message = "Requested seeds selected and gameplayReady verified."
+            else:
+                start_failure = start_log.get("error") or start_log.get("gameplayReadyError") or "none"
+                message = (
+                    "Paced seed selection/start failed; do not start training. "
+                    f"selection_ok={selection_ok} verified={verified} "
+                    f"start_invoked={start_invoked} gameplay_ready={final_gameplay_ready} "
+                    f"seed_selection_active={final_seed_selection_active} "
+                    f"active_bank={format_counts(final_active_counts)} "
+                    f"requested={format_counts(requested_counts)} "
+                    f"start_error={start_failure}"
+                )
 
         return self._seed_selection_response(
             ok=ok,

@@ -57,6 +57,40 @@ def test_core_is_unique_after_unlock_but_initial_duplicate_slots_are_preserved()
     ]
 
 
+def test_guaranteed_rotation_keeps_duplicate_filler_next_to_its_identity() -> None:
+    curriculum = _curriculum(capacity=8)
+    curriculum.record_unlocked(
+        ["WallNut", "CherryBomb", "PotatoMine", "Chomper", "SmallPuff"],
+        episode_index=1,
+    )
+    curriculum.episode_index = 1
+
+    decision = curriculum.choose_loadout(
+        selectable_seeds=curriculum.unlocked_seeds(),
+        observed_capacity=8,
+        previous_loadout=ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+        validation_seeds=curriculum.unlocked_seeds(),
+    )
+
+    assert decision.selected_loadout == [
+        "SunFlower",
+        "SunFlower",
+        "Peashooter",
+        "WallNut",
+        "CherryBomb",
+        "PotatoMine",
+        "Chomper",
+        "SmallPuff",
+    ]
+    assert decision.guaranteed_seeds == [
+        "WallNut",
+        "CherryBomb",
+        "PotatoMine",
+        "Chomper",
+        "SmallPuff",
+    ]
+
+
 def test_new_unlock_guarantee_is_transactional_and_completes_after_four_commits() -> None:
     curriculum = _curriculum()
     curriculum.record_unlocked(["WallNut"], episode_index=1)

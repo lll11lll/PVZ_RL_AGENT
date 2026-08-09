@@ -784,9 +784,26 @@ class AdventureSeedCurriculum:
         if not duplicate_fill:
             duplicate_fill = list(core)
         fill_index = 0
+        remaining_duplicate_slots = max(0, capacity - len(selected))
         while len(selected) < capacity and duplicate_fill:
-            selected.append(duplicate_fill[fill_index % len(duplicate_fill)])
-            sources.append("rotation")
+            filler = duplicate_fill[fill_index % len(duplicate_fill)]
+            # A single expanded slot should retain its duplicate identity next
+            # to the corresponding CORE slot instead of trailing the unlocks.
+            if (
+                guaranteed_selected
+                and capacity > len(self.initial_loadout)
+                and remaining_duplicate_slots == 1
+            ):
+                insertion_index = len(selected)
+                for index in range(len(selected) - 1, -1, -1):
+                    if selected[index] == filler:
+                        insertion_index = index + 1
+                        break
+                selected.insert(insertion_index, filler)
+                sources.insert(insertion_index, "rotation")
+            else:
+                selected.append(filler)
+                sources.append("rotation")
             fill_index += 1
 
         for state in active_states:
