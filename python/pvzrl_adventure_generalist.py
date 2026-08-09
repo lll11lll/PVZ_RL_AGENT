@@ -2689,7 +2689,11 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         except (TypeError, ValueError):
             self.context["seed_selection_commit_blocked_reason"] = "selection_types_unresolvable"
             return False
-        if selected_types != expected_types or Counter(selected_types) != Counter(expected_types):
+        # The chooser list is a UI collection and is not guaranteed to retain
+        # click order after the game transfers cards into the gameplay bank.
+        # Validate that the requested cards were selected here; validate slot
+        # identity from the bridge's ordered activeGameplaySeedSlots below.
+        if Counter(selected_types) != Counter(expected_types):
             self.context["seed_selection_commit_blocked_reason"] = (
                 "selection_card_multiset_or_slot_identity_mismatch"
             )
@@ -2713,18 +2717,45 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "post_selection_active_gameplay_bank_mismatch"
             )
             return False
-        active_cards = list(probe.get("activeGameplayCardBankCards", []) or [])
-        if active_cards:
+        ordered_slots = list(probe.get("activeGameplaySeedSlots", []) or [])
+        if ordered_slots:
             try:
-                active_types = [int(card.get("plantType", -999)) for card in active_cards]
+                indexed_types = [
+                    (
+                        int(slot.get("slotIndex", index)),
+                        int(slot.get("plantType", -999)),
+                    )
+                    for index, slot in enumerate(ordered_slots)
+                    if isinstance(slot, dict)
+                ]
             except (AttributeError, TypeError, ValueError):
-                self.context["seed_selection_commit_blocked_reason"] = "post_selection_cards_invalid"
+                self.context["seed_selection_commit_blocked_reason"] = "post_selection_slots_invalid"
                 return False
+            if len(indexed_types) != len(ordered_slots):
+                self.context["seed_selection_commit_blocked_reason"] = "post_selection_slots_invalid"
+                return False
+            active_types = [plant_type for _, plant_type in sorted(indexed_types, key=lambda item: item[0])]
             if active_types != expected_types:
                 self.context["seed_selection_commit_blocked_reason"] = (
                     "post_selection_slot_identity_mismatch"
                 )
                 return False
+        else:
+            # Older bridge probes may not include ordered slot DTOs.  The raw
+            # card scan is intentionally treated as unordered in that case;
+            # active_counts above still enforces the exact requested multiset.
+            active_cards = list(probe.get("activeGameplayCardBankCards", []) or [])
+            if active_cards:
+                try:
+                    active_types = [int(card.get("plantType", -999)) for card in active_cards]
+                except (AttributeError, TypeError, ValueError):
+                    self.context["seed_selection_commit_blocked_reason"] = "post_selection_cards_invalid"
+                    return False
+                if Counter(active_types) != Counter(expected_types):
+                    self.context["seed_selection_commit_blocked_reason"] = (
+                        "post_selection_active_gameplay_multiset_mismatch"
+                    )
+                    return False
         if bool(probe.get("seedSelectionActive")):
             self.context["seed_selection_commit_blocked_reason"] = "post_selection_seed_screen_still_active"
             return False

@@ -236,6 +236,38 @@ def test_transactional_commit_updates_config_and_curriculum_only_after_canonical
     assert curriculum.episodes_included["WallNut"] == 1
 
 
+def test_transactional_commit_uses_ordered_runtime_slots_not_raw_card_scan_order() -> None:
+    curriculum = _curriculum()
+    curriculum.record_unlocked(["WallNut"], episode_index=1)
+    curriculum.episode_index = 1
+    decision = _decision(curriculum)
+    expected_types = resolve_seed_list(decision.selected_loadout)
+    probe = {
+        # Unity's raw CardUI scan is not a slot-order contract.
+        "activeGameplayCardBankCards": [
+            {"plantType": value} for value in reversed(expected_types)
+        ],
+        # The bridge's slot DTO is explicitly ordered by slotIndex.
+        "activeGameplaySeedSlots": [
+            {"slotIndex": index, "plantType": value}
+            for index, value in enumerate(expected_types)
+        ],
+        "seedSelectionActive": False,
+    }
+    env = _transaction_env(curriculum, decision, probe)
+    selection = {
+        "ok": True,
+        "verification": {
+            "success": True,
+            "selectedSeedTypes": list(reversed(expected_types)),
+        },
+    }
+
+    assert env._commit_pending_seed_selection(selection, decision.selected_loadout) is True
+    assert env.current_loadout == decision.selected_loadout
+    assert env.config.plant_types == expected_types
+
+
 def test_transactional_failure_preserves_state_until_explicit_rollback() -> None:
     curriculum = _curriculum()
     curriculum.record_unlocked(["WallNut"], episode_index=1)
