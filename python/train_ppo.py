@@ -29,6 +29,8 @@ from pvzrl_adventure import (
 )
 from pvzrl_adventure_generalist import (
     ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+    DEFAULT_CORE_SEED_NAMES,
+    DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES,
     ADVENTURE_GENERALIST_MODEL_FAMILY,
     ADVENTURE_GENERALIST_RUN_MODE_EVAL,
     ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
@@ -760,6 +762,20 @@ def _build_config_mapping(
     adventure_generalist_requested = adventure_generalist_train_requested or adventure_generalist_eval_requested
     raw_initial_loadout = value("initial_loadout", ",".join(ADVENTURE_GENERALIST_INITIAL_LOADOUT))
     initial_loadout = parse_initial_loadout(raw_initial_loadout)
+    raw_core_seed_names = value("core_seed_names", list(DEFAULT_CORE_SEED_NAMES))
+    core_seed_names = parse_initial_loadout(raw_core_seed_names)
+    if not core_seed_names:
+        core_seed_names = list(DEFAULT_CORE_SEED_NAMES)
+    new_unlock_guarantee_episodes = max(
+        0,
+        int(
+            value(
+                "new_unlock_guarantee_episodes",
+                DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES,
+            )
+            or 0
+        ),
+    )
     default_seed_list = ",".join(initial_loadout)
     cli_seed_list = getattr(args, "seed_list", None)
     config_seed_list_present = "seed_list" in raw_config and raw_config.get("seed_list") not in (None, "")
@@ -1040,6 +1056,8 @@ def _build_config_mapping(
         "seed_curriculum": str(value("seed_curriculum", "conservative")),
         "unlock_introduction_delay": int(value("unlock_introduction_delay", 0)),
         "new_plant_min_inclusion_prob": float(value("new_plant_min_inclusion_prob", 0.15)),
+        "core_seed_names": list(core_seed_names),
+        "new_unlock_guarantee_episodes": int(new_unlock_guarantee_episodes),
         "infer_capacity_from_unlocks": bool(
             value(
                 "infer_capacity_from_unlocks",
@@ -1413,6 +1431,11 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
             seed_curriculum=str(config.get("seed_curriculum", "conservative")),
             unlock_introduction_delay=int(config.get("unlock_introduction_delay", 0) or 0),
             new_plant_min_inclusion_prob=float(config.get("new_plant_min_inclusion_prob", 0.15) or 0.0),
+            core_seed_names=list(config.get("core_seed_names", DEFAULT_CORE_SEED_NAMES) or DEFAULT_CORE_SEED_NAMES),
+            new_unlock_guarantee_episodes=int(
+                config.get("new_unlock_guarantee_episodes", DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES)
+                or 0
+            ),
             seed_order_source=str(config.get("seed_order_source", "default_canonical")),
             randomize_seed_order=bool(config.get("randomize_seed_order", False)),
             infer_capacity_from_unlocks=bool(config.get("infer_capacity_from_unlocks", True)),
@@ -3929,6 +3952,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--randomize-seed-order", action="store_true")
     parser.add_argument("--unlock-introduction-delay", type=int, default=None)
     parser.add_argument("--new-plant-min-inclusion-prob", type=float, default=None)
+    parser.add_argument("--core-seed-names", default=None)
+    parser.add_argument("--new-unlock-guarantee-episodes", type=int, default=None)
     parser.add_argument("--infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_true", default=None)
     parser.add_argument("--no-infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_false")
     parser.add_argument("--allow-weak-unlocked-capacity-fallback", action="store_true")

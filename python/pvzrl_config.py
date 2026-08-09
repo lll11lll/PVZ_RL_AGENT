@@ -300,6 +300,8 @@ class AdventureConfig:
     seed_curriculum: str
     unlock_introduction_delay: int
     new_plant_min_inclusion_prob: float
+    core_seed_names: Tuple[str, ...]
+    new_unlock_guarantee_episodes: int
     infer_capacity_from_unlocks: bool
     allow_weak_unlocked_capacity_fallback: bool
     adventure_replay_cleared_levels: bool
@@ -526,6 +528,8 @@ class ResolvedRunConfig:
                 seed_curriculum=str(flat["seed_curriculum"]),
                 unlock_introduction_delay=int(flat["unlock_introduction_delay"]),
                 new_plant_min_inclusion_prob=float(flat["new_plant_min_inclusion_prob"]),
+                core_seed_names=_tuple_str(flat["core_seed_names"]),
+                new_unlock_guarantee_episodes=int(flat["new_unlock_guarantee_episodes"]),
                 infer_capacity_from_unlocks=bool(flat["infer_capacity_from_unlocks"]),
                 allow_weak_unlocked_capacity_fallback=bool(flat["allow_weak_unlocked_capacity_fallback"]),
                 adventure_replay_cleared_levels=bool(flat["adventure_replay_cleared_levels"]),

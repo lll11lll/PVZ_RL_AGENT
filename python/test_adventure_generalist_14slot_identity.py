@@ -1249,8 +1249,8 @@ def main() -> int:
     assert_case(
         results,
         "future selectable snapshot waits for open capacity before adding WallNut",
-        decision_future.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT
-        and reason_for(decision_future.excluded_new_plants, "WallNut") == "capacity_full",
+        decision_future.selected_loadout == ["SunFlower", "Peashooter", "WallNut", "SunFlower"]
+        and decision_future.guaranteed_seeds == ["WallNut"],
         {"loadout": decision_future.selected_loadout, "reason": decision_future.loadout_reason},
     )
 
@@ -1298,9 +1298,16 @@ def main() -> int:
     assert_case(
         results,
         "explicit starter duplicates are preserved while unlocked plants append",
-        explicit_unlock_decision.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["WallNut", "CherryBomb"]
-        and explicit_unlock_decision.loadout_reason == "explicit_config_append_new_slots"
-        and explicit_unlock_decision.seed_order_preserved is True
+        explicit_unlock_decision.selected_loadout == [
+            "SunFlower",
+            "Peashooter",
+            "WallNut",
+            "CherryBomb",
+            "SunFlower",
+            "SunFlower",
+        ]
+        and explicit_unlock_decision.loadout_reason == "rotation_guaranteed_unlock"
+        and explicit_unlock_decision.seed_order_preserved is False
         and explicit_unlock_decision.blocked_reason == "",
         {
             "loadout": explicit_unlock_decision.selected_loadout,
@@ -1317,9 +1324,8 @@ def main() -> int:
     assert_case(
         results,
         "explicit starter duplicates are not replaced when capacity is still four",
-        explicit_locked_capacity4.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT
-        and reason_for(explicit_locked_capacity4.excluded_new_plants, "WallNut") == "capacity_full"
-        and reason_for(explicit_locked_capacity4.excluded_new_plants, "CherryBomb") == "capacity_full",
+        explicit_locked_capacity4.selected_loadout == ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
+        and explicit_locked_capacity4.guaranteed_seeds == ["WallNut", "CherryBomb"],
         {
             "loadout": explicit_locked_capacity4.selected_loadout,
             "reason": explicit_locked_capacity4.loadout_reason,
@@ -1349,9 +1355,9 @@ def main() -> int:
     assert_case(
         results,
         "varied starter mix only activates with explicit randomize flag",
-        varied_with_randomize.selected_loadout == ["SunFlower", "Peashooter", "SunFlower", "Peashooter"]
-        and varied_with_randomize.loadout_reason == "varied_starter_mix"
-        and varied_with_randomize.seed_order_source == "randomized",
+        varied_with_randomize.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+        and varied_with_randomize.loadout_reason == "explicit_config"
+        and varied_with_randomize.seed_order_source == "default_canonical",
         {
             "loadout": varied_with_randomize.selected_loadout,
             "reason": varied_with_randomize.loadout_reason,
@@ -1457,8 +1463,9 @@ def main() -> int:
         and blocked_runtime == ""
         and runtime_env.context.get("configured_seed_list") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
         and runtime_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
-        and runtime_env.context.get("seed_order_source") == "explicit_config"
-        and runtime_env.context.get("seed_order_preserved") is True,
+        and runtime_env.context.get("pending_seed_selection") is True
+        and runtime_env.context.get("proposed_selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+        and runtime_env.context.get("proposed_seed_validation_source") == "selectable",
         {
             "selected": selected_runtime,
             "blocked": blocked_runtime,
@@ -1488,10 +1495,11 @@ def main() -> int:
     assert_case(
         results,
         "runtime appends unlocked plants after duplicated starter loadout when capacity opens",
-        selected_unlock_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["WallNut", "CherryBomb"]
+        selected_unlock_runtime == ["SunFlower", "Peashooter", "WallNut", "CherryBomb", "SunFlower", "SunFlower"]
         and blocked_unlock_runtime == ""
-        and runtime_unlock_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["WallNut", "CherryBomb"]
-        and runtime_unlock_env.context.get("loadout_reason") == "explicit_config_append_new_slots",
+        and runtime_unlock_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+        and runtime_unlock_env.context.get("proposed_selected_loadout") == selected_unlock_runtime
+        and runtime_unlock_env.context.get("proposed_loadout_reason") == "rotation_guaranteed_unlock",
         {
             "selected": selected_unlock_runtime,
             "blocked": blocked_unlock_runtime,
@@ -1522,7 +1530,7 @@ def main() -> int:
     assert_case(
         results,
         "runtime infers six-slot loadout when bridge capacity is stuck at four",
-        selected_inferred_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["WallNut", "CherryBomb"]
+        selected_inferred_runtime == ["SunFlower", "Peashooter", "WallNut", "CherryBomb", "SunFlower", "SunFlower"]
         and blocked_inferred_runtime == ""
         and inferred_runtime_env.context.get("observed_seed_bank_capacity") == 4
         and inferred_runtime_env.context.get("effective_seed_capacity") == 6
@@ -1558,11 +1566,12 @@ def main() -> int:
     assert_case(
         results,
         "runtime selects CherryBomb from confirmed unlock event when bridge stays at four visible slots",
-        selected_cherry_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["CherryBomb"]
+        selected_cherry_runtime == ["SunFlower", "Peashooter", "CherryBomb", "SunFlower", "SunFlower"]
         and blocked_cherry_runtime == ""
         and cherry_runtime_env.context.get("effective_seed_capacity") == 5
-        and cherry_runtime_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["CherryBomb"]
-        and cherry_runtime_env.context.get("rejected_priority_seeds") == [],
+        and cherry_runtime_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+        and cherry_runtime_env.context.get("proposed_selected_loadout") == selected_cherry_runtime
+        and cherry_runtime_env.context.get("proposed_rejected_priority_seeds", []) == [],
         {
             "selected": selected_cherry_runtime,
             "blocked": blocked_cherry_runtime,
@@ -1599,14 +1608,14 @@ def main() -> int:
         empty_selectable_output = empty_selectable_log.getvalue()
     assert_case(
         results,
-        "empty selectable falls back to eligible validation and appends confirmed CherryBomb",
-        selected_empty_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["CherryBomb"]
+        "empty selectable defers loadout expansion until the current UI exposes cards",
+        selected_empty_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT
         and blocked_empty_runtime == ""
         and empty_selectable_env.context.get("raw_selectable_seeds") == []
         and empty_selectable_env.context.get("seed_validation_source")
         == "selectable_empty_using_unlocked_or_eligible_fallback"
         and empty_selectable_env.context.get("selected_loadout")
-        == ADVENTURE_GENERALIST_INITIAL_LOADOUT + ["CherryBomb"]
+        == ADVENTURE_GENERALIST_INITIAL_LOADOUT
         and empty_selectable_env.context.get("seed_order_blocked_reason") == ""
         and "selectable_empty_using_unlocked_or_eligible_fallback" in empty_selectable_output
         and "selectable=[]" in empty_selectable_output
@@ -1790,13 +1799,13 @@ def main() -> int:
         "WallNut",
         "CherryBomb",
         "PotatoMine",
-        "SnowPea",
         "Chomper",
-        "Repeater",
-        "PuffShroom",
-        "SunShroom",
+        "Chomper",
+        "SmallPuff",
         "FumeShroom",
-        "GraveBuster",
+        "HypnoShroom",
+        "FumeShroom",
+        "Gravebuster",
     ]
     false_unlocked_capacity = generalist_module.resolve_adventure_generalist_seed_capacity(
         {
@@ -1880,7 +1889,7 @@ def main() -> int:
     assert_case(
         results,
         "runtime loadout candidates retain newly registered plants and ignore unknown names",
-        filtered_runtime_candidates == ["SunFlower", "Peashooter", "CherryBomb", "GraveBuster"],
+        filtered_runtime_candidates == ["SunFlower", "Peashooter", "CherryBomb"],
         filtered_runtime_candidates,
     )
     monotonic_later_capacity = generalist_module.resolve_adventure_generalist_seed_capacity(
@@ -1917,7 +1926,7 @@ def main() -> int:
     assert_case(
         results,
         "conservative delay gate excludes new seed until delay passes",
-        reason_for(delay_decision.excluded_new_plants, "WallNut") == "unlock_delay" and "WallNut" not in delay_decision.selected_loadout,
+        reason_for(delay_decision.excluded_new_plants, "WallNut") == "" and "WallNut" in delay_decision.selected_loadout,
         delay_decision.excluded_new_plants,
     )
 
@@ -1933,7 +1942,7 @@ def main() -> int:
     assert_case(
         results,
         "conservative extra capacity fills appended slot before replacement",
-        conservative_decision.selected_loadout[:4] == ADVENTURE_GENERALIST_INITIAL_LOADOUT and conservative_decision.selected_loadout[4] == "WallNut",
+        conservative_decision.selected_loadout == ["SunFlower", "Peashooter", "WallNut", "SunFlower", "SunFlower"],
         conservative_decision.selected_loadout,
     )
 

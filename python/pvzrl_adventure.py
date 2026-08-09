@@ -1028,6 +1028,23 @@ def adventure_level_identity_diagnostics(
     }
 
 
+def _rollback_seed_selection_transaction(env: PvZMaskedPPOEnv) -> None:
+    hook = getattr(env, "_rollback_pending_seed_selection", None)
+    if callable(hook):
+        hook()
+
+
+def _commit_seed_selection_transaction(
+    env: PvZMaskedPPOEnv,
+    selection: Dict[str, Any],
+    seed_list: List[str],
+) -> bool:
+    hook = getattr(env, "_commit_pending_seed_selection", None)
+    if not callable(hook):
+        return True
+    return bool(hook(selection, list(seed_list)))
+
+
 def replay_current_level_after_validation_win(
     env: PvZMaskedPPOEnv,
     writer: LiveStatusWriter,
@@ -1371,14 +1388,17 @@ def replay_current_level_after_validation_win(
                 try:
                     callback_seed_list, callback_blocked_reason = seed_selection_callback(state, list(seed_names))
                 except Exception as exc:
+                    _rollback_seed_selection_transaction(env)
                     callback_seed_list, callback_blocked_reason = [], f"seed_selection_callback_failed:{exc}"
                 if callback_blocked_reason:
+                    _rollback_seed_selection_transaction(env)
                     return False, str(callback_blocked_reason)
                 if callback_seed_list:
                     seed_names = [str(seed).strip() for seed in callback_seed_list if str(seed).strip()]
             try:
                 selection = env.base.auto_select_seeds(seed_list=seed_names, start_level=True)
             except Exception as exc:
+                _rollback_seed_selection_transaction(env)
                 context["last_error"] = str(exc)
                 context["frontier_replay_last_seed_selection_message"] = f"exception:{exc}"
                 print(
@@ -1392,7 +1412,24 @@ def replay_current_level_after_validation_win(
             context["frontier_replay_last_seed_selection_message"] = str(selection.get("message", ""))
             context["frontier_replay_last_seed_selection_actions"] = list(selection.get("actions", []) or [])[-8:]
             context["frontier_replay_last_seed_selection_start_log"] = dict(selection.get("startLog", {}) or {})
+            if selection.get("ok", False):
+                try:
+                    committed = _commit_seed_selection_transaction(env, selection, seed_names)
+                except Exception as exc:
+                    committed = False
+                    selection = dict(selection)
+                    selection["message"] = f"seed_selection_commit_failed:{exc}"
+                if not committed:
+                    _rollback_seed_selection_transaction(env)
+                    selection = dict(selection)
+                    selection["ok"] = False
+                    selection["message"] = str(
+                        selection.get("message") or "seed_selection_commit_failed"
+                    )
+                    context["frontier_replay_last_seed_selection_ok"] = False
+                    return False, str(selection["message"])
             if not selection.get("ok", False):
+                _rollback_seed_selection_transaction(env)
                 selection_state = selection.get("after") or selection.get("afterStart") or selection.get("afterSelectionBeforeStart") or state
                 if isinstance(selection_state, dict):
                     context["frontier_replay_last_state"] = _post_win_last_state(selection_state)
@@ -1553,15 +1590,37 @@ def prepare_adventure_gameplay(
                 try:
                     callback_seed_list, callback_blocked_reason = seed_selection_callback(state, list(active_seed_list))
                 except Exception as exc:
+                    _rollback_seed_selection_transaction(env)
                     callback_seed_list, callback_blocked_reason = [], f"seed_selection_callback_failed:{exc}"
                 if callback_blocked_reason:
+                    _rollback_seed_selection_transaction(env)
                     return None, {"reset": {"ok": False, "methodUsed": "seed_selection_callback"}}, callback_blocked_reason
                 if callback_seed_list:
                     active_seed_list = [str(seed).strip() for seed in callback_seed_list if str(seed).strip()]
-            selection = env.base.auto_select_seeds(seed_list=active_seed_list, start_level=True)
+            try:
+                selection = env.base.auto_select_seeds(seed_list=active_seed_list, start_level=True)
+            except Exception as exc:
+                _rollback_seed_selection_transaction(env)
+                return None, {"reset": {"ok": False, "methodUsed": "auto_select_seeds"}}, (
+                    f"seed_selection_failed: {exc}"
+                )
             context["last_seed_selection"] = selection
             context["last_reset_reason"] = "auto_select_seeds"
+            if selection.get("ok", False):
+                try:
+                    committed = _commit_seed_selection_transaction(env, selection, active_seed_list)
+                except Exception as exc:
+                    committed = False
+                    selection = dict(selection)
+                    selection["message"] = f"seed_selection_commit_failed:{exc}"
+                if not committed:
+                    _rollback_seed_selection_transaction(env)
+                    return None, {"reset": {"ok": False, "methodUsed": "seed_selection_commit"}}, (
+                        "seed_selection_failed: "
+                        + str(selection.get("message") or "seed_selection_commit_failed")
+                    )
             if not selection.get("ok", False):
+                _rollback_seed_selection_transaction(env)
                 return None, {"reset": {"ok": False, "methodUsed": "auto_select_seeds"}}, (
                     "seed_selection_failed: " + str(selection.get("message", "unknown"))
                 )

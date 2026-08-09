@@ -26,6 +26,11 @@
   "seed_curriculum": "conservative",
   "unlock_introduction_delay": 0,
   "new_plant_min_inclusion_prob": 0.15,
+  "core_seed_names": [
+    "SunFlower",
+    "Peashooter"
+  ],
+  "new_unlock_guarantee_episodes": 4,
   "infer_capacity_from_unlocks": true,
   "allow_weak_unlocked_capacity_fallback": false,
   "adventure_replay_cleared_levels": true,

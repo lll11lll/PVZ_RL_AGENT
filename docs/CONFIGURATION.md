@@ -103,6 +103,8 @@ Startup validation compares wrapper, bridge, profile, UI, seed-selection, and ga
 - `seed_curriculum`
 - `unlock_introduction_delay`
 - `new_plant_min_inclusion_prob`
+- `core_seed_names` (default `SunFlower,Peashooter`; unique CORE identities)
+- `new_unlock_guarantee_episodes` (default `4`; completed eligible inclusions per new unlock)
 - `infer_capacity_from_unlocks`
 - `allow_weak_unlocked_capacity_fallback`
 - `randomize_seed_order`

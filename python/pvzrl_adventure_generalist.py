@@ -28,7 +28,14 @@ from pvzrl_adventure import (
     prepare_adventure_gameplay,
     replay_current_level_after_validation_win,
 )
-from pvzrl_env import normalize_plant_name, parse_seed_list, plant_type_name, registry_entries, resolve_seed_list
+from pvzrl_env import (
+    active_gameplay_bank_state,
+    normalize_plant_name,
+    parse_seed_list,
+    plant_type_name,
+    registry_entries,
+    resolve_seed_list,
+)
 from pvzrl_fusion import FUSION_POLICY_SCRIPTED
 from pvzrl_generalist_progression import (
     GeneralistEpisodeOutcome,
@@ -60,22 +67,54 @@ SEED_PRIORITY = [
     "WallNut",
     "CherryBomb",
     "PotatoMine",
-    "SnowPea",
     "Chomper",
-    "Repeater",
-    "PuffShroom",
-    "SunShroom",
+    "SmallPuff",
     "FumeShroom",
+    "HypnoShroom",
+    "ScaredyShroom",
+    "IceShroom",
+    "DoomShroom",
+    "LilyPad",
+    "Squash",
+    "ThreePeater",
+    "Tanglekelp",
+    "Jalapeno",
+    "Caltrop",
+    "TorchWood",
+    "SeaShroom",
+    "Plantern",
+    "Cactus",
+    "Blover",
+    "StarFruit",
+    "Pumpkin",
+    "Magnetshroom",
+    "Cabbagepult",
+    "Pot",
+    "Cornpult",
+    "Garlic",
+    "Umbrellaleaf",
+    "Marigold",
+    "Melonpult",
+    "Shulkflower",
+    "ElectricOnion",
+    "PineFurnace",
+    "SpruceShooter",
+    "IceLotus",
+    "WaterAloes",
+    "Bamboo",
+    "Imitater",
 ]
 
+# Capacity probes are evidence about the live bank, not a level/night policy.
+# Keep the bounded fallback derived from the canonical catalog so adding a
+# newly supported runtime card does not require another gameplay branch.
 SEED_CAPACITY_INFERENCE_PRIORITY = [
-    "CherryBomb",
-    "WallNut",
-    "PotatoMine",
-    "Repeater",
-]
+    seed for seed in SEED_PRIORITY if seed not in BASE_UNLOCKED_SEEDS
+][:4]
 
 SEED_CAPACITY_MAX = 14
+DEFAULT_CORE_SEED_NAMES = ("SunFlower", "Peashooter")
+DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES = 4
 
 
 @dataclass
@@ -166,6 +205,24 @@ class LoadoutDecision:
     blocked_reason: str = ""
     validation_source: str = "selectable"
     validation_seeds: List[str] = field(default_factory=list)
+    guaranteed_seeds: List[str] = field(default_factory=list)
+    proposed_rotation_cursor: int = 0
+    loadout_provenance: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class UnlockGuaranteeState:
+    seed: str
+    required_inclusions: int
+    completed_inclusions: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, int(self.required_inclusions) - int(self.completed_inclusions))
+
+    @property
+    def pending(self) -> bool:
+        return self.remaining > 0
 
 
 class AdventureSeedCurriculum:
@@ -180,6 +237,8 @@ class AdventureSeedCurriculum:
         new_plant_min_inclusion_prob: float = 0.15,
         seed_order_source: str = SEED_ORDER_SOURCE_DEFAULT,
         randomize_seed_order: bool = False,
+        core_seed_names: Optional[Iterable[str]] = None,
+        new_unlock_guarantee_episodes: int = DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES,
     ) -> None:
         self.initial_loadout = [name for name in _canonical_seed_sequence(initial_loadout)]
         self.max_seed_slots = _clamp_capacity(max_seed_slots, maximum=SEED_CAPACITY_MAX)
@@ -189,12 +248,28 @@ class AdventureSeedCurriculum:
         self.new_plant_min_inclusion_prob = max(0.0, min(1.0, float(new_plant_min_inclusion_prob)))
         self.seed_order_source = _normalize_seed_order_source(seed_order_source)
         self.randomize_seed_order = bool(randomize_seed_order)
+        configured_core = core_seed_names if core_seed_names is not None else DEFAULT_CORE_SEED_NAMES
+        self.core_seed_names = _ordered_unique_seed_names(list(configured_core))
+        self.new_unlock_guarantee_episodes = max(0, int(new_unlock_guarantee_episodes))
         self.unlock_episode: Dict[str, int] = {}
+        self.unlock_order: List[str] = []
+        self.rotation_cursor = 0
         self.episode_index = 0
+        self.episodes_included: Dict[str, int] = {}
+        self.guarantees: Dict[str, UnlockGuaranteeState] = {}
+        self.last_committed_loadout: List[str] = []
         for seed in BASE_UNLOCKED_SEEDS:
-            self.unlock_episode[str(seed)] = 0
+            name = canonicalize_seed_name(seed)
+            self.unlock_episode[name] = 0
+            self.episodes_included.setdefault(name, 0)
+            if name not in self.unlock_order:
+                self.unlock_order.append(name)
         for seed in self.initial_loadout:
-            self.unlock_episode[str(seed)] = 0
+            name = canonicalize_seed_name(seed)
+            self.unlock_episode[name] = 0
+            self.episodes_included.setdefault(name, 0)
+            if name not in self.unlock_order:
+                self.unlock_order.append(name)
 
     def record_unlocked(self, seeds: Iterable[str], episode_index: Optional[int] = None) -> List[str]:
         episode = self.episode_index if episode_index is None else int(episode_index)
@@ -204,6 +279,13 @@ class AdventureSeedCurriculum:
             if not name or name in self.unlock_episode:
                 continue
             self.unlock_episode[name] = episode
+            self.unlock_order.append(name)
+            if self.new_unlock_guarantee_episodes > 0:
+                self.guarantees[name] = UnlockGuaranteeState(
+                    seed=name,
+                    required_inclusions=self.new_unlock_guarantee_episodes,
+                )
+            self.episodes_included.setdefault(name, 0)
             newly_unlocked.append(name)
         return _ordered_by_priority(newly_unlocked)
 
@@ -217,6 +299,22 @@ class AdventureSeedCurriculum:
                 if self.episode_index - int(episode) >= self.unlock_introduction_delay:
                     eligible.add(seed)
         return _ordered_by_priority(eligible)
+
+    def guarantee_remaining(self, seed: str) -> int:
+        name = canonicalize_seed_name(seed)
+        state = self.guarantees.get(name)
+        return state.remaining if state is not None else 0
+
+    def active_guarantees(self) -> List[UnlockGuaranteeState]:
+        return [
+            self.guarantees[name]
+            for name in self._unlock_ordered(self.guarantees.keys())
+            if self.guarantees[name].pending
+        ]
+
+    def rotation_weight(self, seed: str) -> float:
+        name = canonicalize_seed_name(seed)
+        return 1.0 / (1.0 + float(self.episodes_included.get(name, 0)))
 
     def choose_loadout(
         self,
@@ -260,7 +358,11 @@ class AdventureSeedCurriculum:
         eligible_all = self.eligible_seeds()
         eligible_selectable = [seed for seed in eligible_all if seed in selectable_set]
         initial_unique = set(self.initial_loadout)
-        known_new = [seed for seed in _ordered_by_priority(self.unlock_episode.keys()) if seed not in initial_unique]
+        known_new = [
+            seed
+            for seed in self._unlock_ordered(self.unlock_episode.keys())
+            if seed not in initial_unique
+        ]
 
         exclusion_reasons: Dict[str, str] = {}
         for seed in known_new:
@@ -279,7 +381,29 @@ class AdventureSeedCurriculum:
 
         previous = _canonical_seed_sequence(previous_loadout or [])
         explicit_order_locked = self.seed_order_source == SEED_ORDER_SOURCE_EXPLICIT and not self.randomize_seed_order
-        if explicit_order_locked and not new_candidates:
+        active_guarantees = [
+            state.seed
+            for state in self.active_guarantees()
+            if state.seed in selectable_set
+        ]
+        has_progressed = bool(
+            self.last_committed_loadout
+            or any(
+                int(self.episodes_included.get(seed, 0)) > 0
+                for seed in self.unlock_episode
+                if seed not in initial_unique
+            )
+        )
+        preserve_initial = (
+            not active_guarantees
+            and not new_candidates
+            and not has_progressed
+            and capacity >= len(self.initial_loadout)
+        )
+        guaranteed_selected: List[str] = []
+        proposed_rotation_cursor = int(self.rotation_cursor)
+        loadout_provenance: List[Dict[str, str]] = []
+        if preserve_initial:
             if capacity < len(self.initial_loadout):
                 raise RuntimeError(
                     "blocked_reason=configured_seed_list_exceeds_observed_capacity: "
@@ -288,31 +412,11 @@ class AdventureSeedCurriculum:
             selected = [seed for seed in self.initial_loadout if seed in selectable_set]
             local_reasons = {}
             reason = "explicit_config"
-        elif explicit_order_locked:
-            if capacity < len(self.initial_loadout):
-                raise RuntimeError(
-                    "blocked_reason=configured_seed_list_exceeds_observed_capacity: "
-                    f"requested={len(self.initial_loadout)} observed={capacity}"
-                )
-            selected, local_reasons, reason = self._build_explicit_append_loadout(
-                capacity=capacity,
-                selectable_set=selectable_set,
-                new_candidates=new_candidates,
-            )
-        elif self.seed_curriculum == "varied" and self.randomize_seed_order:
-            selected, local_reasons, reason = self._build_varied_loadout(
-                capacity=capacity,
-                selectable_set=selectable_set,
-                eligible_selectable=eligible_selectable,
-                new_candidates=new_candidates,
-                initial_unique=initial_unique,
-            )
         else:
-            selected, local_reasons, reason = self._build_conservative_loadout(
+            selected, local_reasons, reason, guaranteed_selected, proposed_rotation_cursor, loadout_provenance = self._build_component_loadout(
                 capacity=capacity,
                 selectable_set=selectable_set,
                 eligible_selectable=eligible_selectable,
-                new_candidates=new_candidates,
                 previous_loadout=previous,
             )
 
@@ -326,9 +430,8 @@ class AdventureSeedCurriculum:
         excluded_new_plants.sort(key=lambda row: (_priority_index(row.get("seed", "")), str(row.get("reason", ""))))
         selected_loadout = selected[:capacity]
         intentional_unlock_reorder = bool(
-            new_candidates
-            and any(seed in selected_set for seed in new_candidates)
-            and reason == "explicit_config_append_new_slots"
+            (guaranteed_selected or new_candidates)
+            and reason.startswith("rotation_")
         )
         blocked_reason = (
             ""
@@ -349,7 +452,339 @@ class AdventureSeedCurriculum:
             blocked_reason=blocked_reason,
             validation_source=validation_source_text,
             validation_seeds=list(validation_list),
+            guaranteed_seeds=list(guaranteed_selected),
+            proposed_rotation_cursor=int(proposed_rotation_cursor),
+            loadout_provenance=list(loadout_provenance),
         )
+
+    def _unlock_ordered(self, seeds: Iterable[str]) -> List[str]:
+        requested = set(_canonical_seed_sequence(seeds))
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for seed in self.unlock_order:
+            if seed in requested and seed not in seen:
+                ordered.append(seed)
+                seen.add(seed)
+        for seed in _ordered_by_priority(requested):
+            if seed not in seen:
+                ordered.append(seed)
+                seen.add(seed)
+        return ordered
+
+    def _build_component_loadout(
+        self,
+        *,
+        capacity: int,
+        selectable_set: set[str],
+        eligible_selectable: List[str],
+        previous_loadout: List[str],
+    ) -> Tuple[List[str], Dict[str, str], str, List[str], int, List[Dict[str, str]]]:
+        """Build CORE -> NEW_UNLOCK_GUARANTEE -> ROTATION without side effects."""
+
+        del previous_loadout  # The committed counters, not stale slot order, drive rotation.
+        exclusion_reasons: Dict[str, str] = {}
+        selected: List[str] = []
+        sources: List[str] = []
+        guaranteed_selected: List[str] = []
+        core = [seed for seed in self.core_seed_names if seed in selectable_set]
+
+        for seed in core:
+            if len(selected) >= capacity:
+                break
+            selected.append(seed)
+            sources.append("core")
+
+        active_states = self.active_guarantees()
+        for state in active_states:
+            seed = state.seed
+            if seed not in selectable_set:
+                exclusion_reasons[seed] = "not_selectable"
+                continue
+            if seed in selected:
+                guaranteed_selected.append(seed)
+                continue
+            if len(selected) >= capacity:
+                exclusion_reasons[seed] = "guarantee_capacity_deferred"
+                continue
+            selected.append(seed)
+            sources.append("guaranteed_unlock")
+            guaranteed_selected.append(seed)
+
+        rotation_candidates = [
+            seed
+            for seed in self._unlock_ordered(eligible_selectable)
+            if seed in selectable_set and seed not in set(selected)
+        ]
+        rotation_order = self._exposure_balanced_order(rotation_candidates)
+        inserted_rotation: List[str] = []
+        for seed in rotation_order:
+            if len(selected) >= capacity:
+                break
+            selected.append(seed)
+            sources.append("rotation")
+            inserted_rotation.append(seed)
+
+        # Duplicate starter identities remain supported as explicit rotation
+        # fillers after every unique authorized candidate has had a chance.
+        duplicate_fill = [seed for seed in self.initial_loadout if seed in selectable_set]
+        if not duplicate_fill:
+            duplicate_fill = list(core)
+        fill_index = 0
+        while len(selected) < capacity and duplicate_fill:
+            selected.append(duplicate_fill[fill_index % len(duplicate_fill)])
+            sources.append("rotation")
+            fill_index += 1
+
+        for state in active_states:
+            if state.seed not in guaranteed_selected and state.seed in selectable_set:
+                exclusion_reasons.setdefault(state.seed, "guarantee_capacity_deferred")
+
+        if guaranteed_selected:
+            reason = "rotation_guaranteed_unlock"
+        elif inserted_rotation:
+            reason = "rotation_exposure_balanced"
+        elif active_states:
+            reason = "rotation_guarantee_deferred"
+        else:
+            reason = "rotation_stable"
+
+        proposed_cursor = int(self.rotation_cursor)
+        if rotation_candidates:
+            proposed_cursor = (proposed_cursor + 1) % len(rotation_candidates)
+        provenance = [
+            {"slot_index": str(index), "seed": seed, "source": sources[index]}
+            for index, seed in enumerate(selected)
+        ]
+        return selected[:capacity], exclusion_reasons, reason, guaranteed_selected, proposed_cursor, provenance
+
+    def _exposure_balanced_order(self, candidates: Iterable[str]) -> List[str]:
+        unique = self._unlock_ordered(candidates)
+        if not unique:
+            return []
+        unlock_index = {seed: index for index, seed in enumerate(self.unlock_order)}
+        priority_index = {seed: _priority_index(seed) for seed in unique}
+        ordered = sorted(
+            unique,
+            key=lambda seed: (
+                int(self.episodes_included.get(seed, 0)),
+                unlock_index.get(seed, len(unlock_index) + priority_index.get(seed, 0)),
+                priority_index.get(seed, 0),
+                seed,
+            ),
+        )
+        # Rotate only within equal-exposure groups so the cursor cannot make a
+        # well-exposed seed outrank a seed that has never been shown.
+        output: List[str] = []
+        cursor = int(self.rotation_cursor)
+        index = 0
+        while index < len(ordered):
+            count = int(self.episodes_included.get(ordered[index], 0))
+            end = index + 1
+            while end < len(ordered) and int(self.episodes_included.get(ordered[end], 0)) == count:
+                end += 1
+            group = ordered[index:end]
+            if len(group) > 1:
+                offset = cursor % len(group)
+                group = group[offset:] + group[:offset]
+            output.extend(group)
+            index = end
+        return output
+
+    def commit_loadout(
+        self,
+        decision: LoadoutDecision,
+        *,
+        selected_loadout: Optional[Iterable[str]] = None,
+        episode_index: Optional[int] = None,
+    ) -> None:
+        """Commit exposure and guarantee progress after canonical UI success."""
+
+        committed = _canonical_seed_sequence(
+            decision.selected_loadout if selected_loadout is None else selected_loadout
+        )
+        expected = _canonical_seed_sequence(decision.selected_loadout)
+        if committed != expected:
+            raise RuntimeError(
+                "curriculum_commit_loadout_mismatch: "
+                f"expected={expected} committed={committed}"
+            )
+        if episode_index is not None:
+            self.episode_index = max(self.episode_index, int(episode_index))
+        for seed in _ordered_unique_seed_names(committed):
+            self.episodes_included[seed] = int(self.episodes_included.get(seed, 0)) + 1
+        committed_set = set(committed)
+        for seed in decision.guaranteed_seeds:
+            state = self.guarantees.get(seed)
+            if state is None or seed not in committed_set:
+                continue
+            state.completed_inclusions = min(
+                int(state.required_inclusions),
+                int(state.completed_inclusions) + 1,
+            )
+        self.rotation_cursor = int(decision.proposed_rotation_cursor)
+        self.last_committed_loadout = list(committed)
+
+    def _build_rotating_loadout(
+        self,
+        *,
+        capacity: int,
+        selectable_set: set[str],
+        eligible_selectable: List[str],
+        new_candidates: List[str],
+        previous_loadout: List[str],
+    ) -> Tuple[List[str], Dict[str, str], str]:
+        """Keep a small core while making unlocks and rotation observable.
+
+        The configured duplicate slots are retained for checkpoint-compatible
+        startup, but they are deliberately the first replacement targets once
+        the live bank is full.  Only this seed-selection boundary can change
+        the list; the action decoder continues to address the resulting slot
+        identities for the whole episode.
+        """
+
+        exclusion_reasons: Dict[str, str] = {}
+        selected = [seed for seed in previous_loadout if seed in selectable_set][:capacity]
+        if not selected:
+            selected = [seed for seed in self.initial_loadout if seed in selectable_set][:capacity]
+        if not selected:
+            selected = [seed for seed in eligible_selectable if seed in selectable_set][:capacity]
+
+        core: List[str] = []
+        for seed in self.initial_loadout:
+            if seed in selectable_set and seed not in core:
+                core.append(seed)
+
+        # Keep one copy of every configured core seed whenever the current
+        # screen authorizes it.  If a stale loadout omitted one, replace a
+        # non-core slot before considering a core duplicate.
+        for core_seed in core:
+            if core_seed in selected:
+                continue
+            if len(selected) < capacity:
+                selected.append(core_seed)
+                continue
+            replacement = self._replacement_index(
+                selected,
+                core=set(core),
+                protected=set(),
+            )
+            if replacement >= 0:
+                selected[replacement] = core_seed
+
+        selected_set = set(selected)
+        eligible_pool = [
+            seed
+            for seed in self._unlock_ordered(eligible_selectable)
+            if seed in selectable_set and seed not in set(core)
+        ]
+        if not eligible_pool:
+            eligible_pool = [
+                seed
+                for seed in _ordered_by_priority(eligible_selectable)
+                if seed in selectable_set and seed not in set(core)
+            ]
+
+        newest = new_candidates[-1] if new_candidates else ""
+        changed = False
+        inserted: set[str] = set()
+        if newest and newest not in selected_set:
+            if len(selected) < capacity:
+                selected.append(newest)
+            else:
+                replacement = self._replacement_index(
+                    selected,
+                    core=set(core),
+                    protected=set(),
+                )
+                if replacement >= 0:
+                    selected[replacement] = newest
+                else:
+                    exclusion_reasons[newest] = "rotation_pending"
+            if newest in selected:
+                selected_set.add(newest)
+                inserted.add(newest)
+                changed = True
+
+        # Fill open capacity with unlocked runtime identities in discovery
+        # order, then rotate one remaining identity on each full-bank visit.
+        rotation_pool = [seed for seed in eligible_pool if seed != newest]
+        if rotation_pool:
+            offset = self.rotation_cursor % len(rotation_pool)
+            rotation_pool = rotation_pool[offset:] + rotation_pool[:offset]
+        for seed in rotation_pool:
+            if seed in selected_set:
+                continue
+            if len(selected) < capacity:
+                selected.append(seed)
+                selected_set.add(seed)
+                inserted.add(seed)
+                changed = True
+                continue
+            replacement = self._replacement_index(
+                selected,
+                core=set(core),
+                protected=set(inserted) | ({newest} if newest in selected_set else set()),
+            )
+            if replacement < 0:
+                break
+            selected[replacement] = seed
+            selected_set = set(selected)
+            inserted.add(seed)
+            changed = True
+            break
+
+        if rotation_pool:
+            self.rotation_cursor = (self.rotation_cursor + 1) % len(rotation_pool)
+
+        # Keep the checkpoint's duplicate starter shape until there is an
+        # actual unlocked identity to place, and use core duplicates only as
+        # harmless fillers after every authorized unique card is represented.
+        fill_order = [seed for seed in self.initial_loadout if seed in selectable_set]
+        if not fill_order:
+            fill_order = [seed for seed in eligible_selectable if seed in selectable_set]
+        fill_index = 0
+        while len(selected) < capacity and fill_order:
+            selected.append(fill_order[fill_index % len(fill_order)])
+            fill_index += 1
+
+        for seed in new_candidates:
+            if seed not in selected_set:
+                exclusion_reasons.setdefault(seed, "rotation_pending")
+
+        if newest in inserted:
+            reason = "rotation_newest_unlock"
+        elif inserted:
+            reason = "rotation_unlocked_pool"
+        elif changed:
+            reason = "rotation_replacement"
+        else:
+            reason = "rotation_stable"
+        return selected[:capacity], exclusion_reasons, reason
+
+    def _replacement_index(
+        self,
+        selected: List[str],
+        *,
+        core: set[str],
+        protected: set[str],
+    ) -> int:
+        for index in range(len(selected) - 1, -1, -1):
+            seed = selected[index]
+            if seed in core and seed not in protected and selected.count(seed) > 1:
+                return index
+        for index in range(len(selected) - 1, -1, -1):
+            seed = selected[index]
+            if seed not in protected and selected.count(seed) > 1:
+                return index
+        if selected:
+            for offset in range(len(selected)):
+                index = (self.rotation_cursor + offset) % len(selected)
+                if selected[index] not in core and selected[index] not in protected:
+                    return index
+            for index in range(len(selected) - 1, -1, -1):
+                if selected[index] not in protected:
+                    return index
+        return -1
 
     def _build_conservative_loadout(
         self,
@@ -684,6 +1119,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         maintenance_sample_prob: float,
         frontier_win_streak_required: int,
         strict_startup_validation: bool = True,
+        core_seed_names: Optional[Iterable[str]] = None,
+        new_unlock_guarantee_episodes: int = DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES,
     ) -> None:
         super().__init__(config)
         self.run_dir = Path(run_dir)
@@ -701,6 +1138,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             new_plant_min_inclusion_prob=new_plant_min_inclusion_prob,
             seed_order_source=seed_order_source,
             randomize_seed_order=randomize_seed_order,
+            core_seed_names=core_seed_names,
+            new_unlock_guarantee_episodes=new_unlock_guarantee_episodes,
         )
         self.max_seed_slots = SEED_CAPACITY_MAX
         self.max_adventure_levels = max(1, int(max_adventure_levels))
@@ -748,9 +1187,11 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         )
         self.current_selectable_seeds = _ordered_by_priority(set(self.current_loadout))
         self.current_excluded_new_plants: List[Dict[str, str]] = []
+        self._pending_seed_selection: Optional[Dict[str, Any]] = None
         self._base_fusion_policy = str(self.config.fusion_policy)
         self.current_curriculum_mode = "frontier"
         self._apply_loadout(self.current_loadout)
+        self._episode_slot_identity = tuple(int(value) for value in self.config.plant_types)
         self.context: Dict[str, Any] = {
             "mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
             "run_mode": ADVENTURE_GENERALIST_RUN_MODE_TRAIN,
@@ -764,6 +1205,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "selected_seeds": list(self.current_loadout),
             "selected_loadout": list(self.current_loadout),
             "selected_loadout_count": len(self.current_loadout),
+            "episode_slot_identity": list(self._episode_slot_identity),
             "seed_order_source": self.current_seed_order_source,
             "seed_order_preserved": bool(self.current_seed_order_preserved),
             "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
@@ -807,6 +1249,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "level_identity_reliable": None,
             "unlock_aware_seed_curriculum": bool(unlock_aware_seed_curriculum),
             "seed_curriculum": seed_curriculum,
+            "core_seed_names": list(self.curriculum.core_seed_names),
+            "new_unlock_guarantee_episodes": int(self.curriculum.new_unlock_guarantee_episodes),
             "post_win_transition": {},
             "post_win_blocked_reason": "",
             "infer_capacity_from_unlocks": bool(self.infer_capacity_from_unlocks),
@@ -1294,9 +1738,12 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             self.context["blocked_reason"] = blocked_reason or "adventure_generalist_prepare_failed"
             self.writer.write(build_live_status(self, self.context, adventure_state=adventure_state))
             raise RuntimeError(f"blocked_reason={self.context['blocked_reason']}")
+        self._episode_slot_identity = tuple(int(value) for value in self.config.plant_types)
+        self.context["episode_slot_identity"] = list(self._episode_slot_identity)
         return self.start_episode_from_observation(observation, reset_info)
 
     def step(self, action: int):  # type: ignore[override]
+        self._assert_episode_slot_identity()
         encoded, reward, terminated, truncated, info = super().step(action)
         self.context.update(
             {
@@ -1325,6 +1772,17 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         if terminated or truncated:
             self._finish_episode(info)
         return encoded, reward, terminated, truncated, info
+
+    def _assert_episode_slot_identity(self) -> None:
+        """Reject action-slot remapping after gameplay has started."""
+
+        current_slot_identity = tuple(int(value) for value in self.config.plant_types)
+        expected_slot_identity = tuple(getattr(self, "_episode_slot_identity", current_slot_identity))
+        if current_slot_identity != expected_slot_identity:
+            raise RuntimeError(
+                "blocked_reason=generalist_slot_identity_changed_mid_episode: "
+                f"expected={list(expected_slot_identity)} current={list(current_slot_identity)}"
+            )
 
     def _finish_episode(self, info: Dict[str, Any]) -> None:
         summary = info.get("episode_summary", {}) if isinstance(info, dict) else {}
@@ -1717,7 +2175,203 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self._write_unlock_files()
         self.writer.write(build_live_status(self, self.context, last_info=info))
 
+    def _rollback_pending_seed_selection(self) -> None:
+        self._pending_seed_selection = None
+        self.context.update(
+            {
+                "pending_seed_selection": False,
+                "proposed_selected_loadout": [],
+                "proposed_loadout_reason": "",
+                "proposed_loadout_provenance": [],
+                "proposed_guaranteed_seeds": [],
+                "proposed_rejected_priority_seeds": [],
+            }
+        )
+
+    def _verify_pending_seed_selection(
+        self,
+        selection: Dict[str, Any],
+        proposed_loadout: Iterable[str],
+    ) -> bool:
+        if not isinstance(selection, dict) or not bool(selection.get("ok", False)):
+            self.context["seed_selection_commit_blocked_reason"] = "selection_not_ok"
+            return False
+        verification = selection.get("verification")
+        if isinstance(verification, dict) and verification.get("success") is False:
+            self.context["seed_selection_commit_blocked_reason"] = "selection_verification_failed"
+            return False
+        try:
+            expected_types = [int(value) for value in resolve_seed_list(list(proposed_loadout))]
+        except (TypeError, ValueError):
+            self.context["seed_selection_commit_blocked_reason"] = "proposed_seed_list_unresolvable"
+            return False
+
+        selected_raw: Any = (
+            verification.get("selectedSeedTypes")
+            if isinstance(verification, dict) and "selectedSeedTypes" in verification
+            else selection.get("selectedSeedTypes")
+        )
+        try:
+            selected_types = [int(value) for value in list(selected_raw or [])]
+        except (TypeError, ValueError):
+            self.context["seed_selection_commit_blocked_reason"] = "selection_types_unresolvable"
+            return False
+        if selected_types != expected_types or Counter(selected_types) != Counter(expected_types):
+            self.context["seed_selection_commit_blocked_reason"] = (
+                "selection_card_multiset_or_slot_identity_mismatch"
+            )
+            return False
+
+        base = getattr(self, "base", None)
+        seed_probe = getattr(base, "seed_probe", None)
+        if not callable(seed_probe):
+            return True
+        try:
+            probe = seed_probe()
+        except Exception as exc:
+            self.context["seed_selection_commit_blocked_reason"] = f"post_selection_probe_failed:{exc}"
+            return False
+        if not isinstance(probe, dict):
+            self.context["seed_selection_commit_blocked_reason"] = "post_selection_probe_invalid"
+            return False
+        active_counts, _ = active_gameplay_bank_state(probe)
+        if active_counts != Counter(expected_types):
+            self.context["seed_selection_commit_blocked_reason"] = (
+                "post_selection_active_gameplay_bank_mismatch"
+            )
+            return False
+        active_cards = list(probe.get("activeGameplayCardBankCards", []) or [])
+        if active_cards:
+            try:
+                active_types = [int(card.get("plantType", -999)) for card in active_cards]
+            except (AttributeError, TypeError, ValueError):
+                self.context["seed_selection_commit_blocked_reason"] = "post_selection_cards_invalid"
+                return False
+            if active_types != expected_types:
+                self.context["seed_selection_commit_blocked_reason"] = (
+                    "post_selection_slot_identity_mismatch"
+                )
+                return False
+        if bool(probe.get("seedSelectionActive")):
+            self.context["seed_selection_commit_blocked_reason"] = "post_selection_seed_screen_still_active"
+            return False
+        return True
+
+    def _commit_pending_seed_selection(
+        self,
+        selection: Dict[str, Any],
+        seed_list: Iterable[str],
+    ) -> bool:
+        pending = self._pending_seed_selection
+        if not isinstance(pending, dict):
+            self.context["seed_selection_commit_blocked_reason"] = "no_pending_seed_selection"
+            return False
+        proposed = _canonical_seed_sequence(pending.get("proposed_loadout", []))
+        committed = _canonical_seed_sequence(seed_list)
+        if committed != proposed:
+            self.context["seed_selection_commit_blocked_reason"] = "callback_seed_list_changed"
+            return False
+        if not self._verify_pending_seed_selection(selection, proposed):
+            return False
+
+        decision = pending.get("decision")
+        if not isinstance(decision, LoadoutDecision):
+            self.context["seed_selection_commit_blocked_reason"] = "pending_decision_invalid"
+            return False
+
+        curriculum = self.curriculum
+        curriculum_snapshot = {
+            "episode_index": int(curriculum.episode_index),
+            "episodes_included": dict(curriculum.episodes_included),
+            "completed_inclusions": {
+                name: int(state.completed_inclusions)
+                for name, state in curriculum.guarantees.items()
+            },
+            "rotation_cursor": int(curriculum.rotation_cursor),
+            "last_committed_loadout": list(curriculum.last_committed_loadout),
+        }
+        config_seed_list = list(self.config.seed_list)
+        config_plant_types = list(self.config.plant_types)
+        base_seed_list = list(self.base.config.seed_list)
+        base_plant_types = list(self.base.config.plant_types)
+        try:
+            self._apply_loadout(proposed)
+            curriculum.commit_loadout(
+                decision,
+                selected_loadout=proposed,
+                episode_index=self.episode_index,
+            )
+        except Exception as exc:
+            self.config.seed_list = config_seed_list
+            self.config.plant_types = config_plant_types
+            self.base.config.seed_list = base_seed_list
+            self.base.config.plant_types = base_plant_types
+            curriculum.episode_index = curriculum_snapshot["episode_index"]
+            curriculum.episodes_included = curriculum_snapshot["episodes_included"]
+            curriculum.rotation_cursor = curriculum_snapshot["rotation_cursor"]
+            curriculum.last_committed_loadout = curriculum_snapshot["last_committed_loadout"]
+            for name, completed in curriculum_snapshot["completed_inclusions"].items():
+                if name in curriculum.guarantees:
+                    curriculum.guarantees[name].completed_inclusions = completed
+            self.context["seed_selection_commit_blocked_reason"] = f"commit_failed:{exc}"
+            return False
+
+        self.current_loadout = list(proposed)
+        self.current_loadout_reason = str(decision.loadout_reason or "")
+        self.current_seed_order_source = str(decision.seed_order_source or self.seed_order_source)
+        self.current_seed_order_preserved = bool(decision.seed_order_preserved)
+        self.current_seed_order_blocked_reason = str(decision.blocked_reason or "")
+        self.current_selectable_seeds = list(decision.selectable_seeds)
+        self.current_excluded_new_plants = list(decision.excluded_new_plants)
+        self.rejected_priority_seeds = _rejected_priority_seed_diagnostics(
+            list(pending.get("available_priority_seeds", [])),
+            selected_loadout=self.current_loadout,
+            selectable_seeds=list(pending.get("selection_candidates", decision.selectable_seeds)),
+            effective_capacity=int(getattr(self, "effective_seed_capacity", len(proposed))),
+            excluded_new_plants=self.current_excluded_new_plants,
+        )
+        self._episode_slot_identity = tuple(int(value) for value in self.config.plant_types)
+        self._pending_seed_selection = None
+        self.context.update(
+            {
+                "pending_seed_selection": False,
+                "proposed_selected_loadout": [],
+                "proposed_loadout_reason": "",
+                "proposed_loadout_provenance": [],
+                "proposed_guaranteed_seeds": [],
+                "proposed_rejected_priority_seeds": [],
+                "episode_slot_identity": list(self._episode_slot_identity),
+                "configured_seed_list": list(self.configured_seed_list),
+                "selected_seeds": list(self.current_loadout),
+                "selected_loadout": list(self.current_loadout),
+                "selected_loadout_count": len(self.current_loadout),
+                "seed_order_source": self.current_seed_order_source,
+                "seed_order_preserved": bool(self.current_seed_order_preserved),
+                "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
+                "randomize_seed_order": bool(self.randomize_seed_order),
+                "active_seed_slot_count": len(self.current_loadout),
+                "inactive_seed_slot_count": max(0, self.max_seed_slots - len(self.current_loadout)),
+                "inactive_model_slots": max(0, self.max_seed_slots - len(self.current_loadout)),
+                **self._capacity_context_fields(),
+                "raw_selectable_seeds": list(pending.get("raw_selectable", [])),
+                "selectable_seeds": list(decision.selectable_seeds),
+                "seed_validation_source": str(pending.get("validation_source", "selectable")),
+                "seed_validation_available": list(pending.get("available_for_seed_validation", [])),
+                "available_for_seed_validation": list(pending.get("available_for_seed_validation", [])),
+                "eligible_seeds": list(decision.eligible_seeds),
+                "unlocked_seeds": self.curriculum.unlocked_seeds(),
+                "loadout_reason": self.current_loadout_reason,
+                "excluded_new_plants": list(self.current_excluded_new_plants),
+                "guaranteed_seeds": list(decision.guaranteed_seeds),
+                "loadout_provenance": list(decision.loadout_provenance),
+                "curriculum_rotation_cursor": int(self.curriculum.rotation_cursor),
+            }
+        )
+        return True
+
     def _on_seed_selection_screen(self, state: Dict[str, Any], current_seed_list: List[str]) -> Tuple[List[str], str]:
+        if getattr(self, "_pending_seed_selection", None) is not None:
+            self._rollback_pending_seed_selection()
         selectable = _filter_supported_seed_names(_selectable_from_seed_screen_state(state))
         self._record_confirmed_unlock_event_seeds(selectable)
         capacity_inference = resolve_adventure_generalist_seed_capacity(
@@ -1753,11 +2407,28 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 f"validation_source={validation_source} "
                 f"available_for_seed_validation={list(available_for_seed_validation)}"
             )
+        # An empty selectable list is an incomplete/transitioning seed-screen
+        # observation, not proof that every unlocked registry entry can be
+        # clicked on this screen.  Keep the fallback for validating the
+        # configured starter loadout, but never use it to expand the active
+        # loadout.  Capacity/unlock evidence may extend a populated screen
+        # whose current cards are visible; it must not turn an empty UI probe
+        # into a request for a card that the next strict selector cannot see.
+        current_seed_screen_candidates = list(selectable)
+        if selectable:
+            current_seed_screen_candidates.extend(capacity_inference.available_priority_seeds)
         selection_candidates = _filter_loadout_candidate_seeds(
-            list(available_for_seed_validation) + list(capacity_inference.available_priority_seeds),
+            current_seed_screen_candidates,
             eligible_seeds=eligible_seeds,
             unlocked_seeds=unlocked_seeds,
         )
+        previous_loadout = list(current_seed_list or self.current_loadout)
+        selection_capacity = effective_capacity
+        if not selectable:
+            # Capacity inference can remain useful for diagnostics and later
+            # probes, but an empty current UI cannot authorize adding even a
+            # duplicate starter card to the next strict selection request.
+            selection_capacity = min(effective_capacity, len(previous_loadout))
         print(
             "[adventure-generalist] capacity_input "
             f"selectable={list(selectable)} "
@@ -1773,6 +2444,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             f"bridge_reported={capacity_inference.bridge_reported_capacity} "
             f"inferred={capacity_inference.inferred_capacity_from_unlocks} "
             f"effective={effective_capacity} "
+            f"selection_capacity={selection_capacity} "
             f"max_seen={capacity_inference.max_effective_seed_capacity_seen} "
             f"source={capacity_inference.inferred_capacity_source} "
             f"reason={capacity_inference.capacity_inference_reason}"
@@ -1780,8 +2452,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         try:
             decision = self.curriculum.choose_loadout(
                 selectable_seeds=selection_candidates,
-                observed_capacity=effective_capacity,
-                previous_loadout=current_seed_list or self.current_loadout,
+                observed_capacity=selection_capacity,
+                previous_loadout=previous_loadout,
                 validation_seeds=available_for_seed_validation,
                 validation_source=validation_source,
             )
@@ -1848,42 +2520,47 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             )
             return list(self.current_loadout), blocked_reason
 
-        self.current_loadout = list(decision.selected_loadout[:effective_capacity])
-        if getattr(self, "current_curriculum_mode", "frontier") == "later_plant":
-            later_candidates = [
-                seed
-                for seed in ("PotatoMine", "Chomper", "SnowPea", "Repeater")
-                if seed in selection_candidates
-            ]
-            for later_seed in later_candidates:
-                if later_seed in self.current_loadout:
-                    break
-                replacement = next(
-                    (
-                        index
-                        for index in range(len(self.current_loadout) - 1, -1, -1)
-                        if self.current_loadout.count(self.current_loadout[index]) > 1
-                    ),
-                    len(self.current_loadout) - 1,
-                )
-                if replacement >= 0:
-                    self.current_loadout[replacement] = later_seed
-                    decision.loadout_reason = f"{decision.loadout_reason}+later_plant_curriculum"
-                break
-        self.current_loadout_reason = str(decision.loadout_reason or "")
-        self.current_seed_order_source = str(decision.seed_order_source or self.seed_order_source)
-        self.current_seed_order_preserved = bool(decision.seed_order_preserved)
-        self.current_seed_order_blocked_reason = str(decision.blocked_reason or "")
-        self.current_selectable_seeds = list(decision.selectable_seeds)
-        self.current_excluded_new_plants = list(decision.excluded_new_plants)
-        self.rejected_priority_seeds = _rejected_priority_seed_diagnostics(
+        proposed_loadout = list(decision.selected_loadout[:effective_capacity])
+        self._pending_seed_selection = {
+            "decision": decision,
+            "previous_loadout": list(self.current_loadout),
+            "proposed_loadout": list(proposed_loadout),
+            "episode_index": int(self.episode_index),
+            "raw_selectable": list(selectable),
+            "selection_candidates": list(selection_candidates),
+            "validation_source": validation_source,
+            "available_for_seed_validation": list(available_for_seed_validation),
+            "available_priority_seeds": list(capacity_inference.available_priority_seeds),
+        }
+        self.context.update(
+            {
+                "pending_seed_selection": True,
+                "proposed_selected_loadout": list(proposed_loadout),
+                "proposed_loadout_reason": str(decision.loadout_reason or ""),
+                "proposed_loadout_provenance": list(decision.loadout_provenance),
+                "proposed_guaranteed_seeds": list(decision.guaranteed_seeds),
+                "proposed_rotation_cursor": int(decision.proposed_rotation_cursor),
+                "proposed_seed_validation_source": validation_source,
+                "proposed_seed_validation_available": list(available_for_seed_validation),
+                "raw_selectable_seeds": list(selectable),
+                "seed_validation_source": validation_source,
+                "seed_validation_available": list(available_for_seed_validation),
+                "available_for_seed_validation": list(available_for_seed_validation),
+                "proposed_selectable_seeds": list(decision.selectable_seeds),
+                "proposed_eligible_seeds": list(decision.eligible_seeds),
+                "proposed_unlocked_seeds": list(unlocked_seeds),
+                **self._capacity_context_fields(),
+            }
+        )
+        proposed_rejected_priority_seeds = _rejected_priority_seed_diagnostics(
             capacity_inference.available_priority_seeds,
-            selected_loadout=self.current_loadout,
+            selected_loadout=proposed_loadout,
             selectable_seeds=selection_candidates,
             effective_capacity=effective_capacity,
-            excluded_new_plants=self.current_excluded_new_plants,
+            excluded_new_plants=decision.excluded_new_plants,
         )
-        for row in self.rejected_priority_seeds:
+        self.context["proposed_rejected_priority_seeds"] = list(proposed_rejected_priority_seeds)
+        for row in proposed_rejected_priority_seeds:
             print(
                 "[adventure-generalist] priority_seed_rejected "
                 f"seed={row.get('seed', '')} reason={row.get('reason', '')}"
@@ -1894,7 +2571,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             f"observed_capacity={observed_capacity} "
             f"effective_capacity={effective_capacity} "
             f"configured_seed_list={list(decision.configured_seed_list or self.configured_seed_list)} "
-            f"selected_loadout={list(self.current_loadout)} "
+            f"proposed_loadout={list(proposed_loadout)} "
             f"selectable={list(selectable)} "
             f"eligible={eligible_seeds} "
             f"unlocked={unlocked_seeds} "
@@ -1902,36 +2579,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             f"seed_order_source={self.current_seed_order_source} "
             f"seed_order_preserved={bool(self.current_seed_order_preserved)} "
             f"selection_candidates={list(decision.selectable_seeds)} "
-            f"loadout_reason={self.current_loadout_reason} "
-            f"blocked_reason={self.current_seed_order_blocked_reason or 'None'}"
+            f"loadout_reason={decision.loadout_reason} "
+            f"blocked_reason={decision.blocked_reason or 'None'}"
         )
-        self._apply_loadout(self.current_loadout)
-        self.context.update(
-            {
-                "configured_seed_list": list(self.configured_seed_list),
-                "selected_seeds": list(self.current_loadout),
-                "selected_loadout": list(self.current_loadout),
-                "selected_loadout_count": len(self.current_loadout),
-                "seed_order_source": self.current_seed_order_source,
-                "seed_order_preserved": bool(self.current_seed_order_preserved),
-                "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
-                "randomize_seed_order": bool(self.randomize_seed_order),
-                "active_seed_slot_count": len(self.current_loadout),
-                "inactive_seed_slot_count": max(0, self.max_seed_slots - len(self.current_loadout)),
-                "inactive_model_slots": max(0, self.max_seed_slots - len(self.current_loadout)),
-                **self._capacity_context_fields(),
-                "raw_selectable_seeds": list(selectable),
-                "selectable_seeds": list(decision.selectable_seeds),
-                "seed_validation_source": validation_source,
-                "seed_validation_available": list(available_for_seed_validation),
-                "available_for_seed_validation": list(available_for_seed_validation),
-                "eligible_seeds": list(decision.eligible_seeds),
-                "unlocked_seeds": unlocked_seeds,
-                "loadout_reason": self.current_loadout_reason,
-                "excluded_new_plants": list(self.current_excluded_new_plants),
-            }
-        )
-        return list(self.current_loadout), ""
+        return list(proposed_loadout), ""
 
     def _apply_loadout(self, loadout: List[str]) -> None:
         capacity = _clamp_capacity(getattr(self, "effective_seed_capacity", self.observed_seed_bank_capacity), maximum=self.max_seed_slots)
@@ -2620,6 +3271,17 @@ def canonicalize_seed_name(value: Any, known_seed_names: Optional[Iterable[str]]
         if known_name and normalize_plant_name(known_name) == key:
             return known_name
     return text
+
+
+def _ordered_unique_seed_names(values: Iterable[Any]) -> List[str]:
+    output: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = canonicalize_seed_name(value)
+        if name and name not in seen:
+            output.append(name)
+            seen.add(name)
+    return output
 
 
 def _canonical_seed_sequence(values: Iterable[Any], known_seed_names: Optional[Iterable[str]] = None) -> List[str]:
