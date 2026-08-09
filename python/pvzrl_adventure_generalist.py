@@ -66,7 +66,6 @@ SEED_PRIORITY = [
     "PuffShroom",
     "SunShroom",
     "FumeShroom",
-    "GraveBuster",
 ]
 
 SEED_CAPACITY_INFERENCE_PRIORITY = [

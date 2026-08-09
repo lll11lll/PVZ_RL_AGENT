@@ -243,6 +243,21 @@ def _plant_types_to_names(values: List[Any]) -> List[str]:
     return _ordered_unique_seed_names(names)
 
 
+def _ordered_int_values(values: List[Any]) -> List[int]:
+    output: List[int] = []
+    seen = set()
+    for value in values:
+        try:
+            plant_type = int(value)
+        except (TypeError, ValueError):
+            continue
+        if plant_type < 0 or plant_type in seen:
+            continue
+        output.append(plant_type)
+        seen.add(plant_type)
+    return output
+
+
 def _card_names(cards: List[Any]) -> List[str]:
     names: List[Any] = []
     for card in cards:
@@ -292,12 +307,30 @@ def _snapshot_unlock_state(state: Dict[str, Any], source: str = "") -> Dict[str,
         state.get("newPlantUnlockedName") or snapshot.get("newPlantUnlockedName") or (plant_type_name(new_type_int) if new_type_int >= 0 else "")
     )
     visible_seed_names = _ordered_unique_seed_names(
-        _state_list(state, "visibleSeedCardNames")
+        _state_list(state, "confirmedSelectableSeedCardNames")
+        + _snapshot_list(snapshot, "confirmedSelectableSeedCardNames")
+        + _state_list(state, "visibleSeedCardNames")
         + _snapshot_list(snapshot, "visibleSeedCardNames")
+        + _plant_types_to_names(_state_list(state, "confirmedSelectableSeedPlantTypes"))
+        + _plant_types_to_names(_snapshot_list(snapshot, "confirmedSelectableSeedPlantTypes"))
         + _plant_types_to_names(_state_list(state, "visibleSeedPlantTypes"))
         + _plant_types_to_names(_snapshot_list(snapshot, "visibleSeedPlantTypes"))
     )
     unknown_objects = _unknown_objects_from_state(state, snapshot)
+    confirmed_seed_types = _ordered_int_values(
+        _state_list(state, "confirmedSelectableSeedPlantTypes")
+        + _snapshot_list(snapshot, "confirmedSelectableSeedPlantTypes")
+        + _state_list(state, "visibleSeedPlantTypes")
+        + _snapshot_list(snapshot, "visibleSeedPlantTypes")
+    )
+    diagnostic_names = _ordered_unique_seed_names(
+        _state_list(state, "diagnosticPlantNames")
+        + _snapshot_list(snapshot, "diagnosticPlantNames")
+        + ([new_name] if new_name else [])
+    )
+    diagnostic_types = _state_list(state, "diagnosticPlantTypes") + _snapshot_list(snapshot, "diagnosticPlantTypes")
+    if new_type_int >= 0:
+        diagnostic_types.append(new_type_int)
     return {
         "source": source,
         "screenState": state.get("screenState", ""),
@@ -308,7 +341,11 @@ def _snapshot_unlock_state(state: Dict[str, Any], source: str = "") -> Dict[str,
         "newPlantUnlockedPlantType": new_type_int,
         "visibleRewardTexts": _state_list(state, "visibleRewardTexts") + _snapshot_list(snapshot, "visibleRewardTexts"),
         "visibleSeedCardNames": visible_seed_names,
-        "visibleSeedPlantTypes": _state_list(state, "visibleSeedPlantTypes") + _snapshot_list(snapshot, "visibleSeedPlantTypes"),
+        "visibleSeedPlantTypes": confirmed_seed_types,
+        "confirmedSelectableSeedCardNames": visible_seed_names,
+        "confirmedSelectableSeedPlantTypes": confirmed_seed_types,
+        "diagnosticPlantNames": diagnostic_names,
+        "diagnosticPlantTypes": diagnostic_types,
         "unknownUnlockObjects": unknown_objects,
         "unknownVisibleSeedCards": _unknown_objects_from_state({"unknownVisibleSeedCards": _state_list(state, "unknownVisibleSeedCards")}, snapshot),
     }
@@ -328,11 +365,6 @@ def update_unlocked_from_state(
     for key in ("unlockedSeedNames", "availableSeedNames", "selectedSeedNames", "visibleSeedCardNames"):
         values.extend(_state_list(state, key))
     values.extend(snapshot.get("visibleSeedCardNames", []))
-    if snapshot.get("newPlantUnlockedName"):
-        values.append(snapshot["newPlantUnlockedName"])
-    new_type = int(snapshot.get("newPlantUnlockedPlantType", -1) or -1)
-    if new_type >= 0:
-        values.append(plant_type_name(new_type))
     for name in _ordered_unique_seed_names(values):
         unlocked[name] += 1
     if use_known_level_fallback and level in KNOWN_ADVENTURE_LEVEL_UNLOCKS:

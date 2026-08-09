@@ -19,6 +19,7 @@ from pvzrl_registry import (  # noqa: E402
     PlantDefinition,
     PlantRegistry,
     get_plant_registry,
+    normalize_plant_name,
 )
 
 
@@ -56,6 +57,30 @@ def _render_entry(definition: PlantDefinition) -> list[str]:
     ]
 
 
+def _name_id_pairs(registry: PlantRegistry) -> list[tuple[str, int]]:
+    pairs: dict[str, int] = {}
+    for definition in sorted(registry.plants, key=lambda item: item.plant_type_id):
+        for name in (definition.canonical_name, *definition.aliases):
+            key = normalize_plant_name(name)
+            if not key:
+                continue
+            existing = pairs.get(key)
+            if existing is not None and existing != definition.plant_type_id:
+                raise ValueError(
+                    f"canonical registry name {name!r} resolves to both {existing} and {definition.plant_type_id}"
+                )
+            pairs[key] = definition.plant_type_id
+    return sorted(pairs.items(), key=lambda item: (-len(item[0]), item[0], item[1]))
+
+
+def _render_name_matchers(registry: PlantRegistry) -> list[str]:
+    # Text probes contain full hierarchy paths and reward copy.  Ignore very
+    # short aliases so words such as "pea", "sun", or "nut" cannot make an
+    # unrelated UI label look like an unlock.
+    pairs = [(key, plant_type_id) for key, plant_type_id in _name_id_pairs(registry) if len(key) >= 5]
+    return [f'        ({_csharp_string(key)}, {plant_type_id}),' for key, plant_type_id in pairs]
+
+
 def render_bridge_registry(registry: PlantRegistry) -> str:
     if not registry.plants:
         raise ValueError(f"canonical plant registry is empty: {registry.source_path}")
@@ -68,6 +93,7 @@ def render_bridge_registry(registry: PlantRegistry) -> str:
         "using System;",
         "using System.Collections.Generic;",
         "using System.Globalization;",
+        "using System.Text;",
         "",
         "namespace PvZRLBridge;",
         "",
@@ -120,6 +146,27 @@ def render_bridge_registry(registry: PlantRegistry) -> str:
         [
             "        };",
             "",
+            "    private static readonly IReadOnlyDictionary<string, int> ByNormalizedName =",
+            "        new Dictionary<string, int>(StringComparer.Ordinal)",
+            "        {",
+        ]
+    )
+    for key, plant_type_id in _name_id_pairs(registry):
+        lines.append(f"            [{_csharp_string(key)}] = {plant_type_id},")
+    lines.extend(
+        [
+            "        };",
+            "",
+            "    private static readonly (string Key, int PlantTypeId)[] TextMatchers =",
+            "        new[]",
+            "        {",
+        ]
+    )
+    lines.extend(_render_name_matchers(registry))
+    lines.extend(
+        [
+            "        };",
+            "",
             "    public static int Count => ById.Count;",
             "",
             "    public static bool TryGet(int plantTypeId, out GeneratedPlantMetadata metadata)",
@@ -132,6 +179,59 @@ def render_bridge_registry(registry: PlantRegistry) -> str:
             "",
             "        metadata = null!;",
             "        return false;",
+            "    }",
+            "",
+            "    public static bool TryResolvePlantTypeId(string? value, out int plantTypeId)",
+            "    {",
+            "        var key = NormalizeName(value);",
+            "        if (string.IsNullOrWhiteSpace(key))",
+            "        {",
+            "            plantTypeId = -1;",
+            "            return false;",
+            "        }",
+            "",
+            "        return ByNormalizedName.TryGetValue(key, out plantTypeId);",
+            "    }",
+            "",
+            "    public static bool TryResolvePlantTypeIdFromText(string? value, out int plantTypeId)",
+            "    {",
+            "        var normalized = NormalizeName(value);",
+            "        if (string.IsNullOrWhiteSpace(normalized))",
+            "        {",
+            "            plantTypeId = -1;",
+            "            return false;",
+            "        }",
+            "",
+            "        foreach (var matcher in TextMatchers)",
+            "        {",
+            "            if (normalized.Contains(matcher.Key, StringComparison.Ordinal))",
+            "            {",
+            "                plantTypeId = matcher.PlantTypeId;",
+            "                return true;",
+            "            }",
+            "        }",
+            "",
+            "        plantTypeId = -1;",
+            "        return false;",
+            "    }",
+            "",
+            "    private static string NormalizeName(string? value)",
+            "    {",
+            "        if (string.IsNullOrWhiteSpace(value))",
+            "        {",
+            "            return string.Empty;",
+            "        }",
+            "",
+            "        var builder = new StringBuilder(value.Length);",
+            "        foreach (var character in value)",
+            "        {",
+            "            if (char.IsLetterOrDigit(character))",
+            "            {",
+            "                builder.Append(char.ToLowerInvariant(character));",
+            "            }",
+            "        }",
+            "",
+            "        return builder.ToString();",
             "    }",
             "",
             "    public static bool TryGetBridgeFallbackCost(int plantTypeId, out int cost)",

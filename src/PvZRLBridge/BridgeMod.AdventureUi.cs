@@ -128,6 +128,10 @@ public sealed partial class BridgeMod
             visibleRewardTexts = unlockSnapshot.VisibleRewardTexts,
             visibleSeedCardNames = unlockSnapshot.VisibleSeedCardNames,
             visibleSeedPlantTypes = unlockSnapshot.VisibleSeedPlantTypes,
+            confirmedSelectableSeedCardNames = unlockSnapshot.ConfirmedSelectableSeedCardNames,
+            confirmedSelectableSeedPlantTypes = unlockSnapshot.ConfirmedSelectableSeedPlantTypes,
+            diagnosticPlantNames = unlockSnapshot.DiagnosticPlantNames,
+            diagnosticPlantTypes = unlockSnapshot.DiagnosticPlantTypes,
             unknownUnlockObjects = unlockSnapshot.UnknownUnlockObjects,
             unknownVisibleSeedCards = unlockSnapshot.UnknownVisibleSeedCards,
             unlockSnapshot,
@@ -560,20 +564,24 @@ public sealed partial class BridgeMod
             .GroupBy(entry => $"{entry.Name}|{entry.HierarchyPath}|{entry.Text}|{entry.ClassName}")
             .Select(group => group.First())
             .ToList();
-        var inferredTypes = new Dictionary<int, string>();
-        foreach (var card in visibleCards)
+        var confirmedSelectableCards = visibleCards
+            .Where(IsConfirmedSelectableSeedCard)
+            .ToList();
+        var confirmedTypes = new Dictionary<int, string>();
+        foreach (var card in confirmedSelectableCards)
         {
             if (card.PlantType >= 0)
             {
-                inferredTypes[card.PlantType] = PlantTypeName(card.PlantType);
+                confirmedTypes[card.PlantType] = PlantTypeName(card.PlantType);
             }
         }
+        var diagnosticTypes = new Dictionary<int, string>();
         foreach (var entry in signalEntries)
         {
             var plantType = InferPlantTypeFromUiSignal(entry);
             if (plantType >= 0)
             {
-                inferredTypes[plantType] = PlantTypeName(plantType);
+                diagnosticTypes[plantType] = PlantTypeName(plantType);
             }
         }
 
@@ -586,9 +594,9 @@ public sealed partial class BridgeMod
                 break;
             }
         }
-        if (newPlantType < 0 && visibleCards.Count == 1)
+        if (newPlantType < 0 && confirmedSelectableCards.Count == 1)
         {
-            newPlantType = visibleCards[0].PlantType;
+            newPlantType = confirmedSelectableCards[0].PlantType;
         }
 
         var unknownUnlockObjects = signalEntries
@@ -613,13 +621,34 @@ public sealed partial class BridgeMod
                 .Distinct()
                 .Take(32)
                 .ToArray(),
-            VisibleSeedCardNames = inferredTypes
+            VisibleSeedCardNames = confirmedTypes
                 .OrderBy(pair => pair.Key)
                 .Select(pair => pair.Value)
                 .Where(name => !string.IsNullOrWhiteSpace(name))
                 .Distinct()
                 .ToArray(),
-            VisibleSeedPlantTypes = inferredTypes.Keys
+            VisibleSeedPlantTypes = confirmedTypes.Keys
+                .Where(plantType => plantType >= 0)
+                .Distinct()
+                .OrderBy(plantType => plantType)
+                .ToArray(),
+            ConfirmedSelectableSeedCardNames = confirmedTypes
+                .OrderBy(pair => pair.Key)
+                .Select(pair => pair.Value)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct()
+                .ToArray(),
+            ConfirmedSelectableSeedPlantTypes = confirmedTypes.Keys
+                .Where(plantType => plantType >= 0)
+                .Distinct()
+                .OrderBy(plantType => plantType)
+                .ToArray(),
+            DiagnosticPlantNames = diagnosticTypes.Values
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct()
+                .OrderBy(name => name)
+                .ToArray(),
+            DiagnosticPlantTypes = diagnosticTypes.Keys
                 .Where(plantType => plantType >= 0)
                 .Distinct()
                 .OrderBy(plantType => plantType)
@@ -628,6 +657,15 @@ public sealed partial class BridgeMod
             UnknownVisibleSeedCards = unknownVisibleSeedCards
         };
     }
+
+    private static bool IsConfirmedSelectableSeedCard(SeedCardDto card) =>
+        IsVisibleOnScreenCard(card) &&
+        card.PlantType >= 0 &&
+        card.Selectable &&
+        !card.Disabled &&
+        (card.Classification == "availableSeedCard" ||
+         card.Classification == "selectedSeedBank" ||
+         card.Classification == "activeGameplayCardBank");
 
     private static string PlantTypeName(int plantType)
     {
@@ -659,35 +697,9 @@ public sealed partial class BridgeMod
 
     private static int InferPlantTypeFromText(string? value)
     {
-        var normalized = NormalizeUiText(value);
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return -1;
-        }
-        if (normalized.Contains("cherrybomb") ||
-            normalized.Contains("cherry") ||
-            normalized.Contains("bomb"))
-        {
-            return (int)PlantType.CherryBomb;
-        }
-        if (normalized.Contains("sunflower"))
-        {
-            return (int)PlantType.SunFlower;
-        }
-        if (normalized.Contains("peashooter") ||
-            normalized.Contains("peashoter") ||
-            normalized.Contains("peaseed") ||
-            normalized.Contains("pea"))
-        {
-            return (int)PlantType.Peashooter;
-        }
-        if (normalized.Contains("wallnut") ||
-            normalized.Contains("walnut") ||
-            normalized.Contains("nut"))
-        {
-            return (int)PlantType.WallNut;
-        }
-        return -1;
+        return GeneratedPlantRegistry.TryResolvePlantTypeIdFromText(value, out var plantType)
+            ? plantType
+            : -1;
     }
 
     private static StartupPopupInfo DetectStartupPopupInfo(

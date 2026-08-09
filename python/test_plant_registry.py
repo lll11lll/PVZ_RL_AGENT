@@ -34,7 +34,7 @@ def test_registry_is_cached_deeply_immutable_and_source_compatible() -> None:
     assert registry is get_plant_registry()
     assert registry.source_path == PLANT_REGISTRY_PATH.resolve()
     assert registry.version == 1
-    assert len(registry.plants) == 12
+    assert len(registry.plants) == 41
     assert isinstance(registry.plants, tuple)
     assert registry.get_by_id(0).canonical_name == "Peashooter"  # type: ignore[union-attr]
     assert registry.get_by_name("Sun Flower").plant_type_id == 1  # type: ignore[union-attr]
@@ -48,7 +48,7 @@ def test_registry_is_cached_deeply_immutable_and_source_compatible() -> None:
     assert isinstance(registry.plants[0].aliases, tuple)
     assert registry.plants[0].unlock_metadata["authority"] == "runtime_card_ui"
     assert registry.plants[0].fusion_metadata["identity_namespace"] == "base_seed"
-    assert registry.plants[0].gui_display_metadata["display_name"] == "SunFlower"
+    assert registry.plants[0].gui_display_metadata["display_name"] == "Peashooter"
 
     generalist = registry.require_gui_preset("adventure_generalist_initial_loadout")
     assert generalist.seed_names == ("SunFlower", "SunFlower", "Peashooter", "Peashooter")
@@ -67,7 +67,7 @@ def test_registry_path_cache_parses_once_and_validates_ambiguity(tmp_path: Path)
     second = get_plant_registry(custom)
     assert second is first
     assert second.version == 1
-    assert len(second.plants) == 12
+    assert len(second.plants) == 41
 
     ambiguous = tmp_path / "ambiguous.json"
     payload = {
@@ -100,10 +100,13 @@ def test_registry_path_cache_parses_once_and_validates_ambiguity(tmp_path: Path)
 
 def test_pvzrl_env_forwarders_preserve_mutable_shapes_and_seed_resolution() -> None:
     entries = registry_entries()
-    assert [int(entry["plant_type_id"]) for entry in entries] == [1, 0, 3, 2, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert [int(entry["plant_type_id"]) for entry in entries] == list(range(40)) + [245]
     assert resolve_seed_list(["Sun Flower", "Pea", "7", "Peashooter:2"]) == [1, 0, 7, 0, 0]
     assert resolve_seed_list(["WallNut"]) == [3]
-    assert plant_type_name(7) == "Repeater"
+    assert get_plant_registry().resolve_name("Grave Buster") is None
+    assert plant_type_name(5) == "Chomper"
+    assert plant_type_name(7) == "FumeShroom"
+    assert plant_type_name(8) == "HypnoShroom"
     assert plant_type_name(1030) == "1030"
 
     mutable = registry_entry_by_type(0)
@@ -121,9 +124,9 @@ def test_training_flag_does_not_filter_required_compatibility_plants() -> None:
 
 def test_fusion_result_identity_overlay_remains_separate_from_seed_registry() -> None:
     registry = get_plant_registry()
-    assert registry.resolve_name("Repeater") == 7
+    assert registry.resolve_name("Repeater") is None
     assert normalize_plant_name_or_id("Repeater") == 1030
-    assert fusion_plant_name(7) == "Repeater"
+    assert fusion_plant_name(7) == "FumeShroom"
     assert fusion_plant_name(1030) == "DoubleShooer"
     assert normalize_plant_name_or_id("SplitPea") == 1090
     assert fusion_plant_name(1090) == "SplitPea"
@@ -166,6 +169,8 @@ def test_generated_bridge_registry_is_deterministic_and_complete(tmp_path: Path)
     for definition in registry.plants:
         assert f"[{definition.plant_type_id}] = new GeneratedPlantMetadata(" in source
         assert f'canonicalName: "{definition.canonical_name}"' in source
+    assert "Gravebuster" not in source
+    assert "gravebuster" not in source
 
 
 def test_bridge_uses_generated_fallbacks_after_runtime_card_sources() -> None:

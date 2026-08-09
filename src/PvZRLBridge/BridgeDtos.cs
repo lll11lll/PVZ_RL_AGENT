@@ -485,6 +485,10 @@ internal sealed class UnlockScreenSnapshotDto
     public string[] VisibleRewardTexts { get; set; } = Array.Empty<string>();
     public string[] VisibleSeedCardNames { get; set; } = Array.Empty<string>();
     public int[] VisibleSeedPlantTypes { get; set; } = Array.Empty<int>();
+    public string[] ConfirmedSelectableSeedCardNames { get; set; } = Array.Empty<string>();
+    public int[] ConfirmedSelectableSeedPlantTypes { get; set; } = Array.Empty<int>();
+    public string[] DiagnosticPlantNames { get; set; } = Array.Empty<string>();
+    public int[] DiagnosticPlantTypes { get; set; } = Array.Empty<int>();
     public UiProbeEntryDto[] UnknownUnlockObjects { get; set; } = Array.Empty<UiProbeEntryDto>();
     public SeedCardDto[] UnknownVisibleSeedCards { get; set; } = Array.Empty<SeedCardDto>();
 }

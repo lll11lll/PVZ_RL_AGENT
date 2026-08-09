@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 
 namespace PvZRLBridge;
 
@@ -45,7 +46,7 @@ internal sealed class GeneratedPlantMetadata
 
 internal static class GeneratedPlantRegistry
 {
-    public const string SourceSha256 = "608c3064b836f4a219e765c07480763e84dd413c3f84075390b63196f5e8c7b2";
+    public const string SourceSha256 = "dedc6ee1b027b57ef566e1a1659a4a23d7392096ebf2f42e136e3ce71074fa65";
 
     private static readonly IReadOnlyDictionary<int, GeneratedPlantMetadata> ById =
         new Dictionary<int, GeneratedPlantMetadata>
@@ -102,16 +103,6 @@ internal static class GeneratedPlantRegistry
                 bridgeFallbackEnabled: false),
             [5] = new GeneratedPlantMetadata(
                 plantTypeId: 5,
-                canonicalName: "SnowPea",
-                aliases: new[] { "Snow Pea" },
-                fallbackCost: 175,
-                fallbackCooldownSeconds: 7.5f,
-                category: "support",
-                role: "support",
-                enabledForTraining: true,
-                bridgeFallbackEnabled: false),
-            [6] = new GeneratedPlantMetadata(
-                plantTypeId: 6,
                 canonicalName: "Chomper",
                 aliases: new[] { "Chomp" },
                 fallbackCost: 150,
@@ -120,38 +111,18 @@ internal static class GeneratedPlantRegistry
                 role: "attacker",
                 enabledForTraining: true,
                 bridgeFallbackEnabled: false),
-            [7] = new GeneratedPlantMetadata(
-                plantTypeId: 7,
-                canonicalName: "Repeater",
-                aliases: new[] { "Repeater Seed" },
-                fallbackCost: 200,
-                fallbackCooldownSeconds: 7.5f,
-                category: "attacker",
-                role: "attacker",
-                enabledForTraining: true,
-                bridgeFallbackEnabled: false),
-            [8] = new GeneratedPlantMetadata(
-                plantTypeId: 8,
-                canonicalName: "PuffShroom",
-                aliases: new[] { "Puff-shroom", "Puff Shroom" },
+            [6] = new GeneratedPlantMetadata(
+                plantTypeId: 6,
+                canonicalName: "SmallPuff",
+                aliases: new[] { "PuffShroom", "Puff-shroom", "Puff Shroom", "Small Puff" },
                 fallbackCost: 0,
                 fallbackCooldownSeconds: 7.5f,
                 category: "attacker",
                 role: "attacker",
                 enabledForTraining: true,
                 bridgeFallbackEnabled: false),
-            [9] = new GeneratedPlantMetadata(
-                plantTypeId: 9,
-                canonicalName: "SunShroom",
-                aliases: new[] { "Sun-shroom", "Sun Shroom" },
-                fallbackCost: 25,
-                fallbackCooldownSeconds: 7.5f,
-                category: "economy",
-                role: "economy",
-                enabledForTraining: true,
-                bridgeFallbackEnabled: false),
-            [10] = new GeneratedPlantMetadata(
-                plantTypeId: 10,
+            [7] = new GeneratedPlantMetadata(
+                plantTypeId: 7,
                 canonicalName: "FumeShroom",
                 aliases: new[] { "Fume-shroom", "Fume Shroom" },
                 fallbackCost: 75,
@@ -160,16 +131,480 @@ internal static class GeneratedPlantRegistry
                 role: "attacker",
                 enabledForTraining: true,
                 bridgeFallbackEnabled: false),
+            [8] = new GeneratedPlantMetadata(
+                plantTypeId: 8,
+                canonicalName: "HypnoShroom",
+                aliases: new[] { "Hypno-shroom", "Hypno Shroom" },
+                fallbackCost: 75,
+                fallbackCooldownSeconds: 30.0f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [9] = new GeneratedPlantMetadata(
+                plantTypeId: 9,
+                canonicalName: "ScaredyShroom",
+                aliases: new[] { "Scaredy-shroom", "Scaredy Shroom" },
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [10] = new GeneratedPlantMetadata(
+                plantTypeId: 10,
+                canonicalName: "IceShroom",
+                aliases: new[] { "Ice-shroom", "Ice Shroom" },
+                fallbackCost: 75,
+                fallbackCooldownSeconds: 50.0f,
+                category: "control",
+                role: "control",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
             [11] = new GeneratedPlantMetadata(
                 plantTypeId: 11,
-                canonicalName: "GraveBuster",
-                aliases: new[] { "Grave Buster" },
-                fallbackCost: 75,
+                canonicalName: "DoomShroom",
+                aliases: new[] { "Doom-shroom", "Doom Shroom" },
+                fallbackCost: 125,
+                fallbackCooldownSeconds: 50.0f,
+                category: "explosive",
+                role: "explosive",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [12] = new GeneratedPlantMetadata(
+                plantTypeId: 12,
+                canonicalName: "LilyPad",
+                aliases: new[] { "Lily Pad", "Lily" },
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [13] = new GeneratedPlantMetadata(
+                plantTypeId: 13,
+                canonicalName: "Squash",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 50,
+                fallbackCooldownSeconds: 30.0f,
+                category: "control",
+                role: "control",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [14] = new GeneratedPlantMetadata(
+                plantTypeId: 14,
+                canonicalName: "ThreePeater",
+                aliases: new[] { "Threepeater", "Three Peater", "Threepeater Seed" },
+                fallbackCost: 275,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [15] = new GeneratedPlantMetadata(
+                plantTypeId: 15,
+                canonicalName: "Tanglekelp",
+                aliases: new[] { "Tangle Kelp", "Tanglekelp" },
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 50.0f,
+                category: "control",
+                role: "control",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [16] = new GeneratedPlantMetadata(
+                plantTypeId: 16,
+                canonicalName: "Jalapeno",
+                aliases: new[] { "Jalape\u00f1o", "Jalapeno Seed" },
+                fallbackCost: 125,
+                fallbackCooldownSeconds: 50.0f,
+                category: "explosive",
+                role: "explosive",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [17] = new GeneratedPlantMetadata(
+                plantTypeId: 17,
+                canonicalName: "Caltrop",
+                aliases: new[] { "Spikeweed", "Spike Weed", "Spike" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [18] = new GeneratedPlantMetadata(
+                plantTypeId: 18,
+                canonicalName: "TorchWood",
+                aliases: new[] { "Torchwood", "Torch Wood" },
+                fallbackCost: 175,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [19] = new GeneratedPlantMetadata(
+                plantTypeId: 19,
+                canonicalName: "SeaShroom",
+                aliases: new[] { "Sea-shroom", "Sea Shroom" },
+                fallbackCost: 0,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [20] = new GeneratedPlantMetadata(
+                plantTypeId: 20,
+                canonicalName: "Plantern",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 15.0f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [21] = new GeneratedPlantMetadata(
+                plantTypeId: 21,
+                canonicalName: "Cactus",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 125,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [22] = new GeneratedPlantMetadata(
+                plantTypeId: 22,
+                canonicalName: "Blover",
+                aliases: new[] { "Blower" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 15.0f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [23] = new GeneratedPlantMetadata(
+                plantTypeId: 23,
+                canonicalName: "StarFruit",
+                aliases: new[] { "Starfruit", "Star Fruit" },
+                fallbackCost: 125,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [24] = new GeneratedPlantMetadata(
+                plantTypeId: 24,
+                canonicalName: "Pumpkin",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 125,
+                fallbackCooldownSeconds: 30.0f,
+                category: "blocker",
+                role: "blocker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [25] = new GeneratedPlantMetadata(
+                plantTypeId: 25,
+                canonicalName: "Magnetshroom",
+                aliases: new[] { "Magnet-shroom", "Magnet Shroom", "MagnetShroom" },
+                fallbackCost: 100,
                 fallbackCooldownSeconds: 7.5f,
                 category: "utility",
                 role: "utility",
                 enabledForTraining: true,
                 bridgeFallbackEnabled: false),
+            [26] = new GeneratedPlantMetadata(
+                plantTypeId: 26,
+                canonicalName: "Cabbagepult",
+                aliases: new[] { "Cabbage-pult", "Cabbage Pult", "Cabbage" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [27] = new GeneratedPlantMetadata(
+                plantTypeId: 27,
+                canonicalName: "Pot",
+                aliases: new[] { "Flower Pot", "Plant Pot" },
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [28] = new GeneratedPlantMetadata(
+                plantTypeId: 28,
+                canonicalName: "Cornpult",
+                aliases: new[] { "Kernel-pult", "Kernel Pult", "Cornpult", "Corn Pult" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [29] = new GeneratedPlantMetadata(
+                plantTypeId: 29,
+                canonicalName: "Garlic",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 50,
+                fallbackCooldownSeconds: 7.5f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [30] = new GeneratedPlantMetadata(
+                plantTypeId: 30,
+                canonicalName: "Umbrellaleaf",
+                aliases: new[] { "Umbrella Leaf", "UmbrellaLeaf" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 7.5f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [31] = new GeneratedPlantMetadata(
+                plantTypeId: 31,
+                canonicalName: "Marigold",
+                aliases: Array.Empty<string>(),
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 7.5f,
+                category: "economy",
+                role: "economy",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [32] = new GeneratedPlantMetadata(
+                plantTypeId: 32,
+                canonicalName: "Melonpult",
+                aliases: new[] { "Melon-pult", "Melon Pult", "Melonpult" },
+                fallbackCost: 300,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [33] = new GeneratedPlantMetadata(
+                plantTypeId: 33,
+                canonicalName: "Shulkflower",
+                aliases: new[] { "ShulkFlower", "Shulk Flower" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [34] = new GeneratedPlantMetadata(
+                plantTypeId: 34,
+                canonicalName: "ElectricOnion",
+                aliases: new[] { "Amp-nion", "AmpNion", "Electric Onion" },
+                fallbackCost: 225,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [35] = new GeneratedPlantMetadata(
+                plantTypeId: 35,
+                canonicalName: "PineFurnace",
+                aliases: new[] { "Firnace", "Pine Furnace" },
+                fallbackCost: 25,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [36] = new GeneratedPlantMetadata(
+                plantTypeId: 36,
+                canonicalName: "SpruceShooter",
+                aliases: new[] { "Spruce Sharpshooter", "Spruce Shooter" },
+                fallbackCost: 175,
+                fallbackCooldownSeconds: 7.5f,
+                category: "attacker",
+                role: "attacker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [37] = new GeneratedPlantMetadata(
+                plantTypeId: 37,
+                canonicalName: "IceLotus",
+                aliases: new[] { "Snow Lotus", "Ice Lotus" },
+                fallbackCost: 50,
+                fallbackCooldownSeconds: 30.0f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [38] = new GeneratedPlantMetadata(
+                plantTypeId: 38,
+                canonicalName: "WaterAloes",
+                aliases: new[] { "Aloe Aqua", "Water Aloe", "Water Aloes" },
+                fallbackCost: 75,
+                fallbackCooldownSeconds: 7.5f,
+                category: "support",
+                role: "support",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [39] = new GeneratedPlantMetadata(
+                plantTypeId: 39,
+                canonicalName: "Bamboo",
+                aliases: new[] { "Bamblock", "Bamboo Block", "Bamboo" },
+                fallbackCost: 50,
+                fallbackCooldownSeconds: 15.0f,
+                category: "blocker",
+                role: "blocker",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+            [245] = new GeneratedPlantMetadata(
+                plantTypeId: 245,
+                canonicalName: "Imitater",
+                aliases: new[] { "Imitater Seed" },
+                fallbackCost: 100,
+                fallbackCooldownSeconds: 5.0f,
+                category: "utility",
+                role: "utility",
+                enabledForTraining: true,
+                bridgeFallbackEnabled: false),
+        };
+
+    private static readonly IReadOnlyDictionary<string, int> ByNormalizedName =
+        new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            ["sprucesharpshooter"] = 36,
+            ["threepeaterseed"] = 14,
+            ["electriconion"] = 34,
+            ["scaredyshroom"] = 9,
+            ["spruceshooter"] = 36,
+            ["imitaterseed"] = 245,
+            ["jalapenoseed"] = 16,
+            ["magnetshroom"] = 25,
+            ["umbrellaleaf"] = 30,
+            ["bambooblock"] = 39,
+            ["cabbagepult"] = 26,
+            ["hypnoshroom"] = 8,
+            ["pinefurnace"] = 35,
+            ["shulkflower"] = 33,
+            ["threepeater"] = 14,
+            ["cherrybomb"] = 2,
+            ["doomshroom"] = 11,
+            ["fumeshroom"] = 7,
+            ["kernelpult"] = 28,
+            ["peashooter"] = 0,
+            ["potatomine"] = 4,
+            ["puffshroom"] = 6,
+            ["tanglekelp"] = 15,
+            ["wateraloes"] = 38,
+            ["flowerpot"] = 27,
+            ["iceshroom"] = 10,
+            ["melonpult"] = 32,
+            ["seashroom"] = 19,
+            ["smallpuff"] = 6,
+            ["snowlotus"] = 37,
+            ["spikeweed"] = 17,
+            ["starfruit"] = 23,
+            ["sunflower"] = 1,
+            ["torchwood"] = 18,
+            ["wateraloe"] = 38,
+            ["aloeaqua"] = 38,
+            ["bamblock"] = 39,
+            ["cornpult"] = 28,
+            ["icelotus"] = 37,
+            ["imitater"] = 245,
+            ["jalapeno"] = 16,
+            ["marigold"] = 31,
+            ["plantern"] = 20,
+            ["plantpot"] = 27,
+            ["ampnion"] = 34,
+            ["cabbage"] = 26,
+            ["caltrop"] = 17,
+            ["chomper"] = 5,
+            ["economy"] = 1,
+            ["firnace"] = 35,
+            ["jalapeo"] = 16,
+            ["lilypad"] = 12,
+            ["pumpkin"] = 24,
+            ["wallnut"] = 3,
+            ["bamboo"] = 39,
+            ["blover"] = 22,
+            ["blower"] = 22,
+            ["cactus"] = 21,
+            ["cherry"] = 2,
+            ["garlic"] = 29,
+            ["potato"] = 4,
+            ["squash"] = 13,
+            ["chomp"] = 5,
+            ["spike"] = 17,
+            ["lily"] = 12,
+            ["mine"] = 4,
+            ["nut"] = 3,
+            ["pea"] = 0,
+            ["pot"] = 27,
+            ["sun"] = 1,
+        };
+
+    private static readonly (string Key, int PlantTypeId)[] TextMatchers =
+        new[]
+        {
+        ("sprucesharpshooter", 36),
+        ("threepeaterseed", 14),
+        ("electriconion", 34),
+        ("scaredyshroom", 9),
+        ("spruceshooter", 36),
+        ("imitaterseed", 245),
+        ("jalapenoseed", 16),
+        ("magnetshroom", 25),
+        ("umbrellaleaf", 30),
+        ("bambooblock", 39),
+        ("cabbagepult", 26),
+        ("hypnoshroom", 8),
+        ("pinefurnace", 35),
+        ("shulkflower", 33),
+        ("threepeater", 14),
+        ("cherrybomb", 2),
+        ("doomshroom", 11),
+        ("fumeshroom", 7),
+        ("kernelpult", 28),
+        ("peashooter", 0),
+        ("potatomine", 4),
+        ("puffshroom", 6),
+        ("tanglekelp", 15),
+        ("wateraloes", 38),
+        ("flowerpot", 27),
+        ("iceshroom", 10),
+        ("melonpult", 32),
+        ("seashroom", 19),
+        ("smallpuff", 6),
+        ("snowlotus", 37),
+        ("spikeweed", 17),
+        ("starfruit", 23),
+        ("sunflower", 1),
+        ("torchwood", 18),
+        ("wateraloe", 38),
+        ("aloeaqua", 38),
+        ("bamblock", 39),
+        ("cornpult", 28),
+        ("icelotus", 37),
+        ("imitater", 245),
+        ("jalapeno", 16),
+        ("marigold", 31),
+        ("plantern", 20),
+        ("plantpot", 27),
+        ("ampnion", 34),
+        ("cabbage", 26),
+        ("caltrop", 17),
+        ("chomper", 5),
+        ("economy", 1),
+        ("firnace", 35),
+        ("jalapeo", 16),
+        ("lilypad", 12),
+        ("pumpkin", 24),
+        ("wallnut", 3),
+        ("bamboo", 39),
+        ("blover", 22),
+        ("blower", 22),
+        ("cactus", 21),
+        ("cherry", 2),
+        ("garlic", 29),
+        ("potato", 4),
+        ("squash", 13),
+        ("chomp", 5),
+        ("spike", 17),
         };
 
     public static int Count => ById.Count;
@@ -184,6 +619,59 @@ internal static class GeneratedPlantRegistry
 
         metadata = null!;
         return false;
+    }
+
+    public static bool TryResolvePlantTypeId(string? value, out int plantTypeId)
+    {
+        var key = NormalizeName(value);
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            plantTypeId = -1;
+            return false;
+        }
+
+        return ByNormalizedName.TryGetValue(key, out plantTypeId);
+    }
+
+    public static bool TryResolvePlantTypeIdFromText(string? value, out int plantTypeId)
+    {
+        var normalized = NormalizeName(value);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            plantTypeId = -1;
+            return false;
+        }
+
+        foreach (var matcher in TextMatchers)
+        {
+            if (normalized.Contains(matcher.Key, StringComparison.Ordinal))
+            {
+                plantTypeId = matcher.PlantTypeId;
+                return true;
+            }
+        }
+
+        plantTypeId = -1;
+        return false;
+    }
+
+    private static string NormalizeName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                builder.Append(char.ToLowerInvariant(character));
+            }
+        }
+
+        return builder.ToString();
     }
 
     public static bool TryGetBridgeFallbackCost(int plantTypeId, out int cost)
