@@ -126,7 +126,14 @@ public sealed partial class BridgeMod
                                    obs.CardCooldowns.All(c => c.Found);
             var seedState = ResolveSeedStateForObservation(board, rawGameplayReady, forceSeedProbe, out seedProbeMs, out uiScanMs);
             var activeGameplayCounts = new Dictionary<int, int>(seedState.ActiveGameplayTypeCounts);
-            var requiredGameplayCounts = BuildTypeCounts(_config.PlantTypes);
+            // The configured plant types describe the startup model contract.
+            // Adventure Generalist training may replace duplicate identities at
+            // the seed-selection boundary, so runtime readiness must use the
+            // canonical active CardUI bank. Python verifies the requested
+            // multiset and ordered slot identities after selection.
+            var activeGameplaySeedBankReady = BridgeObservationHelpers.IsActiveGameplaySeedBankReady(
+                seedState.ActiveGameplayCardBankCount,
+                activeGameplayCounts);
             obs.SeedSelectionActive = seedState.SeedSelectionActive;
             obs.SeedSelectionPanelActive = seedState.SeedSelectionPanelActive;
             obs.StartButtonActive = seedState.StartButtonActive;
@@ -149,7 +156,7 @@ public sealed partial class BridgeMod
             obs.ActualGameplayReady = rawGameplayReady &&
                                       !obs.SeedSelectionActive &&
                                       !obs.BlockingRewardUiActive &&
-                                      CountsCover(activeGameplayCounts, requiredGameplayCounts);
+                                      activeGameplaySeedBankReady;
             obs.GameplayReady = obs.ActualGameplayReady;
             if (obs.SeedSelectionActive)
             {

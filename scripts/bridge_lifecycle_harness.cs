@@ -30,9 +30,11 @@ internal static class BridgeLifecycleHarness
             DispatchStopRaceHasOneOwner();
             ClientRegistryStopsAndDrainsBoundedly();
             ObservationSchemaIsStable();
+            ProtectedActionCountRemainsStable();
             OccupancyIndexMatchesLegacyScans();
             LaneSummariesMatchLegacyProjection();
             SeedCompatibilityCollectionsMatchLegacyProjection();
+            ActiveGameplaySeedBankReadinessUsesRuntimeBank();
             Console.WriteLine($"Bridge lifecycle harness passed: {_checks} checks.");
             return 0;
         }
@@ -448,6 +450,32 @@ internal static class BridgeLifecycleHarness
                     expectedCosts.OrderBy(pair => pair.Key)),
                 "seed compatibility minimum costs changed");
         }
+    }
+
+    private static void ActiveGameplaySeedBankReadinessUsesRuntimeBank()
+    {
+        var rotatedBank = new Dictionary<int, int>
+        {
+            [1] = 2,
+            [0] = 1,
+            [3] = 1
+        };
+        Check(
+            BridgeObservationHelpers.IsActiveGameplaySeedBankReady(4, rotatedBank),
+            "a non-empty rotated runtime bank must satisfy gameplay readiness");
+        Check(
+            !BridgeObservationHelpers.IsActiveGameplaySeedBankReady(0, rotatedBank),
+            "an empty runtime bank must not satisfy gameplay readiness");
+        Check(
+            !BridgeObservationHelpers.IsActiveGameplaySeedBankReady(4, new Dictionary<int, int>()),
+            "a bank count without runtime card identities must not satisfy gameplay readiness");
+    }
+
+    private static void ProtectedActionCountRemainsStable()
+    {
+        Check(
+            BridgeMod.MaintainedActionCount == 701,
+            "the bridge must retain the protected 701-action surface");
     }
 
     private static PendingRequest NewRequest(long requestId, int timeoutMilliseconds = 1000) =>

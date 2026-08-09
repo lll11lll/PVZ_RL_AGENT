@@ -5,6 +5,26 @@ namespace PvZRLBridge;
 
 internal static class BridgeObservationHelpers
 {
+    public static bool IsActiveGameplaySeedBankReady(
+        int activeGameplayCardBankCount,
+        IReadOnlyDictionary<int, int> activeGameplayCounts)
+    {
+        if (activeGameplayCardBankCount <= 0)
+        {
+            return false;
+        }
+
+        foreach (var pair in activeGameplayCounts)
+        {
+            if (pair.Value > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static void PopulateSeedCompatibilityCollections(
         IReadOnlyList<SeedCardDto> sortedSlotCards,
         Dictionary<int, int> activeGameplayCounts,

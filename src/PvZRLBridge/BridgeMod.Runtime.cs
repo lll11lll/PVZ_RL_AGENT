@@ -218,8 +218,9 @@ public sealed partial class BridgeMod
     private static int EncodeAction(int seedSlotIndex, int row, int column, int rows, int columns) =>
         1 + seedSlotIndex * rows * columns + row * columns + column;
 
-    private int GetActionCount(int rows, int columns, int seedSlotCount = 0) =>
-        1 + Math.Max(seedSlotCount, _config.PlantTypes.Count) * SafePositive(rows, _config.FallbackRows) * SafePositive(columns, _config.FallbackColumns);
+    internal const int MaintainedActionCount = 701;
+
+    private int GetActionCount(int rows, int columns, int seedSlotCount = 0) => MaintainedActionCount;
 
     private DecodedAction DecodeAction(int action, ObservationDto? observation = null)
     {

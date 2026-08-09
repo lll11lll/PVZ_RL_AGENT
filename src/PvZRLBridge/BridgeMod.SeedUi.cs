@@ -321,7 +321,12 @@ public sealed partial class BridgeMod
             sortedSlotCards,
             activeGameplayCounts,
             _seedRuntimeCache.CachedPlantCosts);
-        var requiredGameplayCounts = BuildTypeCounts(_config.PlantTypes);
+        // The configured plant types are the startup model contract, not the
+        // active dynamic curriculum loadout. The active CardUI bank is the
+        // runtime readiness source; Python validates the requested identities.
+        var activeGameplaySeedBankReady = BridgeObservationHelpers.IsActiveGameplaySeedBankReady(
+            probe.ActiveGameplayCardBankCards.Count,
+            activeGameplayCounts);
         _seedRuntimeCache.Valid = true;
         _seedRuntimeCache.SeedSelectionActive = probe.SeedSelectionActive;
         _seedRuntimeCache.SeedSelectionPanelActive = probe.SeedSelectionPanelActive;
@@ -329,9 +334,9 @@ public sealed partial class BridgeMod
         _seedRuntimeCache.BlockingRewardUiActive = probe.BlockingRewardUiActive;
         _seedRuntimeCache.GameplayReady = probe.GameplayReady;
         _seedRuntimeCache.ActualGameplayReady = probe.GameplayReady &&
-                                                !probe.SeedSelectionActive &&
-                                                !probe.BlockingRewardUiActive &&
-                                                CountsCover(activeGameplayCounts, requiredGameplayCounts);
+                                                 !probe.SeedSelectionActive &&
+                                                 !probe.BlockingRewardUiActive &&
+                                                 activeGameplaySeedBankReady;
         _seedRuntimeCache.ActiveGameplayCardBankCount = probe.ActiveGameplayCardBankCards.Count;
         _seedRuntimeCache.ActiveGameplayTypeCounts.Clear();
         foreach (var pair in activeGameplayCounts)
