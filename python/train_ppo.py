@@ -1436,6 +1436,11 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
                 config.get("new_unlock_guarantee_episodes", DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES)
                 or 0
             ),
+            curriculum_state_path=(
+                config.get("curriculum_state_path")
+                or config.get("streamer_curriculum_state_path")
+                or (Path(config["run_dir"]) / "curriculum_state.json")
+            ),
             seed_order_source=str(config.get("seed_order_source", "default_canonical")),
             randomize_seed_order=bool(config.get("randomize_seed_order", False)),
             infer_capacity_from_unlocks=bool(config.get("infer_capacity_from_unlocks", True)),
@@ -3203,6 +3208,8 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
             )
             cycle_now = cycle_before + max(0, current_steps - starting_model_steps)
             try:
+                if isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+                    pvz_env.persist_curriculum_state()
                 checkpoint_model.save(str(temporary))
                 manager = StreamerCheckpointManager(
                     Path(str(config.get("streamer_experiment_dir") or config["run_dir"])),
@@ -3376,6 +3383,8 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
             streamer_runtime_status["phase_handoff_actions"] = int(
                 streamer_phase_handoff_actions
             )
+        if isinstance(pvz_env, AdventureGeneralistTrainingEnv):
+            pvz_env.persist_curriculum_state()
         vec_env.close()
     elapsed = max(1e-6, time.perf_counter() - started)
     timesteps = int(getattr(model, "num_timesteps", config["total_timesteps"]))
@@ -3714,6 +3723,9 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
                 "streamer_cycle": int(cycle),
                 "streamer_phase": STREAM_TRAIN,
                 "streamer_experiment_dir": str(Path(str(config["run_dir"]))),
+                "streamer_curriculum_state_path": str(
+                    Path(str(config["run_dir"])) / "curriculum_state.json"
+                ),
                 "streamer_preserve_bc_rng_state": bool(source_record),
                 "streamer_cycle_policy_steps_completed_before": int(
                     prior_training.get("ppo_policy_timesteps", 0) or 0

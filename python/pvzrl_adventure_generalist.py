@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from collections import Counter
@@ -60,6 +61,7 @@ BLOCKED_STARTUP_VALIDATION_FAILED = "adventure_generalist_startup_validation_fai
 SEED_ORDER_SOURCE_EXPLICIT = "explicit_config"
 SEED_ORDER_SOURCE_DEFAULT = "default_canonical"
 SEED_ORDER_SOURCE_RANDOMIZED = "randomized"
+CURRICULUM_STATE_SCHEMA_VERSION = 1
 
 SEED_PRIORITY = [
     "SunFlower",
@@ -189,6 +191,8 @@ class AdventureGeneralistProgress:
     frontier_replay_supported: bool = True
     frontier_replay_blocked_reason: str = ""
     frontier_mastered_levels: List[int] = field(default_factory=list)
+    loadout_provenance: List[Dict[str, Any]] = field(default_factory=list)
+    per_seed_diagnostics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -254,22 +258,49 @@ class AdventureSeedCurriculum:
         self.unlock_episode: Dict[str, int] = {}
         self.unlock_order: List[str] = []
         self.rotation_cursor = 0
+        self.rng = random.Random()
         self.episode_index = 0
         self.episodes_included: Dict[str, int] = {}
+        self.episodes_eligible: Dict[str, int] = {}
+        self.model_actions_executed: Dict[str, int] = {}
+        self.viewer_actions_executed: Dict[str, int] = {}
+        self.bc_demonstrations_recorded: Dict[str, int] = {}
+        self.last_included_episode: Dict[str, int] = {}
+        self.last_eligible_episode: Dict[str, int] = {}
+        self.confirmed_selectable_history: List[str] = []
         self.guarantees: Dict[str, UnlockGuaranteeState] = {}
         self.last_committed_loadout: List[str] = []
         for seed in BASE_UNLOCKED_SEEDS:
             name = canonicalize_seed_name(seed)
             self.unlock_episode[name] = 0
             self.episodes_included.setdefault(name, 0)
+            self.episodes_eligible.setdefault(name, 0)
+            self.model_actions_executed.setdefault(name, 0)
+            self.viewer_actions_executed.setdefault(name, 0)
+            self.bc_demonstrations_recorded.setdefault(name, 0)
             if name not in self.unlock_order:
                 self.unlock_order.append(name)
         for seed in self.initial_loadout:
             name = canonicalize_seed_name(seed)
             self.unlock_episode[name] = 0
             self.episodes_included.setdefault(name, 0)
+            self.episodes_eligible.setdefault(name, 0)
+            self.model_actions_executed.setdefault(name, 0)
+            self.viewer_actions_executed.setdefault(name, 0)
+            self.bc_demonstrations_recorded.setdefault(name, 0)
             if name not in self.unlock_order:
                 self.unlock_order.append(name)
+
+    def _ensure_seed_diagnostic(self, seed: Any) -> str:
+        name = canonicalize_seed_name(seed)
+        if not name:
+            return ""
+        self.episodes_included.setdefault(name, 0)
+        self.episodes_eligible.setdefault(name, 0)
+        self.model_actions_executed.setdefault(name, 0)
+        self.viewer_actions_executed.setdefault(name, 0)
+        self.bc_demonstrations_recorded.setdefault(name, 0)
+        return name
 
     def record_unlocked(self, seeds: Iterable[str], episode_index: Optional[int] = None) -> List[str]:
         episode = self.episode_index if episode_index is None else int(episode_index)
@@ -285,9 +316,199 @@ class AdventureSeedCurriculum:
                     seed=name,
                     required_inclusions=self.new_unlock_guarantee_episodes,
                 )
-            self.episodes_included.setdefault(name, 0)
+            self._ensure_seed_diagnostic(name)
+            if name not in self.confirmed_selectable_history:
+                self.confirmed_selectable_history.append(name)
             newly_unlocked.append(name)
         return _ordered_by_priority(newly_unlocked)
+
+    def record_confirmed_selectable(self, seeds: Iterable[str]) -> List[str]:
+        confirmed: List[str] = []
+        for seed in _canonical_seed_sequence(seeds):
+            name = self._ensure_seed_diagnostic(seed)
+            if not name:
+                continue
+            if name not in self.confirmed_selectable_history:
+                self.confirmed_selectable_history.append(name)
+                confirmed.append(name)
+        return _ordered_by_priority(confirmed)
+
+    def record_eligible(self, seeds: Iterable[str], episode_index: Optional[int] = None) -> None:
+        episode = self.episode_index if episode_index is None else int(episode_index)
+        for seed in _canonical_seed_sequence(seeds):
+            name = canonicalize_seed_name(seed)
+            if not name or name not in self.unlock_episode:
+                continue
+            self._ensure_seed_diagnostic(name)
+            if self.last_eligible_episode.get(name) == episode:
+                continue
+            self.episodes_eligible[name] = int(self.episodes_eligible.get(name, 0)) + 1
+            self.last_eligible_episode[name] = episode
+
+    def record_action_usage(self, seed: Any, *, source: str) -> None:
+        name = canonicalize_seed_name(seed)
+        if not name or name not in self.unlock_episode:
+            return
+        self._ensure_seed_diagnostic(name)
+        normalized_source = str(source or "model").strip().lower()
+        if normalized_source == "viewer":
+            self.viewer_actions_executed[name] = int(self.viewer_actions_executed.get(name, 0)) + 1
+        else:
+            self.model_actions_executed[name] = int(self.model_actions_executed.get(name, 0)) + 1
+
+    def record_bc_demonstration(self, seed: Any) -> None:
+        name = canonicalize_seed_name(seed)
+        if not name or name not in self.unlock_episode:
+            return
+        self._ensure_seed_diagnostic(name)
+        self.bc_demonstrations_recorded[name] = int(self.bc_demonstrations_recorded.get(name, 0)) + 1
+
+    def loadout_provenance(self, loadout: Iterable[str]) -> List[Dict[str, Any]]:
+        active_guarantees = {state.seed for state in self.active_guarantees()}
+        core_seen: set[str] = set()
+        provenance: List[Dict[str, Any]] = []
+        for slot_index, seed in enumerate(_canonical_seed_sequence(loadout)):
+            source = "rotation"
+            if seed in self.core_seed_names and seed not in core_seen:
+                source = "core"
+                core_seen.add(seed)
+            elif seed in active_guarantees:
+                source = "guaranteed_unlock"
+            provenance.append({"slot_index": int(slot_index), "seed": seed, "source": source})
+        return provenance
+
+    def per_seed_diagnostics(
+        self,
+        *,
+        selected_loadout: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        names = set(self.unlock_episode)
+        names.update(self.episodes_included)
+        names.update(self.episodes_eligible)
+        names.update(self.model_actions_executed)
+        names.update(self.viewer_actions_executed)
+        names.update(self.bc_demonstrations_recorded)
+        names.update(self.core_seed_names)
+        selected_names = set(_canonical_seed_sequence(selected_loadout or []))
+        result: Dict[str, Dict[str, Any]] = {}
+        for name in self._unlock_ordered(names):
+            state = self.guarantees.get(name)
+            result[name] = {
+                "episodes_eligible": int(self.episodes_eligible.get(name, 0)),
+                "episodes_included": int(self.episodes_included.get(name, 0)),
+                "model_actions_executed": int(self.model_actions_executed.get(name, 0)),
+                "viewer_actions_executed": int(self.viewer_actions_executed.get(name, 0)),
+                "bc_demonstrations_recorded": int(self.bc_demonstrations_recorded.get(name, 0)),
+                "last_included_episode": self.last_included_episode.get(name),
+                "currently_core": bool(name in self.core_seed_names),
+                "currently_guaranteed": bool(state is not None and state.pending),
+                "guarantee_remaining": int(state.remaining if state is not None else 0),
+                "current_rotation_weight": float(self.rotation_weight(name)),
+                "currently_selected": bool(name in selected_names),
+                "unlock_episode": int(self.unlock_episode.get(name, 0)),
+                "confirmed_selectable": bool(name in self.confirmed_selectable_history),
+            }
+        return result
+
+    def restore_state(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("curriculum_state_payload_not_object")
+        if int(payload.get("schema_version", 0) or 0) != CURRICULUM_STATE_SCHEMA_VERSION:
+            raise ValueError("curriculum_state_schema_version_mismatch")
+        known_registry_names = {
+            canonicalize_seed_name(entry.get("canonical_name", ""))
+            for entry in registry_entries()
+            if isinstance(entry, dict) and entry.get("canonical_name")
+        }
+        known_names = known_registry_names | set(self.initial_loadout) | set(BASE_UNLOCKED_SEEDS)
+
+        def valid_name(value: Any) -> str:
+            name = canonicalize_seed_name(value)
+            return name if name in known_names else ""
+
+        def restore_counter(key: str) -> Dict[str, int]:
+            raw = payload.get(key, {})
+            if not isinstance(raw, dict):
+                return {}
+            restored: Dict[str, int] = {}
+            for raw_name, raw_value in raw.items():
+                name = valid_name(raw_name)
+                if not name:
+                    continue
+                try:
+                    restored[name] = max(0, int(raw_value or 0))
+                except (TypeError, ValueError):
+                    raise ValueError(f"curriculum_state_invalid_counter:{key}:{raw_name}")
+            return restored
+
+        persisted_order = payload.get("unlock_order", [])
+        if not isinstance(persisted_order, list):
+            raise ValueError("curriculum_state_unlock_order_invalid")
+        persisted_unlock_episode = restore_counter("unlock_episode")
+        for raw_name in persisted_order:
+            name = valid_name(raw_name)
+            if name:
+                persisted_unlock_episode.setdefault(name, 0)
+        self.unlock_episode = {}
+        self.unlock_order = []
+        for seed in list(BASE_UNLOCKED_SEEDS) + list(self.initial_loadout) + list(persisted_order):
+            name = valid_name(seed)
+            if name and name not in self.unlock_episode:
+                self.unlock_episode[name] = int(persisted_unlock_episode.get(name, 0))
+                self.unlock_order.append(name)
+        for name, episode in persisted_unlock_episode.items():
+            if name not in self.unlock_episode:
+                self.unlock_episode[name] = int(episode)
+                self.unlock_order.append(name)
+
+        self.episode_index = max(0, int(payload.get("episode_index", 0) or 0))
+        self.episodes_included = restore_counter("episodes_included")
+        self.episodes_eligible = restore_counter("episodes_eligible")
+        self.model_actions_executed = restore_counter("model_actions_executed")
+        self.viewer_actions_executed = restore_counter("viewer_actions_executed")
+        self.bc_demonstrations_recorded = restore_counter("bc_demonstrations_recorded")
+        self.last_included_episode = restore_counter("last_included_episode")
+        self.last_eligible_episode = restore_counter("last_eligible_episode")
+        self.confirmed_selectable_history = [
+            name for name in _canonical_seed_sequence(payload.get("confirmed_selectable_history", []))
+            if valid_name(name)
+        ]
+        self.rotation_cursor = max(0, int(payload.get("rotation_cursor", 0) or 0))
+        raw_rng_state = payload.get("rng_state")
+        if raw_rng_state is not None:
+            if not isinstance(raw_rng_state, list) or len(raw_rng_state) != 3:
+                raise ValueError("curriculum_state_rng_state_invalid")
+            try:
+                rng_state = (
+                    int(raw_rng_state[0]),
+                    tuple(int(value) for value in raw_rng_state[1]),
+                    raw_rng_state[2],
+                )
+                self.rng.setstate(rng_state)
+            except (TypeError, ValueError, IndexError) as exc:
+                raise ValueError("curriculum_state_rng_state_invalid") from exc
+        self.last_committed_loadout = [
+            name for name in _canonical_seed_sequence(payload.get("last_committed_loadout", []))
+            if valid_name(name)
+        ]
+        restored_guarantees = payload.get("guarantees", {})
+        if not isinstance(restored_guarantees, dict):
+            raise ValueError("curriculum_state_guarantees_invalid")
+        self.guarantees = {}
+        for raw_name, raw_state in restored_guarantees.items():
+            name = valid_name(raw_name)
+            if not name:
+                continue
+            if not isinstance(raw_state, dict):
+                raise ValueError(f"curriculum_state_guarantee_invalid:{raw_name}")
+            required = max(0, int(raw_state.get("required_inclusions", 0) or 0))
+            completed = max(0, min(required, int(raw_state.get("completed_inclusions", 0) or 0)))
+            self.guarantees[name] = UnlockGuaranteeState(name, required, completed)
+        for name in self.unlock_episode:
+            self._ensure_seed_diagnostic(name)
+        for name in self.initial_loadout:
+            if name not in self.confirmed_selectable_history:
+                self.confirmed_selectable_history.append(name)
 
     def unlocked_seeds(self) -> List[str]:
         return _ordered_by_priority(self.unlock_episode.keys())
@@ -412,6 +633,7 @@ class AdventureSeedCurriculum:
             selected = [seed for seed in self.initial_loadout if seed in selectable_set]
             local_reasons = {}
             reason = "explicit_config"
+            loadout_provenance = self.loadout_provenance(selected)
         else:
             selected, local_reasons, reason, guaranteed_selected, proposed_rotation_cursor, loadout_provenance = self._build_component_loadout(
                 capacity=capacity,
@@ -612,6 +834,7 @@ class AdventureSeedCurriculum:
             self.episode_index = max(self.episode_index, int(episode_index))
         for seed in _ordered_unique_seed_names(committed):
             self.episodes_included[seed] = int(self.episodes_included.get(seed, 0)) + 1
+            self.last_included_episode[seed] = int(self.episode_index)
         committed_set = set(committed)
         for seed in decision.guaranteed_seeds:
             state = self.guarantees.get(seed)
@@ -914,7 +1137,7 @@ class AdventureSeedCurriculum:
             if seed in selected:
                 continue
             is_new_seed = seed not in initial_unique
-            if is_new_seed and random.random() > max(self.new_plant_min_inclusion_prob, 0.5):
+            if is_new_seed and self.rng.random() > max(self.new_plant_min_inclusion_prob, 0.5):
                 exclusion_reasons.setdefault(seed, "probability_gate")
                 continue
             selected.append(seed)
@@ -1121,6 +1344,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         strict_startup_validation: bool = True,
         core_seed_names: Optional[Iterable[str]] = None,
         new_unlock_guarantee_episodes: int = DEFAULT_NEW_UNLOCK_GUARANTEE_EPISODES,
+        curriculum_state_path: Optional[Path | str] = None,
     ) -> None:
         super().__init__(config)
         self.run_dir = Path(run_dir)
@@ -1128,6 +1352,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.progress_jsonl_path = self.run_dir / "adventure_training_progress.jsonl"
         self.plant_unlocks_path = self.run_dir / "plant_unlocks.json"
         self.seed_slot_unlocks_path = self.run_dir / "seed_slot_unlocks.json"
+        self.curriculum_state_path = Path(curriculum_state_path) if curriculum_state_path else self.run_dir / "curriculum_state.json"
         self.writer = LiveStatusWriter(live_status_path)
         self.curriculum = AdventureSeedCurriculum(
             initial_loadout=initial_loadout,
@@ -1141,6 +1366,16 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             core_seed_names=core_seed_names,
             new_unlock_guarantee_episodes=new_unlock_guarantee_episodes,
         )
+        self.curriculum_restore_status = "new"
+        self.curriculum_restore_blocked_reason = ""
+        if self.curriculum_state_path.is_file():
+            try:
+                persisted_curriculum = json.loads(self.curriculum_state_path.read_text(encoding="utf-8"))
+                self.curriculum.restore_state(persisted_curriculum)
+                self.curriculum_restore_status = "restored"
+            except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                self.curriculum_restore_blocked_reason = f"curriculum_state_restore_failed:{exc}"
+                raise RuntimeError(f"blocked_reason={self.curriculum_restore_blocked_reason}") from exc
         self.max_seed_slots = SEED_CAPACITY_MAX
         self.max_adventure_levels = max(1, int(max_adventure_levels))
         self.max_attempts_per_level = max(1, int(max_attempts_per_level))
@@ -1159,7 +1394,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "recent_cleared": float(recent_cleared_sample_prob),
             "maintenance": float(maintenance_sample_prob),
         }
-        self.episode_index = 0
+        self.episode_index = int(self.curriculum.episode_index)
         self.current_sample_source = "frontier"
         self.configured_seed_list = list(self.curriculum.initial_loadout)
         self.seed_order_source = _normalize_seed_order_source(seed_order_source)
@@ -1177,6 +1412,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         self.rejected_priority_seeds: List[Dict[str, str]] = []
         self.confirmed_unlock_event_seeds: List[str] = []
         self.current_loadout = list(initial_loadout[: self.observed_seed_bank_capacity])
+        self.current_loadout_provenance = self.curriculum.loadout_provenance(self.current_loadout)
         self.current_loadout_reason = "initial"
         self.current_seed_order_source = self.seed_order_source
         self.current_seed_order_preserved = _seed_order_preserved(self.configured_seed_list, self.current_loadout)
@@ -1219,6 +1455,13 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             **self._capacity_context_fields(),
             "inactive_model_slots": max(0, self.max_seed_slots - len(self.current_loadout)),
             "loadout_reason": self.current_loadout_reason,
+            "loadout_provenance": list(self.current_loadout_provenance),
+            "per_seed_diagnostics": self.curriculum.per_seed_diagnostics(
+                selected_loadout=self.current_loadout
+            ),
+            "curriculum_state_path": str(self.curriculum_state_path),
+            "curriculum_restore_status": self.curriculum_restore_status,
+            "curriculum_restore_blocked_reason": self.curriculum_restore_blocked_reason,
             "excluded_new_plants": list(self.current_excluded_new_plants),
             "current_level": self.current_level,
             "current_attempt": 0,
@@ -1270,6 +1513,74 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                     "frontier_replay_blocked_reason": BLOCKED_FRONTIER_REPLAY_REQUIRED,
                 }
             )
+        self._persist_curriculum_state()
+
+    def persist_curriculum_state(self) -> None:
+        """Atomically persist curriculum and per-seed usage outside PPO tensors."""
+
+        curriculum = self.curriculum
+        rng_state = curriculum.rng.getstate()
+        payload = {
+            "schema_version": CURRICULUM_STATE_SCHEMA_VERSION,
+            "model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
+            "updated_at": time.time(),
+            "episode_index": int(self.episode_index),
+            "unlock_order": list(curriculum.unlock_order),
+            "unlock_episode": dict(sorted(curriculum.unlock_episode.items())),
+            "confirmed_selectable_history": list(curriculum.confirmed_selectable_history),
+            "guarantees": {
+                name: {
+                    "seed": state.seed,
+                    "required_inclusions": int(state.required_inclusions),
+                    "completed_inclusions": int(state.completed_inclusions),
+                    "remaining": int(state.remaining),
+                    "pending": bool(state.pending),
+                }
+                for name, state in sorted(curriculum.guarantees.items())
+            },
+            "episodes_eligible": dict(sorted(curriculum.episodes_eligible.items())),
+            "episodes_included": dict(sorted(curriculum.episodes_included.items())),
+            "model_actions_executed": dict(sorted(curriculum.model_actions_executed.items())),
+            "viewer_actions_executed": dict(sorted(curriculum.viewer_actions_executed.items())),
+            "bc_demonstrations_recorded": dict(sorted(curriculum.bc_demonstrations_recorded.items())),
+            "last_included_episode": dict(sorted(curriculum.last_included_episode.items())),
+            "last_eligible_episode": dict(sorted(curriculum.last_eligible_episode.items())),
+            "rotation_cursor": int(curriculum.rotation_cursor),
+            "rng_state": [
+                rng_state[0],
+                list(rng_state[1]),
+                rng_state[2],
+            ],
+            "last_committed_loadout": list(curriculum.last_committed_loadout),
+            "current_loadout": list(self.current_loadout),
+            "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+            "per_seed_diagnostics": curriculum.per_seed_diagnostics(
+                selected_loadout=self.current_loadout
+            ),
+        }
+        path_value = getattr(self, "curriculum_state_path", None)
+        if path_value is None:
+            run_dir = getattr(self, "run_dir", None)
+            if run_dir is None:
+                # Keep bridge-free legacy test doubles and recovery probes
+                # usable; real environments always set this path in __init__.
+                return
+            path_value = Path(run_dir) / "curriculum_state.json"
+            self.curriculum_state_path = path_value
+        path = Path(path_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(str(temporary), str(path))
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _persist_curriculum_state(self) -> None:
+        self.persist_curriculum_state()
 
     def _raise_if_hard_blocked(self) -> None:
         blocked_reason = str(getattr(self, "_hard_blocked_reason", "") or "")
@@ -1694,6 +2005,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "selected_seeds": list(self.current_loadout),
                 "selected_loadout": list(self.current_loadout),
                 "selected_loadout_count": len(self.current_loadout),
+                "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+                "per_seed_diagnostics": self.curriculum.per_seed_diagnostics(
+                    selected_loadout=self.current_loadout
+                ),
                 "seed_order_source": self.current_seed_order_source,
                 "seed_order_preserved": bool(self.current_seed_order_preserved),
                 "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
@@ -1745,6 +2060,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
     def step(self, action: int):  # type: ignore[override]
         self._assert_episode_slot_identity()
         encoded, reward, terminated, truncated, info = super().step(action)
+        self._record_seed_usage_from_step(info)
         self.context.update(
             {
                 "status": "running",
@@ -1772,6 +2088,102 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         if terminated or truncated:
             self._finish_episode(info)
         return encoded, reward, terminated, truncated, info
+
+    def _seed_name_for_action_info(
+        self,
+        info: Dict[str, Any],
+        *,
+        slot_override: Optional[int] = None,
+    ) -> str:
+        action_result = info.get("action_result") if isinstance(info, dict) else None
+        action_result = action_result if isinstance(action_result, dict) else {}
+        decision = action_result.get("actionDecision")
+        decision = decision if isinstance(decision, dict) else {}
+        intent = decision.get("intent")
+        intent = intent if isinstance(intent, dict) else {}
+        slot_value = slot_override
+        if slot_value is None:
+            slot_value = intent.get("seed_slot")
+        try:
+            slot_index = int(slot_value) if slot_value is not None else -1
+        except (TypeError, ValueError):
+            slot_index = -1
+        if 0 <= slot_index < len(self.current_loadout):
+            return canonicalize_seed_name(self.current_loadout[slot_index])
+        selected_type = decision.get("selected_plant_type", -1)
+        if selected_type in (None, -1):
+            decoded = action_result.get("decoded")
+            if isinstance(decoded, dict):
+                selected_type = decoded.get("plantType", decoded.get("ingredientPlantType", -1))
+        try:
+            name = canonicalize_seed_name(plant_type_name(int(selected_type)))
+        except (TypeError, ValueError):
+            return ""
+        return name if name in self.curriculum.unlock_episode else ""
+
+    def _record_seed_usage_from_step(self, info: Dict[str, Any]) -> None:
+        if not isinstance(info, dict):
+            return
+        source = str(info.get("action_source") or "MODEL").strip().upper()
+        if source == "TWITCH":
+            transition = info.get("streamer_transition")
+            diagnostics = info.get("streamer_viewer_diagnostics")
+            verified = bool(
+                isinstance(transition, dict)
+                and transition.get("execution_succeeded")
+                and str(transition.get("execution_status") or "") == "executed_verified"
+            )
+            if not verified and isinstance(diagnostics, dict):
+                verified = str(diagnostics.get("execution_status") or "") == "executed_verified"
+            last_action = getattr(self, "_streamer_v1_last_action", {}) or {}
+            slot_override = last_action.get("requested_slot") if isinstance(last_action, dict) else None
+            if verified:
+                seed = self._seed_name_for_action_info(info, slot_override=slot_override)
+                self.curriculum.record_action_usage(seed, source="viewer")
+                self.context["per_seed_diagnostics"] = self.curriculum.per_seed_diagnostics(
+                    selected_loadout=self.current_loadout
+                )
+                try:
+                    self.persist_curriculum_state()
+                except Exception as exc:
+                    self.context["curriculum_persistence_error"] = str(exc)
+            return
+        seed = self._seed_name_for_action_info(info)
+        self.curriculum.record_action_usage(seed, source="model")
+        self.context["per_seed_diagnostics"] = self.curriculum.per_seed_diagnostics(
+            selected_loadout=self.current_loadout
+        )
+
+    def record_streamer_bc_result(
+        self,
+        *,
+        action_id: int,
+        observation_revision: str,
+        recorded: bool,
+        reject_reason: str = "",
+    ) -> None:
+        super().record_streamer_bc_result(
+            action_id=action_id,
+            observation_revision=observation_revision,
+            recorded=recorded,
+            reject_reason=reject_reason,
+        )
+        if not recorded:
+            return
+        last_action = getattr(self, "_streamer_v1_last_action", {}) or {}
+        slot_override = last_action.get("requested_slot") if isinstance(last_action, dict) else None
+        seed = self._seed_name_for_action_info(
+            {"action_result": {"actionDecision": {"intent": {"seed_slot": slot_override}}}},
+            slot_override=slot_override,
+        )
+        self.curriculum.record_bc_demonstration(seed)
+        self.context["per_seed_diagnostics"] = self.curriculum.per_seed_diagnostics(
+            selected_loadout=self.current_loadout
+        )
+        try:
+            self._persist_curriculum_state()
+        except Exception as exc:
+            self.context["curriculum_persistence_error"] = str(exc)
 
     def _assert_episode_slot_identity(self) -> None:
         """Reject action-slot remapping after gameplay has started."""
@@ -2067,6 +2479,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             sample_source=self.current_sample_source,
             result=result,
             selected_loadout=list(self.current_loadout),
+            loadout_provenance=list(getattr(self, "current_loadout_provenance", [])),
             configured_seed_list=list(self.configured_seed_list),
             selected_loadout_count=selected_loadout_count,
             active_seed_slot_count=selected_loadout_count,
@@ -2122,9 +2535,13 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             frontier_replay_supported=bool(self.frontier_replay_supported),
             frontier_replay_blocked_reason=str(self.frontier_replay_blocked_reason or frontier_replay_blocked_reason or ""),
             frontier_mastered_levels=list(self.frontier_mastered_levels),
+            per_seed_diagnostics=self.curriculum.per_seed_diagnostics(
+                selected_loadout=self.current_loadout
+            ),
         )
         self._append_progress(progress)
         self.episode_index += 1
+        self.curriculum.episode_index = int(self.episode_index)
         self.context.update(
             {
                 "state": "EPISODE_COMPLETE",
@@ -2143,6 +2560,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "selected_seeds": list(self.current_loadout),
                 "selected_loadout": list(self.current_loadout),
                 "selected_loadout_count": selected_loadout_count,
+                "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+                "per_seed_diagnostics": self.curriculum.per_seed_diagnostics(
+                    selected_loadout=self.current_loadout
+                ),
                 "seed_order_source": self.current_seed_order_source,
                 "seed_order_preserved": bool(self.current_seed_order_preserved),
                 "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
@@ -2172,6 +2593,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "post_win_transition_allowed": bool(self.context.get("post_win_transition_allowed", False)),
             }
         )
+        self._persist_curriculum_state()
         self._write_unlock_files()
         self.writer.write(build_live_status(self, self.context, last_info=info))
 
@@ -2283,6 +2705,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         curriculum_snapshot = {
             "episode_index": int(curriculum.episode_index),
             "episodes_included": dict(curriculum.episodes_included),
+            "last_included_episode": dict(curriculum.last_included_episode),
             "completed_inclusions": {
                 name: int(state.completed_inclusions)
                 for name, state in curriculum.guarantees.items()
@@ -2294,6 +2717,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         config_plant_types = list(self.config.plant_types)
         base_seed_list = list(self.base.config.seed_list)
         base_plant_types = list(self.base.config.plant_types)
+        previous_loadout = list(self.current_loadout)
+        previous_provenance = list(getattr(self, "current_loadout_provenance", []))
         try:
             self._apply_loadout(proposed)
             curriculum.commit_loadout(
@@ -2301,6 +2726,11 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 selected_loadout=proposed,
                 episode_index=self.episode_index,
             )
+            self.current_loadout = list(proposed)
+            self.current_loadout_provenance = list(
+                decision.loadout_provenance or curriculum.loadout_provenance(proposed)
+            )
+            self._persist_curriculum_state()
         except Exception as exc:
             self.config.seed_list = config_seed_list
             self.config.plant_types = config_plant_types
@@ -2308,15 +2738,21 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             self.base.config.plant_types = base_plant_types
             curriculum.episode_index = curriculum_snapshot["episode_index"]
             curriculum.episodes_included = curriculum_snapshot["episodes_included"]
+            curriculum.last_included_episode = curriculum_snapshot["last_included_episode"]
             curriculum.rotation_cursor = curriculum_snapshot["rotation_cursor"]
             curriculum.last_committed_loadout = curriculum_snapshot["last_committed_loadout"]
             for name, completed in curriculum_snapshot["completed_inclusions"].items():
                 if name in curriculum.guarantees:
                     curriculum.guarantees[name].completed_inclusions = completed
+            self.current_loadout = previous_loadout
+            self.current_loadout_provenance = previous_provenance
             self.context["seed_selection_commit_blocked_reason"] = f"commit_failed:{exc}"
             return False
 
         self.current_loadout = list(proposed)
+        self.current_loadout_provenance = list(
+            decision.loadout_provenance or curriculum.loadout_provenance(proposed)
+        )
         self.current_loadout_reason = str(decision.loadout_reason or "")
         self.current_seed_order_source = str(decision.seed_order_source or self.seed_order_source)
         self.current_seed_order_preserved = bool(decision.seed_order_preserved)
@@ -2363,7 +2799,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 "loadout_reason": self.current_loadout_reason,
                 "excluded_new_plants": list(self.current_excluded_new_plants),
                 "guaranteed_seeds": list(decision.guaranteed_seeds),
-                "loadout_provenance": list(decision.loadout_provenance),
+                "loadout_provenance": list(self.current_loadout_provenance),
+                "per_seed_diagnostics": curriculum.per_seed_diagnostics(
+                    selected_loadout=self.current_loadout
+                ),
                 "curriculum_rotation_cursor": int(self.curriculum.rotation_cursor),
             }
         )
@@ -2393,7 +2832,9 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         candidate_evidence = _filter_supported_seed_names(
             list(selectable) + list(capacity_inference.available_priority_seeds)
         )
+        self.curriculum.record_confirmed_selectable(candidate_evidence)
         self.curriculum.record_unlocked(candidate_evidence, self.episode_index)
+        self.curriculum.record_eligible(candidate_evidence, self.episode_index)
         eligible_seeds = self.curriculum.eligible_seeds()
         unlocked_seeds = self.curriculum.unlocked_seeds()
         available_for_seed_validation, validation_source = _available_for_seed_validation(
@@ -2716,6 +3157,11 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
 
     def _write_unlock_files(self) -> None:
         selected_count = len(self.current_loadout)
+        curriculum_state_path = getattr(
+            self,
+            "curriculum_state_path",
+            Path(getattr(self, "run_dir", Path("."))) / "curriculum_state.json",
+        )
         unlock_payload = {
             "updated_at": time.time(),
             "unlocked_seeds": self.curriculum.unlocked_seeds(),
@@ -2725,6 +3171,12 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "loadout_reason": self.current_loadout_reason,
             "configured_seed_list": list(self.configured_seed_list),
             "selected_loadout": list(self.current_loadout),
+            "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+            "per_seed_diagnostics": self.curriculum.per_seed_diagnostics(
+                selected_loadout=self.current_loadout
+            ),
+            "curriculum_state_path": str(curriculum_state_path),
+            "curriculum_state_schema_version": CURRICULUM_STATE_SCHEMA_VERSION,
             "seed_order_source": self.current_seed_order_source,
             "seed_order_preserved": bool(self.current_seed_order_preserved),
             "seed_order_blocked_reason": self.current_seed_order_blocked_reason,
@@ -2745,6 +3197,12 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "inactive_model_slots": max(0, self.max_seed_slots - selected_count),
             "configured_seed_list": list(self.configured_seed_list),
             "selected_loadout": list(self.current_loadout),
+            "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+            "per_seed_diagnostics": self.curriculum.per_seed_diagnostics(
+                selected_loadout=self.current_loadout
+            ),
+            "curriculum_state_path": str(curriculum_state_path),
+            "curriculum_state_schema_version": CURRICULUM_STATE_SCHEMA_VERSION,
             "loadout_reason": self.current_loadout_reason,
             "seed_order_source": self.current_seed_order_source,
             "seed_order_preserved": bool(self.current_seed_order_preserved),
