@@ -211,7 +211,7 @@ class LoadoutDecision:
     validation_seeds: List[str] = field(default_factory=list)
     guaranteed_seeds: List[str] = field(default_factory=list)
     proposed_rotation_cursor: int = 0
-    loadout_provenance: List[Dict[str, str]] = field(default_factory=list)
+    loadout_provenance: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -270,6 +270,9 @@ class AdventureSeedCurriculum:
         self.confirmed_selectable_history: List[str] = []
         self.guarantees: Dict[str, UnlockGuaranteeState] = {}
         self.last_committed_loadout: List[str] = []
+        self.last_committed_loadout_provenance: List[Dict[str, Any]] = []
+        self.restored_current_loadout: List[str] = []
+        self.restored_loadout_provenance: List[Dict[str, Any]] = []
         for seed in BASE_UNLOCKED_SEEDS:
             name = canonicalize_seed_name(seed)
             self.unlock_episode[name] = 0
@@ -491,6 +494,30 @@ class AdventureSeedCurriculum:
             name for name in _canonical_seed_sequence(payload.get("last_committed_loadout", []))
             if valid_name(name)
         ]
+        self.restored_current_loadout = [
+            name for name in _canonical_seed_sequence(payload.get("current_loadout", []))
+            if valid_name(name)
+        ]
+        raw_provenance = payload.get("loadout_provenance", [])
+        self.restored_loadout_provenance = []
+        if isinstance(raw_provenance, list):
+            for row in raw_provenance:
+                if not isinstance(row, dict):
+                    continue
+                name = valid_name(row.get("seed", ""))
+                if not name:
+                    continue
+                try:
+                    slot_index = int(row.get("slot_index", len(self.restored_loadout_provenance)))
+                except (TypeError, ValueError):
+                    continue
+                self.restored_loadout_provenance.append(
+                    {
+                        "slot_index": slot_index,
+                        "seed": name,
+                        "source": str(row.get("source", "rotation") or "rotation"),
+                    }
+                )
         restored_guarantees = payload.get("guarantees", {})
         if not isinstance(restored_guarantees, dict):
             raise ValueError("curriculum_state_guarantees_invalid")
@@ -504,6 +531,11 @@ class AdventureSeedCurriculum:
             required = max(0, int(raw_state.get("required_inclusions", 0) or 0))
             completed = max(0, min(required, int(raw_state.get("completed_inclusions", 0) or 0)))
             self.guarantees[name] = UnlockGuaranteeState(name, required, completed)
+        self.last_committed_loadout_provenance = list(self.restored_loadout_provenance)
+        if not self.last_committed_loadout_provenance and self.last_committed_loadout:
+            self.last_committed_loadout_provenance = self.loadout_provenance(
+                self.last_committed_loadout
+            )
         for name in self.unlock_episode:
             self._ensure_seed_diagnostic(name)
         for name in self.initial_loadout:
@@ -774,7 +806,7 @@ class AdventureSeedCurriculum:
         if rotation_candidates:
             proposed_cursor = (proposed_cursor + 1) % len(rotation_candidates)
         provenance = [
-            {"slot_index": str(index), "seed": seed, "source": sources[index]}
+            {"slot_index": int(index), "seed": seed, "source": sources[index]}
             for index, seed in enumerate(selected)
         ]
         return selected[:capacity], exclusion_reasons, reason, guaranteed_selected, proposed_cursor, provenance
@@ -846,6 +878,11 @@ class AdventureSeedCurriculum:
             )
         self.rotation_cursor = int(decision.proposed_rotation_cursor)
         self.last_committed_loadout = list(committed)
+        self.last_committed_loadout_provenance = list(
+            decision.loadout_provenance or self.loadout_provenance(committed)
+        )
+        self.restored_current_loadout = []
+        self.restored_loadout_provenance = []
 
     def _build_rotating_loadout(
         self,
@@ -1520,11 +1557,25 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
 
         curriculum = self.curriculum
         rng_state = curriculum.rng.getstate()
+        persisted_loadout = list(curriculum.last_committed_loadout)
+        persisted_provenance = list(curriculum.last_committed_loadout_provenance)
+        if not persisted_loadout:
+            persisted_loadout = list(
+                getattr(curriculum, "restored_current_loadout", [])
+                or self.current_loadout
+            )
+            persisted_provenance = list(
+                getattr(curriculum, "restored_loadout_provenance", [])
+                or getattr(self, "current_loadout_provenance", [])
+            )
         payload = {
             "schema_version": CURRICULUM_STATE_SCHEMA_VERSION,
             "model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
             "updated_at": time.time(),
-            "episode_index": int(self.episode_index),
+            "episode_index": max(
+                int(self.episode_index),
+                int(curriculum.episode_index),
+            ),
             "unlock_order": list(curriculum.unlock_order),
             "unlock_episode": dict(sorted(curriculum.unlock_episode.items())),
             "confirmed_selectable_history": list(curriculum.confirmed_selectable_history),
@@ -1552,8 +1603,8 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
                 rng_state[2],
             ],
             "last_committed_loadout": list(curriculum.last_committed_loadout),
-            "current_loadout": list(self.current_loadout),
-            "loadout_provenance": list(getattr(self, "current_loadout_provenance", [])),
+            "current_loadout": persisted_loadout,
+            "loadout_provenance": persisted_provenance,
             "per_seed_diagnostics": curriculum.per_seed_diagnostics(
                 selected_loadout=self.current_loadout
             ),
@@ -2712,6 +2763,11 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             },
             "rotation_cursor": int(curriculum.rotation_cursor),
             "last_committed_loadout": list(curriculum.last_committed_loadout),
+            "last_committed_loadout_provenance": list(
+                curriculum.last_committed_loadout_provenance
+            ),
+            "restored_current_loadout": list(curriculum.restored_current_loadout),
+            "restored_loadout_provenance": list(curriculum.restored_loadout_provenance),
         }
         config_seed_list = list(self.config.seed_list)
         config_plant_types = list(self.config.plant_types)
@@ -2741,6 +2797,13 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             curriculum.last_included_episode = curriculum_snapshot["last_included_episode"]
             curriculum.rotation_cursor = curriculum_snapshot["rotation_cursor"]
             curriculum.last_committed_loadout = curriculum_snapshot["last_committed_loadout"]
+            curriculum.last_committed_loadout_provenance = curriculum_snapshot[
+                "last_committed_loadout_provenance"
+            ]
+            curriculum.restored_current_loadout = curriculum_snapshot["restored_current_loadout"]
+            curriculum.restored_loadout_provenance = curriculum_snapshot[
+                "restored_loadout_provenance"
+            ]
             for name, completed in curriculum_snapshot["completed_inclusions"].items():
                 if name in curriculum.guarantees:
                     curriculum.guarantees[name].completed_inclusions = completed

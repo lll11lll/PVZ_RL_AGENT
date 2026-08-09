@@ -11,6 +11,7 @@ from pvzrl_adventure_generalist import (
     AdventureSeedCurriculum,
     CURRICULUM_STATE_SCHEMA_VERSION,
 )
+from pvzrl_sb3 import PvZSB3Config
 
 
 def _curriculum() -> AdventureSeedCurriculum:
@@ -19,6 +20,34 @@ def _curriculum() -> AdventureSeedCurriculum:
         max_seed_slots=4,
         seed_order_source="explicit_config",
         new_unlock_guarantee_episodes=4,
+    )
+
+
+def _real_env(run_dir: Path) -> AdventureGeneralistTrainingEnv:
+    return AdventureGeneralistTrainingEnv(
+        PvZSB3Config(
+            seed_list=list(ADVENTURE_GENERALIST_INITIAL_LOADOUT),
+            plant_types=[1, 1, 0, 0],
+        ),
+        run_dir=run_dir,
+        live_status_path=None,
+        initial_loadout=list(ADVENTURE_GENERALIST_INITIAL_LOADOUT),
+        max_adventure_levels=5,
+        max_attempts_per_level=3,
+        adventure_start_level=1,
+        unlock_aware_seed_curriculum=True,
+        seed_curriculum="conservative",
+        unlock_introduction_delay=0,
+        new_plant_min_inclusion_prob=0.15,
+        seed_order_source="explicit_config",
+        randomize_seed_order=False,
+        infer_capacity_from_unlocks=True,
+        allow_weak_unlocked_capacity_fallback=False,
+        replay_cleared_levels=False,
+        frontier_sample_prob=0.6,
+        recent_cleared_sample_prob=0.3,
+        maintenance_sample_prob=0.1,
+        frontier_win_streak_required=1,
     )
 
 
@@ -122,6 +151,32 @@ def test_stale_curriculum_state_cannot_select_a_seed_absent_from_live_evidence()
     assert "WallNut" not in decision.selected_loadout
     assert "NotARealPlant" not in curriculum.unlock_episode
     assert "NotARealPlant" not in curriculum.per_seed_diagnostics()
+
+
+def test_real_env_restart_preserves_last_committed_loadout_and_state_file(tmp_path: Path) -> None:
+    first = _real_env(tmp_path)
+    first.curriculum.record_unlocked(["WallNut"], episode_index=1)
+    first.curriculum.episode_index = 1
+    decision = first.curriculum.choose_loadout(
+        selectable_seeds=["SunFlower", "Peashooter", "WallNut"],
+        observed_capacity=4,
+        previous_loadout=ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+        validation_seeds=["SunFlower", "Peashooter", "WallNut"],
+    )
+    first.curriculum.commit_loadout(decision, episode_index=1)
+    first.current_loadout = list(decision.selected_loadout)
+    first.current_loadout_provenance = list(decision.loadout_provenance)
+    first.persist_curriculum_state()
+    before = json.loads((tmp_path / "curriculum_state.json").read_text(encoding="utf-8"))
+
+    second = _real_env(tmp_path)
+    after = json.loads((tmp_path / "curriculum_state.json").read_text(encoding="utf-8"))
+    assert second.curriculum_restore_status == "restored"
+    assert second.episode_index == 1
+    assert second.curriculum.last_committed_loadout == decision.selected_loadout
+    assert second.curriculum.guarantee_remaining("WallNut") == 3
+    assert after["current_loadout"] == before["current_loadout"]
+    assert after["loadout_provenance"] == before["loadout_provenance"]
 
 
 def test_rotated_slot_and_verified_streamer_events_update_only_the_right_seed() -> None:
