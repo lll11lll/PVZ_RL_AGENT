@@ -35,6 +35,10 @@ from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ADVENTURE_IDENTITY_ACTION_COUNT,
     ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    CELLS_PER_SLOT,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
+    is_supported_live_board_geometry,
 )
 from pvzrl_fusion import (
     FUSION_POLICY_NONE,
@@ -97,6 +101,7 @@ from pvzrl_runtime_state import ResetRuntimeState
 from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
+    REWARD_POLICY_VERSION,
     RewardComposition,
     RewardCompositionState,
     RewardConfig,
@@ -175,8 +180,8 @@ class PvZEnvConfig:
     save_freeze_debug_bundle: bool = True
     step_seconds: float = 0.25
     plant_types: List[int] = field(default_factory=lambda: list(GENERALIST_INITIAL_PLANT_TYPES))
-    row_count: int = 5
-    column_count: int = 10
+    row_count: int = DEFAULT_ROWS
+    column_count: int = DEFAULT_COLS
     game_speed: float = 1.0
     game_speed_mode: str = "game_speed"
     seed: int = 12345
@@ -225,6 +230,7 @@ class BridgeTimeoutError(TimeoutError):
 class EpisodeLog:
     policy: str
     episode_index: int
+    reward_policy_version: str = REWARD_POLICY_VERSION
     episode_reward: float = 0.0
     terminal_reason: str = ""
     done_reason: str = "none"
@@ -243,6 +249,16 @@ class EpisodeLog:
     reset_failures: int = 0
     bridge_errors: int = 0
     average_reward_per_step: float = 0.0
+    reward_component_total: float = 0.0
+    reward_unattributed_adjustment_total: float = 0.0
+    reward_components_match: bool = True
+    threat_raw_before: float = 0.0
+    threat_raw_after: float = 0.0
+    threat_before: float = 0.0
+    threat_after: float = 0.0
+    threat_raw_delta: float = 0.0
+    threat_normalized_delta: float = 0.0
+    threat_clipped_delta: float = 0.0
     won: bool = False
     lost: bool = False
     timed_out: bool = False
@@ -305,6 +321,7 @@ class EpisodeLog:
     win_loss_reward_total: float = 0.0
     illegal_penalty_total: float = 0.0
     mower_loss_penalty_total: float = 0.0
+    threat_delta_reward_total: float = 0.0
     danger_delta_reward_total: float = 0.0
     undefended_threat_penalty_total: float = 0.0
     lane_response_reward_total: float = 0.0
@@ -791,6 +808,75 @@ def active_gameplay_bank_state(probe: Dict[str, Any]) -> Tuple[Counter, int]:
     return counts, sum(counts.values())
 
 
+def ordered_runtime_seed_slot_types(payload: Dict[str, Any]) -> List[int]:
+    """Return the exact runtime slot sequence from a canonical bridge payload.
+
+    Gameplay observations expose ``seedSlots`` while seed probes expose
+    ``activeGameplaySeedSlots``.  Both are slot-indexed runtime identities;
+    raw CardUI scan order and configured startup metadata are deliberately not
+    accepted as substitutes.
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    raw_slots: Any = payload.get("seedSlots")
+    if not isinstance(raw_slots, list) or not raw_slots:
+        raw_slots = payload.get("activeGameplaySeedSlots")
+    if not isinstance(raw_slots, list) or not raw_slots:
+        return []
+
+    indexed: List[Tuple[int, int]] = []
+    for fallback_index, raw_slot in enumerate(raw_slots):
+        if not isinstance(raw_slot, dict):
+            return []
+        try:
+            slot_index = int(raw_slot.get("slotIndex", fallback_index))
+            plant_type = int(raw_slot.get("plantType", -999))
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if slot_index < 0 or plant_type < 0:
+            return []
+        indexed.append((slot_index, plant_type))
+
+    indexed.sort(key=lambda item: item[0])
+    if [slot_index for slot_index, _ in indexed] != list(range(len(indexed))):
+        return []
+    return [plant_type for _, plant_type in indexed]
+
+
+def gameplay_slot_identity_verification(
+    observation: Dict[str, Any],
+    requested_sequence: List[int],
+) -> Dict[str, Any]:
+    """Verify the ordered gameplay slots on one canonical gameplay frame."""
+
+    expected = [int(value) for value in requested_sequence]
+    actual = ordered_runtime_seed_slot_types(observation)
+    gameplay_ready = bool(
+        isinstance(observation, dict)
+        and (observation.get("gameplayReady") or observation.get("isGameplayReady"))
+        and not (observation.get("seedSelectionActive") or observation.get("isSeedSelectionScreen"))
+    )
+    exact_identity = bool(actual and actual == expected)
+    if not gameplay_ready:
+        reason = "canonical_gameplay_not_ready"
+    elif not actual:
+        reason = "ordered_runtime_seed_slots_missing"
+    elif actual != expected:
+        reason = "ordered_runtime_seed_slot_identity_mismatch"
+    else:
+        reason = "ok"
+    return {
+        "success": bool(gameplay_ready and exact_identity),
+        "source": "finalObservation.seedSlots",
+        "gameplayReady": bool(gameplay_ready),
+        "requestedSeedTypes": expected,
+        "activeSeedTypes": actual,
+        "activeSeedSlotCount": len(actual),
+        "reason": reason,
+    }
+
+
 def seed_slots_from_observation(observation: Dict[str, Any], fallback_plant_types: List[int]) -> List[Dict[str, Any]]:
     slots = list(observation.get("seedSlots", []) or [])
     if slots:
@@ -846,9 +932,9 @@ class PvZGymEnv:
                 f"Unsupported run_mode: {self.config.run_mode!r}; expected Adventure Generalist "
                 f"train/eval mode ({sorted(ADVENTURE_GENERALIST_RUN_MODES)!r})"
             )
-        if int(self.config.row_count) != 5 or int(self.config.column_count) != 10:
+        if int(self.config.row_count) != DEFAULT_ROWS or int(self.config.column_count) != DEFAULT_COLS:
             raise ValueError(
-                "Adventure Generalist requires a 5x10 board: "
+                "Adventure Generalist requires a fixed 6x10 model board: "
                 f"row_count={self.config.row_count}, column_count={self.config.column_count}"
             )
         if len(self.config.plant_types) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
@@ -911,6 +997,8 @@ class PvZGymEnv:
         self._possible_win_pending_steps = 0
         self._loss_pending_wait_steps = 0
         self._episode_lost_mower_rows: set[int] = set()
+        self._episode_missing_mower_rows: set[int] = set()
+        self._episode_mower_baseline_ready = False
         self._last_fusion_diagnostics: Dict[str, Any] = default_fusion_diagnostics(self.config.fusion_policy)
         rows = max(0, int(self.config.row_count))
         previous_state = getattr(self, "_reward_state", None)
@@ -955,6 +1043,18 @@ class PvZGymEnv:
         baseline = observation if isinstance(observation, dict) else self.previous_observation
         if not isinstance(baseline, dict):
             baseline = {}
+        baseline_rows = max(0, int(self.config.row_count))
+        baseline_active_rows = frozenset()
+        if baseline:
+            baseline_facts = build_step_facts(baseline, self.config.plant_types)
+            baseline_rows = max(0, int(baseline_facts.rows or self.config.row_count))
+            baseline_active_rows = baseline_facts.mower.active_rows or frozenset()
+            self._episode_mower_baseline_ready = bool(
+                baseline_rows > 0
+                and set(range(baseline_rows)).issubset(baseline_active_rows)
+                and int(baseline_facts.mower.logical_count) >= baseline_rows
+                and int(baseline_facts.mower.visible_count) >= baseline_rows
+            )
         print(
             "[corruption-debug] reset corruption trackers "
             f"reason={reason or 'new_attempt'} "
@@ -979,6 +1079,12 @@ class PvZGymEnv:
                 f"zombieCount={baseline.get('zombieCount')} "
                 f"mowerCount={baseline.get('logicalMowerCount')} "
                 f"nextStep={baseline.get('nextStep')}"
+            )
+        if self._episode_mower_baseline_ready:
+            print(
+                "[corruption-baseline] "
+                f"mowers_initialized={[row in baseline_active_rows for row in range(baseline_rows)]} "
+                "classification=stable_gameplay_entry corruption=False"
             )
 
     def start_game(self) -> None:
@@ -2451,7 +2557,10 @@ class PvZGymEnv:
                 final_observation={},
             )
         stable, stable_probe = self._wait_for_stable_seed_selection(
-            timeout=max(1.0, self.config.seed_click_delay * 3.0),
+            # The chooser animates in after Adventure navigation.  One second
+            # is too short on a normal live launch even though the same screen
+            # becomes safely interactive a moment later.
+            timeout=max(3.0, self.config.seed_click_delay * 3.0),
             required_consecutive=2,
         )
         if not stable:
@@ -2656,10 +2765,22 @@ class PvZGymEnv:
         )
         start_invoked = False
         after_start = after_selection
+        immediate_after_start: Dict[str, Any] = {}
+        post_transition_probe: Dict[str, Any] = {}
         final_observation: Dict[str, Any] = {}
         final_gameplay_ready = False
         final_seed_selection_active = bool(after_selection.get("seedSelectionActive"))
         final_active_counts: Counter = Counter()
+        gameplay_slot_verification: Dict[str, Any] = {
+            "success": False,
+            "source": "finalObservation.seedSlots",
+            "gameplayReady": False,
+            "requestedSeedTypes": list(requested_sequence),
+            "activeSeedTypes": [],
+            "activeSeedSlotCount": 0,
+            "reason": "start_not_invoked",
+        }
+        transition_status = "start_not_invoked"
 
         if start_level and pre_start_ok:
             start_log["preStartSelectedBankCount"] = selected_count
@@ -2701,7 +2822,9 @@ class PvZGymEnv:
             )
             actions.extend(str(action) for action in start_response.get("actions", []))
             time.sleep(max(0.0, self.config.post_start_delay))
-            after_start = self.seed_probe()
+            immediate_after_start = self.seed_probe()
+            after_start = immediate_after_start
+            transition_status = "waiting_for_gameplay"
             try:
                 final_observation = self.wait_for_gameplay_ready(
                     timeout=self.config.reset_wait_timeout,
@@ -2712,12 +2835,39 @@ class PvZGymEnv:
             except Exception as exc:
                 start_log["gameplayReadyError"] = str(exc)
                 final_observation = {}
-            final_probe = self.seed_probe()
-            after_start = final_probe
-            final_active_counts, _ = active_gameplay_bank_state(final_probe)
-            final_gameplay_ready = bool(final_observation.get("gameplayReady") or final_probe.get("gameplayReady"))
-            final_seed_selection_active = bool(final_probe.get("seedSelectionActive"))
-            if not final_gameplay_ready and final_seed_selection_active:
+            gameplay_slot_verification = gameplay_slot_identity_verification(
+                final_observation,
+                requested_sequence,
+            )
+            final_gameplay_ready = bool(gameplay_slot_verification.get("success"))
+            if final_gameplay_ready:
+                # The accepted observation is one coherent bridge frame: raw
+                # gameplay readiness, seed-screen inactivity, an active CardUI
+                # bank, and ordered runtime seed slots all agreed.  A separate
+                # UI probe may briefly retain chooser objects after Let's Rock;
+                # keep it as diagnostics but never let it veto this stronger
+                # canonical frame.
+                transition_status = "gameplay_confirmed"
+                post_transition_probe = self.seed_probe()
+            else:
+                # A start click that did not reach canonical gameplay may only
+                # be retried after the chooser is proven interactable and
+                # stable across multiple post-timeout frames.  One stale flag
+                # is not sufficient.
+                stable_seed_screen, stable_probe = self._wait_for_stable_seed_selection(
+                    timeout=max(0.75, self.config.seed_click_delay * 2.0),
+                    required_consecutive=2,
+                )
+                post_transition_probe = stable_probe or self.seed_probe()
+                transition_status = (
+                    "seed_selection_still_interactive"
+                    if stable_seed_screen
+                    else "gameplay_transition_timeout"
+                )
+            after_start = post_transition_probe or immediate_after_start
+            final_active_counts, _ = active_gameplay_bank_state(after_start)
+            final_seed_selection_active = bool(after_start.get("seedSelectionActive"))
+            if not final_gameplay_ready and transition_status == "seed_selection_still_interactive":
                 actions.append("bridge_auto_select_fallback_skipped_after_start_click")
                 start_log["fallbackStart"] = {
                     "ok": False,
@@ -2727,6 +2877,8 @@ class PvZGymEnv:
                 }
             start_log["gameplayReady"] = final_gameplay_ready
             start_log["seedSelectionActiveAfterStart"] = final_seed_selection_active
+            start_log["transitionStatus"] = transition_status
+            start_log["gameplaySlotVerification"] = dict(gameplay_slot_verification)
             start_log["activeGameplayBankMultiset"] = counts_to_entries(final_active_counts)
             start_log["activeGameplayBankMultisetText"] = format_counts(final_active_counts)
         elif start_level:
@@ -2744,8 +2896,6 @@ class PvZGymEnv:
                 or (
                     start_invoked
                     and final_gameplay_ready
-                    and not final_seed_selection_active
-                    and counts_cover(final_active_counts, requested_counts)
                 )
             )
         )
@@ -2761,6 +2911,8 @@ class PvZGymEnv:
                     f"start_invoked={start_invoked} gameplay_ready={final_gameplay_ready} "
                     f"seed_selection_active={final_seed_selection_active} "
                     f"active_bank={format_counts(final_active_counts)} "
+                    f"transition_status={transition_status} "
+                    f"slot_identity={gameplay_slot_verification.get('reason', 'unknown')} "
                     f"requested={format_counts(requested_counts)} "
                     f"start_error={start_failure}"
                 )
@@ -2783,6 +2935,10 @@ class PvZGymEnv:
             start_invoked=start_invoked,
             gameplay_ready_before_start=gameplay_ready_before_start,
             final_observation=final_observation,
+            transition_status=transition_status,
+            gameplay_slot_verification=gameplay_slot_verification,
+            immediate_after_start=immediate_after_start,
+            post_transition_probe=post_transition_probe,
         )
 
     def select_seed_card_once(
@@ -2820,6 +2976,10 @@ class PvZGymEnv:
         start_invoked: bool,
         gameplay_ready_before_start: bool,
         final_observation: Dict[str, Any],
+        transition_status: str = "",
+        gameplay_slot_verification: Optional[Dict[str, Any]] = None,
+        immediate_after_start: Optional[Dict[str, Any]] = None,
+        post_transition_probe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         verification = {
             "success": not missing and selected_counts == requested_counts,
@@ -2847,7 +3007,11 @@ class PvZGymEnv:
             "afterSelectionBeforeStart": after_selection,
             "afterStart": after_start,
             "after": after_start,
+            "immediateAfterStart": dict(immediate_after_start or {}),
+            "postTransitionProbe": dict(post_transition_probe or {}),
             "finalObservation": final_observation,
+            "transitionStatus": str(transition_status or ""),
+            "gameplaySlotVerification": dict(gameplay_slot_verification or {}),
             "message": message,
         }
 
@@ -3721,6 +3885,7 @@ class PvZGymEnv:
             "predicted_result_name": "",
             "fusion_legal": True,
             "fusion_blocked_reason": "",
+            "fusion_runtime_authorized": True,
         }
         intent = fusion_intent_from_candidate(
             candidate,
@@ -3958,6 +4123,7 @@ class PvZGymEnv:
         payload.setdefault("predicted_result_name", str(coach_bridge_command.get("predicted_result_name") or ""))
         payload.setdefault("fusion_legal", True)
         payload.setdefault("fusion_blocked_reason", "")
+        payload.setdefault("fusion_runtime_authorized", True)
         return payload
 
     def _coach_fusion_rejection_reason(
@@ -4117,6 +4283,7 @@ class PvZGymEnv:
             info: Dict[str, Any] = {
                 "action_result": action_result,
                 "reward_breakdown": reward_breakdown,
+                "reward_diagnostics": reward_events,
                 "terminal_hint": observation.get("terminalHint"),
                 "terminal_reason": terminal_reason,
                 "needs_reset": True,
@@ -4260,11 +4427,23 @@ class PvZGymEnv:
             pre_observation,
             self.config.plant_types,
         )
-        pre_step_mask = self.action_mask(pre_observation, facts=pre_step_facts)
+        decision_source = str((coach_context_payload or {}).get("source") or action_source or "direct")
+        canonical_viewer_execution = decision_source.strip().lower() in {
+            "twitch",
+            "viewer",
+        }
+        # Streamer policy restrictions (including tactical masks) constrain
+        # PPO sampling, but they are not physical game legality.  Viewer
+        # execution must validate against the canonical action path for this
+        # exact pre-dispatch observation.
+        pre_step_mask = self.action_mask(
+            pre_observation,
+            facts=pre_step_facts,
+            include_tactical_masks=not canonical_viewer_execution,
+        )
         pre_step_legal_actions = [
             index for index, allowed in enumerate(pre_step_mask) if bool(allowed)
         ]
-        decision_source = str((coach_context_payload or {}).get("source") or action_source or "direct")
         decision_metadata = dict(action_source_metadata or {})
         if coach_context_payload:
             decision_metadata.update(coach_context_payload)
@@ -4276,6 +4455,7 @@ class PvZGymEnv:
             bridge_command=coach_bridge_payload,
             intent=action_intent,
             facts=pre_step_facts,
+            include_tactical_masks=not canonical_viewer_execution,
         )
         pre_step_mask_blocked = bool(requested_action != 0 and not pre_step_decision.legal)
         pre_step_audit: Dict[str, Any] = {}
@@ -4395,6 +4575,7 @@ class PvZGymEnv:
             info = {
                 "action_result": action_result,
                 "reward_breakdown": reward_breakdown,
+                "reward_diagnostics": reward_events,
                 "terminal_hint": observation.get("terminalHint"),
                 "terminal_reason": "bridge_timeout",
                 "done_reason": "env_corruption",
@@ -4641,6 +4822,7 @@ class PvZGymEnv:
         info = {
             "action_result": action_result,
             "reward_breakdown": reward_breakdown,
+            "reward_diagnostics": reward_events,
             "terminal_hint": observation.get("terminalHint"),
             "legal_actions": legal,
             "bridge_legal_actions": self.bridge_legal_actions(observation),
@@ -4837,6 +5019,7 @@ class PvZGymEnv:
         observation: Dict[str, Any],
         *,
         facts: Optional[StepFacts] = None,
+        include_tactical_masks: bool = True,
     ) -> ActionValidationConfig:
         snapshot = facts or self._step_facts_cache.get(
             observation,
@@ -4844,6 +5027,11 @@ class PvZGymEnv:
         )
         rows = int(snapshot.rows or self.config.row_count)
         cols = int(snapshot.columns or self.config.column_count)
+        if not is_supported_live_board_geometry(rows, cols):
+            raise ValueError(
+                "Adventure Generalist supports only 5x10 or 6x10 live boards: "
+                f"row_count={rows}, column_count={cols}"
+            )
         slots = snapshot.seed_slots
         if len(slots) > ADVENTURE_IDENTITY_MAX_SEED_SLOTS:
             raise ValueError(
@@ -4859,12 +5047,21 @@ class PvZGymEnv:
             action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
             plant_types=tuple(int(value) for value in self.config.plant_types),
             max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
-            rows=rows,
-            cols=cols,
+            # Fixed model geometry; ActionValidationContext retains the live
+            # dimensions for bounds checks and masking.
+            rows=self.config.row_count,
+            cols=self.config.column_count,
             fusion_action_mask_enabled=self._fusion_action_mask_enabled(),
-            tactical_masks=bool(getattr(self.config, "tactical_masks", False)),
-            wallnut_tactical_mask=bool(getattr(self.config, "wallnut_tactical_mask", False)),
-            cherrybomb_tactical_mask=bool(getattr(self.config, "cherrybomb_tactical_mask", False)),
+            tactical_masks=bool(
+                include_tactical_masks and getattr(self.config, "tactical_masks", False)
+            ),
+            wallnut_tactical_mask=bool(
+                include_tactical_masks and getattr(self.config, "wallnut_tactical_mask", False)
+            ),
+            cherrybomb_tactical_mask=bool(
+                include_tactical_masks
+                and getattr(self.config, "cherrybomb_tactical_mask", False)
+            ),
             fusion_compatible_pairs=compatible_pairs_for_observation(
                 observation,
                 self.config.plant_types,
@@ -4880,8 +5077,9 @@ class PvZGymEnv:
         action_count: int,
         *,
         facts: Optional[StepFacts] = None,
+        include_tactical_masks: bool = True,
     ) -> Dict[int, str]:
-        if not self._tactical_masks_enabled():
+        if not include_tactical_masks or not self._tactical_masks_enabled():
             return {}
         tactical_enabled = bool(getattr(self.config, "tactical_masks", False))
         wallnut_enabled = tactical_enabled or bool(getattr(self.config, "wallnut_tactical_mask", False))
@@ -4891,7 +5089,7 @@ class PvZGymEnv:
         columns = int(observation.get("columnCount") or 0)
         if rows <= 0 or columns <= 0:
             return {}
-        cells = rows * columns
+        cells = CELLS_PER_SLOT
         rejections: Dict[int, str] = {}
         for action_id in range(1, max(0, int(action_count))):
             encoded = action_id - 1
@@ -4902,7 +5100,9 @@ class PvZGymEnv:
                 if 0 <= slot_index < len(snapshot.seed_slots)
                 else -1
             )
-            row, column = divmod(cell, columns)
+            row, column = divmod(cell, DEFAULT_COLS)
+            if row >= rows or column >= columns:
+                continue
             if plant_type == 3 and wallnut_enabled:
                 allowed, reason = self._wallnut_tactical_action_allowed(
                     observation,
@@ -4929,6 +5129,7 @@ class PvZGymEnv:
         *,
         bridge_actions: Optional[List[int]] = None,
         facts: Optional[StepFacts] = None,
+        include_tactical_masks: bool = True,
     ) -> ActionDecisionCache:
         resolved_bridge_actions = [
             int(action)
@@ -4940,7 +5141,11 @@ class PvZGymEnv:
             observation,
             self.config.plant_types,
         )
-        validation_config = self._action_validation_config(observation, facts=snapshot)
+        validation_config = self._action_validation_config(
+            observation,
+            facts=snapshot,
+            include_tactical_masks=include_tactical_masks,
+        )
         action_count = validation_config.spec.action_count
         restart_screen = is_restart_screen_observation(observation)
         context = build_action_validation_context(
@@ -4959,6 +5164,7 @@ class PvZGymEnv:
             observation,
             action_count,
             facts=snapshot,
+            include_tactical_masks=include_tactical_masks,
         )
         if tactical_rejections:
             tactical = tuple(sorted((int(action), str(reason)) for action, reason in tactical_rejections.items()))
@@ -5005,12 +5211,14 @@ class PvZGymEnv:
         bridge_actions: Optional[List[int]] = None,
         intent: Optional[ActionIntent] = None,
         facts: Optional[StepFacts] = None,
+        include_tactical_masks: bool = True,
     ) -> ActionDecision:
         obs = observation or self.previous_observation or self.observe()
         cache = self._action_cache_for(
             obs,
             bridge_actions=bridge_actions,
             facts=facts,
+            include_tactical_masks=include_tactical_masks,
         )
         action_id = int(action)
         resolved_intent = intent
@@ -5035,6 +5243,7 @@ class PvZGymEnv:
                 frame_identity=cache.context.frame_identity.token,
                 config_fingerprint=cache.context.config_fingerprint,
                 resolved_action_kind=resolved_intent.action_kind,
+                required_sun=0,
                 bridge_authoritative=True,
                 cache_reused=False,
             )
@@ -5052,9 +5261,14 @@ class PvZGymEnv:
         observation: Optional[Dict[str, Any]] = None,
         *,
         facts: Optional[StepFacts] = None,
+        include_tactical_masks: bool = True,
     ) -> List[int]:
         obs = observation or self.previous_observation or self.observe()
-        cache = self._action_cache_for(obs, facts=facts)
+        cache = self._action_cache_for(
+            obs,
+            facts=facts,
+            include_tactical_masks=include_tactical_masks,
+        )
         return [1 if allowed else 0 for allowed in cache.mask]
 
     def mask_diagnostics(
@@ -5128,6 +5342,12 @@ class PvZGymEnv:
                 "mask_all_but_wait_count": 1 if sum(1 for value in current_mask if value) <= 1 else 0,
                 "tactical_mask_block_reason_counts": dict(sorted(tactical_counts.items())),
             }
+        active_slot_diagnostics = self._active_seed_slot_mask_diagnostics(
+            obs,
+            cache,
+            facts=snapshot,
+        )
+        total_legal_action_count = sum(1 for allowed in current_mask if allowed)
         return {
             "legal_actions_by_seed_slot": self._legal_actions_by_seed_slot(
                 obs,
@@ -5140,14 +5360,18 @@ class PvZGymEnv:
                 facts=snapshot,
             ),
             "python_mask_block_reason_counts": dict(sorted(blocked_counts.items())),
-            "python_legal_action_count": sum(1 for allowed in current_mask if allowed),
+            "python_legal_action_count": total_legal_action_count,
             "bridge_legal_action_count": len(bridge_actions),
+            "total_legal_action_count": total_legal_action_count,
+            "wait_legal": bool(current_mask[0]) if current_mask else False,
+            "active_seed_slot_count": len(snapshot.seed_slots),
+            "active_seed_slots": active_slot_diagnostics,
             "slot_readiness_by_seed_slot": self._slot_readiness_by_seed_slot(
                 obs,
                 facts=snapshot,
             ),
             "action_cache": self.action_cache_diagnostics(),
-            **self._fusion_mask_diagnostics(obs, facts=snapshot),
+            **self._fusion_mask_diagnostics(obs, facts=snapshot, cache=cache),
             **tactical_diag,
         }
 
@@ -5292,6 +5516,7 @@ class PvZGymEnv:
         observation: Dict[str, Any],
         *,
         facts: Optional[StepFacts] = None,
+        cache: Optional[ActionDecisionCache] = None,
     ) -> Dict[str, Any]:
         """Classify occupied-tile/seed pairings into fusion mask diagnostics counts."""
 
@@ -5312,6 +5537,10 @@ class PvZGymEnv:
         if rows <= 0 or cols <= 0:
             return out
         snapshot = self._facts_snapshot(observation, facts)
+        decision_cache = cache or self._action_cache_for(
+            observation,
+            facts=snapshot,
+        )
         slots = snapshot.seed_slots
         occupied_cells = {
             cell: plant.plant_type
@@ -5322,6 +5551,17 @@ class PvZGymEnv:
         for (prow, pcol), _existing in occupied_cells.items():
             for slot_index, slot in enumerate(slots):
                 seed_slot_index = int(slot.slot_index if slot.slot_index >= 0 else slot_index)
+                action_id = (
+                    1
+                    + seed_slot_index * CELLS_PER_SLOT
+                    + prow * DEFAULT_COLS
+                    + pcol
+                )
+                decision = (
+                    decision_cache.decisions[action_id]
+                    if 0 <= action_id < len(decision_cache.decisions)
+                    else None
+                )
                 # Always classify as if fusion were enabled so the disabled case
                 # can report how many compatible fusions are being suppressed.
                 reason = get_fusion_illegal_reason(
@@ -5333,7 +5573,11 @@ class PvZGymEnv:
                     plant_types=self.config.plant_types,
                     facts=snapshot,
                 )
-                if reason == "incompatible_pair":
+                runtime_authorized = action_id in decision_cache.context.bridge_legal_actions
+                if enabled and decision is not None and decision.legal and decision.resolved_action_kind == "fusion":
+                    out["fusion_actions_available_count"] += 1
+                    available_tiles.add((prow, pcol))
+                elif reason == "incompatible_pair" and not runtime_authorized:
                     out["fusion_actions_masked_incompatible_count"] += 1
                 elif reason == "cooldown_not_ready":
                     out["fusion_actions_masked_cooldown_count"] += 1
@@ -5341,10 +5585,13 @@ class PvZGymEnv:
                     out["fusion_actions_masked_sun_count"] += 1
                 elif reason == "":
                     if enabled:
-                        out["fusion_actions_available_count"] += 1
-                        available_tiles.add((prow, pcol))
+                        if decision is not None and decision.legal:
+                            out["fusion_actions_available_count"] += 1
+                            available_tiles.add((prow, pcol))
                     else:
                         out["fusion_actions_masked_disabled_count"] += 1
+                elif not enabled and runtime_authorized:
+                    out["fusion_actions_masked_disabled_count"] += 1
         out["fusion_candidate_tiles"] = sorted(available_tiles)
         return out
     def _legal_actions_by_seed_slot(
@@ -5368,16 +5615,99 @@ class PvZGymEnv:
             actions = []
         rows = int(observation.get("rowCount") or 0)
         columns = int(observation.get("columnCount") or 0)
-        cells = rows * columns
-        if cells <= 0:
+        if rows <= 0 or columns <= 0:
             return counts
         for action in actions:
             if int(action) <= 0:
                 continue
-            slot_index = (int(action) - 1) // cells
+            slot_index = (int(action) - 1) // CELLS_PER_SLOT
             if str(slot_index) in counts:
                 counts[str(slot_index)] += 1
         return counts
+
+    def _active_seed_slot_mask_diagnostics(
+        self,
+        observation: Dict[str, Any],
+        cache: ActionDecisionCache,
+        *,
+        facts: Optional[StepFacts] = None,
+    ) -> List[Dict[str, Any]]:
+        """Explain every active runtime slot against the canonical mask."""
+
+        snapshot = self._facts_snapshot(observation, facts)
+        rows = int(cache.context.rows)
+        columns = int(cache.context.cols)
+        cells = CELLS_PER_SLOT
+        sun = int(cache.context.sun)
+        diagnostics: List[Dict[str, Any]] = []
+        for fallback_index, slot in enumerate(snapshot.seed_slots):
+            slot_index = int(slot.slot_index if slot.slot_index >= 0 else fallback_index)
+            reasons: Counter[str] = Counter()
+            legal_cells = 0
+            bridge_legal_cells = 0
+            if cells > 0:
+                first_action = 1 + slot_index * cells
+                for action_id in range(first_action, first_action + cells):
+                    if action_id in cache.context.bridge_legal_actions:
+                        bridge_legal_cells += 1
+                    if not 0 <= action_id < len(cache.decisions):
+                        reasons["action_out_of_range"] += 1
+                        continue
+                    decision = cache.decisions[action_id]
+                    if decision.legal:
+                        legal_cells += 1
+                    else:
+                        reasons[str(decision.rejection_reason or "filtered")] += 1
+            slot_snapshot = self._seed_slot_snapshot(
+                observation,
+                slot_index,
+                facts=snapshot,
+            )
+            tactical_masked = sum(
+                count for reason, count in reasons.items() if reason.startswith("tactical_")
+            )
+            other_masked = sum(
+                count
+                for reason, count in reasons.items()
+                if reason
+                not in {
+                    "cooldown_not_ready",
+                    "insufficient_sun",
+                    "bridge_legal_actions_missing",
+                    "occupied_cell",
+                }
+                and not reason.startswith("tactical_")
+            )
+            dominant_reason = ""
+            if legal_cells == 0 and reasons:
+                dominant_reason = reasons.most_common(1)[0][0]
+            diagnostics.append(
+                {
+                    "slot_index": slot_index,
+                    "plant_type": int(slot.plant_type),
+                    "plant_identity": slot.plant_type_name
+                    or (plant_type_name(slot.plant_type) if slot.plant_type >= 0 else "unknown"),
+                    "ready": bool(slot.ready),
+                    "usable": bool(slot.usable and not slot.disabled),
+                    "disabled": bool(slot.disabled),
+                    "seed_cost": int(slot.seed_cost),
+                    "cost_source": str(slot_snapshot.get("source") or ""),
+                    "sun": sun,
+                    "affordable": bool(sun >= int(slot.seed_cost)),
+                    "legal_cells": int(legal_cells),
+                    "bridge_legal_cells": int(bridge_legal_cells),
+                    "masked_by_cooldown": int(reasons.get("cooldown_not_ready", 0)),
+                    "masked_by_sun": int(reasons.get("insufficient_sun", 0)),
+                    "masked_by_tactical_masks": int(tactical_masked),
+                    "masked_by_bridge_legality": int(reasons.get("bridge_legal_actions_missing", 0)),
+                    "masked_by_occupancy": int(reasons.get("occupied_cell", 0)),
+                    "masked_by_other": int(other_masked),
+                    "total_legal_actions": int(legal_cells),
+                    "mask_reason_counts": dict(sorted(reasons.items())),
+                    "reason": dominant_reason,
+                }
+            )
+        return diagnostics
 
     def _slot_readiness_by_seed_slot(
         self,
@@ -5450,6 +5780,98 @@ class PvZGymEnv:
     def restore_game_speed(self) -> Dict[str, Any]:
         return self.client.request("restore_game_speed")
 
+    def ensure_gameplay_speed(
+        self,
+        observation: Dict[str, Any],
+        *,
+        timeout: float = 1.0,
+        poll_seconds: float = 0.05,
+    ) -> Dict[str, Any]:
+        """Verify configured speed once at a canonical gameplay boundary.
+
+        The bridge continuously corrects speed drift. This boundary check makes
+        a seed-to-gameplay scene reset observable and re-sends configuration
+        only when the returned gameplay frame proves a mismatch.
+        """
+
+        if not isinstance(observation, dict) or not bool(observation.get("gameplayReady")):
+            return observation
+        if not any(
+            key in observation
+            for key in ("requestedGameSpeed", "effectiveGameSpeed", "gameSpeed")
+        ):
+            # Bridge-free fixtures predate speed diagnostics. Do not invent a
+            # live validation result when the fields are genuinely unavailable.
+            return observation
+
+        desired = max(0.01, float(self.config.game_speed))
+        mode = str(self.config.game_speed_mode or "game_speed").strip().lower()
+
+        def speed_value(payload: Dict[str, Any], key: str) -> Optional[float]:
+            try:
+                value = payload.get(key)
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def matches(payload: Dict[str, Any]) -> bool:
+            requested = speed_value(payload, "requestedGameSpeed")
+            effective = speed_value(payload, "effectiveGameSpeed")
+            unity_time_scale = speed_value(payload, "unityTimeScale")
+            return bool(
+                requested is not None
+                and effective is not None
+                and unity_time_scale is not None
+                and abs(requested - desired) <= 0.001
+                and abs(effective - desired) <= 0.001
+                and abs(unity_time_scale - desired) <= 0.001
+            )
+
+        current = observation
+        reapplied = False
+        effective_before = speed_value(current, "effectiveGameSpeed")
+        time_scale_before = speed_value(current, "unityTimeScale")
+        print(
+            "[game-speed] gameplay entered "
+            f"desired={desired:.1f} "
+            f"effective_before={effective_before if effective_before is not None else 'unknown'} "
+            f"time_scale_before={time_scale_before if time_scale_before is not None else 'unknown'} "
+            f"screenState={current.get('screenState')} "
+            f"gameplayReady={bool(current.get('gameplayReady'))}"
+        )
+        if mode != "safe" and not matches(current):
+            self.configure()
+            reapplied = True
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                current = self.observe()
+                if matches(current) or time.monotonic() >= deadline:
+                    break
+                time.sleep(max(0.0, float(poll_seconds)))
+
+        effective = speed_value(current, "effectiveGameSpeed")
+        requested = speed_value(current, "requestedGameSpeed")
+        unity_time_scale = speed_value(current, "unityTimeScale")
+        applied = f"{desired:.1f}" if reapplied else "not_needed"
+        print(
+            "[game-speed] "
+            f"applied={applied} "
+            f"desired={desired:.1f} "
+            f"requested={requested if requested is not None else 'unknown'} "
+            f"effective_after={effective if effective is not None else 'unknown'} "
+            f"time_scale_after={unity_time_scale if unity_time_scale is not None else 'unknown'} "
+            f"mode={mode} screenState={current.get('screenState')} "
+            f"gameplayReady={bool(current.get('gameplayReady'))} reapplied={reapplied}"
+        )
+        if mode != "safe" and not matches(current):
+            raise RuntimeError(
+                "gameplay_speed_not_applied: "
+                f"desired={desired:.3f} requested={requested} effective={effective} "
+                f"unityTimeScale={unity_time_scale} mode={mode} "
+                f"screenState={current.get('screenState')}"
+            )
+        return current
+
     def close(self) -> None:
         try:
             self.restore_game_speed()
@@ -5460,7 +5882,8 @@ class PvZGymEnv:
     def _encode_action(self, seed_slot_index: int, row: int, column: int, rows: int, cols: int) -> int:
         if seed_slot_index < 0:
             return 0
-        return 1 + seed_slot_index * rows * cols + row * cols + column
+        del rows, cols
+        return 1 + seed_slot_index * CELLS_PER_SLOT + row * DEFAULT_COLS + column
 
     def _environment_safety_diagnostics(
         self,
@@ -5473,6 +5896,7 @@ class PvZGymEnv:
         current_facts: Optional[StepFacts] = None,
     ) -> Dict[str, Any]:
         del action_result
+        baseline_was_ready = bool(self._episode_mower_baseline_ready)
         result = compose_environment_safety_diagnostics(
             previous,
             current,
@@ -5480,6 +5904,8 @@ class PvZGymEnv:
             fallback_plant_types=self.config.plant_types,
             fallback_row_count=self.config.row_count,
             lost_mower_rows=self._episode_lost_mower_rows,
+            missing_mower_rows=self._episode_missing_mower_rows,
+            mower_baseline_ready=self._episode_mower_baseline_ready,
             live_board_progress=self._has_live_board_progress(current),
             post_win_signal_present=self._post_win_signal_present(current),
             cleanup_signal_active=bool(
@@ -5497,6 +5923,17 @@ class PvZGymEnv:
             current_facts=current_facts,
         )
         self._episode_lost_mower_rows = set(result.next_lost_mower_rows)
+        self._episode_missing_mower_rows = set(result.next_missing_mower_rows)
+        self._episode_mower_baseline_ready = bool(result.mower_baseline_ready)
+        if not baseline_was_ready and self._episode_mower_baseline_ready:
+            current_snapshot = current_facts or build_step_facts(current, self.config.plant_types)
+            active_rows = current_snapshot.mower.active_rows or frozenset()
+            rows = max(0, int(current_snapshot.rows or self.config.row_count))
+            print(
+                "[corruption-baseline] "
+                f"mowers_initialized={[row in active_rows for row in range(rows)]} "
+                "classification=initial_materialization corruption=False"
+            )
         return result.diagnostics
     def _facts_snapshot(
         self,
@@ -5586,17 +6023,16 @@ def parse_plant_types(raw: Optional[str]) -> List[int]:
 def decode_action(action: int, observation: Dict[str, Any], plant_types: List[int]) -> Dict[str, int]:
     if action <= 0:
         return {"kind": 0, "slot_index": -1, "plant_type": -1, "row": -1, "column": -1}
-    rows = int(observation.get("rowCount", 0))
-    cols = int(observation.get("columnCount", 0))
-    if rows <= 0 or cols <= 0:
+    live_rows = int(observation.get("rowCount", 0))
+    live_cols = int(observation.get("columnCount", 0))
+    if live_rows <= 0 or live_cols <= 0:
         return {"kind": -1, "slot_index": -1, "plant_type": -1, "row": -1, "column": -1}
-    cells = rows * cols
     encoded = action - 1
-    slot_index = encoded // cells
-    cell = encoded % cells
+    slot_index = encoded // CELLS_PER_SLOT
+    cell = encoded % CELLS_PER_SLOT
     slots = seed_slots_from_observation(observation, plant_types)
     plant_type = int(slots[slot_index].get("plantType", -1)) if 0 <= slot_index < len(slots) else -1
-    return {"kind": 1, "slot_index": slot_index, "plant_type": plant_type, "row": cell // cols, "column": cell % cols}
+    return {"kind": 1, "slot_index": slot_index, "plant_type": plant_type, "row": cell // DEFAULT_COLS, "column": cell % DEFAULT_COLS}
 
 
 def legal_actions_for_plant_type(env: PvZGymEnv, observation: Dict[str, Any], plant_type: int) -> List[int]:
@@ -7670,6 +8106,7 @@ def accumulate_reward_episode_totals(log: EpisodeLog, info: Dict[str, Any]) -> N
     breakdown = info.get("reward_breakdown") if isinstance(info, dict) else {}
     if not isinstance(breakdown, dict):
         return
+    component_sum = 0.0
     for component in REWARD_COMPONENT_FIELDS:
         field_name = f"{component}_total"
         try:
@@ -7677,6 +8114,31 @@ def accumulate_reward_episode_totals(log: EpisodeLog, info: Dict[str, Any]) -> N
         except (TypeError, ValueError):
             continue
         setattr(log, field_name, float(getattr(log, field_name, 0.0)) + value)
+        component_sum += value
+    log.reward_component_total += component_sum
+    try:
+        step_total = float(breakdown.get("reward_total") or 0.0)
+    except (TypeError, ValueError):
+        step_total = component_sum
+    log.reward_unattributed_adjustment_total += step_total - component_sum
+    diagnostics = info.get("reward_diagnostics")
+    if isinstance(diagnostics, dict):
+        log.reward_policy_version = str(
+            diagnostics.get("reward_policy_version") or REWARD_POLICY_VERSION
+        )
+        for field_name in (
+            "threat_raw_before",
+            "threat_raw_after",
+            "threat_before",
+            "threat_after",
+            "threat_raw_delta",
+            "threat_normalized_delta",
+            "threat_clipped_delta",
+        ):
+            try:
+                setattr(log, field_name, float(diagnostics.get(field_name) or 0.0))
+            except (TypeError, ValueError):
+                pass
 
 
 def accumulate_lane_episode_diagnostics(log: EpisodeLog, action: int, info: Dict[str, Any]) -> None:
@@ -8017,6 +8479,10 @@ def run_episode(
     log.lost = log.done_reason == "loss"
     log.timed_out = log.done_reason == "timeout"
     log.actual_terminal = log.done_reason in ("win", "loss")
+    log.reward_components_match = abs(
+        log.episode_reward
+        - (log.reward_component_total + log.reward_unattributed_adjustment_total)
+    ) <= 1e-6
     finalize_lane_episode_diagnostics(log)
     return log
 

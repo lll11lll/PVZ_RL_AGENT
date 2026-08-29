@@ -770,6 +770,11 @@ class HumanCoachOverrideHook:
         match = selected_action == ppo_action
         override = not match
         reward_components = self._base_reward_components(match=match, override=override, legal_execution=True)
+        if command.kind == "fuse":
+            # Reward Policy V2 accounts fusion once in the environment.  A
+            # coach source must not stack match/execution shaping on that same
+            # fusion event.
+            reward_components = {key: 0.0 for key in reward_components}
         reward_delta = sum(reward_components.values())
         if reward_components:
             self.stats.coach_legal_execution_reward_total += reward_components.get(COACH_REWARD_LEGAL_EXECUTION_COMPONENT, 0.0)
@@ -1053,8 +1058,6 @@ class HumanCoachOverrideHook:
                 self.stats.last_fusion_result = "success"
                 self.stats.last_rejected_reason = ""
                 self.stats.last_error = ""
-                if self.reward_enabled:
-                    components[COACH_REWARD_FUSION_SUCCESS_COMPONENT] += self.fusion_success_reward
             elif fusion_attempted:
                 self.stats.fusion_failure_count += 1
                 self.stats.last_fusion_result = "failed"
@@ -1069,8 +1072,6 @@ class HumanCoachOverrideHook:
         tactical_useful = self._is_tactical_useful(decision, info)
         if tactical_useful:
             self.stats.tactical_useful_count += 1
-            if self.reward_enabled:
-                components[COACH_REWARD_TACTICAL_USEFULNESS_COMPONENT] += self.tactical_usefulness_reward
 
         outcome_reward = sum(float(value) for value in components.values())
         if decision.command is None and outcome_reward == 0.0:
@@ -2115,6 +2116,7 @@ def build_env_fusion_probe(
             "mix_lookup_key": mix_lookup_key,
             "fusion_legal": True,
             "fusion_blocked_reason": "",
+            "fusion_runtime_authorized": True,
         }
         if isinstance(selected_candidate, dict):
             candidate_payload.update(_fusion_tactical_metrics(observation, row=row, col=col, candidate=selected_candidate))

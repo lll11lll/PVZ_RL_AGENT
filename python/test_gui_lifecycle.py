@@ -150,8 +150,14 @@ def _bare_dashboard() -> PvZDashboard:
     dashboard.active_process = None
     dashboard.active_process_name = ""
     dashboard.active_process_started_at = None
+    dashboard.active_process_started_wall_time = None
+    dashboard.process_lifecycle_state = "OFFLINE"
+    dashboard.process_lifecycle_detail = ""
     dashboard.live_writer_warning_emitted = False
     dashboard.process_status_var = FakeVar()
+    dashboard.process_lifecycle_var = FakeVar()
+    dashboard.last_good_status = None
+    dashboard.last_live_health = ""
     dashboard.launch_buttons = []
     dashboard.stop_buttons = []
     return dashboard
@@ -299,7 +305,82 @@ def test_launch_process_preserves_popen_contract(tmp_path: Path, monkeypatch: An
     assert captured["kwargs"]["text"] is True
     assert captured["kwargs"]["bufsize"] == 1
     assert dashboard.active_run_path == str((tmp_path / "runs/snapshot").resolve())
-    assert dashboard.process_status_var.value == "Running: training"
+    assert dashboard.process_status_var.value == "STARTING: training"
+
+
+def test_fresh_blocked_streamer_status_prevents_duplicate_backend_launch() -> None:
+    dashboard = _bare_dashboard()
+    dashboard.last_live_health = "BLOCKED_SEED_SELECTION"
+    dashboard.last_good_status = {
+        "status": "blocked",
+        "streamer_v1_enabled": True,
+        "run_mode": "adventure_generalist_14slot_train",
+        "active_run": "runs/external_streamer",
+    }
+    messages: list[str] = []
+    dashboard._append_log = messages.append
+
+    dashboard.launch_process("duplicate", ["python", "train.py"])
+
+    assert dashboard.active_process is None
+    assert dashboard.process_lifecycle_state == "ERROR"
+    assert any("another backend appears active" in message for message in messages)
+
+
+def test_launch_freshly_reads_the_command_status_target_before_popen(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    dashboard = _bare_dashboard()
+    dashboard.project_root = tmp_path
+    dashboard.live_status_path = tmp_path / "previous.json"
+    dashboard._resolve_text_path = lambda raw: (tmp_path / raw).resolve()
+    target = tmp_path / "target" / "live_status.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_mode": "adventure_generalist_14slot_train",
+                "active_run": "runs/external-target",
+            }
+        ),
+        encoding="utf-8",
+    )
+    messages: list[str] = []
+    dashboard._append_log = messages.append
+
+    def forbidden_popen(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("duplicate launch reached Popen")
+
+    monkeypatch.setattr(pvzrl_gui_process.subprocess, "Popen", forbidden_popen)
+    dashboard.launch_process(
+        "duplicate",
+        ["python", "train.py", "--live-status-path", "target/live_status.json"],
+    )
+
+    assert dashboard.active_process is None
+    assert any("another backend appears active" in message for message in messages)
+
+
+def test_intentional_nonzero_stop_is_offline_but_spontaneous_exit_is_error() -> None:
+    stopped = _bare_dashboard()
+    stopped_process = ImmediateExitProcess()
+    stopped_process.returncode = 1
+    stopped.active_process = stopped_process
+    stopped.active_process_name = "training"
+    stopped._stopping_process = stopped_process
+    stopped._handle_process_exit("training", stopped_process, 1)
+    assert stopped.process_lifecycle_state == "OFFLINE"
+    assert stopped.process_lifecycle_detail == "training stopped"
+
+    crashed = _bare_dashboard()
+    crashed_process = ImmediateExitProcess()
+    crashed_process.returncode = 1
+    crashed.active_process = crashed_process
+    crashed.active_process_name = "training"
+    crashed._handle_process_exit("training", crashed_process, 1)
+    assert crashed.process_lifecycle_state == "ERROR"
+    assert crashed.process_lifecycle_detail == "training exited 1"
 
 
 def test_poll_and_log_callbacks_are_tracked_and_bounded() -> None:

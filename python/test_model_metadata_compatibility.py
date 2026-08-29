@@ -7,17 +7,38 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from pvzrl_action_space import (
+    ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    ADVENTURE_IDENTITY_OBSERVATION_VERSION,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
+)
+from pvzrl_adventure_generalist import ADVENTURE_GENERALIST_MODEL_FAMILY
 from pvzrl_model_metadata import (
     format_compatibility_failure,
     model_compatibility_live_status,
     validate_model_metadata,
     write_model_metadata,
 )
+from pvzrl_observation_layout import observation_shape_for_config
+from pvzrl_rewards import REWARD_POLICY_VERSION
 
 
-MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
+MODEL_FAMILY = ADVENTURE_GENERALIST_MODEL_FAMILY
+LEGACY_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
 INITIAL_SEEDS = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
 INITIAL_PLANT_TYPES = [1, 1, 0, 0]
+OBSERVATION_SHAPE = observation_shape_for_config(
+    {
+        "action_space_mode": ACTION_SPACE_ADVENTURE_14_IDENTITY,
+        "max_seed_slots": ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+        "row_count": DEFAULT_ROWS,
+        "column_count": DEFAULT_COLS,
+    }
+)
 
 
 def config(
@@ -30,10 +51,10 @@ def config(
         "model_family": model_family,
         "seed_list": list(seed_list),
         "plant_types": list(plant_types),
-        "action_space_mode": "adventure_14slot_identity",
-        "max_seed_slots": 14,
-        "row_count": 5,
-        "column_count": 10,
+        "action_space_mode": ACTION_SPACE_ADVENTURE_14_IDENTITY,
+        "max_seed_slots": ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+        "row_count": DEFAULT_ROWS,
+        "column_count": DEFAULT_COLS,
         "total_timesteps": 123,
     }
 
@@ -73,6 +94,31 @@ def assert_case(
     }
 
 
+def test_reward_policy_mismatch_warns_but_does_not_block() -> None:
+    with tempfile.TemporaryDirectory(prefix="pvzrl_reward_metadata_test_") as temp_dir:
+        root = Path(temp_dir)
+        model_path = fake_model(root, "legacy_reward", config())
+        metadata_path = model_path.parent / "model_metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["reward_policy_version"] = "legacy_strategy_v1"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        report = validate_model_metadata(
+            model_path,
+            {**config(), "reward_policy_version": REWARD_POLICY_VERSION},
+            model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+            model_observation_shape=OBSERVATION_SHAPE,
+        )
+
+    assert report.ok is True
+    assert report.blocked_reason is None
+    assert any("reward_policy_version_mismatch" in item for item in report.warnings)
+    live = model_compatibility_live_status(report)
+    assert live["model_reward_policy_version"] == "legacy_strategy_v1"
+    assert live["env_reward_policy_version"] == REWARD_POLICY_VERSION
+    assert live["reward_policy_version_mismatch"] is True
+
+
 def main() -> int:
     initial_config = config()
     # Seed inventory may grow/change across Adventure progression without
@@ -87,6 +133,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="pvzrl_metadata_test_") as temp_dir:
         root = Path(temp_dir)
         generalist_model = fake_model(root, "generalist", initial_config)
+        legacy_model = fake_model(
+            root,
+            "legacy_v1_family",
+            config(model_family=LEGACY_MODEL_FAMILY),
+        )
         missing_model = fake_model(root, "missing_metadata", None)
 
         checks = [
@@ -95,8 +146,8 @@ def main() -> int:
                 validate_model_metadata(
                     generalist_model,
                     initial_config,
-                    model_action_count=701,
-                    model_observation_shape=(4297,),
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                    model_observation_shape=OBSERVATION_SHAPE,
                 ),
                 True,
                 None,
@@ -106,8 +157,8 @@ def main() -> int:
                 validate_model_metadata(
                     generalist_model,
                     progressed_config,
-                    model_action_count=701,
-                    model_observation_shape=(4297,),
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                    model_observation_shape=OBSERVATION_SHAPE,
                 ),
                 True,
                 None,
@@ -117,8 +168,19 @@ def main() -> int:
                 validate_model_metadata(
                     generalist_model,
                     wrong_family_config,
-                    model_action_count=701,
-                    model_observation_shape=(4297,),
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                    model_observation_shape=OBSERVATION_SHAPE,
+                ),
+                False,
+                "model_family_mismatch",
+            ),
+            (
+                "C2 historical v1 checkpoint family fails",
+                validate_model_metadata(
+                    legacy_model,
+                    initial_config,
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                    model_observation_shape=OBSERVATION_SHAPE,
                 ),
                 False,
                 "model_family_mismatch",
@@ -128,8 +190,8 @@ def main() -> int:
                 validate_model_metadata(
                     missing_model,
                     initial_config,
-                    model_action_count=701,
-                    model_observation_shape=(4297,),
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
+                    model_observation_shape=OBSERVATION_SHAPE,
                 ),
                 False,
                 "missing_model_metadata",
@@ -139,8 +201,8 @@ def main() -> int:
                 validate_model_metadata(
                     generalist_model,
                     initial_config,
-                    model_action_count=700,
-                    model_observation_shape=(4297,),
+                    model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT - 1,
+                    model_observation_shape=OBSERVATION_SHAPE,
                 ),
                 False,
                 "action_count_mismatch",
@@ -166,15 +228,15 @@ def main() -> int:
                 "F live status exposes the exact Generalist contract",
                 bool(
                     live_status.get("compatible") is True
-                    and live_status.get("model_action_count") == 701
-                    and live_status.get("env_action_count") == 701
-                    and live_status.get("action_space_mode") == "adventure_14slot_identity"
+                    and live_status.get("model_action_count") == ADVENTURE_IDENTITY_ACTION_COUNT
+                    and live_status.get("env_action_count") == ADVENTURE_IDENTITY_ACTION_COUNT
+                    and live_status.get("action_space_mode") == ACTION_SPACE_ADVENTURE_14_IDENTITY
                     and live_status.get("action_decoder_version")
-                    == "seedslot14x50_plus_wait_v1"
+                    == ADVENTURE_IDENTITY_ACTION_DECODER_VERSION
                     and live_status.get("observation_version")
-                    == "adventure_14slot_identity_v1"
-                    and live_status.get("model_observation_shape") == [4297]
-                    and live_status.get("env_observation_shape") == [4297]
+                    == ADVENTURE_IDENTITY_OBSERVATION_VERSION
+                    and live_status.get("model_observation_shape") == list(OBSERVATION_SHAPE)
+                    and live_status.get("env_observation_shape") == list(OBSERVATION_SHAPE)
                 ),
                 None,
                 True,

@@ -27,6 +27,13 @@ public sealed partial class BridgeMod
         var seedProbeMs = 0.0;
         var uiScanMs = 0.0;
         var board = FindBoard();
+        var activeBoardCount = 0;
+        var boardSingletonReady = true;
+        if (board != null || _boardSingletonCheckArmed)
+        {
+            board = EnsureSingleActiveBoard(board, out activeBoardCount);
+            boardSingletonReady = !BridgeObservationHelpers.HasDuplicateActiveBoards(activeBoardCount);
+        }
         var createPlant = FindCreatePlant();
         var restartInfo = DetectRestartScreenInfo(forceRestartProbe || board == null);
         var obs = new ObservationDto
@@ -101,6 +108,13 @@ public sealed partial class BridgeMod
             AddLaneSummaries(obs);
 
             var possibleWin = obs.MaxWave > 0 && obs.Wave >= obs.MaxWave && obs.ZombieCount == 0 && !obs.MoreZombiesComing;
+            if (possibleWin && !_boardSingletonCheckArmed)
+            {
+                // Arm before the post-win UI handler clicks through to the
+                // next Adventure stage. This also covers an automatic game
+                // transition where no explicit bridge UI command is issued.
+                ArmBoardSingletonCheck("possible_win");
+            }
             obs.Done = obs.Over;
             obs.TerminalHint = possibleWin ? "possible_win" : obs.Over ? "game_over_or_loss" : "running";
             if (!HasLossRestartEvidence(obs) && (forceRestartProbe || obs.Over))
@@ -119,11 +133,14 @@ public sealed partial class BridgeMod
             }
 
             obs.TotalPlantHealth = obs.Plants.Sum(p => Math.Max(0, p.Health));
-            var rawGameplayReady = obs.BoardFound &&
-                                   obs.CreatePlantFound &&
-                                   obs.BoardStartMove &&
-                                   !obs.Done &&
-                                   obs.CardCooldowns.All(c => c.Found);
+            // This preliminary gate is intentionally structural. CardCooldowns
+            // still contains the configured startup projection here; the live
+            // dynamic CardUI identities are resolved and validated below.
+            var rawGameplayReady = BridgeObservationHelpers.IsRawBoardGameplayReady(
+                obs.BoardFound,
+                obs.CreatePlantFound,
+                obs.BoardStartMove,
+                obs.Done);
             var seedState = ResolveSeedStateForObservation(board, rawGameplayReady, forceSeedProbe, out seedProbeMs, out uiScanMs);
             var activeGameplayCounts = new Dictionary<int, int>(seedState.ActiveGameplayTypeCounts);
             // The configured plant types describe the startup model contract.
@@ -158,20 +175,32 @@ public sealed partial class BridgeMod
                                       !obs.BlockingRewardUiActive &&
                                       activeGameplaySeedBankReady;
             obs.GameplayReady = obs.ActualGameplayReady;
-            if (obs.SeedSelectionActive)
+            if (!boardSingletonReady)
+            {
+                // Object.Destroy is end-of-frame. Do not expose a playable
+                // frame while the old board/spawner is still alive; the next
+                // observation will re-check and release the gate once only one
+                // active Board remains.
+                obs.ActualGameplayReady = false;
+                obs.GameplayReady = false;
+                obs.LegalActionReason = "duplicate_board_cleanup_pending";
+            }
+            if (boardSingletonReady && obs.SeedSelectionActive)
             {
                 obs.LegalActionReason = "seed_selection_active";
             }
-            else if (obs.BlockingRewardUiActive)
+            else if (boardSingletonReady && obs.BlockingRewardUiActive)
             {
                 obs.LegalActionReason = "blocking_reward_ui_active";
             }
-            else if (!obs.ActualGameplayReady)
+            else if (boardSingletonReady && !obs.ActualGameplayReady)
             {
                 obs.LegalActionReason = "gameplay_not_ready";
             }
 
-            obs.NextStep = obs.OnLossScreen
+            obs.NextStep = !boardSingletonReady
+                ? "wait_for_single_board"
+                : obs.OnLossScreen
                 ? "click_restart"
                 : obs.OnSeedSelectionScreen
                     ? "auto_select_seeds_then_lets_rock"
@@ -517,11 +546,21 @@ public sealed partial class BridgeMod
             return;
         }
 
-        var size = obs.RowCount * obs.ColumnCount;
+        // Action identities are always 60-cell slot blocks.  A five-lane
+        // board simply emits no legal actions for the padded sixth lane.
+        var size = MaintainedCellsPerSlot;
         var occupiedCellKeys = BridgeObservationHelpers.BuildOccupiedCellKeys(
             obs,
             obs.RowCount,
             obs.ColumnCount);
+        var sourcePlantsByCell = obs.Plants
+            .Where(plant =>
+                plant.Row >= 0 &&
+                plant.Row < obs.RowCount &&
+                plant.Column >= 0 &&
+                plant.Column < obs.ColumnCount)
+            .GroupBy(plant => BridgeObservationHelpers.CellKey(plant.Row, plant.Column, obs.ColumnCount))
+            .ToDictionary(group => group.Key, group => group.First());
         foreach (var slot in orderedSeedSlots)
         {
             if (!slot.Usable || obs.Sun < slot.SeedCost || !slot.Ready || slot.Disabled)
@@ -535,16 +574,37 @@ public sealed partial class BridgeMod
             {
                 for (var column = 0; column < obs.ColumnCount; column++)
                 {
-                    if (occupiedCellKeys.Contains(
-                            BridgeObservationHelpers.CellKey(
-                                row,
-                                column,
-                                obs.ColumnCount)))
+                    var cellKey = BridgeObservationHelpers.CellKey(row, column, obs.ColumnCount);
+                    if (occupiedCellKeys.Contains(cellKey))
                     {
+                        // Occupied-cell actions are fusion actions, not normal
+                        // placements.  Probe them here so the single bridge
+                        // legal-action list can authorize runtime-discovered
+                        // pairs that Python's static recipe table does not
+                        // know yet.  FusionStepCommand remains the final
+                        // authority and proves the source-tile mutation.
+                        if (sourcePlantsByCell.TryGetValue(cellKey, out var source))
+                        {
+                            try
+                            {
+                                var fusionCandidate = ProbeFusionCandidate(obs, source, slot, createPlant);
+                                if (fusionCandidate.FusionLegal)
+                                {
+                                    var fusionAction = 1 + slot.SlotIndex * size + row * MaintainedColumns + column;
+                                    obs.LegalActions.Add(fusionAction);
+                                }
+                            }
+                            catch
+                            {
+                                // A transient IL2CPP/UI read must not make the
+                                // whole board observation fail.  The action is
+                                // simply absent and will be re-probed next frame.
+                            }
+                        }
                         continue;
                     }
 
-                    var action = 1 + slot.SlotIndex * size + row * obs.ColumnCount + column;
+                    var action = 1 + slot.SlotIndex * size + row * MaintainedColumns + column;
                     try
                     {
                         if (createPlant.CheckBox(column, row, plantType))

@@ -61,6 +61,13 @@ public sealed partial class BridgeMod : MelonMod
     private long _validSpeedModeApplyCount;
     private long _resetCount;
     private long _letsRockClickCount;
+    // Board creation is asynchronous around loss-menu restarts and UIMgr.EnterGame.
+    // Keep a short-lived singleton gate armed across those transitions so a stale
+    // Board cannot keep its own sky-sun producer alive beside the new board.
+    private bool _boardSingletonCheckArmed;
+    private int _lastBoardSingletonCheckFrame = -100000;
+    private int _lastActiveBoardCount;
+    private int _boardSingletonStableChecks;
     private int _lastSunDebugFrame = -100000;
     private SunDebugSnapshot _sunDebugSnapshot = new();
     private bool _speedConfigDirty = true;

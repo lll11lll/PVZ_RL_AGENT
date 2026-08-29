@@ -19,6 +19,7 @@ def _observation(
     wave: int = 3,
     game_time: float = 10.0,
     seed_slots: List[Dict[str, Any]] | None = None,
+    row_count: int = 5,
 ) -> Dict[str, Any]:
     active_rows = sorted(int(row) for row in mower_rows)
     return {
@@ -32,7 +33,7 @@ def _observation(
         "terminalHint": "running",
         "done": False,
         "over": False,
-        "rowCount": 5,
+        "rowCount": row_count,
         "columnCount": 9,
         "wave": wave,
         "maxWave": 10,
@@ -125,6 +126,8 @@ def _compose(
     *,
     requested_action: int,
     lost_mower_rows: frozenset[int] = frozenset(),
+    missing_mower_rows: frozenset[int] = frozenset(),
+    mower_baseline_ready: bool = False,
     with_facts: bool = False,
 ):
     plant_types = (1, 0)
@@ -135,6 +138,8 @@ def _compose(
         fallback_plant_types=plant_types,
         fallback_row_count=5,
         lost_mower_rows=lost_mower_rows,
+        missing_mower_rows=missing_mower_rows,
+        mower_baseline_ready=mower_baseline_ready,
         live_board_progress=False,
         post_win_signal_present=False,
         cleanup_signal_active=False,
@@ -147,29 +152,65 @@ def _compose(
 
 
 def test_mower_respawn_preserves_exact_event_and_advances_immutable_state() -> None:
-    before_loss = _observation(frame=9, mower_rows=(0, 1, 2, 3))
-    previous = _observation(frame=10, mower_rows=(0, 2, 3))
-    loss_result = _compose(before_loss, previous, requested_action=0)
+    before_loss = _observation(frame=9, mower_rows=(0, 1, 2, 3), row_count=4)
+    absent_once = _observation(frame=10, mower_rows=(0, 2, 3), row_count=4)
+    missing_result = _compose(
+        before_loss,
+        absent_once,
+        requested_action=0,
+        mower_baseline_ready=True,
+    )
+    assert missing_result.diagnostics == _diagnostics([])
+    assert missing_result.next_lost_mower_rows == frozenset()
+    assert missing_result.next_missing_mower_rows == frozenset({1})
+
+    previous = _observation(frame=11, mower_rows=(0, 2, 3), row_count=4)
+    loss_result = _compose(
+        absent_once,
+        previous,
+        requested_action=0,
+        lost_mower_rows=missing_result.next_lost_mower_rows,
+        missing_mower_rows=missing_result.next_missing_mower_rows,
+        mower_baseline_ready=missing_result.mower_baseline_ready,
+    )
     assert loss_result.diagnostics == _diagnostics([])
     assert loss_result.next_lost_mower_rows == frozenset({1})
+    assert loss_result.next_missing_mower_rows == frozenset()
 
-    current = _observation(frame=11, mower_rows=(0, 1, 2, 3))
+    current = _observation(frame=12, mower_rows=(0, 1, 2, 3), row_count=4)
     result = _compose(
         previous,
         current,
         requested_action=166,
         lost_mower_rows=loss_result.next_lost_mower_rows,
+        missing_mower_rows=loss_result.next_missing_mower_rows,
+        mower_baseline_ready=loss_result.mower_baseline_ready,
     )
-    expected_event = _event(
+    mower_event = _event(
         current,
         "mower_respawn_detected",
         rows=[1],
-        mowers_before=[True, False, True, True, False],
-        mowers_after=[True, True, True, True, False],
+        mowers_before=[True, False, True, True],
+        mowers_after=[True, True, True, True],
+        last_action=166,
+    )
+    board_event = _event(
+        current,
+        "board_refresh_detected",
+        plant_count_before=4,
+        plant_count_after=4,
+        visible_plant_count_before=4,
+        visible_plant_count_after=4,
+        wave_before=3,
+        wave_after=3,
+        time_before=10.0,
+        time_after=10.0,
+        mower_count_before=3,
+        mower_count_after=4,
         last_action=166,
     )
 
-    assert result.diagnostics == _diagnostics([expected_event])
+    assert result.diagnostics == _diagnostics([mower_event, board_event])
     assert result.next_lost_mower_rows == frozenset({1})
     with pytest.raises(FrozenInstanceError):
         result.next_lost_mower_rows = frozenset()  # type: ignore[misc]

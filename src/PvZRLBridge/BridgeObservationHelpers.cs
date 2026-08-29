@@ -3,8 +3,125 @@ using System.Collections.Generic;
 
 namespace PvZRLBridge;
 
+internal readonly record struct GameSpeedTargets(
+    float GameSpeed,
+    float TimeScale,
+    float FixedDeltaTime);
+
 internal static class BridgeObservationHelpers
 {
+    public static GameSpeedTargets ResolveGameSpeedTargets(
+        string mode,
+        float requestedGameSpeed,
+        float originalGameSpeed,
+        float originalTimeScale,
+        float originalFixedDeltaTime,
+        float currentTimeScale,
+        bool gameplayReady)
+    {
+        var requested = Math.Max(0.01f, requestedGameSpeed);
+        if (mode == "time_scale")
+        {
+            return new GameSpeedTargets(
+                originalGameSpeed,
+                requested,
+                originalFixedDeltaTime * requested);
+        }
+
+        if (mode == "game_speed" && gameplayReady)
+        {
+            // This mirrors the game's native speed setting: GameAPP.gameSpeed
+            // stores the selected multiplier and Time.timeScale applies it to
+            // the simulation. Preserve a zero time scale while paused; the
+            // configured multiplier is restored as soon as play resumes.
+            var targetTimeScale = currentTimeScale <= 0.0001f
+                ? currentTimeScale
+                : requested;
+            return new GameSpeedTargets(
+                requested,
+                targetTimeScale,
+                originalFixedDeltaTime);
+        }
+
+        // Menu, chooser, transition, terminal, and safe mode retain the
+        // captured native timing. The configured multiplier is applied only
+        // after the board reaches structural gameplay readiness.
+        return new GameSpeedTargets(
+            originalGameSpeed,
+            originalTimeScale,
+            originalFixedDeltaTime);
+    }
+
+    public static bool IsMainMenuControlPath(string? hierarchyPath)
+    {
+        var normalized = (hierarchyPath ?? "")
+            .Replace('\\', '/')
+            .Trim();
+        return normalized.StartsWith(
+            "MainMenuCanvas/MainMenu",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsSeedSelectionControlPath(string? hierarchyPath)
+    {
+        var normalized = (hierarchyPath ?? "")
+            .Replace('\\', '/')
+            .Trim();
+        return normalized.Contains(
+            "/InGameUI(Clone)/Bottom/SeedLibrary",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static string ClassifyAdventureScreenState(
+        bool boardFound,
+        bool startupPopupVisible,
+        bool lossDetected,
+        bool seedSelectionActive,
+        bool gameplayReady,
+        bool rewardActive,
+        bool adventureVisible,
+        bool mainMenuVisible)
+    {
+        if (startupPopupVisible)
+        {
+            return "startup_popup";
+        }
+        if (lossDetected)
+        {
+            return "game_over";
+        }
+        if (seedSelectionActive)
+        {
+            return "seed_selection";
+        }
+        if (rewardActive)
+        {
+            return "reward_unlock";
+        }
+        if (gameplayReady)
+        {
+            return "gameplay";
+        }
+        if (adventureVisible || (!boardFound && mainMenuVisible))
+        {
+            return "main_menu";
+        }
+        if (!boardFound)
+        {
+            return "loading_or_menu";
+        }
+        return "transition";
+    }
+
+    public static bool IsRawBoardGameplayReady(
+        bool boardFound,
+        bool createPlantFound,
+        bool boardStartMove,
+        bool done) =>
+        boardFound && createPlantFound && boardStartMove && !done;
+
+    public static bool HasDuplicateActiveBoards(int activeBoardCount) => activeBoardCount > 1;
+
     public static bool IsActiveGameplaySeedBankReady(
         int activeGameplayCardBankCount,
         IReadOnlyDictionary<int, int> activeGameplayCounts)

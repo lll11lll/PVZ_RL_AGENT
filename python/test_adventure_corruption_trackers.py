@@ -86,6 +86,7 @@ def main() -> int:
 
     live_before_loss = observation(range(5), frame=200, wave=3, plants=8, zombies=3)
     live_after_loss = observation([0, 2, 4], frame=220, wave=3, plants=8, zombies=2)
+    live_loss_confirmed = observation([0, 2, 4], frame=230, wave=3, plants=8, zombies=2)
     live_after_respawn = observation(range(5), frame=240, wave=3, plants=9, zombies=2)
     env.begin_new_attempt(live_before_loss, reason="test_live_board")
     env._environment_safety_diagnostics(
@@ -94,8 +95,14 @@ def main() -> int:
         action_result={},
         requested_action=0,
     )
-    live_diagnostics = env._environment_safety_diagnostics(
+    env._environment_safety_diagnostics(
         live_after_loss,
+        live_loss_confirmed,
+        action_result={},
+        requested_action=0,
+    )
+    live_diagnostics = env._environment_safety_diagnostics(
+        live_loss_confirmed,
         live_after_respawn,
         action_result={},
         requested_action=0,

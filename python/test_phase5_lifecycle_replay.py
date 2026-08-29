@@ -45,7 +45,7 @@ def _observation(defaults: dict[str, Any], overlay: dict[str, Any]) -> dict[str,
 
 @pytest.fixture(scope="module")
 def legacy_env() -> PvZGymEnv:
-    env = PvZGymEnv(PvZEnvConfig(row_count=5, start_sun=500))
+    env = PvZGymEnv(PvZEnvConfig(start_sun=500))
     yield env
     # No bridge was opened; avoid close()'s best-effort restore request.
     env.client.close()

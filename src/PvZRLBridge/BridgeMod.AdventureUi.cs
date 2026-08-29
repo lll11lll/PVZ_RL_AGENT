@@ -74,22 +74,18 @@ public sealed partial class BridgeMod
         var unlockVisible = unlockSnapshot.UnlockScreenVisible || unlockSnapshot.NewPlantUnlockedVisible;
         var rewardActive = seedProbe.BlockingRewardUiActive || rewardVisible || unlockVisible || trophyVisible;
 
-        var screenState = ClassifyAdventureScreenState(
+        var screenState = BridgeObservationHelpers.ClassifyAdventureScreenState(
             boardFound: board != null,
             startupPopupVisible: startupInfo.StartupPopupVisible,
             lossDetected: lossDetected,
             seedSelectionActive: seedProbe.SeedSelectionActive,
-            gameplayReady: rawGameplayReady && !seedProbe.SeedSelectionActive && !seedProbe.BlockingRewardUiActive,
+            gameplayReady: rawGameplayReady && !lossDetected && !seedProbe.SeedSelectionActive && !seedProbe.BlockingRewardUiActive,
             rewardActive: rewardActive,
             adventureVisible: adventureSignals.Count > 0,
             mainMenuVisible: mainMenuSignals.Count > 0);
-        if (trophyVisible)
+        if (!lossDetected && screenState == "reward_unlock" && trophyVisible)
         {
             screenState = "level_complete_trophy";
-        }
-        else if (rewardVisible || unlockVisible)
-        {
-            screenState = "reward_unlock";
         }
         var level = SafeReadGameBoardLevel();
         var profileAdventureLevel = SafeReadProfileAdventureLevel(out var profileAdventureLevelSource);
@@ -204,17 +200,34 @@ public sealed partial class BridgeMod
                 message = "Startup popup is active; dismiss it before clicking Adventure."
             };
         }
-        var clicked = TryClickFirstVisibleUiSignal(
-            "Adventure",
-            IsAdventureButtonSignalText,
+        var clicked = TryInvokeAdventureModeButton(
             actions,
             out var methodUsed,
             out var targetName,
             out var targetPath);
+        if (!clicked)
+        {
+            clicked = TryInvokeMainMenuAdventureButton(
+                actions,
+                out methodUsed,
+                out targetName,
+                out targetPath);
+        }
+        if (!clicked)
+        {
+            clicked = TryClickFirstVisibleUiSignal(
+                "Adventure",
+                IsAdventureButtonSignalText,
+                actions,
+                out methodUsed,
+                out targetName,
+                out targetPath);
+        }
         if (clicked)
         {
             InvalidateSeedRuntimeCache("press_adventure_once");
             InvalidateRestartUiCache("press_adventure_once");
+            ArmBoardSingletonCheck("press_adventure_once");
         }
 
         return new
@@ -229,6 +242,142 @@ public sealed partial class BridgeMod
             after = AdventureScreenState(root),
             message = clicked ? "Adventure button clicked." : "No visible Adventure button candidate could be clicked."
         };
+    }
+
+    private bool TryInvokeAdventureModeButton(
+        List<string> actions,
+        out string methodUsed,
+        out string targetName,
+        out string targetPath)
+    {
+        methodUsed = "";
+        targetName = "";
+        targetPath = "";
+        try
+        {
+            var candidates = Object.FindObjectsOfType<Advanture_Btn>()
+                .Where(button => button != null && button.gameObject != null && button.gameObject.activeInHierarchy)
+                .OrderBy(button => button.transform != null ? BuildHierarchyPath(button.transform) : "")
+                .ToList();
+            foreach (var button in candidates)
+            {
+                var path = button.transform != null ? BuildHierarchyPath(button.transform) : "";
+                var name = SafeObjectName(button.gameObject) ?? "Advanture_Btn";
+                try
+                {
+                    if (TryInvokeNoArg(button, "OnMouseDown", out _))
+                    {
+                        actions.Add($"Advanture_Btn.OnMouseDown({path})");
+                    }
+                    if (TryInvokeNoArg(button, "OnMouseUpAsButton", out var upError))
+                    {
+                        methodUsed = "Advanture_Btn.OnMouseUpAsButton";
+                        targetName = name;
+                        targetPath = path;
+                        actions.Add($"{methodUsed}({targetPath})");
+                        return true;
+                    }
+                    if (TryInvokeNoArg(button, "OnMouseUp", out upError))
+                    {
+                        methodUsed = "Advanture_Btn.OnMouseUp";
+                        targetName = name;
+                        targetPath = path;
+                        actions.Add($"{methodUsed}({targetPath})");
+                        return true;
+                    }
+                    actions.Add($"Advanture_Btn candidate unavailable: {path} {upError}");
+                }
+                catch (Exception ex)
+                {
+                    actions.Add($"Advanture_Btn candidate failed: {path} {ex.Message}");
+                }
+            }
+            actions.Add($"Advanture_Btn candidates={candidates.Count}");
+        }
+        catch (Exception ex)
+        {
+            actions.Add("FindObjectsOfType<Advanture_Btn>() failed: " + ex.Message);
+        }
+        return false;
+    }
+
+    private bool TryInvokeMainMenuAdventureButton(
+        List<string> actions,
+        out string methodUsed,
+        out string targetName,
+        out string targetPath)
+    {
+        methodUsed = "";
+        targetName = "";
+        targetPath = "";
+        try
+        {
+            var candidates = Object.FindObjectsOfType<MainMenu_Btn>()
+                .Where(button => button != null && button.gameObject != null && button.gameObject.activeInHierarchy)
+                .Select(button => new
+                {
+                    Button = button,
+                    Name = SafeObjectName(button.gameObject) ?? "MainMenu_Btn",
+                    Path = button.transform != null ? BuildHierarchyPath(button.transform) : ""
+                })
+                .Where(candidate =>
+                {
+                    var normalized = NormalizeUiText($"{candidate.Name} {candidate.Path}");
+                    return normalized.Contains("advanture") ||
+                           normalized.Contains("adventure") ||
+                           normalized.Contains("btngrave");
+                })
+                .OrderByDescending(candidate =>
+                {
+                    var normalized = NormalizeUiText($"{candidate.Name} {candidate.Path}");
+                    return normalized.Contains("advanture") || normalized.Contains("adventure") ? 1 : 0;
+                })
+                .ThenBy(candidate => candidate.Path)
+                .ToList();
+
+            foreach (var candidate in candidates)
+            {
+                try
+                {
+                    if (TryInvokeWithCompatibleSignature(
+                            candidate.Button,
+                            "ButtonInput",
+                            out _,
+                            candidate.Name))
+                    {
+                        methodUsed = $"MainMenu_Btn.ButtonInput({candidate.Name})";
+                        targetName = candidate.Name;
+                        targetPath = candidate.Path;
+                        actions.Add($"{methodUsed}({targetPath})");
+                        return true;
+                    }
+                    if (TryInvokeNoArg(candidate.Button, "OnMouseDown", out _))
+                    {
+                        actions.Add($"MainMenu_Btn.OnMouseDown({candidate.Path})");
+                    }
+                    if (TryInvokeNoArg(candidate.Button, "OnMouseUpAsButton", out var upError) ||
+                        TryInvokeNoArg(candidate.Button, "OnMouseUp", out upError))
+                    {
+                        methodUsed = "MainMenu_Btn.OnMouseUpAsButton";
+                        targetName = candidate.Name;
+                        targetPath = candidate.Path;
+                        actions.Add($"{methodUsed}({targetPath})");
+                        return true;
+                    }
+                    actions.Add($"MainMenu_Btn Adventure candidate unavailable: {candidate.Path} {upError}");
+                }
+                catch (Exception ex)
+                {
+                    actions.Add($"MainMenu_Btn Adventure candidate failed: {candidate.Path} {ex.Message}");
+                }
+            }
+            actions.Add($"MainMenu_Btn Adventure candidates={candidates.Count}");
+        }
+        catch (Exception ex)
+        {
+            actions.Add("FindObjectsOfType<MainMenu_Btn>() failed: " + ex.Message);
+        }
+        return false;
     }
 
     private object ClickStartupOkOnce(JsonElement root)
@@ -350,6 +499,11 @@ public sealed partial class BridgeMod
         {
             InvalidateSeedRuntimeCache("click_trophy_once");
             InvalidateRestartUiCache("click_trophy_once");
+            // A level-complete trophy click can begin the reward/next-level
+            // transition before the next seed chooser is visible. Arm the
+            // board singleton gate at this boundary so a replacement Board
+            // cannot overlap the old one with two sun producers.
+            ArmBoardSingletonCheck("click_trophy_once");
         }
 
         return new
@@ -424,6 +578,10 @@ public sealed partial class BridgeMod
         {
             InvalidateSeedRuntimeCache("click_reward_continue_once");
             InvalidateRestartUiCache("click_reward_continue_once");
+            // Reward Continue is the stage-handoff boundary for Adventure
+            // progression. Check for duplicate Boards before the next level
+            // is allowed to reach gameplay readiness.
+            ArmBoardSingletonCheck("click_reward_continue_once");
         }
 
         return new
@@ -491,47 +649,6 @@ public sealed partial class BridgeMod
             after = AdventureScreenState(root),
             message = clicked ? "Try Again/Restart button clicked." : "No Try Again/Restart candidate could be clicked."
         };
-    }
-
-    private static string ClassifyAdventureScreenState(
-        bool boardFound,
-        bool startupPopupVisible,
-        bool lossDetected,
-        bool seedSelectionActive,
-        bool gameplayReady,
-        bool rewardActive,
-        bool adventureVisible,
-        bool mainMenuVisible)
-    {
-        if (startupPopupVisible)
-        {
-            return "startup_popup";
-        }
-        if (rewardActive)
-        {
-            return "reward_unlock";
-        }
-        if (seedSelectionActive)
-        {
-            return "seed_selection";
-        }
-        if (gameplayReady)
-        {
-            return "gameplay";
-        }
-        if (lossDetected)
-        {
-            return "game_over";
-        }
-        if (adventureVisible || (!boardFound && mainMenuVisible))
-        {
-            return "main_menu";
-        }
-        if (!boardFound)
-        {
-            return "loading_or_menu";
-        }
-        return "transition";
     }
 
     private static string[] SeedNames(IEnumerable<int> plantTypes) =>
@@ -785,7 +902,9 @@ public sealed partial class BridgeMod
 
     private static bool IsAlmanacOrSeedPacketSignal(UiProbeEntryDto entry)
     {
-        if (!IsVisibleUiSignal(entry))
+        if (!IsVisibleUiSignal(entry) ||
+            BridgeObservationHelpers.IsMainMenuControlPath(entry.HierarchyPath) ||
+            BridgeObservationHelpers.IsSeedSelectionControlPath(entry.HierarchyPath))
         {
             return false;
         }

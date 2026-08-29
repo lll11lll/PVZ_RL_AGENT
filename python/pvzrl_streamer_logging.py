@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+import numpy as np
 
 
 _FORBIDDEN_EXACT_KEYS = frozenset(
@@ -130,4 +133,15 @@ def compact_observation_revision(observation: Optional[Mapping[str, Any]]) -> st
     return ""
 
 
-__all__ = ["BufferedStreamerEventLogger", "compact_observation_revision"]
+def observation_vector_digest(observation: Any) -> str:
+    """Hash one model-facing observation without persisting its contents."""
+
+    array = np.asarray(observation, dtype=np.float32)
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
+__all__ = [
+    "BufferedStreamerEventLogger",
+    "compact_observation_revision",
+    "observation_vector_digest",
+]

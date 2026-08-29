@@ -132,19 +132,22 @@ class ConfigResolver:
         cli_key: Optional[str] = None,
         json_aliases: Tuple[str, ...] = (),
         mode_default: Any = CONFIG_UNSET,
+        explicit_false: bool = False,
     ) -> bool:
-        """Resolve an enable-only argparse switch without treating False as explicit.
+        """Resolve an argparse boolean switch with optional paired-false support.
 
         Store-true options use ``False`` as argparse's unsupplied sentinel. A
         true CLI flag wins; otherwise JSON (including false), mode, and global
         defaults are considered in order. Paired true/false options should use
-        :meth:`value` with an argparse default of ``None`` instead.
+        an argparse default of ``None`` and pass ``explicit_false=True`` so an
+        explicit negative switch wins over a JSON ``true``.
         """
 
         cli_name = cli_key or key
-        if getattr(self.cli_namespace, cli_name, False) is True:
+        cli_value = getattr(self.cli_namespace, cli_name, None if explicit_false else False)
+        if cli_value is True or (explicit_false and cli_value is False):
             self.sources[key] = ConfigSource.CLI
-            return True
+            return bool(cli_value)
         json_keys = tuple(json_key for json_key in (key, *json_aliases) if json_key in self.json_values)
         if json_keys:
             self.sources[key] = ConfigSource.JSON
@@ -451,6 +454,7 @@ class ResolvedRunConfig:
     artifacts: ArtifactConfig
     bridge: BridgeConfig
     model_contract: ModelContractConfig
+    reward_policy_version: str
     reward: Mapping[str, float]
     value_sources: Mapping[str, ConfigSource]
     _flat: Mapping[str, Any] = field(repr=False, compare=False)
@@ -647,6 +651,7 @@ class ResolvedRunConfig:
                 cols=int(flat["cols"]),
                 cells_per_seed_slot=int(flat["cells_per_seed_slot"]),
             ),
+            reward_policy_version=str(flat.get("reward_policy_version") or ""),
             reward=MappingProxyType(reward),
             value_sources=MappingProxyType(dict(value_sources or {})),
             _flat=_deep_freeze(flat),

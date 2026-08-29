@@ -215,10 +215,17 @@ public sealed partial class BridgeMod
         return legal.Contains(0) ? 0 : legal.First();
     }
 
-    private static int EncodeAction(int seedSlotIndex, int row, int column, int rows, int columns) =>
-        1 + seedSlotIndex * rows * columns + row * columns + column;
+    private static int EncodeAction(int seedSlotIndex, int row, int column, int rows, int columns)
+    {
+        // The policy board is permanently padded to six rows.  ``rows`` is a
+        // live-board loop bound for the caller, never a decoder dimension.
+        return 1 + seedSlotIndex * MaintainedCellsPerSlot + row * MaintainedColumns + column;
+    }
 
-    internal const int MaintainedActionCount = 701;
+    internal const int MaintainedRows = 6;
+    internal const int MaintainedColumns = 10;
+    internal const int MaintainedCellsPerSlot = MaintainedRows * MaintainedColumns;
+    internal const int MaintainedActionCount = 14 * MaintainedCellsPerSlot + 1;
 
     private int GetActionCount(int rows, int columns, int seedSlotCount = 0) => MaintainedActionCount;
 
@@ -237,14 +244,30 @@ public sealed partial class BridgeMod
             return DecodedAction.Wait();
         }
 
-        var cells = rows * columns;
         var encoded = action - 1;
-        var seedSlotIndex = encoded / cells;
-        var cell = encoded % cells;
+        if (action >= MaintainedActionCount)
+        {
+            return DecodedAction.Invalid(action, $"action {action} is outside the maintained 0..{MaintainedActionCount - 1} surface");
+        }
+
+        if ((rows != 5 && rows != MaintainedRows) || columns != MaintainedColumns)
+        {
+            return DecodedAction.Invalid(action, $"unsupported live board geometry {rows}x{columns}; expected 5x10 or 6x10");
+        }
+
+        var seedSlotIndex = encoded / MaintainedCellsPerSlot;
+        var cell = encoded % MaintainedCellsPerSlot;
         var slots = observation?.SeedSlots ?? new List<SeedSlotDto>();
         if (seedSlotIndex < 0 || seedSlotIndex >= slots.Count)
         {
             return DecodedAction.Invalid(action, $"seed slot index {seedSlotIndex} out of range; active seedSlotCount={slots.Count}");
+        }
+
+        var row = cell / MaintainedColumns;
+        var column = cell % MaintainedColumns;
+        if (row >= rows)
+        {
+            return DecodedAction.Invalid(action, $"row {row} is padded and outside the live {rows}x{columns} board");
         }
 
         var slot = slots[seedSlotIndex];
@@ -256,8 +279,8 @@ public sealed partial class BridgeMod
             PlantType = slot.PlantType,
             PlantTypeName = slot.PlantTypeName,
             SeedCost = slot.SeedCost,
-            Row = cell / columns,
-            Column = cell % columns
+            Row = row,
+            Column = column
         };
     }
 
@@ -267,31 +290,26 @@ public sealed partial class BridgeMod
         {
             EnsureOriginalSpeed();
             var mode = NormalizeGameSpeedMode(_config.GameSpeedMode);
-            var targetGameSpeed = _originalGameSpeed;
-            var targetTimeScale = _originalTimeScale;
-            var targetFixedDeltaTime = _originalFixedDeltaTime;
-
-            if (mode == "safe")
-            {
-                // Safe/valid mode keeps normal game timers intact; requested speed is diagnostic only.
-            }
-            else if (mode == "time_scale")
-            {
-                var scale = Math.Max(0.01f, _config.GameSpeed);
-                targetTimeScale = scale;
-                targetFixedDeltaTime = _originalFixedDeltaTime * scale;
-            }
-            else if (_config.GameSpeed > 0f)
-            {
-                targetGameSpeed = _config.GameSpeed;
-            }
+            var currentGameSpeed = TryReadGameSpeed();
+            var currentTimeScale = SafeReadTimeScale();
+            var currentFixedDeltaTime = SafeReadFixedDeltaTime();
+            var gameplayReady = mode == "game_speed" &&
+                                ComputeRawGameplayReady(FindBoard());
+            var targets = BridgeObservationHelpers.ResolveGameSpeedTargets(
+                mode,
+                _config.GameSpeed,
+                _originalGameSpeed,
+                _originalTimeScale,
+                _originalFixedDeltaTime,
+                currentTimeScale,
+                gameplayReady);
+            var targetGameSpeed = targets.GameSpeed;
+            var targetTimeScale = targets.TimeScale;
+            var targetFixedDeltaTime = targets.FixedDeltaTime;
 
             var configChanged = _speedConfigDirty ||
                                 _lastAppliedSpeedMode != mode ||
                                 Math.Abs(_lastRequestedGameSpeed - _config.GameSpeed) > 0.0001f;
-            var currentGameSpeed = TryReadGameSpeed();
-            var currentTimeScale = SafeReadTimeScale();
-            var currentFixedDeltaTime = SafeReadFixedDeltaTime();
             var speedDrifted = Math.Abs(currentGameSpeed - targetGameSpeed) > 0.0001f;
             var timeDrifted = Math.Abs(currentTimeScale - targetTimeScale) > 0.0001f;
             var fixedDrifted = Math.Abs(currentFixedDeltaTime - targetFixedDeltaTime) > 0.0001f;
@@ -445,8 +463,9 @@ public sealed partial class BridgeMod
         {
             return SafeReadTimeScale();
         }
-        var speed = TryReadGameSpeed();
-        return speed > 0f ? speed : _config.GameSpeed;
+        // GameAPP.gameSpeed is only the configured multiplier. Unity's time
+        // scale is the effective PvZ simulation speed used by the native game.
+        return SafeReadTimeScale();
     }
 
     private static string NormalizeGameSpeedMode(string? value)

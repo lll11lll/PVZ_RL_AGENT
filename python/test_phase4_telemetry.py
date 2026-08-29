@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import pvzrl_telemetry
+import train_ppo
 from pvzrl_adventure import build_agent_payload, build_live_status
 from pvzrl_sb3 import PvZMaskedPPOEnv
 from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
@@ -16,6 +17,9 @@ from train_ppo import (
     EpisodeMetricWriter,
     build_runtime_live_status_payload,
     clean_episode_row,
+    compact_streamer_comparison,
+    compact_streamer_evaluation,
+    streamer_live_status_fields,
     write_progress_csv_rows,
 )
 
@@ -137,7 +141,7 @@ def test_runtime_live_status_builder_keeps_compatibility_keys_and_types() -> Non
             "run_dir": "runs/example",
             "seed_list": ["SunFlower", "SunFlower", "Peashooter", "Peashooter"],
             "plant_types": [1, 1, 0, 0],
-            "action_space_mode": "adventure_14slot_identity",
+                "action_space_mode": "adventure_14slot_identity_full_v2",
             "max_seed_slots": 14,
             "total_timesteps": 100,
         },
@@ -174,6 +178,189 @@ def test_runtime_live_status_builder_keeps_compatibility_keys_and_types() -> Non
     assert isinstance(payload["rows"], dict)
     assert payload["legal_action_count"] == 3
     assert payload["screenState"] == "gameplay"
+
+
+def test_streamer_live_status_normalizes_update_gates_and_safe_viewer_totals() -> None:
+    fields = streamer_live_status_fields(
+        {
+            "streamer_v1_enabled": True,
+            "streamer_experiment_dir": "runs/streamer/full-v2",
+            "streamer_phase": "STREAM_TRAIN",
+            "streamer_bc_enabled": True,
+            "streamer_policy_steps_per_cycle": 25000,
+            "streamer_baseline_evaluation": {
+                "summary": {
+                    "episodes_completed": 5,
+                    "win_rate": 0.6,
+                    "raw_detail": "not_status_data",
+                },
+                "adventure_start_level": 2,
+                "next_adventure_level": 4,
+                "unbounded_detail": {"ignored": True},
+            },
+            "streamer_evaluation_comparison": {
+                "comparison_to_baseline": 1,
+                "comparison_protocol_compatible": {"baseline": True},
+                "evaluation_start_adventure_level": 3,
+                "next_adventure_level": 4,
+                "ignored": "not_status_data",
+            },
+        },
+        {
+            "streamer_runtime": {
+                "streamer_command_queue": {
+                    "depth": 2,
+                    "counters": {
+                        "accepted": 11,
+                        "permanently_rejected": 3,
+                        "phase_rejected": 1,
+                        "capacity_rejected": 2,
+                        "duplicate": 1,
+                        "expired": 4,
+                    },
+                },
+                "bc_demo_rejected_count": 7,
+            },
+        },
+    )
+
+    assert fields["evaluation_chat_control"] is False
+    assert fields["streamer_experiment_dir"] == "runs/streamer/full-v2"
+    assert fields["ppo_updates_enabled"] is True
+    assert fields["bc_updates_enabled"] is True
+    assert fields["bc_demo_rejected_count"] == 7
+    assert fields["viewer_commands_accepted_count"] == 11
+    assert fields["viewer_commands_invalid_count"] == 3
+    assert fields["viewer_commands_rejected_count"] == 7
+    assert fields["baseline_evaluation"] == {
+        "episodes_completed": 5,
+        "win_rate": 0.6,
+        "adventure_start_level": 2,
+        "next_adventure_level": 4,
+    }
+    assert fields["evaluation_comparison"] == {
+        "comparison_to_baseline": 1,
+        "comparison_protocol_compatible": {"baseline": True},
+        "evaluation_start_adventure_level": 3,
+        "next_adventure_level": 4,
+    }
+
+
+def test_streamer_orchestrator_status_publishes_canonical_experiment_dir(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    baseline = tmp_path / "baseline.zip"
+    baseline.write_bytes(b"synthetic checkpoint")
+    experiment = tmp_path / "relative" / "experiment"
+    written: list[dict[str, Any]] = []
+
+    class FakeModel:
+        num_timesteps = 123
+
+    class FakeMaskablePPO:
+        @staticmethod
+        def load(_path: str) -> FakeModel:
+            return FakeModel()
+
+    class FakeStatusWriter:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def write(self, payload: dict[str, Any], *, force: bool = False) -> None:
+            written.append(dict(payload))
+
+    def fake_cycles(**kwargs: Any) -> dict[str, Any]:
+        kwargs["status_sink"]({"status": "running", "mode": "STREAM_TRAIN"})
+        return {"ok": True}
+
+    monkeypatch.setattr(train_ppo, "require_maskable_ppo", lambda: FakeMaskablePPO)
+    monkeypatch.setattr(train_ppo, "loaded_model_compatibility_report", lambda *args, **kwargs: {})
+    monkeypatch.setattr(train_ppo, "print_compatibility_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(train_ppo, "raise_if_incompatible", lambda *args, **kwargs: None)
+    monkeypatch.setattr(train_ppo, "env_metadata_for_config", lambda _config: {})
+    monkeypatch.setattr(train_ppo, "LiveStatusWriter", FakeStatusWriter)
+    monkeypatch.setattr(train_ppo, "run_streamer_cycles", fake_cycles)
+
+    config = {
+        "streamer_baseline_checkpoint": str(baseline),
+        "run_dir": str(experiment),
+        "streamer_platform": "mock",
+        "action_count": 841,
+        "observation_version": "adventure_14slot_identity_full_v2",
+    }
+    args = train_ppo.argparse.Namespace(live_status_path=experiment / "live_status.json")
+
+    assert train_ppo.run_streamer_v1(config, args) == {"ok": True}
+    canonical = str(experiment.resolve(strict=False))
+    assert config["streamer_experiment_dir"] == canonical
+    assert written[-1]["streamer_experiment_dir"] == canonical
+
+
+def test_streamer_evaluation_status_disables_updates_and_keeps_stable_defaults() -> None:
+    fields = streamer_live_status_fields(
+        {
+            "streamer_v1_enabled": True,
+            "streamer_phase": "EVALUATE",
+            "streamer_bc_enabled": True,
+        },
+        {
+            "streamer_runtime": {
+                "streamer_mode": "STREAM_TRAIN",
+                "ppo_updates_enabled": True,
+                "bc_updates_enabled": True,
+                "bc_demo_rejected_count": None,
+            }
+        },
+    )
+
+    assert fields["streamer_mode"] == "EVALUATE"
+    assert fields["evaluation_chat_control"] is False
+    assert fields["ppo_updates_enabled"] is False
+    assert fields["bc_updates_enabled"] is False
+    assert fields["bc_demo_rejected_count"] == 0
+    assert fields["viewer_commands_accepted_count"] == 0
+    assert fields["viewer_commands_rejected_count"] == 0
+    assert fields["viewer_commands_invalid_count"] == 0
+
+
+def test_streamer_compaction_keeps_level_and_comparison_context_only() -> None:
+    evaluation = compact_streamer_evaluation(
+        {
+            "summary": {"episodes_completed": 2, "avg_reward": 4.5, "detail": [1, 2]},
+            "adventure_start_level": 6,
+            "next_adventure_level": 7,
+            "streamer_cycle": 3,
+            "full_episode_rows": [{"ignored": True}],
+        }
+    )
+    comparison = compact_streamer_comparison(
+        {
+            "comparison_to_best_before_promotion": "UNKNOWN",
+            "comparison_protocol_compatible": {"best": False},
+            "best_promoted": False,
+            "train_start_adventure_level": 5,
+            "evaluation_start_adventure_level": 6,
+            "next_adventure_level": 7,
+            "training": {"ignored": True},
+        }
+    )
+
+    assert evaluation == {
+        "episodes_completed": 2,
+        "avg_reward": 4.5,
+        "adventure_start_level": 6,
+        "next_adventure_level": 7,
+        "streamer_cycle": 3,
+    }
+    assert comparison == {
+        "comparison_to_best_before_promotion": "UNKNOWN",
+        "comparison_protocol_compatible": {"best": False},
+        "best_promoted": False,
+        "train_start_adventure_level": 5,
+        "evaluation_start_adventure_level": 6,
+        "next_adventure_level": 7,
+    }
 
 
 def test_adventure_live_status_computes_action_mask_once() -> None:

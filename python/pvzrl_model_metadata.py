@@ -17,6 +17,7 @@ from pvzrl_action_space import (
     spec_from_config,
 )
 from pvzrl_observation_layout import observation_shape_for_config
+from pvzrl_rewards import REWARD_POLICY_VERSION
 
 
 MODEL_METADATA_FILENAME = "model_metadata.json"
@@ -140,6 +141,9 @@ def model_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "model_family": str(config.get("model_family") or ""),
         "seed_list": seed_list,
         "plant_types": plant_types,
+        "reward_policy_version": str(
+            config.get("reward_policy_version") or REWARD_POLICY_VERSION
+        ),
         **spec.to_metadata(),
         "observation_shape": observation_shape_from_config(config),
     }
@@ -196,7 +200,7 @@ def apply_model_metadata_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
         mode=mode,
         plant_types=plant_types,
         max_seed_slots=int(max_seed_slots),
-        rows=int(updated.get("row_count", updated.get("rows", 5)) or 5),
+        rows=int(updated.get("row_count", updated.get("rows", 6)) or 6),
         cols=int(updated.get("column_count", updated.get("cols", 10)) or 10),
     )
     updated.update(spec.to_metadata())
@@ -228,6 +232,9 @@ def env_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "cells_per_seed_slot": int(spec.rows) * int(spec.cols),
         "observation_shape": observation_shape_from_config(updated),
         "model_family": str(updated.get("model_family") or ""),
+        "reward_policy_version": str(
+            updated.get("reward_policy_version") or REWARD_POLICY_VERSION
+        ),
     }
 
 
@@ -257,6 +264,9 @@ def expected_model_metadata_from_env(env_metadata: Dict[str, Any]) -> Dict[str, 
         "cols": _optional_int(env_metadata.get("cols")),
         "cells_per_seed_slot": _optional_int(env_metadata.get("cells_per_seed_slot")),
         "observation_shape": _normalized_int_list(env_metadata.get("observation_shape")),
+        "reward_policy_version": str(
+            env_metadata.get("reward_policy_version") or REWARD_POLICY_VERSION
+        ),
     }
 
 
@@ -382,6 +392,19 @@ def validate_model_metadata(
     actual = dict(actual)
     if model_observation_shape is not None:
         actual["loaded_observation_shape"] = _normalized_int_list(model_observation_shape)
+
+    model_reward_policy = str(
+        actual.get("reward_policy_version") or "legacy_or_unknown"
+    )
+    env_reward_policy = str(
+        env_metadata.get("reward_policy_version") or REWARD_POLICY_VERSION
+    )
+    if model_reward_policy != env_reward_policy:
+        warnings.append(
+            "reward_policy_version_mismatch:"
+            f"model={model_reward_policy},environment={env_reward_policy};"
+            " continuing because reward policy does not change model dimensions"
+        )
 
     metadata_version = _optional_int(actual.get("metadata_version"))
     if metadata_version != MODEL_METADATA_VERSION:
@@ -717,6 +740,16 @@ def model_compatibility_live_status(result: CompatibilityCheck) -> Dict[str, Any
             model_metadata.get("loaded_observation_shape", model_metadata.get("observation_shape", []))
         ),
         "env_observation_shape": _normalized_int_list(env_metadata.get("observation_shape", [])),
+        "model_reward_policy_version": str(
+            model_metadata.get("reward_policy_version") or "legacy_or_unknown"
+        ),
+        "env_reward_policy_version": str(
+            env_metadata.get("reward_policy_version") or REWARD_POLICY_VERSION
+        ),
+        "reward_policy_version_mismatch": str(
+            model_metadata.get("reward_policy_version") or "legacy_or_unknown"
+        )
+        != str(env_metadata.get("reward_policy_version") or REWARD_POLICY_VERSION),
         "metadata_path": result.metadata_path,
         "metadata_inferred": bool(result.metadata_inferred),
         "warnings": list(result.warnings),

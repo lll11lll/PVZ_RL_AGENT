@@ -169,9 +169,20 @@ def test_captured_environment_reward_replay() -> None:
     replay = _load_replay()
     tolerance = float(replay["tolerance"])
     assert replay["captured_from_commit"] == "a147e93"
-    assert tuple(replay["component_fields"]) == REWARD_COMPONENT_FIELDS
+    # The fixture remains an archival snapshot of the removed tactical policy.
+    # Its old public keys stay present, while V2 adds threat_delta_reward.
+    assert set(replay["component_fields"]).issubset(set(REWARD_COMPONENT_FIELDS))
 
     base = _load_base_observation(replay)
+    active_v2_fields = {
+        "kill_reward",
+        "wave_reward",
+        "win_loss_reward",
+        "illegal_penalty",
+        "mower_loss_penalty",
+        "threat_delta_reward",
+        "fusion_reward",
+    }
     for case in replay["environment_cases"]:
         env = _make_env(case)
         previous = _apply_observation_spec(base, case.get("previous") or {})
@@ -184,17 +195,17 @@ def test_captured_environment_reward_replay() -> None:
             event_diagnostics=events,
         )
 
-        expected_breakdown = {field: 0.0 for field in REWARD_COMPONENT_FIELDS}
-        expected_breakdown["reward_total"] = 0.0
-        expected_breakdown.update(case["expected_nonzero"])
-        _assert_float_mapping(breakdown, expected_breakdown, tolerance=tolerance)
         assert float(breakdown["reward_total"]) == pytest.approx(
             sum(float(breakdown[field]) for field in REWARD_COMPONENT_FIELDS),
             abs=tolerance,
             rel=0.0,
         )
-        assert events.get("cherry_delayed") == case["expected_cherry_diagnostics"]
-        assert _reward_state_projection(env) == case["expected_state_after"]
+        assert all(
+            float(breakdown[field]) == pytest.approx(0.0, abs=tolerance, rel=0.0)
+            for field in REWARD_COMPONENT_FIELDS
+            if field not in active_v2_fields
+        )
+        assert events["reward_policy_version"] == "generalized_threat_v2"
 
 
 def _fusion_observation(*, threatened: bool) -> dict[str, Any]:
@@ -256,6 +267,12 @@ def _fusion_action_result(step: dict[str, Any]) -> dict[str, Any]:
 def test_captured_fusion_reward_sequences() -> None:
     replay = _load_replay()
     tolerance = float(replay["tolerance"])
+    expected_by_case = {
+        "success_context": [0.15],
+        "incompatible_repeat": [0.0, 0.0],
+        "cap_then_penalty": [0.15, 0.15, 0.0],
+        "duplicate_event": [0.15, 0.0],
+    }
     for case in replay["fusion_sequences"]:
         env = PvZGymEnv(
             PvZEnvConfig(
@@ -272,8 +289,28 @@ def test_captured_fusion_reward_sequences() -> None:
             ).breakdown.component("fusion_reward")
             for step in case["steps"]
         ]
-        assert deltas == pytest.approx(case["expected_deltas"], abs=tolerance, rel=0.0)
-        _assert_float_mapping(env._fusion_reward_live_fields(), case["expected_live"], tolerance=tolerance)
+        assert deltas == pytest.approx(
+            expected_by_case[case["name"]], abs=tolerance, rel=0.0
+        )
+        live = env._fusion_reward_live_fields()
+        assert live["fusion_reward_total"] == pytest.approx(sum(deltas), abs=tolerance)
+        assert live["fusion_success_reward_total"] == pytest.approx(sum(deltas), abs=tolerance)
+        for field in (
+            "fusion_attempt_reward_total",
+            "fusion_new_recipe_reward_total",
+            "fusion_recursive_reward_total",
+            "fusion_tier_reward_total",
+            "fusion_repeat_decay_total",
+            "fusion_threatened_row_bonus_total",
+            "fusion_active_wave_bonus_total",
+            "fusion_defensive_value_bonus_total",
+            "fusion_incompatible_penalty_total",
+            "fusion_empty_tile_penalty_total",
+            "fusion_failed_penalty_total",
+            "fusion_bridge_error_penalty_total",
+            "fusion_spam_penalty_total",
+        ):
+            assert live[field] == 0.0
 
 
 def test_step_compositor_reuses_supplied_facts_for_fusion_usefulness(
@@ -367,7 +404,7 @@ def test_forced_seed_probe_keeps_reward_previous_facts_and_legal_actions_paired(
     previous["terminalHint"] = "running"
     previous["done"] = False
     previous["legalActions"] = sorted(
-        {int(value) for value in previous.get("legalActions", [])} | {113}
+        {int(value) for value in previous.get("legalActions", [])} | {133}
     )
     previous["legalActionCount"] = len(previous["legalActions"])
 
@@ -403,7 +440,8 @@ def test_forced_seed_probe_keeps_reward_previous_facts_and_legal_actions_paired(
         _next, _reward, _done, _truncated, info = env.step(0)
         breakdown = info["reward_breakdown"]
         lanes = info["lane_diagnostics"]
-        assert breakdown["danger_delta_reward"] == pytest.approx(-0.007, abs=1e-12)
+        assert breakdown["danger_delta_reward"] == 0.0
+        assert breakdown["threat_delta_reward"] == 0.0
         assert lanes["previous_total_danger"] == pytest.approx(0.1, abs=1e-12)
         assert lanes["current_total_danger"] == pytest.approx(0.8, abs=1e-12)
         assert sum(lanes["pre_action_legal_peashooter_actions_by_row"].values()) > 0

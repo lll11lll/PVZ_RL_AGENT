@@ -11,13 +11,16 @@ from gymnasium import spaces
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from pvzrl_streamer_ppo import (
+    BehaviorTransition,
+    DemonstrationValidationError,
     OffPolicyContaminationError,
     STREAMER_TRANSITION_INFO_KEY,
     STREAMER_TRANSITION_SCHEMA_VERSION,
     StreamerMaskablePPO,
     behavior_transition_from_info,
 )
-from pvzrl_sb3 import PvZMaskedPPOEnv
+from pvzrl_streamer_logging import observation_vector_digest
+from pvzrl_sb3 import PvZMaskedPPOEnv, _viewer_tile_snapshot
 from train_ppo import finish_streamer_episode_boundary
 
 
@@ -54,10 +57,13 @@ class ScriptedStep:
     post_observation: tuple[float, float]
     reward: float
     mask: tuple[bool, bool, bool] = (True, True, True)
+    viewer_execution_mask: Optional[tuple[bool, bool, bool]] = None
+    observation_revision: Optional[str] = None
     executed_action: Optional[int] = None
     different_from_policy: bool = False
     execution_succeeded: bool = True
     demo_eligible: bool = False
+    omit_demo_provenance: bool = False
     terminated: bool = False
     truncated: bool = False
     done_reason: str = ""
@@ -114,6 +120,8 @@ class ScriptedStreamerEnv(gym.Env[np.ndarray, int]):
                 executed = int(spec.executed_action)
             else:
                 executed = proposed
+            viewer_mask = spec.viewer_execution_mask or spec.mask
+            observation_revision = spec.observation_revision or f"frame-{self.index}"
             transition = {
                 "schema_version": STREAMER_TRANSITION_SCHEMA_VERSION,
                 "behavior_source": "viewer",
@@ -122,14 +130,40 @@ class ScriptedStreamerEnv(gym.Env[np.ndarray, int]):
                 "executed_action": executed,
                 "execution_succeeded": bool(spec.execution_succeeded),
                 "demo_eligible": bool(spec.demo_eligible),
-                "execution_status": "success" if spec.execution_succeeded else "bridge_rejected",
+                "execution_status": "executed_verified" if spec.execution_succeeded else "bridge_rejected",
+                "bridge_success": bool(spec.execution_succeeded),
+                "canonical_legality_result": "LEGAL" if spec.execution_succeeded else "REJECTED",
+                "canonical_legality_reason": "" if spec.execution_succeeded else "bridge_rejected",
+                "viewer_action_id": executed,
+                "policy_mask_allowed": bool(
+                    0 <= executed < len(spec.mask) and spec.mask[executed]
+                ),
+                "demonstration_mask_allowed": bool(
+                    0 <= executed < len(viewer_mask) and viewer_mask[executed]
+                ),
+                "viewer_observation_revision": observation_revision,
+                "demonstration_observation_revision": observation_revision,
+                "demonstration_action_mask": list(viewer_mask),
+                "demonstration_observation_digest": observation_vector_digest(
+                    np.asarray(spec.pre_observation, dtype=np.float32)
+                ),
+                "policy_observation_revision": observation_revision,
                 "demonstration": {
                     "episode_id": spec.episode_id,
                     "observation_version": "fixture_v1",
-                    "observation_revision": f"frame-{self.index}",
+                    "observation_revision": observation_revision,
                     "command_type": "slot",
                 },
             }
+            if spec.omit_demo_provenance:
+                for key in (
+                    "demonstration_action_mask",
+                    "demonstration_observation_revision",
+                    "demonstration_observation_digest",
+                    "viewer_observation_revision",
+                    "policy_observation_revision",
+                ):
+                    transition.pop(key, None)
             info: dict[str, Any] = {STREAMER_TRANSITION_INFO_KEY: transition}
         elif spec.kind == "policy":
             executed = proposed
@@ -278,6 +312,140 @@ def test_viewer_transition_never_enters_rollout_and_gae_bootstraps_previewer_sta
         vec_env.close()
 
 
+def test_reserved_policy_action_uses_canonical_viewer_mask_for_bc_and_training_continues():
+    """Reproduce the live reservation/policy-mask versus BC-mask failure."""
+
+    env = ScriptedStreamerEnv(
+        [
+            ScriptedStep("policy", (0.0, 0.0), (1.0, 0.0), 1.0),
+            ScriptedStep(
+                "viewer",
+                (1.0, 0.0),
+                (2.0, 0.0),
+                10.0,
+                # The reserved Twitch action is intentionally excluded from
+                # PPO while it remains physically executable for the viewer.
+                mask=(True, True, False),
+                viewer_execution_mask=(True, True, True),
+                executed_action=2,
+                demo_eligible=True,
+            ),
+            ScriptedStep("policy", (2.0, 0.0), (3.0, 0.0), 2.0),
+        ]
+    )
+    vec_env, model = _collect(env)
+    try:
+        assert len(model.demonstration_buffer) == 1
+        record = model.demonstration_buffer.records()[0]
+        assert record.action == 2
+        assert bool(record.action_mask[2]) is True
+        assert bool(env.calls[1]["mask"][2]) is False
+        assert env.calls[1]["proposed"] != 2
+        assert model.last_rollout_policy_transitions == 2
+        assert model.total_environment_actions == 3
+        assert model.bc_demo_rejected_count == 0
+    finally:
+        vec_env.close()
+
+
+def test_bc_provenance_revision_mismatch_is_rejected_before_storage():
+    env = ScriptedStreamerEnv(
+        [ScriptedStep("policy", (0.0, 0.0), (1.0, 0.0), 0.0)]
+    )
+    vec_env, model, _callback = _make_model(env, n_steps=1)
+    try:
+        observation = np.asarray([[0.0, 0.0]], dtype=np.float32)
+        transition = BehaviorTransition(
+            behavior_source="viewer",
+            viewer_controlled=True,
+            proposed_policy_action=0,
+            executed_action=1,
+            execution_succeeded=True,
+            demo_eligible=True,
+            execution_status="executed_verified",
+            bridge_success=True,
+            viewer_action_id=1,
+            demonstration_mask_allowed=True,
+            canonical_legality_result="LEGAL",
+            demonstration_action_mask=(True, True, True),
+            demonstration_observation_revision="frame-1",
+            viewer_observation_revision="frame-1",
+            policy_observation_revision="frame-2",
+            demonstration_observation_digest=observation_vector_digest(observation[0]),
+        )
+        with pytest.raises(DemonstrationValidationError, match="revision mismatch"):
+            model._record_demonstration(
+                observation,
+                transition,
+            )
+        assert len(model.demonstration_buffer) == 0
+    finally:
+        vec_env.close()
+
+
+def test_genuinely_illegal_viewer_action_keeps_buffer_validation_authoritative():
+    env = ScriptedStreamerEnv(
+        [ScriptedStep("policy", (0.0, 0.0), (1.0, 0.0), 0.0)]
+    )
+    vec_env, model, _callback = _make_model(env, n_steps=1)
+    try:
+        observation = np.asarray([[0.0, 0.0]], dtype=np.float32)
+        transition = BehaviorTransition(
+            behavior_source="viewer",
+            viewer_controlled=True,
+            proposed_policy_action=0,
+            executed_action=1,
+            execution_succeeded=True,
+            demo_eligible=True,
+            execution_status="executed_verified",
+            bridge_success=True,
+            viewer_action_id=1,
+            demonstration_mask_allowed=False,
+            canonical_legality_result="LEGAL",
+            demonstration_action_mask=(True, False, True),
+            demonstration_observation_revision="frame-1",
+            viewer_observation_revision="frame-1",
+            policy_observation_revision="frame-1",
+            demonstration_observation_digest=observation_vector_digest(observation[0]),
+        )
+        with pytest.raises(DemonstrationValidationError, match="masked"):
+            model._record_demonstration(
+                observation,
+                transition,
+            )
+        assert len(model.demonstration_buffer) == 0
+    finally:
+        vec_env.close()
+
+
+def test_verified_viewer_intervention_survives_a_production_bc_provenance_rejection():
+    env = ScriptedStreamerEnv(
+        [
+            ScriptedStep("policy", (0.0, 0.0), (1.0, 0.0), 1.0),
+            ScriptedStep(
+                "viewer",
+                (1.0, 0.0),
+                (2.0, 0.0),
+                3.0,
+                executed_action=1,
+                execution_succeeded=True,
+                demo_eligible=True,
+                omit_demo_provenance=True,
+            ),
+            ScriptedStep("policy", (2.0, 0.0), (3.0, 0.0), 2.0),
+        ]
+    )
+    vec_env, model = _collect(env)
+    try:
+        assert model.verified_viewer_interventions == 1
+        assert len(model.demonstration_buffer) == 0
+        assert model.bc_demo_rejected_count == 1
+        assert model.last_rollout_policy_transitions == 2
+        assert model.total_environment_actions == 3
+    finally:
+        vec_env.close()
+
+
 def test_back_to_back_viewer_steps_cut_once_and_same_action_rejection_is_excluded():
     env = ScriptedStreamerEnv(
         [
@@ -310,6 +478,7 @@ def test_back_to_back_viewer_steps_cut_once_and_same_action_rejection_is_exclude
         assert model.total_environment_actions == 4
         assert model.num_timesteps == 2
         assert model.viewer_interventions == 2
+        assert model.verified_viewer_interventions == 1
         assert len(model.last_rollout_boundaries) == 1
         assert len(model.demonstration_buffer) == 1
         boundary = model.last_rollout_boundaries[0]
@@ -321,6 +490,37 @@ def test_back_to_back_viewer_steps_cut_once_and_same_action_rejection_is_exclude
         assert bool(buffer.episode_starts[1, 0]) is True
     finally:
         vec_env.close()
+
+
+def test_viewer_tile_snapshot_proves_the_requested_board_mutation():
+    before = {
+        "rowCount": 5,
+        "columnCount": 10,
+        "plants": [],
+        "visiblePlants": [],
+        "seedSlots": [],
+    }
+    after = {
+        "rowCount": 5,
+        "columnCount": 10,
+        "plants": [
+            {
+                "row": 2,
+                "column": 4,
+                "type": 1,
+                "typeName": "SunFlower",
+                "instanceId": 41,
+            }
+        ],
+        "visiblePlants": [],
+        "seedSlots": [],
+    }
+    pre_tile = _viewer_tile_snapshot(before, 2, 4)
+    post_tile = _viewer_tile_snapshot(after, 2, 4)
+    assert pre_tile["known"] and not pre_tile["occupied"]
+    assert post_tile["known"] and post_tile["occupied"]
+    assert post_tile["resulting_plant"] == "SunFlower"
+    assert pre_tile["signature"] != post_tile["signature"]
 
 
 def test_terminal_viewer_action_resets_before_policy_resumes_and_preserves_execution_mask():

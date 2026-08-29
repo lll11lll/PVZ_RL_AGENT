@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -8,21 +9,15 @@ from typing import Any
 import pytest
 
 import train_ppo
+from pvzrl_model_metadata import model_metadata_from_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = REPO_ROOT / "configs" / "ppo_adventure_generalist_14slot_identity_v1.json"
-PROTECTED_CHECKPOINT = (
-    REPO_ROOT
-    / "runs"
-    / "ppo_adventure_generalist_14slot_identity_v1_20260627_172727"
-    / "checkpoints"
-    / "ppo_pvz_370000_steps.zip"
-)
-ACTION_COUNT = 701
-OBSERVATION_SHAPE = (4297,)
-DECODER_VERSION = "seedslot14x50_plus_wait_v1"
-OBSERVATION_VERSION = "adventure_14slot_identity_v1"
+CONFIG_PATH = REPO_ROOT / "configs" / "ppo_adventure_generalist_full_v2.json"
+ACTION_COUNT = 841
+OBSERVATION_SHAPE = (4364,)
+DECODER_VERSION = "seedslot14x60_padded6x10_plus_wait_v2"
+OBSERVATION_VERSION = "adventure_14slot_identity_full_v2"
 
 
 def _sha256(path: Path) -> str:
@@ -38,6 +33,7 @@ def _build_config(
     *,
     resume_model: Path | None = None,
     evaluation: bool = False,
+    model_path: Path | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     argv = [
         "--config",
@@ -52,7 +48,7 @@ def _build_config(
             [
                 "--adventure-generalist-eval",
                 "--model-path",
-                str(PROTECTED_CHECKPOINT),
+                str(model_path),
             ]
         )
     else:
@@ -80,14 +76,28 @@ def _assert_generalist_contract(config: dict[str, Any]) -> None:
         "adventure_generalist_14slot_eval",
     }
     assert config["action_count"] == ACTION_COUNT
-    assert config["action_space_mode"] == "adventure_14slot_identity"
+    assert config["action_space_mode"] == "adventure_14slot_identity_full_v2"
     assert config["max_seed_slots"] == 14
     assert config["action_decoder_version"] == DECODER_VERSION
     assert config["observation_version"] == OBSERVATION_VERSION
     assert metadata["env_action_count"] == ACTION_COUNT
     assert tuple(metadata["observation_shape"]) == OBSERVATION_SHAPE
     assert metadata["decoder_wait_action"] == 0
-    assert metadata["placement_action_range"] == [1, 700]
+    assert metadata["placement_action_range"] == [1, 840]
+
+
+@pytest.fixture
+def compatible_full_adventure_checkpoint(tmp_path: Path) -> Path:
+    source_run = tmp_path / "full_adventure_source"
+    checkpoint = source_run / "checkpoints" / "ppo_pvz_8_steps.zip"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"fake-full-adventure-checkpoint\n")
+    raw_config = train_ppo.load_json(CONFIG_PATH)
+    (source_run / "model_metadata.json").write_text(
+        json.dumps(model_metadata_from_config(raw_config), indent=2),
+        encoding="utf-8",
+    )
+    return checkpoint
 
 
 @pytest.fixture
@@ -252,12 +262,12 @@ def test_fresh_generalist_training_reaches_learn_with_new_timestep_history(
 def test_generalist_resume_preserves_checkpoint_and_continues_timestep_history(
     tmp_path: Path,
     fake_training_runtime: dict[str, Any],
+    compatible_full_adventure_checkpoint: Path,
 ) -> None:
-    assert PROTECTED_CHECKPOINT.is_file()
-    source_hash_before = _sha256(PROTECTED_CHECKPOINT)
-    source_stat_before = PROTECTED_CHECKPOINT.stat()
+    source_hash_before = _sha256(compatible_full_adventure_checkpoint)
+    source_stat_before = compatible_full_adventure_checkpoint.stat()
     run_dir = tmp_path / "resumed_generalist"
-    _args, config = _build_config(run_dir, resume_model=PROTECTED_CHECKPOINT)
+    _args, config = _build_config(run_dir, resume_model=compatible_full_adventure_checkpoint)
     _assert_generalist_contract(config)
 
     train_ppo.train(config, run_dir / "live_status.json")
@@ -265,7 +275,7 @@ def test_generalist_resume_preserves_checkpoint_and_continues_timestep_history(
     assert len(fake_training_runtime["constructor_calls"]) == 0
     assert len(fake_training_runtime["load_calls"]) == 1
     load = fake_training_runtime["load_calls"][0]
-    assert load["path"] == PROTECTED_CHECKPOINT.resolve()
+    assert load["path"] == compatible_full_adventure_checkpoint.resolve()
     assert load["env"] is fake_training_runtime["vec_envs"][0]
     assert Path(load["tensorboard_log"]).resolve().is_relative_to(run_dir.resolve())
 
@@ -275,23 +285,32 @@ def test_generalist_resume_preserves_checkpoint_and_continues_timestep_history(
     assert learn["timesteps_before"] == 370000
     assert learn["timesteps_after"] == 370008
 
-    assert _sha256(PROTECTED_CHECKPOINT) == source_hash_before
-    source_stat_after = PROTECTED_CHECKPOINT.stat()
+    assert _sha256(compatible_full_adventure_checkpoint) == source_hash_before
+    source_stat_after = compatible_full_adventure_checkpoint.stat()
     assert source_stat_after.st_size == source_stat_before.st_size
     assert source_stat_after.st_mtime_ns == source_stat_before.st_mtime_ns
     assert (run_dir / "model.zip").is_file()
     assert (run_dir / "final_model.zip").is_file()
-    assert all(path.is_relative_to(run_dir) for path in tmp_path.rglob("*") if path.is_file())
+    generated = [
+        path
+        for path in tmp_path.rglob("*")
+        if path.is_file() and not path.is_relative_to(compatible_full_adventure_checkpoint.parents[1])
+    ]
+    assert all(path.is_relative_to(run_dir) for path in generated)
 
 
 def test_generalist_evaluation_validates_checkpoint_before_adventure_runner(
     tmp_path: Path,
     fake_training_runtime: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    compatible_full_adventure_checkpoint: Path,
 ) -> None:
-    assert PROTECTED_CHECKPOINT.is_file()
     run_dir = tmp_path / "generalist_eval"
-    args, config = _build_config(run_dir, evaluation=True)
+    args, config = _build_config(
+        run_dir,
+        evaluation=True,
+        model_path=compatible_full_adventure_checkpoint,
+    )
     _assert_generalist_contract(config)
     calls: list[dict[str, Any]] = []
 
@@ -300,20 +319,20 @@ def test_generalist_evaluation_validates_checkpoint_before_adventure_runner(
 
     monkeypatch.setattr(train_ppo, "run_adventure_eval", fake_run_adventure_eval)
 
-    train_ppo.adventure_evaluate(config, PROTECTED_CHECKPOINT, args)
+    train_ppo.adventure_evaluate(config, compatible_full_adventure_checkpoint, args)
 
     assert len(fake_training_runtime["load_calls"]) == 1
     load = fake_training_runtime["load_calls"][0]
-    assert load["path"] == PROTECTED_CHECKPOINT.resolve()
+    assert load["path"] == compatible_full_adventure_checkpoint.resolve()
     assert load["env"] is None
     assert len(calls) == 1
 
     call = calls[0]
     assert call["config"] is config
     assert call["model"] is load["model"]
-    assert Path(call["model_path"]).resolve() == PROTECTED_CHECKPOINT.resolve()
+    assert Path(call["model_path"]).resolve() == compatible_full_adventure_checkpoint.resolve()
     assert call["deterministic"] is True
-    assert call["env_config"].action_space_mode == "adventure_14slot_identity"
+    assert call["env_config"].action_space_mode == "adventure_14slot_identity_full_v2"
     assert call["env_config"].max_seed_slots == 14
     assert call["env_config"].action_decoder_version == DECODER_VERSION
     assert call["env_config"].observation_version == OBSERVATION_VERSION

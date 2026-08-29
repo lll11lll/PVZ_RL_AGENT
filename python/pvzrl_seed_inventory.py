@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
+from pvzrl_action_space import CELLS_PER_SLOT
 from pvzrl_registry import get_plant_registry
 
 
@@ -54,6 +55,7 @@ def inventory_payload(
     max_seed_slots: int = 0,
     legal_action_count: int = 0,
     mask_block_reason_counts: Optional[Dict[str, int]] = None,
+    slot_identities: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     selected_list = ordered_unique(selected)
     unlocked_list = ordered_unique(unlocked)
@@ -65,6 +67,7 @@ def inventory_payload(
     slot_denominator = max(1, int(max_seed_slots or len(selected_list) or len(available_list) or 1))
     available_required_total = max(1, len(required_available_list))
     unlocked_required_total = max(1, len(required_unlocked_list))
+    slot_identity_list = [dict(slot) for slot in (slot_identities or []) if isinstance(slot, dict)]
     return {
         "selected_seeds": selected_list,
         "unlocked_seeds": unlocked_list,
@@ -92,6 +95,21 @@ def inventory_payload(
         ),
         "legal_action_count": int(legal_action_count or 0),
         "mask_block_reason_counts": dict(sorted((mask_block_reason_counts or {}).items())),
+        # ``selected_seeds``/``available_seeds`` intentionally remain compact
+        # unique-name diagnostics.  Action legality never reads them; these
+        # slot records are the identity-preserving runtime view used to debug
+        # duplicate cards and per-slot cooldown/readiness.
+        "slot_identities": slot_identity_list,
+        "slot_identity_count": len(slot_identity_list),
+        "ready_slot_count": sum(1 for slot in slot_identity_list if bool(slot.get("ready"))),
+        "usable_slot_count": sum(
+            1
+            for slot in slot_identity_list
+            if bool(slot.get("usable")) and not bool(slot.get("disabled"))
+        ),
+        "affordable_slot_count": sum(
+            1 for slot in slot_identity_list if bool(slot.get("affordable"))
+        ),
     }
 
 
@@ -122,6 +140,41 @@ def inventory_from_runtime_sources(
         or adventure_state.get("visibleSeedCardNames", [])
         or observation.get("availableSeedNames", [])
     )
+    sun = _safe_float(observation.get("sun"), 0.0)
+    slot_identities = []
+    for position, slot in enumerate(slots):
+        if not isinstance(slot, dict):
+            continue
+        try:
+            slot_index = int(slot.get("slotIndex", position))
+        except (TypeError, ValueError):
+            slot_index = int(position)
+        try:
+            plant_type = int(slot.get("plantType", -1))
+        except (TypeError, ValueError):
+            plant_type = -1
+        try:
+            seed_cost = max(0, int(float(slot.get("seedCost", 0) or 0)))
+        except (TypeError, ValueError):
+            seed_cost = 0
+        slot_identities.append(
+            {
+                "slot_index": slot_index,
+                "plant_type": plant_type,
+                "plant_name": str(
+                    slot.get("plantTypeName")
+                    or slot.get("displayName")
+                    or canonical_seed(slot.get("plantType"))
+                ),
+                "card_instance_id": slot.get("cardInstanceId", slot.get("instanceId", 0)),
+                "ready": bool(slot.get("ready")),
+                "usable": bool(slot.get("usable", True)),
+                "disabled": bool(slot.get("disabled")),
+                "seed_cost": seed_cost,
+                "current_cooldown": slot.get("currentCooldown", slot.get("cooldown", 0)),
+                "affordable": bool(sun >= seed_cost),
+            }
+        )
     return inventory_payload(
         selected=selected,
         unlocked=unlocked,
@@ -131,6 +184,7 @@ def inventory_from_runtime_sources(
         max_seed_slots=max_seed_slots,
         legal_action_count=legal_action_count,
         mask_block_reason_counts=mask_block_reason_counts,
+        slot_identities=slot_identities,
     )
 
 
@@ -229,7 +283,7 @@ def adventure_identity_features(observation: Dict[str, Any], max_seed_slots: int
             _clip(affordable_count / denom),
             _clip(unlocked_selected_count / denom),
             _clip(len(duplicate_counts) / denom),
-            _clip(legal_count / max(1.0, denom * 50.0 + 1.0)),
+            _clip(legal_count / max(1.0, denom * float(CELLS_PER_SLOT) + 1.0)),
             1.0 if observation.get("seedSelectionActive") else 0.0,
             1.0 if observation.get("gameplayReady") else 0.0,
             _clip(sun / 1000.0),

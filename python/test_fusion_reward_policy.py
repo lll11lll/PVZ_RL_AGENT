@@ -117,22 +117,29 @@ class FusionRewardPolicyTests(unittest.TestCase):
             result,
             rejected_reason=rejected_reason,
         )
-        delta = env._compose_step_reward(
+        composition = env._compose_step_reward(
             obs,
             obs,
             result,
             previous_legal_actions=[],
-        ).breakdown.component("fusion_reward")
+        )
+        breakdown = composition.breakdown.to_dict()
+        delta = breakdown["fusion_reward"]
         diag.update(env._fusion_reward_live_fields())
-        return {"delta": delta, "diagnostics": diag}
+        return {
+            "delta": delta,
+            "breakdown": breakdown,
+            "annotations": composition.annotations_dict(),
+            "diagnostics": diag,
+        }
 
     def test_successful_legal_fusion_is_rewarded(self) -> None:
         env = self.make_env()
         outcome = self.apply_event(env, action_result(success=True), observation())
-        self.assertGreater(outcome["delta"], 0.0)
+        self.assertAlmostEqual(outcome["delta"], 0.15)
         self.assertEqual(outcome["diagnostics"]["fusion_success_count"], 1)
-        self.assertGreater(outcome["diagnostics"]["fusion_success_reward_total"], 0.0)
-        self.assertGreater(outcome["diagnostics"]["fusion_attempt_reward_total"], 0.0)
+        self.assertAlmostEqual(outcome["diagnostics"]["fusion_success_reward_total"], 0.15)
+        self.assertEqual(outcome["diagnostics"]["fusion_attempt_reward_total"], 0.0)
 
     def test_incompatible_and_empty_fusions_get_no_success_reward(self) -> None:
         for reason, field in (
@@ -143,48 +150,45 @@ class FusionRewardPolicyTests(unittest.TestCase):
                 env = self.make_env()
                 result = action_result(success=False, reason=reason, legal=False)
                 outcome = self.apply_event(env, result, observation(), rejected_reason=reason)
-                self.assertLessEqual(outcome["delta"], 0.0)
+                self.assertEqual(outcome["delta"], 0.0)
+                self.assertAlmostEqual(outcome["breakdown"]["illegal_penalty"], -0.1)
                 self.assertEqual(outcome["diagnostics"]["fusion_success_reward_total"], 0.0)
-                self.assertLess(outcome["diagnostics"][field], 0.0)
+                self.assertEqual(outcome["diagnostics"][field], 0.0)
                 self.assertEqual(outcome["diagnostics"]["fusion_rejected_count"], 1)
 
-    def test_threatened_row_receives_contextual_bonuses(self) -> None:
-        env = self.make_env()
-        outcome = self.apply_event(env, action_result(success=True), observation(threatened=True))
-        diag = outcome["diagnostics"]
-        self.assertGreater(diag["fusion_threatened_row_bonus_total"], 0.0)
-        self.assertGreater(diag["fusion_active_wave_bonus_total"], 0.0)
-        self.assertGreater(diag["fusion_defensive_value_bonus_total"], 0.0)
-
-    def test_positive_cap_does_not_block_penalties(self) -> None:
-        reward = RewardConfig(max_fusion_reward_per_episode=0.60)
-        env = self.make_env(reward)
-        first = self.apply_event(env, action_result(success=True, col=4), observation())
-        second = self.apply_event(env, action_result(success=True, col=5), observation())
-        self.assertAlmostEqual(env._reward_state.fusion.positive_total, 0.60, places=7)
-        self.assertAlmostEqual(env._reward_state.fusion.reward_total, 0.60, places=7)
-        self.assertTrue(second["diagnostics"]["fusion_reward_capped"])
-
-        bad = action_result(success=False, reason="bridge_error", legal=True, col=6)
-        penalty = self.apply_event(env, bad, observation(), rejected_reason="bridge_error")
-        self.assertLess(penalty["delta"], 0.0)
-        self.assertLess(env._reward_state.fusion.reward_total, 0.60)
-        totals = env._fusion_reward_live_fields()
-        component_sum = sum(
-            float(totals[field])
-            for field in REWARD_FIELDS
-            if field.endswith("_total") and field != "fusion_reward_total"
+    def test_fusion_reward_is_context_independent(self) -> None:
+        quiet = self.apply_event(self.make_env(), action_result(success=True), observation())
+        threatened = self.apply_event(
+            self.make_env(),
+            action_result(success=True),
+            observation(threatened=True),
         )
-        self.assertAlmostEqual(component_sum, totals["fusion_reward_total"], places=7)
+        self.assertEqual(quiet["delta"], threatened["delta"])
+        for field in (
+            "fusion_threatened_row_bonus_total",
+            "fusion_active_wave_bonus_total",
+            "fusion_defensive_value_bonus_total",
+        ):
+            self.assertEqual(threatened["diagnostics"][field], 0.0)
 
-    def test_repeated_bad_attempt_gets_spam_penalty(self) -> None:
+    def test_success_coefficient_can_be_zero_without_other_reward_changes(self) -> None:
+        env = self.make_env(RewardConfig(fusion_success_reward=0.0))
+        outcome = self.apply_event(env, action_result(success=True), observation())
+        self.assertEqual(outcome["delta"], 0.0)
+        self.assertTrue(outcome["annotations"]["fusionRewardAccounted"])
+        self.assertFalse(outcome["annotations"]["fusionRewardApplied"])
+        self.assertEqual(outcome["breakdown"]["illegal_penalty"], 0.0)
+
+    def test_repeated_bad_attempt_is_accounted_once_without_spam_shaping(self) -> None:
         env = self.make_env()
         result = action_result(success=False, reason="incompatible_pair", legal=False)
         first = self.apply_event(env, result, observation(), rejected_reason="incompatible_pair")
         second = self.apply_event(env, result, observation(), rejected_reason="incompatible_pair")
+        self.assertAlmostEqual(first["breakdown"]["illegal_penalty"], -0.1)
+        self.assertEqual(second["breakdown"]["illegal_penalty"], 0.0)
         self.assertEqual(first["diagnostics"]["fusion_spam_penalty_total"], 0.0)
-        self.assertLess(second["diagnostics"]["fusion_spam_penalty_total"], 0.0)
-        self.assertIn("spam", second["diagnostics"]["fusion_last_reward_reason"])
+        self.assertEqual(second["diagnostics"]["fusion_spam_penalty_total"], 0.0)
+        self.assertTrue(second["annotations"]["fusionRewardDuplicateSuppressed"])
 
     def test_reset_clears_reward_cap_and_spam_history(self) -> None:
         env = self.make_env(RewardConfig(max_fusion_reward_per_episode=0.1))
@@ -334,8 +338,8 @@ class FusionRewardPolicyTests(unittest.TestCase):
             result,
             previous_legal_actions=[],
         ).breakdown.component("fusion_reward")
-        self.assertLess(delta, 0.0)
-        self.assertLess(env._fusion_reward_live_fields()["fusion_bridge_error_penalty_total"], 0.0)
+        self.assertEqual(delta, 0.0)
+        self.assertEqual(env._fusion_reward_live_fields()["fusion_bridge_error_penalty_total"], 0.0)
 
     def test_generalist_episode_aggregation_uses_canonical_row_reducers(self) -> None:
         first = {

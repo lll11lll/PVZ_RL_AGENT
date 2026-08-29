@@ -693,6 +693,108 @@ public sealed partial class BridgeMod
                normalized == "board reinit";
     }
 
+    private void ArmBoardSingletonCheck(string reason)
+    {
+        _boardSingletonCheckArmed = true;
+        _lastBoardSingletonCheckFrame = -100000;
+        _lastActiveBoardCount = 0;
+        _boardSingletonStableChecks = 0;
+        if (!string.IsNullOrWhiteSpace(reason))
+        {
+            LoggerInstance.Msg($"[board-singleton] check armed reason={reason}");
+        }
+    }
+
+    private Board? EnsureSingleActiveBoard(Board? primaryHint, out int activeBoardCount)
+    {
+        const int periodicCheckFrames = 30;
+        const int armedRetryFrames = 15;
+        var frame = 0;
+        try { frame = Time.frameCount; } catch { }
+
+        var checkInterval = _boardSingletonCheckArmed ? armedRetryFrames : periodicCheckFrames;
+        var shouldCheck = frame - _lastBoardSingletonCheckFrame >= checkInterval;
+        if (!shouldCheck)
+        {
+            activeBoardCount = _lastActiveBoardCount;
+            return primaryHint;
+        }
+
+        _lastBoardSingletonCheckFrame = frame;
+        List<Board> boards;
+        try
+        {
+            boards = Object.FindObjectsOfType<Board>()
+                .Where(candidate => candidate != null)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            // A failed safety scan is not proof that only one Board remains.
+            // Fail closed for this observation and keep the gate armed so the
+            // next observation retries the singleton check.
+            _boardSingletonCheckArmed = true;
+            _boardSingletonStableChecks = 0;
+            activeBoardCount = Math.Max(2, _lastActiveBoardCount);
+            _lastActiveBoardCount = activeBoardCount;
+            LoggerInstance.Msg($"[board-singleton] scan failed; retrying: {ex.Message}");
+            return primaryHint;
+        }
+
+        var previousCount = _lastActiveBoardCount;
+        activeBoardCount = boards.Count;
+        _lastActiveBoardCount = activeBoardCount;
+        if (activeBoardCount <= 1)
+        {
+            if (_boardSingletonCheckArmed)
+            {
+                // Keep checking for a short grace window after a restart.
+                // UIMgr.EnterGame can create the replacement Board a few
+                // frames after the old Board disappears; disarming on the
+                // first singleton observation would reopen the duplicate
+                // spawner race in that gap.
+                if (activeBoardCount == 1)
+                {
+                    _boardSingletonStableChecks++;
+                }
+                else
+                {
+                    _boardSingletonStableChecks = 0;
+                }
+
+                if (previousCount > 1 || _boardSingletonStableChecks == 1)
+                {
+                    LoggerInstance.Msg(
+                        $"[board-singleton] activeBoards={activeBoardCount}; " +
+                        $"stableChecks={_boardSingletonStableChecks}/3");
+                }
+
+                if (_boardSingletonStableChecks < 3)
+                {
+                    return boards.FirstOrDefault() ?? primaryHint;
+                }
+
+                LoggerInstance.Msg("[board-singleton] recovered activeBoards=1");
+            }
+            _boardSingletonCheckArmed = false;
+            _boardSingletonStableChecks = 0;
+            return boards.FirstOrDefault() ?? primaryHint;
+        }
+
+        var primary = SelectPrimaryBoard(boards, primaryHint);
+        var actions = new List<string>();
+        DestroyDuplicateBoards(primary, actions);
+        _boardSingletonCheckArmed = true;
+        _boardSingletonStableChecks = 0;
+        if (previousCount != activeBoardCount)
+        {
+            LoggerInstance.Msg(
+                $"[board-singleton] blocked gameplay activeBoards={activeBoardCount}; " +
+                string.Join(" ", actions));
+        }
+        return primary;
+    }
+
     private Board DestroyDuplicateBoards(Board primaryHint, List<string> actions)
     {
         List<Board> boards;
@@ -715,6 +817,7 @@ public sealed partial class BridgeMod
 
         var primary = SelectPrimaryBoard(boards, primaryHint);
         var primaryId = SafeInstanceId(primary);
+        var primaryGameObjectId = SafeInstanceId(primary.gameObject);
         var destroyed = 0;
         foreach (var duplicate in boards)
         {
@@ -725,7 +828,19 @@ public sealed partial class BridgeMod
 
             try
             {
-                Object.Destroy(duplicate.gameObject);
+                // Normally each Board owns a distinct root GameObject. If a
+                // malformed scene instead attached two Board components to
+                // one root, remove only the duplicate component so the
+                // retained Board and its scene object stay alive.
+                if (SafeInstanceId(duplicate.gameObject) == primaryGameObjectId)
+                {
+                    Object.Destroy(duplicate);
+                    actions.Add($"DestroyDuplicateBoardComponent({SafeInstanceId(duplicate)})");
+                }
+                else
+                {
+                    Object.Destroy(duplicate.gameObject);
+                }
                 destroyed++;
             }
             catch (Exception ex)
@@ -738,7 +853,7 @@ public sealed partial class BridgeMod
         return primary;
     }
 
-    private Board SelectPrimaryBoard(List<Board> boards, Board primaryHint)
+    private Board SelectPrimaryBoard(List<Board> boards, Board? primaryHint)
     {
         var hintId = SafeInstanceId(primaryHint);
         return boards
@@ -1620,6 +1735,7 @@ public sealed partial class BridgeMod
                     targetName = SafeObjectName(button.gameObject) ?? button.type.ToString();
                     targetPath = BuildHierarchyPath(button.transform);
                     actions.Add($"{methodUsed}({targetPath})");
+                    ArmBoardSingletonCheck("loss_menu_restart");
                     return true;
                 }
                 catch (Exception ex)
@@ -1643,6 +1759,7 @@ public sealed partial class BridgeMod
             targetName = fallbackName;
             targetPath = fallbackPath;
             actions.Add($"Restart fallback clicked via {fallbackMethod}: {fallbackPath}");
+            ArmBoardSingletonCheck("restart_fallback");
             return true;
         }
 
@@ -2143,6 +2260,7 @@ public sealed partial class BridgeMod
             var levelName = GameAPP.theIZLevelName ?? string.Empty;
             UIMgr.EnterGame(levelType, levelNumber, 0, levelName);
             actions.Add($"UIMgr.EnterGame({levelType},{levelNumber},0,{levelName})");
+            ArmBoardSingletonCheck("UIMgr.EnterGame");
             return true;
         }
         catch (Exception ex)
@@ -2193,6 +2311,10 @@ public sealed partial class BridgeMod
             actions.Add("InitBoard.StartInit() failed: " + ex.Message);
         }
 
+        if (invoked)
+        {
+            ArmBoardSingletonCheck("InitBoard.quick_reset");
+        }
         return invoked;
     }
 }

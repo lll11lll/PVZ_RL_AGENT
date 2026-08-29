@@ -25,7 +25,13 @@ import uuid
 
 import numpy as np
 
+from pvzrl_action_space import (
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    CELLS_PER_SLOT,
+    build_action_space_spec,
+)
 from pvzrl_demonstrations import DemonstrationBuffer
+from pvzrl_observation_layout import build_observation_layout
 from pvzrl_stream_commands import (
     BoundedViewerCommandQueue,
     ViewerCommand,
@@ -38,8 +44,10 @@ from pvzrl_streamer_source import DeterministicStreamCommandSource
 SOAK_REPORT_VERSION = 1
 DEFAULT_QUEUE_CAPACITY = 256
 DEFAULT_DEMO_CAPACITY = 4_096
-OBSERVATION_SHAPE = (4_297,)
-ACTION_COUNT = 701
+OBSERVATION_SHAPE = build_observation_layout(build_action_space_spec()).shape
+
+
+ACTION_COUNT = ADVENTURE_IDENTITY_ACTION_COUNT
 _VIEWER_HASH_SECRET = b"pvzrl-streamer-soak-local-secret-v1"
 
 
@@ -82,7 +90,7 @@ def _atomic_json_write(path: Path, payload: Mapping[str, Any]) -> None:
 def _message_text(sequence: int, rng: random.Random) -> tuple[str, str]:
     """Return a deterministic command and its intended simulation class."""
 
-    row = 1 + rng.randrange(5)
+    row = 1 + rng.randrange(6)
     column = 1 + rng.randrange(10)
     if sequence % 19 == 0:
         return "!unknown command", "parse_rejected"
@@ -118,7 +126,7 @@ def _resolve_command(command: ViewerCommand, *, frame: int) -> _SyntheticResolut
             frame_identity=f"soak:{frame}",
         )
     slot = int(command.seed_slot or 0)
-    action_id = 1 + slot * 50 + int(command.row) * 10 + int(command.column)
+    action_id = 1 + slot * CELLS_PER_SLOT + int(command.row) * 10 + int(command.column)
     return _SyntheticResolution(
         legal=True,
         classification="resolved",

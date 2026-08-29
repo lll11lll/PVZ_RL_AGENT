@@ -1,15 +1,18 @@
 """Adventure Generalist action-space contract.
 
 Adventure Generalist is the sole maintained policy layout.  Its action space
-has one wait action followed by fourteen 5x10 seed-slot placement blocks:
+has one wait action followed by fourteen padded 6x10 seed-slot placement
+blocks.  Five-lane Adventure boards use the same layout: their sixth-lane
+actions are masked from the live bridge and their observation features are
+zero-padded.
 
 * action ``0`` waits;
-* actions ``1..700`` place/fuse using seed-slot-major ordering;
-* decoder version ``seedslot14x50_plus_wait_v1`` is checkpoint semantics.
+* actions ``1..840`` place/fuse using seed-slot-major ordering;
+* decoder version ``seedslot14x60_padded6x10_plus_wait_v2`` is checkpoint
+  semantics.
 
-The ``dynamic_seed_slots`` metadata key is retained because it is serialized in
-the protected Generalist checkpoint.  It describes the live seed inventory; it
-does not imply support for the removed ``dynamic_14`` policy decoder.
+The ``dynamic_seed_slots`` metadata key describes the live seed inventory; it
+does not resize the fixed model action surface.
 """
 
 from __future__ import annotations
@@ -18,16 +21,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
-ACTION_SPACE_ADVENTURE_14_IDENTITY = "adventure_14slot_identity"
+ACTION_SPACE_ADVENTURE_14_IDENTITY = "adventure_14slot_identity_full_v2"
 ACTION_SPACE_MODES = {ACTION_SPACE_ADVENTURE_14_IDENTITY}
 
-DEFAULT_ROWS = 5
+DEFAULT_ROWS = 6
 DEFAULT_COLS = 10
+SUPPORTED_LIVE_ROWS = frozenset({5, DEFAULT_ROWS})
 CELLS_PER_SLOT = DEFAULT_ROWS * DEFAULT_COLS
 ADVENTURE_IDENTITY_MAX_SEED_SLOTS = 14
 
-ADVENTURE_IDENTITY_OBSERVATION_VERSION = "adventure_14slot_identity_v1"
-ADVENTURE_IDENTITY_ACTION_DECODER_VERSION = "seedslot14x50_plus_wait_v1"
+ADVENTURE_IDENTITY_OBSERVATION_VERSION = "adventure_14slot_identity_full_v2"
+ADVENTURE_IDENTITY_ACTION_DECODER_VERSION = "seedslot14x60_padded6x10_plus_wait_v2"
 ADVENTURE_IDENTITY_WAIT_ACTION = 0
 ADVENTURE_IDENTITY_ACTION_COUNT = ADVENTURE_IDENTITY_MAX_SEED_SLOTS * CELLS_PER_SLOT + 1
 
@@ -83,11 +87,18 @@ def normalize_action_space_mode(value: Any) -> str:
 
 
 def _validate_board_geometry(rows: int, cols: int) -> None:
-    if int(rows) != DEFAULT_ROWS or int(cols) != DEFAULT_COLS:
+    if not is_supported_live_board_geometry(rows, cols):
         raise ValueError(
-            "Adventure Generalist requires a 5x10 board: "
+            "Adventure Generalist requires a 5x10 or 6x10 live board under "
+            "the fixed padded 6x10 model contract: "
             f"rows={rows}, cols={cols}"
         )
+
+
+def is_supported_live_board_geometry(rows: int, cols: int) -> bool:
+    """Return whether a runtime board fits the padded full-Adventure model."""
+
+    return int(rows) in SUPPORTED_LIVE_ROWS and int(cols) == DEFAULT_COLS
 
 
 def build_action_space_spec(
@@ -167,10 +178,11 @@ def decode_policy_action(
     cols: int = DEFAULT_COLS,
 ) -> Dict[str, int]:
     normalize_action_space_mode(mode)
+    # The decoder is checkpoint semantics.  Runtime observations may expose a
+    # five-lane board, but they must never reinterpret the permanent 60-cell
+    # action blocks as 50-cell blocks.
     obs = observation if isinstance(observation, dict) else {}
-    obs_rows = int(obs.get("rowCount") or rows)
-    obs_cols = int(obs.get("columnCount") or cols)
-    decoded = adventure_identity_action_to_slot_cell(int(action), rows=obs_rows, cols=obs_cols)
+    decoded = adventure_identity_action_to_slot_cell(int(action), rows=rows, cols=cols)
 
     plant_type = -1
     slot_index = int(decoded.get("slot_index", -1))

@@ -1,7 +1,7 @@
 """Phase 3 compatibility contracts for the shared action/fusion pipeline.
 
 The assertions in this file intentionally use independent, exhaustive oracles
-where practical.  They protect the sole maintained 701-action Generalist
+where practical.  They protect the sole maintained padded 841-action Generalist
 layout, the complete mask (not a sampling of actions), fusion recipe/compatibility
 semantics, rejection precedence, and one-event/one-count accounting while the
 runtime paths are consolidated.
@@ -20,6 +20,9 @@ import pvzrl_env
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ADVENTURE_IDENTITY_ACTION_COUNT,
+    CELLS_PER_SLOT,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
     build_action_space_spec,
     decode_policy_action,
 )
@@ -55,6 +58,7 @@ from pvzrl_fusion import (
     account_fusion_execution_once,
     apply_fusion_attempt_result,
     are_fusion_compatible,
+    build_fusion_diagnostics,
     default_fusion_diagnostics,
     fusion_compatibility_kind,
     fusion_execution_from_result,
@@ -68,8 +72,10 @@ from test_refactor_support import STARTER_TYPES, load_observation_fixture, make_
 
 
 ROWS = 5
-COLS = 10
-CELLS = ROWS * COLS
+COLS = DEFAULT_COLS
+# This fixture represents a pre-Pool five-lane board.  Policy blocks remain
+# six rows wide, so the bridge-visible fifth lane must not compact slot IDs.
+OCCUPIED_PEA_ACTION = 1 + 2 * CELLS_PER_SLOT + 2 * DEFAULT_COLS + 3
 
 
 def _expected_decode(action: int) -> tuple[int, int, int, int]:
@@ -78,7 +84,12 @@ def _expected_decode(action: int) -> tuple[int, int, int, int]:
     if action == 0:
         return 0, -1, -1, -1
     encoded = action - 1
-    return 1, encoded // CELLS, (encoded % CELLS) // COLS, encoded % COLS
+    return (
+        1,
+        encoded // CELLS_PER_SLOT,
+        (encoded % CELLS_PER_SLOT) // DEFAULT_COLS,
+        encoded % DEFAULT_COLS,
+    )
 
 
 def test_every_generalist_policy_action_decodes_with_direct_bridge_identity() -> None:
@@ -125,7 +136,7 @@ def _expected_generalist_mask(observation: dict, *, fusion_enabled: bool) -> lis
     rows = int(observation["rowCount"])
     cols = int(observation["columnCount"])
     cells = rows * cols
-    action_count = int(observation["actionCount"])
+    action_count = ADVENTURE_IDENTITY_ACTION_COUNT
     slots = [slot for slot in observation.get("seedSlots", []) if isinstance(slot, dict)]
     bridge_legal = {int(action) for action in observation.get("legalActions", [])}
     occupied = _occupied_by_cell(observation)
@@ -133,11 +144,13 @@ def _expected_generalist_mask(observation: dict, *, fusion_enabled: bool) -> lis
     expected[0] = True
     for action in range(1, action_count):
         encoded = action - 1
-        slot_index = encoded // cells
+        slot_index = encoded // CELLS_PER_SLOT
         if not 0 <= slot_index < len(slots):
             continue
-        row = (encoded % cells) // cols
-        column = encoded % cols
+        row = (encoded % CELLS_PER_SLOT) // DEFAULT_COLS
+        column = encoded % DEFAULT_COLS
+        if row >= rows:
+            continue
         slot = slots[slot_index]
         if int(slot.get("slotIndex", slot_index)) != slot_index:
             continue
@@ -164,19 +177,19 @@ def _expected_generalist_mask(observation: dict, *, fusion_enabled: bool) -> lis
 
 def test_complete_generalist_mask_matches_independent_oracle() -> None:
     observation = load_observation_fixture()
-    observation["actionCount"] = 701
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     expected = _expected_generalist_mask(observation, fusion_enabled=True)
 
     identity = make_wrapper(fusion_enabled=True)
     try:
         identity._last_observation = copy.deepcopy(observation)
         identity_mask = identity.action_masks()
-        assert identity_mask.shape == (701,)
+        assert identity_mask.shape == (ADVENTURE_IDENTITY_ACTION_COUNT,)
         assert identity_mask.tolist() == expected
 
         # Every policy-visible mask bit must agree with the bridge action
         # identity, not merely have the same number of enabled entries.
-        for policy_action in range(701):
+        for policy_action in range(ADVENTURE_IDENTITY_ACTION_COUNT):
             assert bool(identity_mask[policy_action]) is bool(expected[policy_action])
     finally:
         identity.close()
@@ -204,10 +217,10 @@ def _validation_config(
     )
 
 
-def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask() -> None:
+def test_authoritative_cache_decisions_match_every_entry_of_the_padded_mask() -> None:
     mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
     observation = load_observation_fixture()
-    observation["actionCount"] = 701
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     bridge_actions = list(observation["legalActions"])
     config = _validation_config(observation, mode=mode)
     cache = build_action_decision_cache(
@@ -217,7 +230,7 @@ def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask() -> No
     )
     expected_mask = _expected_generalist_mask(observation, fusion_enabled=True)
     assert list(cache.mask) == expected_mask
-    assert len(cache.decisions) == 701
+    assert len(cache.decisions) == ADVENTURE_IDENTITY_ACTION_COUNT
 
     # Independently rebuild every intent and validate it against the same
     # immutable context.  The complete mask must be the direct projection of
@@ -247,7 +260,7 @@ def test_authoritative_cache_decisions_match_every_entry_of_the_701_mask() -> No
 
 def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> None:
     observation = load_observation_fixture()
-    observation["actionCount"] = 701
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     config = _validation_config(observation)
     sources = (
         "model",
@@ -264,7 +277,7 @@ def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> N
     decisions = []
     for source in sources:
         decision = validate_policy_action(
-            124,  # slot 2 Peashooter on the occupied Peashooter at row 2/col 3
+            OCCUPIED_PEA_ACTION,  # slot 2 Peashooter on the occupied Peashooter at row 2/col 3
             source=source,
             observation=observation,
             config=config,
@@ -349,7 +362,7 @@ def test_all_action_sources_receive_identical_decisions_and_stable_schema() -> N
 
 def test_action_cache_key_reuses_only_a_demonstrably_identical_frame_and_config() -> None:
     observation = load_observation_fixture()
-    observation["actionCount"] = 701
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     bridge_actions = list(observation["legalActions"])
     config = _validation_config(observation)
 
@@ -369,14 +382,14 @@ def test_action_cache_key_reuses_only_a_demonstrably_identical_frame_and_config(
     assert baseline.mask == identical.mask
 
     cached_intent = build_action_intent(
-        124,
+        OCCUPIED_PEA_ACTION,
         source="human_coach",
         mode=config.action_space_mode,
         observation=observation,
         plant_types=STARTER_TYPES,
         max_seed_slots=14,
     )
-    reused = baseline.decision_for(124, intent=cached_intent)
+    reused = baseline.decision_for(OCCUPIED_PEA_ACTION, intent=cached_intent)
     assert reused is not None and reused.cache_reused and reused.source == "human_coach"
     assert reused.frame_identity == baseline.key.frame_identity
     assert reused.config_fingerprint == baseline.key.config_fingerprint
@@ -427,9 +440,9 @@ def test_action_cache_key_reuses_only_a_demonstrably_identical_frame_and_config(
     )
     assert config_cache.key.frame_identity == baseline.key.frame_identity
     assert config_cache.key.config_fingerprint != baseline.key.config_fingerprint
-    assert baseline.decisions[124].legal
-    assert not config_cache.decisions[124].legal
-    assert config_cache.decisions[124].rejection_reason == "occupied_cell"
+    assert baseline.decisions[OCCUPIED_PEA_ACTION].legal
+    assert not config_cache.decisions[OCCUPIED_PEA_ACTION].legal
+    assert config_cache.decisions[OCCUPIED_PEA_ACTION].rejection_reason == "occupied_cell"
 
     no_compatibility = replace(
         config,
@@ -442,7 +455,11 @@ def test_action_cache_key_reuses_only_a_demonstrably_identical_frame_and_config(
         bridge_legal_actions=bridge_actions,
     )
     assert compatibility_cache.key.config_fingerprint != baseline.key.config_fingerprint
-    assert compatibility_cache.decisions[124].rejection_reason == FUSION_ILLEGAL_INCOMPATIBLE
+    # The occupied action is present in the bridge legal-action list, so the
+    # runtime candidate is authoritative even when the offline compatibility
+    # table is deliberately empty.
+    assert compatibility_cache.decisions[OCCUPIED_PEA_ACTION].legal
+    assert compatibility_cache.decisions[OCCUPIED_PEA_ACTION].resolved_action_kind == ACTION_KIND_FUSION
 
 
 def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_change() -> None:
@@ -450,7 +467,7 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
     try:
         base = wrapper.base
         observation = load_observation_fixture()
-        observation["actionCount"] = 701
+        observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
         first_mask = base.action_mask(observation)
         first_stats = base.action_cache_diagnostics()
         assert first_stats["misses"] == 1
@@ -461,9 +478,9 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
         assert second_stats["misses"] == 1
         assert second_stats["hits"] >= 1
 
-        decision = base.action_decision(124, observation, source="human_coach")
+        decision = base.action_decision(OCCUPIED_PEA_ACTION, observation, source="human_coach")
         filter_decision = base.action_decision(
-            124,
+            OCCUPIED_PEA_ACTION,
             observation,
             source="python_filter",
             bridge_actions=list(observation["legalActions"]),
@@ -472,7 +489,7 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
         assert filter_decision.cache_reused and filter_decision.legal
         assert filter_decision.rejection_reason == ""
         mismatched_intent = build_action_intent(
-            124,
+            OCCUPIED_PEA_ACTION,
             source="gui",
             mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
             observation=observation,
@@ -498,13 +515,13 @@ def test_environment_reuses_mask_decision_for_filter_and_invalidates_on_state_ch
         wrapper.close()
 
 
-def test_environment_execution_safeguard_matches_all_701_cached_mask_bits() -> None:
+def test_environment_execution_safeguard_matches_all_padded_cached_mask_bits() -> None:
     wrapper = make_wrapper(fusion_enabled=True)
     try:
         observation = load_observation_fixture()
-        observation["actionCount"] = 701
+        observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
         mask = wrapper.base.action_mask(observation)
-        assert len(mask) == 701
+        assert len(mask) == ADVENTURE_IDENTITY_ACTION_COUNT
         for action, allowed in enumerate(mask):
             decision = wrapper.base.action_decision(
                 action,
@@ -547,7 +564,7 @@ def test_environment_execution_preserves_bridge_result_and_adds_structured_sourc
     wrapper = make_wrapper(fusion_enabled=True)
     base = wrapper.base
     observation = load_observation_fixture()
-    observation["actionCount"] = 701
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     base.previous_observation = copy.deepcopy(observation)
     base.config.step_seconds = 0.0
     base.config.seed_screen_check_interval = 10_000
@@ -607,7 +624,7 @@ def test_terminal_and_timeout_results_keep_the_structured_action_contract() -> N
         terminal = load_observation_fixture()
         terminal.update(
             {
-                "actionCount": 701,
+                "actionCount": ADVENTURE_IDENTITY_ACTION_COUNT,
                 "screenState": "game_over_restart_screen",
                 "onGameOverScreen": True,
                 "gameplayReady": False,
@@ -628,7 +645,7 @@ def test_terminal_and_timeout_results_keep_the_structured_action_contract() -> N
         assert terminal_result["structuredActionResult"]["bridge_accepted"] is None
 
         active = load_observation_fixture()
-        active["actionCount"] = 701
+        active["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
         base.previous_observation = active
         base.client = TimeoutClient()  # type: ignore[assignment]
         _obs, _reward, done, _truncated, info = base.step(
@@ -805,6 +822,83 @@ def test_recipe_registry_is_immutable_directional_and_derives_mapping_views() ->
         FUSION_RECIPES[0].result_plant_type = -1  # type: ignore[misc]
 
 
+def test_runtime_probe_authorizes_unlisted_pair_and_keeps_unresolved_result_unknown() -> None:
+    observation = _recipe_observation(1, 2)  # SunFlower tile + CherryBomb card.
+    observation.update({"gameplayReady": True, "boardFound": True, "canReadBoard": True})
+    dynamic_action = 1 + 2 * DEFAULT_COLS + 4
+    observation["legalActions"] = [0, dynamic_action]
+    probe = {
+        "fusionCandidates": [
+            {
+                "sourceRow": 2,
+                "sourceCol": 4,
+                "sourcePlantType": 1,
+                "ingredientSeedSlotIndex": 0,
+                "ingredientPlantType": 2,
+                "fusionLegal": True,
+                "predictedResultType": -1,
+                "predictedResultName": "",
+            }
+        ]
+    }
+
+    diagnostics = build_fusion_diagnostics(
+        "observe",
+        observation,
+        bridge_probe=probe,
+    )
+    candidates = diagnostics["fusion_candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["fusion_legal"] is True
+    assert candidates[0]["fusion_runtime_authorized"] is True
+    assert candidates[0]["predicted_result_type"] == -1
+
+    intent = fusion_intent_from_candidate(candidates[0], source="model")
+    assert intent.predicted_result_type == -1
+    assert validate_fusion_intent(intent, observation).legal
+
+    cached_probe = {
+        "fusionCandidates": [
+            {
+                **probe["fusionCandidates"][0],
+                "predictedResultType": 2001,
+                "predictedResultName": "RuntimeHybrid",
+                "predictedResultResolutionSource": "runtime_cache",
+                "mixLookupFound": True,
+                "mixLookupKey": "1+2",
+            }
+        ]
+    }
+    cached_candidates = build_fusion_diagnostics(
+        "observe",
+        observation,
+        bridge_probe=cached_probe,
+    )["fusion_candidates"]
+    cached_intent = fusion_intent_from_candidate(cached_candidates[0], source="model")
+    assert cached_intent.predicted_result_type == 2001
+    assert cached_intent.predicted_result_name == "RuntimeHybrid"
+
+    env = PvZGymEnv(
+        PvZEnvConfig(
+            plant_types=[2],
+            fusion_action_mask_enabled=True,
+            row_count=6,
+            column_count=10,
+        )
+    )
+    try:
+        decision = env.action_decision(
+            dynamic_action,
+            observation,
+            source="runtime_probe_test",
+            bridge_actions=observation["legalActions"],
+        )
+        assert decision.legal
+        assert decision.resolved_action_kind == ACTION_KIND_FUSION
+    finally:
+        env.close()
+
+
 def test_fusion_structured_records_are_deeply_immutable() -> None:
     candidate = {
         **_candidate(),
@@ -861,8 +955,8 @@ def test_fusion_intent_validation_is_source_independent_and_schema_stable() -> N
         intent = fusion_intent_from_candidate(
             candidate,
             source=source,
-            requested_action=124,
-            executed_action=124,
+            requested_action=OCCUPIED_PEA_ACTION,
+            executed_action=OCCUPIED_PEA_ACTION,
             metadata={"origin": source},
         )
         decision = validate_fusion_intent(intent, observation)
@@ -1125,8 +1219,8 @@ def test_environment_fusion_adapter_is_tile_scoped_source_attributed_and_exactly
     intent = fusion_intent_from_candidate(
         _candidate(),
         source=raw_source,
-        requested_action=124,
-        executed_action=124,
+        requested_action=OCCUPIED_PEA_ACTION,
+        executed_action=OCCUPIED_PEA_ACTION,
     )
     try:
         result, diagnostics = env._execute_fusion_intent(
@@ -1383,16 +1477,19 @@ def test_failed_environment_fusion_is_counted_and_rewarded_once_across_copied_re
         assert diagnostics["fusion_failed_count"] == 1
         assert diagnostics["fusion_rejected_count"] == 1
 
-        first_reward = env._compose_step_reward(
+        first_composition = env._compose_step_reward(
             observation, observation, result, previous_legal_actions=[]
-        ).breakdown.component("fusion_reward")
+        )
         copied_result = copy.deepcopy(result)
-        second_reward = env._compose_step_reward(
+        second_composition = env._compose_step_reward(
             observation, observation, copied_result, previous_legal_actions=[]
-        ).breakdown.component("fusion_reward")
-        assert first_reward < 0.0
-        assert second_reward == 0.0
-        assert result["fusionRewardApplied"] is True
+        )
+        assert first_composition.breakdown.component("fusion_reward") == 0.0
+        assert first_composition.breakdown.component("illegal_penalty") == -0.1
+        assert second_composition.breakdown.component("fusion_reward") == 0.0
+        assert second_composition.breakdown.component("illegal_penalty") == 0.0
+        assert result["fusionRewardApplied"] is False
+        assert result["fusionRewardAccounted"] is True
         assert copied_result["fusionRewardDuplicateSuppressed"] is True
     finally:
         env.close()

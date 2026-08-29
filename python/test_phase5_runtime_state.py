@@ -245,8 +245,6 @@ def test_manual_reset_machine_uses_one_state_owner_and_preserves_payload(
 ) -> None:
     env = PvZGymEnv(
         PvZEnvConfig(
-            row_count=5,
-            column_count=10,
             reset_wait_timeout=1.0,
             reset_poll_seconds=0.01,
         )

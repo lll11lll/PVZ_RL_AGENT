@@ -59,6 +59,13 @@ DEFAULT_COMMAND_TTL_SECONDS = 30.0
 DEFAULT_OPPORTUNITY_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_POLL_MESSAGES = 16
 
+# Shared scheduling vocabulary.  The resolver owns the canonical mapping from
+# rejection reasons; the controller repeats only these stable string values so
+# it remains independent of the resolver module and its import direction.
+LEGAL = "LEGAL"
+TEMPORARILY_BLOCKED = "TEMPORARILY_BLOCKED"
+PERMANENTLY_INVALID = "PERMANENTLY_INVALID"
+
 _ALLOWED_MESSAGE = re.compile(r"^[A-Za-z0-9_! -]+$")
 _VIEWER_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_EVENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
@@ -348,6 +355,9 @@ class ViewerCommandOutcome:
     frame_identity: str = ""
     phase_generation: int = 0
     occurred_monotonic: float = 0.0
+    retry_count: int = 0
+    legality: str = ""
+    required_sun: int = 0
 
     def to_safe_dict(self) -> dict[str, Any]:
         return {
@@ -361,6 +371,9 @@ class ViewerCommandOutcome:
             "frame_identity": self.frame_identity,
             "phase_generation": self.phase_generation,
             "occurred_monotonic": self.occurred_monotonic,
+            "retry_count": int(self.retry_count),
+            "legality": self.legality,
+            "required_sun": int(self.required_sun),
         }
 
 
@@ -602,6 +615,8 @@ class ViewerActionResolutionLike(Protocol):
     reason: str
     action_id: Optional[int]
     frame_identity: str
+    legality: str
+    required_sun: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,6 +664,12 @@ class ViewerCommandController:
         self._accepting = True
         self._closed = False
         self._source_gate_epoch: Optional[int] = None
+        self._pending_command_id = ""
+        self._pending_block_reason = ""
+        self._pending_required_sun = 0
+        self._pending_retry_count = 0
+        self._pending_first_blocked_monotonic = 0.0
+        self._pending_last_attempt_monotonic = 0.0
 
     @property
     def next_opportunity_monotonic(self) -> float:
@@ -660,6 +681,7 @@ class ViewerCommandController:
 
     def close(self, *, timeout_seconds: float = 5.0) -> bool:
         self._closed = True
+        self.clear_pending_state(clear_queue=True, clear_source=True, reason="close")
         if self.source is None:
             return True
         return bool(self.source.stop(timeout_seconds=float(timeout_seconds)))
@@ -673,6 +695,7 @@ class ViewerCommandController:
         clear_dedupe: bool = False,
     ) -> ViewerCommandQueueSnapshot:
         at = float(self._monotonic() if now is None else now)
+        self._clear_pending_viewer_command()
         snapshot = self.queue.begin_phase(phase_name, clear_dedupe=clear_dedupe)
         self._accepting = bool(accepting)
         self._next_opportunity_monotonic = at
@@ -685,6 +708,110 @@ class ViewerCommandController:
             except Exception:
                 self._source_gate_epoch = None
         return snapshot
+
+    def _clear_pending_viewer_command(self) -> None:
+        self._pending_command_id = ""
+        self._pending_block_reason = ""
+        self._pending_required_sun = 0
+        self._pending_retry_count = 0
+        self._pending_first_blocked_monotonic = 0.0
+        self._pending_last_attempt_monotonic = 0.0
+
+    def clear_pending_state(
+        self,
+        *,
+        clear_queue: bool = False,
+        clear_source: bool = False,
+        reason: str = "reset",
+    ) -> int:
+        """Clear pending viewer state at reset/evaluation/phase boundaries."""
+
+        self._clear_pending_viewer_command()
+        cleared = 0
+        if clear_queue:
+            cleared = int(self.queue.clear(increment_generation=False))
+        if clear_source and self.source is not None:
+            try:
+                self.source.clear()
+            except Exception:
+                self.queue.record_status("source_clear_error")
+        if cleared:
+            self.queue.record_status("pending_cleared", cleared)
+        return cleared
+
+    def pending_reservation(self) -> Mapping[str, int]:
+        """Return the current canonical sun reservation, if any."""
+
+        required = int(self._pending_required_sun)
+        reserved = (
+            required
+            if required > 0 and self._pending_block_reason.strip().lower() == "insufficient_sun"
+            else 0
+        )
+        return MappingProxyType(
+            {
+                "required_sun": max(0, required),
+                "reserved_sun": max(0, reserved),
+            }
+        )
+
+    def record_viewer_execution(self, command_id: str, *, succeeded: bool) -> None:
+        """Record the single canonical execution result for a popped command."""
+
+        if not command_id:
+            return
+        self.queue.record_status("executed" if bool(succeeded) else "execution_failed")
+
+    def prepare_pending(
+        self,
+        resolve_command: Callable[[ViewerCommand], ViewerActionResolutionLike],
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Preflight the FIFO head before PPO mask/action selection.
+
+        This records a first temporary block without opening an intervention
+        opportunity or consuming the command.  The normal ``tick`` still owns
+        FIFO removal and execution, so a legal command cannot execute twice.
+        """
+
+        at = float(self._monotonic() if now is None else now)
+        if self._closed or not self._accepting:
+            return None
+        self.poll_source(now=at)
+        queued = self.queue.peek()
+        if queued is None or queued.phase_generation != self.queue.phase_generation:
+            return None
+        if at >= queued.expires_monotonic:
+            if self._pending_command_id == queued.command_id:
+                self._clear_pending_viewer_command()
+            return None
+        if self._pending_command_id == queued.command_id:
+            return None
+        try:
+            resolution = resolve_command(queued.command)
+        except Exception:
+            return None
+        semantic = getattr(resolution, "legality", None)
+        if semantic is None:
+            semantic = getattr(resolution, "legality_class", None)
+        if semantic is None:
+            classification = str(getattr(resolution, "classification", "") or "").strip().upper()
+            if classification in {"LEGAL", "TEMPORARILY_BLOCKED", "PERMANENTLY_INVALID"}:
+                semantic = classification
+        if str(semantic or "").strip().upper() != "TEMPORARILY_BLOCKED":
+            return resolution
+        self._pending_command_id = queued.command_id
+        self._pending_block_reason = str(getattr(resolution, "reason", "") or "temporarily_blocked")
+        try:
+            self._pending_required_sun = max(0, int(getattr(resolution, "required_sun", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            self._pending_required_sun = 0
+        self._pending_retry_count = 0
+        self._pending_first_blocked_monotonic = at
+        self._pending_last_attempt_monotonic = at
+        self.queue.record_status("temporarily_blocked")
+        return resolution
 
     @staticmethod
     def _safe_message_event_id(message: Any) -> str:
@@ -720,6 +847,7 @@ class ViewerCommandController:
                 and source_epoch != self._source_gate_epoch
             ):
                 phase_name = self.queue.snapshot().phase_name
+                self._clear_pending_viewer_command()
                 self.queue.begin_phase(phase_name)
                 self.queue.record_status("source_epoch_cleared")
             self._source_gate_epoch = source_epoch
@@ -755,6 +883,7 @@ class ViewerCommandController:
                 parsed = self.parser.try_parse(command_text)
                 if not parsed.accepted or parsed.command is None:
                     self.queue.record_status("parse_rejected")
+                    self.queue.record_status("permanently_rejected")
                     outcomes.append(
                         ViewerCommandOutcome(
                             status="parse_rejected",
@@ -777,6 +906,7 @@ class ViewerCommandController:
                 )
             except (TypeError, ValueError, UnicodeError) as exc:
                 self.queue.record_status("source_message_rejected")
+                self.queue.record_status("permanently_rejected")
                 reason = str(exc) if str(exc) in {"missing_event_id"} else type(exc).__name__
                 outcomes.append(
                     ViewerCommandOutcome(
@@ -816,6 +946,7 @@ class ViewerCommandController:
                     outcomes=tuple(outcomes),
                 )
             if queued.phase_generation != self.queue.phase_generation:
+                self._clear_pending_viewer_command()
                 removed = self.queue.pop_head(
                     queued.command_id,
                     status="phase_stale",
@@ -826,6 +957,7 @@ class ViewerCommandController:
                     outcomes.append(removed[1])
                 continue
             if at >= queued.expires_monotonic:
+                self._clear_pending_viewer_command()
                 removed = self.queue.pop_head(
                     queued.command_id,
                     status="expired",
@@ -839,6 +971,7 @@ class ViewerCommandController:
             try:
                 resolution = resolve_command(queued.command)
             except Exception as exc:
+                self._clear_pending_viewer_command()
                 removed = self.queue.pop_head(
                     queued.command_id,
                     status="unresolvable",
@@ -854,6 +987,95 @@ class ViewerCommandController:
             classification = str(getattr(resolution, "classification", "unresolvable") or "unresolvable")
             reason = str(getattr(resolution, "reason", "") or "")
             frame_identity = str(getattr(resolution, "frame_identity", "") or "")
+
+            # New semantic resolutions retain the FIFO head while a canonical
+            # short-lived resource/readiness gate is blocking the command.
+            # Older resolution shims without ``legality`` keep their original
+            # drop-on-illegal behavior for compatibility with legacy callers.
+            semantic_legality = getattr(resolution, "legality", None)
+            if semantic_legality is None:
+                semantic_legality = getattr(resolution, "legality_class", None)
+            if semantic_legality is None and classification.strip().upper() in {
+                "LEGAL",
+                "TEMPORARILY_BLOCKED",
+                "PERMANENTLY_INVALID",
+            }:
+                semantic_legality = classification
+            if semantic_legality is not None:
+                semantic_legality = str(semantic_legality).strip().upper()
+                if semantic_legality == "TEMPORARILY_BLOCKED":
+                    if self._pending_command_id != queued.command_id:
+                        self._pending_command_id = queued.command_id
+                        self._pending_retry_count = 0
+                        self._pending_first_blocked_monotonic = at
+                    else:
+                        self._pending_retry_count += 1
+                    self._pending_block_reason = reason or "temporarily_blocked"
+                    try:
+                        self._pending_required_sun = max(
+                            0,
+                            int(getattr(resolution, "required_sun", 0) or 0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        self._pending_required_sun = 0
+                    self._pending_last_attempt_monotonic = at
+                    if self._pending_retry_count == 0:
+                        self.queue.record_status("temporarily_blocked")
+                    else:
+                        self.queue.record_status("pending_retry")
+                    outcomes.append(
+                        ViewerCommandOutcome(
+                            status="temporarily_blocked",
+                            reason=self._pending_block_reason,
+                            command_id=queued.command_id,
+                            event_id=queued.event_id,
+                            viewer_hash=queued.viewer_hash,
+                            command=queued.command,
+                            action_id=int(action_id) if action_id is not None else None,
+                            frame_identity=frame_identity,
+                            phase_generation=queued.phase_generation,
+                            occurred_monotonic=at,
+                            retry_count=self._pending_retry_count,
+                            legality="TEMPORARILY_BLOCKED",
+                            required_sun=self._pending_required_sun,
+                        )
+                    )
+                    return ViewerCommandControllerTick(
+                        opportunity_opened=True,
+                        next_opportunity_monotonic=self._next_opportunity_monotonic,
+                        outcomes=tuple(outcomes),
+                        resolution=resolution,
+                    )
+
+                if semantic_legality != "LEGAL" or not legal or action_id is None:
+                    self._clear_pending_viewer_command()
+                    removed = self.queue.pop_head(
+                        queued.command_id,
+                        status="permanently_rejected",
+                        reason=reason or "permanently_invalid",
+                        now=at,
+                    )
+                    if removed is not None:
+                        outcome = removed[1]
+                        outcomes.append(
+                            ViewerCommandOutcome(
+                                status=outcome.status,
+                                reason=outcome.reason,
+                                command_id=outcome.command_id,
+                                event_id=outcome.event_id,
+                                viewer_hash=outcome.viewer_hash,
+                                command=outcome.command,
+                                action_id=int(action_id) if action_id is not None else None,
+                                frame_identity=frame_identity,
+                                phase_generation=outcome.phase_generation,
+                                occurred_monotonic=outcome.occurred_monotonic,
+                                legality="PERMANENTLY_INVALID",
+                            )
+                        )
+                    continue
+
+            pending_retry_count = int(self._pending_retry_count)
+            self._clear_pending_viewer_command()
             if not legal or action_id is None:
                 drop_status = classification if classification in {"currently_illegal", "unresolvable", "stale"} else "unresolvable"
                 removed = self.queue.pop_head(
@@ -898,6 +1120,9 @@ class ViewerCommandController:
                 frame_identity=frame_identity,
                 phase_generation=selection_outcome.phase_generation,
                 occurred_monotonic=selection_outcome.occurred_monotonic,
+                retry_count=pending_retry_count,
+                legality="LEGAL",
+                required_sun=max(0, int(getattr(resolution, "required_sun", 0) or 0)),
             )
             outcomes.append(selection_outcome)
             if execute_command is None:
@@ -910,6 +1135,7 @@ class ViewerCommandController:
                 )
             try:
                 execution_result = execute_command(selected, resolution)
+                self.queue.record_status("executed")
             except Exception as exc:
                 self.queue.record_status("execution_error")
                 outcomes.append(
@@ -989,12 +1215,56 @@ class ViewerCommandController:
 
     def diagnostics(self) -> dict[str, Any]:
         snapshot = self.queue.snapshot().to_safe_dict()
+        counters = dict(snapshot.get("counters") or {})
+        # Keep the externally useful semantic counters stable even before the
+        # first command reaches each terminal state.
+        for key in (
+            "temporarily_blocked",
+            "permanently_rejected",
+            "expired",
+            "executed",
+        ):
+            counters.setdefault(key, 0)
+        snapshot["counters"] = counters
+        queued = self.queue.peek()
+        pending = None
+        pending_age = 0.0
+        pending_expiry = 0.0
+        pending_reason = ""
+        pending_required_sun = 0
+        pending_retry_count = 0
+        reserved_sun = 0
+        if queued is not None and self._pending_command_id == queued.command_id:
+            now = float(self._monotonic())
+            pending = queued.to_safe_dict()
+            pending_age = max(0.0, now - float(queued.received_monotonic))
+            pending_expiry = max(0.0, float(queued.expires_monotonic) - now)
+            pending_reason = str(self._pending_block_reason or "")
+            pending_required_sun = max(0, int(self._pending_required_sun))
+            pending_retry_count = max(0, int(self._pending_retry_count))
+            if pending_reason.strip().lower() == "insufficient_sun":
+                reserved_sun = pending_required_sun
         return {
             "streamer_command_accepting": bool(self._accepting),
             "streamer_command_closed": bool(self._closed),
             "streamer_command_next_opportunity_monotonic": self._next_opportunity_monotonic,
             "streamer_command_opportunity_interval_seconds": self.opportunity_interval_seconds,
             "streamer_command_queue": snapshot,
+            "temporarily_blocked": int(counters["temporarily_blocked"]),
+            "permanently_rejected": int(counters["permanently_rejected"]),
+            "expired": int(counters["expired"]),
+            "executed": int(counters["executed"]),
+            "streamer_temporarily_blocked_count": int(counters["temporarily_blocked"]),
+            "streamer_permanently_rejected_count": int(counters["permanently_rejected"]),
+            "streamer_expired_count": int(counters["expired"]),
+            "streamer_executed_count": int(counters["executed"]),
+            "pending_viewer_command": pending,
+            "pending_viewer_command_age": pending_age,
+            "pending_viewer_block_reason": pending_reason,
+            "pending_viewer_required_sun": pending_required_sun,
+            "streamer_reserved_sun": reserved_sun,
+            "pending_viewer_retry_count": pending_retry_count,
+            "pending_viewer_expiry_remaining": pending_expiry,
         }
 
 
@@ -1063,6 +1333,9 @@ __all__ = [
     "DEFAULT_MAX_MESSAGE_LENGTH",
     "DEFAULT_OPPORTUNITY_INTERVAL_SECONDS",
     "DEFAULT_QUEUE_CAPACITY",
+    "LEGAL",
+    "TEMPORARILY_BLOCKED",
+    "PERMANENTLY_INVALID",
     "QueuedViewerCommand",
     "StreamCommandController",
     "ViewerCommand",

@@ -28,8 +28,8 @@ internal sealed class BridgeConfig
     public float GameSpeed { get; set; } = 1f;
     public string GameSpeedMode { get; set; } = "game_speed";
     public int Seed { get; set; } = 12345;
-    public int FallbackRows { get; set; } = 5;
-    public int FallbackColumns { get; set; } = 9;
+    public int FallbackRows { get; set; } = 6;
+    public int FallbackColumns { get; set; } = 10;
     public int SeedScreenCheckInterval { get; set; } = 100;
     public bool DebugPerformance { get; set; }
     public bool DebugObservation { get; set; }

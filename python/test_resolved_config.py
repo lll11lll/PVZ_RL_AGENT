@@ -10,11 +10,11 @@ from pathlib import Path
 import pytest
 
 from pvzrl_config import ConfigSource, IgnoredLegacyConfigWarning, resolve_config_value
-from train_ppo import build_arg_parser, build_config, build_resolved_config
+from train_ppo import build_arg_parser, build_config, build_resolved_config, make_env_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GENERALIST_CONFIG = ROOT / "configs" / "ppo_adventure_generalist_14slot_identity_v1.json"
+GENERALIST_CONFIG = ROOT / "configs" / "ppo_adventure_generalist_full_v2.json"
 GENERALIST_TRAIN = "adventure_generalist_14slot_train"
 GENERALIST_EVAL = "adventure_generalist_14slot_eval"
 GENERALIST_LOADOUT = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
@@ -108,7 +108,7 @@ def test_global_generalist_defaults_are_stable() -> None:
     config = build_config(build_arg_parser().parse_args([]), {})
     assert config["run_mode"] == GENERALIST_TRAIN
     assert config["advance_on_wins"] == 1
-    assert config["max_adventure_levels"] == 5
+    assert config["max_adventure_levels"] == 50
     assert config["max_attempts_per_level"] == 10
     assert config["adventure_start_level"] == 1
     assert config["seed_list"] == GENERALIST_LOADOUT
@@ -272,9 +272,9 @@ def test_typed_sections_round_trip_without_flat_contract_drift() -> None:
     assert resolved.environment.board_timeout == flat["board_timeout"]
     assert resolved.seed_actions.seed_list == tuple(flat["seed_list"])
     assert resolved.adventure.advance_on_wins == flat["advance_on_wins"]
-    assert resolved.model_contract.action_count == 701
-    assert resolved.model_contract.action_decoder_version == "seedslot14x50_plus_wait_v1"
-    assert resolved.model_contract.observation_version == "adventure_14slot_identity_v1"
+    assert resolved.model_contract.action_count == 841
+    assert resolved.model_contract.action_decoder_version == "seedslot14x60_padded6x10_plus_wait_v2"
+    assert resolved.model_contract.observation_version == "adventure_14slot_identity_full_v2"
     assert dict(resolved.reward) == flat["reward"]
     assert resolved.value_sources["learning_rate"] is ConfigSource.GLOBAL_DEFAULT
 
@@ -328,15 +328,15 @@ def test_tracked_generalist_config_preserves_protected_contract() -> None:
     args = build_arg_parser().parse_args(["--adventure-generalist-train"])
     config = build_config(args, raw_config)
     assert config["run_mode"] == GENERALIST_TRAIN
-    assert config["model_family"] == "ppo_adventure_generalist_14slot_identity_v1"
+    assert config["model_family"] == "ppo_adventure_generalist_14slot_identity_full_v2"
     assert config["seed_list"] == GENERALIST_LOADOUT
     assert config["plant_types"] == [1, 1, 0, 0]
     assert config["max_seed_slots"] == 14
-    assert config["action_count"] == 701
+    assert config["action_count"] == 841
     assert config["decoder_wait_action"] == 0
-    assert config["placement_action_range"] == [1, 700]
-    assert config["action_decoder_version"] == "seedslot14x50_plus_wait_v1"
-    assert config["observation_version"] == "adventure_14slot_identity_v1"
+    assert config["placement_action_range"] == [1, 840]
+    assert config["action_decoder_version"] == "seedslot14x60_padded6x10_plus_wait_v2"
+    assert config["observation_version"] == "adventure_14slot_identity_full_v2"
     assert config["identity_seed_slots"] is True
     assert "incompatible_with_4slot_specialist" not in config
 
@@ -352,6 +352,26 @@ def _streamer_args(*extra: str) -> Namespace:
             *extra,
         ]
     )
+
+
+def test_adventure_and_streamer_default_to_four_x_gameplay_speed() -> None:
+    configurations = [
+        build_config(
+            build_arg_parser().parse_args(["--adventure-generalist-train"]),
+            {},
+        ),
+        build_config(
+            build_arg_parser().parse_args(["--adventure-generalist-eval"]),
+            {},
+        ),
+        build_config(_streamer_args(), {}),
+    ]
+    for config in configurations:
+        assert config["game_speed"] == pytest.approx(4.0)
+        assert config["game_speed_mode"] == "game_speed"
+        environment = make_env_config(config)
+        assert environment.game_speed == pytest.approx(4.0)
+        assert environment.game_speed_mode == "game_speed"
 
 
 def test_streamer_intervention_interval_has_a_practical_minimum() -> None:

@@ -498,3 +498,31 @@ def test_reset_clears_replay_recovery_latch_before_starting_attempt(
     assert env.current_attempt == 1
     assert observation == {"frame": 1}
     assert reset_info == {"reset": True}
+
+
+def test_empty_seed_screen_does_not_expand_loadout_from_unlock_fallback(tmp_path) -> None:
+    env = fake_generalist_env(tmp_path)
+    expected_loadout = list(env.current_loadout)
+    env.curriculum.record_unlocked(["CherryBomb"], episode_index=1)
+    env.curriculum.episode_index = 2
+    env.episode_index = 2
+    env.confirmed_unlock_event_seeds = ["CherryBomb"]
+    env._apply_loadout = lambda _loadout: None
+
+    selected, blocked = env._on_seed_selection_screen(
+        {
+            "screenState": "seed_selection",
+            "isSeedSelectionScreen": True,
+            "visibleSeedCardNames": [],
+            "availableSeedNames": [],
+            "selectedSeedNames": [],
+            "unlockedSeedNames": ["SunFlower", "Peashooter", "CherryBomb"],
+            "seedSlotCapacity": 4,
+        },
+        expected_loadout,
+    )
+
+    assert blocked == ""
+    assert selected == expected_loadout
+    assert env.context["raw_selectable_seeds"] == []
+    assert env.context["selected_loadout"] == expected_loadout

@@ -1,7 +1,7 @@
 """Canonical action resolution for Streamer Mode V1 viewer commands.
 
 The resolver does not implement game legality.  It projects one structured
-viewer command onto the permanent 701-action identity, asks the environment's
+viewer command onto the permanent 841-action identity, asks the environment's
 canonical ``action_decision`` callback for each relevant slot-cell action, and
 requires the supplied current action mask to agree with those decisions.
 """
@@ -38,6 +38,39 @@ RESOLUTION_CURRENTLY_ILLEGAL = "currently_illegal"
 RESOLUTION_UNRESOLVABLE = "unresolvable"
 RESOLUTION_STALE = "stale"
 
+# Stable semantic classes consumed by the FIFO controller.  The legacy
+# ``classification`` values above remain in diagnostics and compatibility
+# tests; these classes answer the scheduling question independently of the
+# older status vocabulary.
+LEGAL = "LEGAL"
+TEMPORARILY_BLOCKED = "TEMPORARILY_BLOCKED"
+PERMANENTLY_INVALID = "PERMANENTLY_INVALID"
+LEGALITY_LEGAL = LEGAL
+LEGALITY_TEMPORARILY_BLOCKED = TEMPORARILY_BLOCKED
+LEGALITY_PERMANENTLY_INVALID = PERMANENTLY_INVALID
+
+_TEMPORARY_REASONS = frozenset(
+    {
+        "insufficient_sun",
+        "cooldown_not_ready",
+        "restart_screen",
+        "gameplay_not_ready",
+        "board_not_readable",
+        "seed_selection_active",
+        "bridge_legal_actions_missing",
+        "not_gameplay",
+        "reward_or_unlock_screen_active",
+        "target_not_available",
+    }
+)
+_STRUCTURAL_STALE_REASONS = frozenset(
+    {
+        "action_mask_shape_mismatch",
+        "action_identity_geometry_mismatch",
+        "unsupported_viewer_command_kind",
+    }
+)
+
 
 ActionDecisionProvider = Callable[[int], Optional[ActionDecision]]
 
@@ -54,12 +87,22 @@ class ViewerActionResolution:
     decision: Optional[ActionDecision]
     frame_identity: str
     considered_action_ids: Tuple[int, ...] = ()
+    legality: str = LEGAL
+    required_sun: int = 0
+
+    @property
+    def legality_class(self) -> str:
+        """Compatibility alias for integrations that use class terminology."""
+
+        return self.legality
 
     def to_safe_dict(self) -> dict[str, Any]:
         return {
             "legal": bool(self.legal),
             "classification": self.classification,
+            "legality": self.legality,
             "reason": self.reason,
+            "required_sun": int(self.required_sun),
             "action_id": self.action_id,
             "frame_identity": self.frame_identity,
             "considered_action_ids": list(self.considered_action_ids),
@@ -90,6 +133,79 @@ def _selected_plant_type(decision: ActionDecision) -> int:
         return -1
 
 
+def _is_fusion_candidate(decision: ActionDecision) -> bool:
+    """Use canonical action metadata to retain blocked fusion candidates."""
+
+    if decision.resolved_action_kind == ACTION_KIND_FUSION:
+        return True
+    try:
+        existing = int(decision.existing_plant_type)
+        selected = int(_selected_plant_type(decision))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return existing >= 0 and selected >= 0 and fusion_recipe(existing, selected) is not None
+
+
+def _is_temporarily_blocked_tile_candidate(decision: ActionDecision) -> bool:
+    """Retain runtime-only fusion pairs while canonical readiness is pending."""
+
+    try:
+        return (
+            not decision.legal
+            and int(decision.existing_plant_type) >= 0
+            and str(decision.rejection_reason or "").strip().lower() in _TEMPORARY_REASONS
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _legality_for_failure(classification: str, reason: str) -> str:
+    """Map canonical rejection reasons onto the scheduling semantics."""
+
+    normalized_classification = str(classification or "").strip().lower()
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_classification == RESOLUTION_RESOLVED:
+        return LEGAL
+    if normalized_reason in _TEMPORARY_REASONS:
+        return TEMPORARILY_BLOCKED
+    if normalized_classification == RESOLUTION_STALE and normalized_reason not in _STRUCTURAL_STALE_REASONS:
+        # A stale frame/configuration is a short-lived observation race.  The
+        # controller should retry the same FIFO head on the next opportunity.
+        return TEMPORARILY_BLOCKED
+    return PERMANENTLY_INVALID
+
+
+def _blocked_legality(
+    decisions: Sequence[ActionDecision],
+    *,
+    default_reason: str,
+    tile_placement: bool = False,
+) -> str:
+    """Classify a failed candidate set using the canonical decisions only."""
+
+    if tile_placement and any(int(decision.existing_plant_type) >= 0 for decision in decisions):
+        return PERMANENTLY_INVALID
+    reasons = [str(decision.rejection_reason or "") for decision in decisions if not decision.legal]
+    if any(_legality_for_failure(RESOLUTION_CURRENTLY_ILLEGAL, reason) == TEMPORARILY_BLOCKED for reason in reasons):
+        return TEMPORARILY_BLOCKED
+    return _legality_for_failure(RESOLUTION_CURRENTLY_ILLEGAL, default_reason)
+
+
+def _required_sun_for(decisions: Sequence[ActionDecision]) -> int:
+    costs = []
+    for decision in decisions:
+        try:
+            required = max(0, int(getattr(decision, "required_sun", 0)))
+        except (TypeError, ValueError, OverflowError):
+            required = 0
+        if required:
+            costs.append(required)
+    # A named plant may have duplicate identity slots.  Reserve the cheapest
+    # canonical candidate rather than unnecessarily blocking on an expensive
+    # duplicate that would not be selected first when it becomes legal.
+    return min(costs) if costs else 0
+
+
 def _resolution(
     *,
     classification: str,
@@ -99,7 +215,10 @@ def _resolution(
     decision: Optional[ActionDecision] = None,
     source: str = "twitch",
     source_metadata: Optional[Mapping[str, Any]] = None,
+    legality: Optional[str] = None,
+    required_sun: int = 0,
 ) -> ViewerActionResolution:
+    resolved_legality = str(legality or _legality_for_failure(classification, reason))
     if decision is None:
         return ViewerActionResolution(
             legal=False,
@@ -110,6 +229,8 @@ def _resolution(
             decision=None,
             frame_identity=str(frame_identity or ""),
             considered_action_ids=tuple(int(value) for value in considered),
+            legality=resolved_legality,
+            required_sun=max(0, int(required_sun)),
         )
 
     safe_metadata = filter_safe_action_source_metadata(source_metadata)
@@ -128,6 +249,8 @@ def _resolution(
         decision=sourced_decision,
         frame_identity=str(sourced_decision.frame_identity),
         considered_action_ids=tuple(int(value) for value in considered),
+        legality=LEGAL,
+        required_sun=max(0, int(getattr(sourced_decision, "required_sun", 0))),
     )
 
 
@@ -249,6 +372,7 @@ def resolve_viewer_action(
                 reason="plant_not_in_current_loadout",
                 considered=considered,
                 frame_identity=frame_identity,
+                legality=PERMANENTLY_INVALID,
             )
         legal_matching = [
             decision
@@ -271,6 +395,16 @@ def resolve_viewer_action(
                 ),
                 considered=considered,
                 frame_identity=frame_identity,
+                legality=(
+                    PERMANENTLY_INVALID
+                    if wrong_kind
+                    else _blocked_legality(
+                        matching,
+                        default_reason=_first_rejection_reason(matching, "plant_not_currently_legal"),
+                        tile_placement=True,
+                    )
+                ),
+                required_sun=_required_sun_for(matching),
             )
 
     elif command.kind is ViewerCommandKind.SLOT:
@@ -286,34 +420,38 @@ def resolve_viewer_action(
                 reason="slot_action_identity_unavailable",
                 considered=considered,
                 frame_identity=frame_identity,
+                legality=PERMANENTLY_INVALID,
             )
         legal_matching = [
             decision
             for decision in matching
             if decision.legal
             and mask[decision.policy_action]
-            and decision.resolved_action_kind == ACTION_KIND_PLACEMENT
+            and decision.resolved_action_kind in {ACTION_KIND_PLACEMENT, ACTION_KIND_FUSION}
         ]
         if not legal_matching:
-            wrong_kind = bool(
-                matching[0].legal and matching[0].resolved_action_kind == ACTION_KIND_FUSION
-            )
             return _resolution(
                 classification=RESOLUTION_CURRENTLY_ILLEGAL,
-                reason=(
-                    "slot_command_requires_empty_tile"
-                    if wrong_kind
-                    else _first_rejection_reason(matching, "slot_not_currently_legal")
-                ),
+                reason=_first_rejection_reason(matching, "slot_not_currently_legal"),
                 considered=considered,
                 frame_identity=frame_identity,
+                legality=_blocked_legality(
+                    matching,
+                    default_reason=_first_rejection_reason(matching, "slot_not_currently_legal"),
+                    tile_placement=False,
+                ),
+                required_sun=_required_sun_for(matching),
             )
 
     elif command.kind in {ViewerCommandKind.FUSE_RESULT, ViewerCommandKind.FUSE_TILE}:
         fusion_decisions = [
             decision
             for decision in decisions
-            if decision.resolved_action_kind == ACTION_KIND_FUSION
+            if _is_fusion_candidate(decision)
+            or (
+                command.kind is ViewerCommandKind.FUSE_TILE
+                and _is_temporarily_blocked_tile_candidate(decision)
+            )
         ]
         if command.kind is ViewerCommandKind.FUSE_RESULT:
             target_result = int(
@@ -349,6 +487,15 @@ def resolve_viewer_action(
                 reason=_first_rejection_reason(matching, fallback),
                 considered=considered,
                 frame_identity=frame_identity,
+                legality=(
+                    _blocked_legality(
+                        matching,
+                        default_reason=_first_rejection_reason(matching, fallback),
+                    )
+                    if matching
+                    else PERMANENTLY_INVALID
+                ),
+                required_sun=_required_sun_for(matching),
             )
     else:  # defensive for data constructed outside the strict parser.
         return _resolution(
@@ -356,6 +503,7 @@ def resolve_viewer_action(
             reason="unsupported_viewer_command_kind",
             considered=considered,
             frame_identity=frame_identity,
+            legality=PERMANENTLY_INVALID,
         )
 
     # Candidate actions were generated in permanent action-ID order and every
@@ -418,6 +566,12 @@ class ViewerActionResolver:
 
 
 __all__ = [
+    "LEGAL",
+    "TEMPORARILY_BLOCKED",
+    "PERMANENTLY_INVALID",
+    "LEGALITY_LEGAL",
+    "LEGALITY_TEMPORARILY_BLOCKED",
+    "LEGALITY_PERMANENTLY_INVALID",
     "RESOLUTION_CURRENTLY_ILLEGAL",
     "RESOLUTION_RESOLVED",
     "RESOLUTION_STALE",

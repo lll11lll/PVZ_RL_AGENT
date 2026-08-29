@@ -35,6 +35,7 @@ REWARD_COMPONENT_FIELDS = (
     "win_loss_reward",
     "illegal_penalty",
     "mower_loss_penalty",
+    "threat_delta_reward",
     "danger_delta_reward",
     "undefended_threat_penalty",
     "lane_response_reward",
@@ -94,6 +95,19 @@ REWARD_COMPONENT_FIELDS = (
 )
 REWARD_EPISODE_TOTAL_FIELDS = tuple(f"{field}_total" for field in REWARD_COMPONENT_FIELDS)
 
+REWARD_POLICY_VERSION = "generalized_threat_v2"
+REWARD_POLICY_V2_CORE_FIELDS = (
+    "win_reward",
+    "loss_penalty",
+    "wave_reward",
+    "kill_reward",
+    "threat_delta_coef",
+    "threat_delta_clip",
+    "mower_loss_penalty",
+    "illegal_action_penalty",
+    "fusion_success_reward",
+)
+
 FUSION_REWARD_COMPONENT_NAMES = (
     "fusion_attempt_reward",
     "fusion_success_reward",
@@ -114,33 +128,42 @@ FUSION_REWARD_COMPONENT_NAMES = (
 
 @dataclass
 class RewardConfig:
-    kill_reward: float = 1.0
+    """Reward Policy V2 coefficients.
+
+    The long tail of zero-valued fields is intentionally retained as a
+    configuration/serialization compatibility surface.  The V2 compositor
+    does not consult those plant-, lane-, tier-, or context-specific values.
+    """
+
+    kill_reward: float = 0.25
     wave_reward: float = 2.0
-    plant_health_loss_penalty: float = 0.002
-    illegal_action_penalty: float = 0.15
-    mower_loss_penalty: float = 1.25
-    danger_delta_scale: float = 0.01
-    lane_response_reward: float = 0.45
-    undefended_close_threat_penalty: float = 0.02
+    plant_health_loss_penalty: float = 0.0
+    illegal_action_penalty: float = 0.10
+    mower_loss_penalty: float = 2.0
+    threat_delta_coef: float = 0.75
+    threat_delta_clip: float = 1.0
+    danger_delta_scale: float = 0.0
+    lane_response_reward: float = 0.0
+    undefended_close_threat_penalty: float = 0.0
     close_threat_threshold: float = 0.6
-    threat_balanced_row_reward: float = 0.5
-    threat_balanced_zero_defender_bonus: float = 0.25
-    overdefended_row_penalty: float = 0.2
-    role_positioning_reward: float = 0.25
-    first_peashooter_in_row_reward: float = 0.75
-    first_defense_undefended_threatened_row_reward: float = 1.25
-    all_rows_peashooter_coverage_reward: float = 3.0
-    sunflower_overbuild_before_defense_penalty: float = 0.2
-    defense_before_extra_economy_reward: float = 0.5
-    sunflower_while_undefended_threat_penalty: float = 0.45
-    plant_elsewhere_while_undefended_threat_penalty: float = 0.25
+    threat_balanced_row_reward: float = 0.0
+    threat_balanced_zero_defender_bonus: float = 0.0
+    overdefended_row_penalty: float = 0.0
+    role_positioning_reward: float = 0.0
+    first_peashooter_in_row_reward: float = 0.0
+    first_defense_undefended_threatened_row_reward: float = 0.0
+    all_rows_peashooter_coverage_reward: float = 0.0
+    sunflower_overbuild_before_defense_penalty: float = 0.0
+    defense_before_extra_economy_reward: float = 0.0
+    sunflower_while_undefended_threat_penalty: float = 0.0
+    plant_elsewhere_while_undefended_threat_penalty: float = 0.0
     undefended_threat_grace_steps: float = 40.0
-    late_undefended_threat_penalty: float = 0.03
-    reduce_undefended_threat_reward: float = 1.0
-    wait_while_actionable_threat_penalty: float = 0.05
-    first_peashooter_threatened_row_reward: float = 0.35
-    all_active_threatened_rows_have_peashooter_reward: float = 0.15
-    sunflower_greed_while_defense_missing_penalty: float = 0.15
+    late_undefended_threat_penalty: float = 0.0
+    reduce_undefended_threat_reward: float = 0.0
+    wait_while_actionable_threat_penalty: float = 0.0
+    first_peashooter_threatened_row_reward: float = 0.0
+    all_active_threatened_rows_have_peashooter_reward: float = 0.0
+    sunflower_greed_while_defense_missing_penalty: float = 0.0
     early_sunflower_reward: float = 0.0
     safe_sunflower_position_reward: float = 0.0
     sunflower_overbuild_penalty: float = 0.0
@@ -150,54 +173,64 @@ class RewardConfig:
     row_balance_reward: float = 0.0
     useful_peashooter_position_reward: float = 0.0
     overdefense_penalty: float = 0.0
-    wallnut_blocks_active_threat_reward: float = 0.25
-    wallnut_low_value_placement_penalty: float = 0.06
+    wallnut_blocks_active_threat_reward: float = 0.0
+    wallnut_low_value_placement_penalty: float = 0.0
     wallnut_threatened_lane_reward: float = 0.0
     wallnut_between_zombie_and_house_reward: float = 0.0
     wallnut_frontline_reward: float = 0.0
     wallnut_emergency_block_reward: float = 0.0
     wallnut_useless_penalty: float = 0.0
-    cherrybomb_tactical_kill_reward: float = 0.5
-    cherrybomb_tough_bonus_reward: float = 0.75
-    cherrybomb_mower_save_bonus_reward: float = 0.25
-    cherrybomb_wasted_penalty: float = 0.35
+    cherrybomb_tactical_kill_reward: float = 0.0
+    cherrybomb_tough_bonus_reward: float = 0.0
+    cherrybomb_mower_save_bonus_reward: float = 0.0
+    cherrybomb_wasted_penalty: float = 0.0
     cherrybomb_kill_reward: float = 0.0
     cherrybomb_heavy_zombie_bonus: float = 0.0
     cherrybomb_cluster_bonus: float = 0.0
     cherrybomb_emergency_reward: float = 0.0
     cherrybomb_zero_kill_penalty: float = 0.0
     cherrybomb_low_value_penalty: float = 0.0
-    mower_risk_reduction_reward: float = 0.15
-    tough_zombie_response_reward: float = 0.15
+    mower_risk_reduction_reward: float = 0.0
+    tough_zombie_response_reward: float = 0.0
     row_danger_delta_reward: float = 0.0
     high_danger_unanswered_penalty: float = 0.0
     mower_exposure_penalty: float = 0.0
     minimum_viable_defense_reward: float = 0.0
-    coach_match_reward: float = 0.02
-    coach_legal_execution_reward: float = 0.01
-    coach_override_penalty: float = -0.01
-    coach_fusion_success_reward: float = 0.03
-    coach_tactical_usefulness_reward: float = 0.01
-    fusion_attempt_reward: float = 0.02
-    fusion_success_reward: float = 0.50
-    fusion_new_recipe_reward: float = 0.15
-    fusion_recursive_reward: float = 0.20
-    fusion_tier2_reward: float = 0.10
-    fusion_tier3_reward: float = 0.25
-    fusion_repeat_reward_multiplier: float = 0.25
-    fusion_threatened_row_bonus: float = 0.15
-    fusion_active_wave_bonus: float = 0.10
-    fusion_defensive_value_bonus: float = 0.10
-    fusion_incompatible_penalty: float = -0.10
-    fusion_empty_tile_penalty: float = -0.08
-    fusion_failed_penalty: float = -0.10
-    fusion_bridge_error_penalty: float = -0.25
-    fusion_spam_penalty: float = -0.05
-    max_fusion_reward_per_episode: float = 3.0
+    coach_match_reward: float = 0.0
+    coach_legal_execution_reward: float = 0.0
+    coach_override_penalty: float = 0.0
+    coach_fusion_success_reward: float = 0.0
+    coach_tactical_usefulness_reward: float = 0.0
+    fusion_attempt_reward: float = 0.0
+    fusion_success_reward: float = 0.15
+    fusion_new_recipe_reward: float = 0.0
+    fusion_recursive_reward: float = 0.0
+    fusion_tier2_reward: float = 0.0
+    fusion_tier3_reward: float = 0.0
+    fusion_repeat_reward_multiplier: float = 1.0
+    fusion_threatened_row_bonus: float = 0.0
+    fusion_active_wave_bonus: float = 0.0
+    fusion_defensive_value_bonus: float = 0.0
+    fusion_incompatible_penalty: float = 0.0
+    fusion_empty_tile_penalty: float = 0.0
+    fusion_failed_penalty: float = 0.0
+    fusion_bridge_error_penalty: float = 0.0
+    fusion_spam_penalty: float = 0.0
+    max_fusion_reward_per_episode: float = 0.0
     # Compatibility-only: absolute proximity punishment is intentionally unused.
     proximity_penalty: float = 0.01
-    win_reward: float = 10.0
-    loss_penalty: float = 10.0
+    win_reward: float = 15.0
+    loss_penalty: float = 15.0
+
+
+def reward_policy_v2_core_config(
+    config: Optional[RewardConfig] = None,
+) -> Dict[str, float]:
+    resolved = config or RewardConfig()
+    return {
+        field_name: float(getattr(resolved, field_name))
+        for field_name in REWARD_POLICY_V2_CORE_FIELDS
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +290,17 @@ class PendingCherryEvent:
     mower_risk: bool = False
     credited: bool = False
 
+
+@dataclass(frozen=True, slots=True)
+class ThreatMeasurement:
+    """Plant-agnostic board threat derived only from live zombie pressure."""
+
+    raw: float = 0.0
+    normalized: float = 0.0
+    positioned_zombies: int = 0
+    fallback_zombies: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class FusionRewardState:
     reward_total: float = 0.0
@@ -295,6 +339,8 @@ class RewardCompositionState:
     max_undefended_threat_age_by_row: Tuple[int, ...] = ()
     undefended_threat_age_sum_by_row: Tuple[int, ...] = ()
     undefended_threat_age_count_by_row: Tuple[int, ...] = ()
+    mower_baseline_count: int = -1
+    mower_losses_accounted: int = 0
     fusion: FusionRewardState = field(default_factory=FusionRewardState)
 
     @classmethod
@@ -460,6 +506,64 @@ def _lane_danger_by_row(facts: StepFacts, rows: int) -> Dict[int, float]:
         row: max(0.0, float(facts.lane_by_row[row].danger)) if row in facts.lane_by_row else 0.0
         for row in range(max(0, rows))
     }
+
+
+def compute_board_threat(
+    facts: StepFacts,
+    *,
+    fallback_rows: int = 5,
+    fallback_columns: int = 10,
+) -> ThreatMeasurement:
+    """Return bounded, plant-independent zombie pressure for one frame.
+
+    Each positioned zombie contributes ``proximity**2 * health_weight``, where
+    proximity is 1 at the house edge and 0 at the far board edge, and
+    ``health_weight = 0.5 + 0.5 * health_ratio``.  Lane summaries fill only
+    zombies that are reported by a lane but lack individual positions.  The
+    raw sum is normalized as ``raw / (raw + rows)`` so the public potential is
+    stable in ``[0, 1)`` across five- and six-lane boards.
+    """
+
+    rows = max(1, _row_count(facts, fallback_rows))
+    columns = max(1, int(facts.columns or fallback_columns))
+    raw = 0.0
+    positioned_by_row = {row: 0 for row in range(rows)}
+    positioned = 0
+    for zombie in facts.alive_zombies:
+        if not zombie.has_position or not 0 <= int(zombie.row) < rows:
+            continue
+        proximity = max(0.0, min(1.0, 1.0 - float(zombie.x) / float(columns)))
+        if float(zombie.max_health) > 0.0:
+            ratio = max(0.0, min(1.0, float(zombie.health) / float(zombie.max_health)))
+            health_weight = 0.5 + 0.5 * ratio
+        else:
+            health_weight = 1.0
+        raw += proximity * proximity * health_weight
+        positioned_by_row[int(zombie.row)] += 1
+        positioned += 1
+
+    fallback = 0
+    for row in range(rows):
+        lane = facts.lane_by_row.get(row)
+        if lane is None:
+            continue
+        missing = max(0, int(lane.zombie_count) - positioned_by_row[row])
+        if missing <= 0 or lane.nearest_zombie_x is None:
+            continue
+        proximity = max(
+            0.0,
+            min(1.0, 1.0 - float(lane.nearest_zombie_x) / float(columns)),
+        )
+        raw += float(missing) * proximity * proximity
+        fallback += missing
+
+    normalized = raw / (raw + float(rows)) if raw > 0.0 else 0.0
+    return ThreatMeasurement(
+        raw=float(raw),
+        normalized=float(normalized),
+        positioned_zombies=positioned,
+        fallback_zombies=fallback,
+    )
 
 
 def _nearest_zombie_x_by_row(facts: StepFacts, rows: int) -> Dict[int, Optional[float]]:
@@ -746,7 +850,7 @@ def _updated_threat_ages(
     return tuple(ages), tuple(maxima), tuple(sums), tuple(counts)
 
 
-def compose_environment_reward(
+def _compose_legacy_strategy_reward_snapshot(
     previous: Optional[Mapping[str, Any]],
     current: Mapping[str, Any],
     action_result: Optional[Mapping[str, Any]],
@@ -770,6 +874,7 @@ def compose_environment_reward(
     columns = max(1, int(prior_facts.columns or fallback_columns))
     components = {name: 0.0 for name in REWARD_COMPONENT_FIELDS}
     action = reward_action_from_result(action_result)
+    is_fusion_event = _fusion_event_from_result(action_result, previous) is not None
 
     kill_delta = max(0, _safe_int(current.get("killCount")) - _safe_int(previous.get("killCount")))
     components["kill_reward"] = kill_delta * config.kill_reward
@@ -1052,6 +1157,167 @@ def compose_environment_reward(
     )
 
 
+def compose_environment_reward(
+    previous: Optional[Mapping[str, Any]],
+    current: Mapping[str, Any],
+    action_result: Optional[Mapping[str, Any]],
+    *,
+    config: RewardConfig,
+    state: RewardCompositionState,
+    plant_types: Sequence[int] = (),
+    fallback_rows: int = 5,
+    fallback_columns: int = 10,
+    previous_legal_actions: Sequence[int] = (),
+    previous_facts: Optional[StepFacts] = None,
+    current_facts: Optional[StepFacts] = None,
+) -> RewardComposition:
+    """Compose Reward Policy V2 from six generalized gameplay signals.
+
+    Plant identity, placement role, lane identity, fusion recipe/tier/context,
+    and absolute plant health are deliberately absent.  Legacy configuration
+    fields and component keys remain serialization-compatible but stay zero.
+    """
+
+    del previous_legal_actions  # retained in the public call contract
+    if previous is None:
+        return RewardComposition(
+            RewardBreakdown(),
+            state,
+            event_diagnostics=(("reward_policy_version", REWARD_POLICY_VERSION),),
+        )
+
+    prior_facts = previous_facts or build_step_facts(previous, plant_types)
+    next_facts = current_facts or build_step_facts(current, plant_types)
+    components = {name: 0.0 for name in REWARD_COMPONENT_FIELDS}
+    action = reward_action_from_result(action_result)
+    is_fusion_event = _fusion_event_from_result(action_result, previous) is not None
+
+    kill_delta = max(
+        0,
+        _safe_int(current.get("killCount")) - _safe_int(previous.get("killCount")),
+    )
+    # Preserve the historical Cherry Bomb attribution telemetry without letting
+    # it shape Reward Policy V2.  The tracker only annotates later kills (and
+    # zero-kill expiry); all returned plant-specific reward values are ignored.
+    pending_cherries, _ignored_cherry_reward, _ignored_cherry_penalty, cherry_diag = (
+        _advance_pending_cherries(
+            state.pending_cherry_events,
+            kill_delta,
+            config,
+        )
+    )
+    if (
+        action.plant_placed
+        and not action.illegal
+        and not is_fusion_event
+        and action.plant_type == 2
+        and action.row >= 0
+        and action.column >= 0
+    ):
+        nearby = _nearby_zombie_context(
+            prior_facts,
+            action.row,
+            action.column,
+            radius=2.75,
+        )
+        pending_cherries = (
+            *pending_cherries,
+            PendingCherryEvent(
+                row=action.row,
+                column=action.column,
+                nearby_tough=int(nearby["tough"]),
+                nearby_buckethead=int(nearby["buckethead"]),
+                nearby_conehead=int(nearby["conehead"]),
+                mower_risk=action.row in _mower_risk_rows(prior_facts, fallback_rows),
+            ),
+        )
+    wave_delta = max(
+        0,
+        _safe_int(current.get("wave")) - _safe_int(previous.get("wave")),
+    )
+    components["kill_reward"] = float(kill_delta) * float(config.kill_reward)
+    components["wave_reward"] = float(wave_delta) * float(config.wave_reward)
+
+    # Fusion events own their exact-once invalid-action accounting in
+    # compose_step_reward.  Ordinary illegal actions are penalized here.
+    if action.illegal and not is_fusion_event:
+        components["illegal_penalty"] = -abs(float(config.illegal_action_penalty))
+
+    baseline = max(
+        int(state.mower_baseline_count),
+        int(prior_facts.mower.count),
+        int(next_facts.mower.count),
+    )
+    cumulative_mower_losses = max(0, baseline - int(next_facts.mower.count))
+    new_mower_losses = max(
+        0,
+        cumulative_mower_losses - int(state.mower_losses_accounted),
+    )
+    components["mower_loss_penalty"] = (
+        -float(new_mower_losses) * abs(float(config.mower_loss_penalty))
+    )
+
+    threat_before = compute_board_threat(
+        prior_facts,
+        fallback_rows=fallback_rows,
+        fallback_columns=fallback_columns,
+    )
+    threat_after = compute_board_threat(
+        next_facts,
+        fallback_rows=fallback_rows,
+        fallback_columns=fallback_columns,
+    )
+    raw_delta = float(threat_before.raw - threat_after.raw)
+    normalized_delta = float(threat_before.normalized - threat_after.normalized)
+    clip = max(0.0, abs(float(config.threat_delta_clip)))
+    clipped_delta = max(-clip, min(clip, normalized_delta))
+    components["threat_delta_reward"] = (
+        float(config.threat_delta_coef) * clipped_delta
+    )
+
+    if bool(current.get("done")):
+        terminal_hint = str(current.get("terminalHint") or "")
+        if terminal_hint == "possible_win":
+            components["win_loss_reward"] = abs(float(config.win_reward))
+        elif terminal_hint == "game_over_or_loss" and _is_restart_screen(current):
+            components["win_loss_reward"] = -abs(float(config.loss_penalty))
+
+    next_state = replace(
+        state,
+        pending_cherry_events=tuple(pending_cherries),
+        mower_baseline_count=baseline,
+        mower_losses_accounted=max(
+            int(state.mower_losses_accounted),
+            cumulative_mower_losses,
+        ),
+    )
+    diagnostics: Tuple[Tuple[str, Any], ...] = (
+        ("reward_policy_version", REWARD_POLICY_VERSION),
+        ("cherry_delayed", cherry_diag),
+        ("kill_delta", kill_delta),
+        ("wave_delta", wave_delta),
+        ("mower_losses_new", new_mower_losses),
+        ("mower_losses_accounted", next_state.mower_losses_accounted),
+        ("threat_raw_before", threat_before.raw),
+        ("threat_raw_after", threat_after.raw),
+        ("threat_before", threat_before.normalized),
+        ("threat_after", threat_after.normalized),
+        ("threat_raw_delta", raw_delta),
+        ("threat_normalized_delta", normalized_delta),
+        ("threat_clipped_delta", clipped_delta),
+        ("threat_delta_reward", components["threat_delta_reward"]),
+        ("threat_positioned_zombies_before", threat_before.positioned_zombies),
+        ("threat_positioned_zombies_after", threat_after.positioned_zombies),
+        ("threat_fallback_zombies_before", threat_before.fallback_zombies),
+        ("threat_fallback_zombies_after", threat_after.fallback_zombies),
+    )
+    return RewardComposition(
+        breakdown=RewardBreakdown.from_mapping(components),
+        state=next_state,
+        event_diagnostics=diagnostics,
+    )
+
+
 def fusion_source_from_result(action_result: Mapping[str, Any]) -> str:
     intent_source = str(action_result.get("fusionIntentSource") or action_result.get("fusion_intent_source") or "")
     if intent_source:
@@ -1181,7 +1447,7 @@ def _fusion_components_tuple(values: Mapping[str, float]) -> Tuple[float, ...]:
     return tuple(float(values.get(name, 0.0)) for name in FUSION_REWARD_COMPONENT_NAMES)
 
 
-def compose_fusion_reward(
+def _compose_legacy_fusion_reward_snapshot(
     state: FusionRewardState,
     observation: Optional[Mapping[str, Any]],
     action_result: Optional[Mapping[str, Any]],
@@ -1416,6 +1682,148 @@ def compose_fusion_reward(
     return next_state, net, annotations
 
 
+_FUSION_SYSTEM_FAILURE_REASONS = frozenset(
+    {
+        "exception",
+        "bridge_error",
+        "fusion_bridge_unavailable",
+        "fusion_probe_failed",
+        "gameplay_not_ready",
+        "not_gameplay",
+        "seed_selection_active",
+        "terminal_or_transition_state",
+        "reward_or_unlock_screen_active",
+        "startup_stale_command_blocked",
+        "coach_command_already_executed",
+    }
+)
+
+
+def _fusion_reward_event_id(
+    state: FusionRewardState,
+    event: Mapping[str, Any],
+    action_result: Mapping[str, Any],
+    observation: Optional[Mapping[str, Any]],
+    facts: Optional[StepFacts],
+) -> Tuple[str, bool]:
+    explicit = str(
+        action_result.get("fusionEventId")
+        or action_result.get("fusion_event_id")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit, False
+    snapshot = facts
+    if snapshot is None and isinstance(observation, Mapping):
+        snapshot = build_step_facts(observation, ())
+    frame_identity = snapshot.identity.token if snapshot is not None else "unversioned"
+    fallback = "|".join(
+        (
+            "fusion-fallback-v2",
+            frame_identity,
+            str(_safe_int(event.get("row"), default=-1)),
+            str(_safe_int(event.get("col"), default=-1)),
+            str(_safe_int(event.get("seed_slot"), default=-1)),
+            str(event.get("reason") or "success"),
+            "1" if bool(event.get("success")) else "0",
+            str(event.get("source") or "model"),
+        )
+    )
+    # The state counter is deliberately absent: duplicate bookkeeping for the
+    # same frame/action must resolve to the same identity.
+    del state
+    return fallback, True
+
+
+def compose_fusion_reward(
+    state: FusionRewardState,
+    observation: Optional[Mapping[str, Any]],
+    action_result: Optional[Mapping[str, Any]],
+    *,
+    config: RewardConfig,
+    plant_types: Sequence[int] = (),
+    facts: Optional[StepFacts] = None,
+    enable_recipe_discovery_reward: bool = False,
+    enable_fusion_chain_rewards: bool = False,
+    enable_repeat_recipe_decay: bool = False,
+) -> Tuple[FusionRewardState, float, Tuple[Tuple[str, Any], ...]]:
+    """Apply the single Reward Policy V2 fusion signal exactly once.
+
+    A confirmed legal, board-changing fusion receives only
+    ``fusion_success_reward``.  Recipe identity, tier, lane, tactical context,
+    discovery, recursion, repetition, and combinations never affect reward.
+    The legacy feature switches remain accepted no-ops for config compatibility.
+    """
+
+    del plant_types
+    del enable_recipe_discovery_reward
+    del enable_fusion_chain_rewards
+    del enable_repeat_recipe_decay
+    event = _fusion_event_from_result(action_result, observation)
+    if event is None or not isinstance(action_result, Mapping):
+        return state, 0.0, ()
+
+    event_id, fallback_id = _fusion_reward_event_id(
+        state,
+        event,
+        action_result,
+        observation,
+        facts,
+    )
+    if event_id in state.accounted_event_ids:
+        return state, 0.0, (
+            ("fusionRewardDuplicateSuppressed", True),
+            ("fusionRewardEventId", event_id),
+        )
+
+    success = bool(event.get("success"))
+    legal = bool(event.get("legal", success))
+    board_changed = bool(event.get("board_changed", success))
+    confirmed_success = bool(success and legal and board_changed)
+    reason = str(event.get("reason") or ("success" if confirmed_success else "failed"))
+    system_failure = bool(not confirmed_success and reason in _FUSION_SYSTEM_FAILURE_REASONS)
+    invalid_action = bool(not confirmed_success and not system_failure)
+    delta = float(config.fusion_success_reward) if confirmed_success else 0.0
+
+    component_totals = state.component_dict()
+    if confirmed_success:
+        component_totals["fusion_success_reward"] += delta
+    accounted = set(state.accounted_event_ids)
+    accounted.add(event_id)
+    row = _safe_int(event.get("row"), default=-1)
+    col = _safe_int(event.get("col"), default=-1)
+    seed_slot = _safe_int(event.get("seed_slot"), default=-1)
+    recent_attempts = (
+        *state.recent_attempts,
+        (row, col, seed_slot, "" if confirmed_success else reason, state.event_counter),
+    )[-20:]
+    next_state = replace(
+        state,
+        reward_total=float(state.reward_total) + delta,
+        positive_total=float(state.positive_total) + max(0.0, delta),
+        capped=False,
+        component_totals=_fusion_components_tuple(component_totals),
+        last_reward_delta=delta,
+        last_reward_reason=reason,
+        last_usefulness_bonus=0.0,
+        last_source=str(event.get("source") or "model"),
+        recent_attempts=tuple(recent_attempts),
+        event_counter=state.event_counter + 1,
+        accounted_event_ids=frozenset(accounted),
+    )
+    annotations: Tuple[Tuple[str, Any], ...] = (
+        ("fusionRewardAccounted", True),
+        ("fusionRewardApplied", confirmed_success and delta != 0.0),
+        ("fusionRewardDelta", delta),
+        ("fusionRewardEventId", event_id),
+        ("fusionRewardFallbackEventId", fallback_id),
+        ("fusionConfirmedSuccess", confirmed_success),
+        ("fusionInvalidAction", invalid_action),
+        ("fusionSystemFailure", system_failure),
+    )
+    return next_state, delta, annotations
+
+
 def fusion_reward_live_fields(state: FusionRewardState) -> Dict[str, Any]:
     totals = state.component_dict()
     return {
@@ -1489,6 +1897,11 @@ def compose_step_reward(
     breakdown = ordinary.breakdown
     if fusion_delta:
         breakdown = breakdown.with_components({"fusion_reward": fusion_delta})
+    annotation_values = dict(annotations)
+    if bool(annotation_values.get("fusionInvalidAction")):
+        breakdown = breakdown.with_components(
+            {"illegal_penalty": -abs(float(config.illegal_action_penalty))}
+        )
     if terminal_reward_override is not None:
         breakdown = breakdown.with_components(
             {"win_loss_reward": float(terminal_reward_override)},
@@ -1501,7 +1914,14 @@ def compose_step_reward(
     return RewardComposition(
         breakdown=breakdown,
         state=replace(ordinary.state, fusion=fusion),
-        event_diagnostics=ordinary.event_diagnostics,
+        event_diagnostics=ordinary.event_diagnostics
+        + (
+            ("fusion_reward_delta", fusion_delta),
+            (
+                "fusion_invalid_action_penalty_applied",
+                bool(annotation_values.get("fusionInvalidAction")),
+            ),
+        ),
         action_result_annotations=annotations,
         fusion_reward_delta=fusion_delta,
     )
@@ -1518,6 +1938,10 @@ __all__ = [
     "RewardComposition",
     "RewardCompositionState",
     "RewardConfig",
+    "REWARD_POLICY_VERSION",
+    "REWARD_POLICY_V2_CORE_FIELDS",
+    "ThreatMeasurement",
+    "compute_board_threat",
     "compose_environment_reward",
     "compose_fusion_reward",
     "compose_step_reward",
@@ -1525,4 +1949,5 @@ __all__ = [
     "fusion_source_from_result",
     "merge_reward_components",
     "reward_action_from_result",
+    "reward_policy_v2_core_config",
 ]

@@ -19,6 +19,9 @@ from pvzrl_adventure_generalist import (
 )
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
+    ADVENTURE_IDENTITY_OBSERVATION_VERSION,
     build_action_space_spec,
 )
 from pvzrl_env import plant_type_name, resolve_seed_list
@@ -166,14 +169,14 @@ def test_dynamic_slot_identities_keep_the_frozen_generalist_contract() -> None:
         max_seed_slots=14,
     )
 
-    assert spec.action_count == 701
-    assert spec.observation_version == "adventure_14slot_identity_v1"
-    assert spec.action_decoder_version == "seedslot14x50_plus_wait_v1"
+    assert spec.action_count == ADVENTURE_IDENTITY_ACTION_COUNT == 841
+    assert spec.observation_version == ADVENTURE_IDENTITY_OBSERVATION_VERSION
+    assert spec.action_decoder_version == ADVENTURE_IDENTITY_ACTION_DECODER_VERSION
     assert spec.max_seed_slots == 14
     assert spec.identity_seed_slots is True
 
 
-def test_existing_generalist_checkpoint_metadata_and_load_remain_compatible() -> None:
+def test_legacy_generalist_checkpoint_is_rejected_by_the_full_adventure_contract() -> None:
     candidates = sorted(
         (
             path
@@ -189,9 +192,7 @@ def test_existing_generalist_checkpoint_metadata_and_load_remain_compatible() ->
         pytest.skip("protected local 370000-step checkpoint is not present")
 
     model_path = candidates[0]
-    config_path = model_path.parents[2] / "resolved_config.json"
-    if not config_path.is_file():
-        config_path = ROOT / "configs" / "ppo_adventure_generalist_14slot_identity_v1.json"
+    config_path = ROOT / "configs" / "ppo_adventure_generalist_full_v2.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     report = validate_model_metadata(
         model_path,
@@ -199,10 +200,5 @@ def test_existing_generalist_checkpoint_metadata_and_load_remain_compatible() ->
         model_action_count=701,
         model_observation_shape=(4297,),
     )
-    assert report.ok, report.to_dict()
-
-    from sb3_contrib import MaskablePPO
-
-    model = MaskablePPO.load(str(model_path), device="cpu")
-    assert model.action_space.n == 701
-    assert tuple(model.observation_space.shape) == (4297,)
+    assert not report.ok
+    assert report.blocked_reason in {"model_family_mismatch", "action_count_mismatch"}

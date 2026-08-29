@@ -36,11 +36,11 @@ def test_streamer_hotpath_report_exercises_all_synthetic_production_paths() -> N
     assert report["schema_version"] == 1
     assert report["benchmark"] == "pvzrl_streamer_v1_hotpaths"
     assert report["synthetic_bridge_free"] is True
-    assert report["contracts"]["observation_shape"] == [4297]
-    assert report["contracts"]["action_count"] == 701
+    assert report["contracts"]["observation_shape"] == [4364]
+    assert report["contracts"]["action_count"] == 841
     assert report["contracts"]["identity_slots"] == 14
     assert report["contracts"]["mask_true_count"] == 1
-    assert report["contracts"]["resolved_action_id"] == 114
+    assert report["contracts"]["resolved_action_id"] == 134
     assert report["contracts"]["viewer_coordinates_converted_once"] == {
         "viewer_row": 2,
         "viewer_column": 4,
@@ -58,8 +58,8 @@ def test_streamer_hotpath_report_exercises_all_synthetic_production_paths() -> N
         assert measurement["p95_us_per_operation"] >= 0.0, name
 
     bc = report["contracts"]["bc"]
-    assert bc["observation_shape"] == [4297]
-    assert bc["action_count"] == 701
+    assert bc["observation_shape"] == [4364]
+    assert bc["action_count"] == 841
     assert bc["bc_updates_observed"] == 1
     assert bc["last_bc_loss"] > 0.0
     assert bc["ppo_actor_pressure_neutralized"] is True

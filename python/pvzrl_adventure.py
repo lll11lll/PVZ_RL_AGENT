@@ -24,7 +24,7 @@ from pvzrl_env import (
     plant_type_name,
     registry_entries,
 )
-from pvzrl_rewards import REWARD_EPISODE_TOTAL_FIELDS
+from pvzrl_rewards import REWARD_EPISODE_TOTAL_FIELDS, REWARD_POLICY_VERSION
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields
 from pvzrl_human_coach import human_coach_live_status_from_hook
 from pvzrl_lifecycle import (
@@ -48,7 +48,7 @@ POST_WIN_RECOVERY_POLL_SECONDS = 0.25
 DEFAULT_ADVENTURE_SOFT_MAX_STEPS = 2000
 DEFAULT_ADVENTURE_HARD_MAX_STEPS = 3500
 ADVENTURE_GENERALIST_EVAL_RUN_MODE = "adventure_generalist_14slot_eval"
-ADVENTURE_GENERALIST_ACTION_SPACE_MODE = "adventure_14slot_identity"
+ADVENTURE_GENERALIST_ACTION_SPACE_MODE = "adventure_14slot_identity_full_v2"
 LEVEL_IDENTITY_POST_WIN_STATES = {"level_complete_trophy", "reward_unlock", "reward_screen"}
 LEVEL_IDENTITY_TRANSITIONAL_STATES = {
     *LEVEL_IDENTITY_POST_WIN_STATES,
@@ -219,6 +219,161 @@ def _ordered_unique_seed_names(values: List[Any]) -> List[str]:
         output.append(name)
         seen.add(name)
     return output
+
+
+def _canonical_seed_sequence(values: List[Any]) -> List[str]:
+    """Canonicalize a requested deck without discarding intentional duplicates."""
+
+    return [name for name in (canonical_seed_name(value) for value in values) if name]
+
+
+EVALUATION_LOADOUT_PRIORITY = (
+    # The core remains useful in every world.  Pool support is deliberately
+    # activated only when the interactive CardUI state proves these cards can
+    # be selected; no world-number heuristic invents a seed-card capability.
+    "SunFlower",
+    "Peashooter",
+    "LilyPad",
+    "Tanglekelp",
+)
+
+
+@dataclass
+class RuntimeEvaluationLoadoutSelector:
+    """Choose a stable, runtime-authorized evaluation loadout at seed screens.
+
+    The full-Adventure model keeps fourteen permanent *model* slots, while a
+    live seed chooser may expose fewer selectable cards.  This selector never
+    expands from registry or remembered unlock evidence alone: a new card can
+    enter evaluation only after the live chooser reports it.  It consequently
+    makes Pool support available without forcing aquatic cards into land
+    levels or trusting stale profile text.
+    """
+
+    configured_seed_list: List[str]
+    max_seed_slots: int
+    context: Dict[str, Any]
+    rotation_cursor: int = 0
+
+    def __post_init__(self) -> None:
+        self.configured_seed_list = _canonical_seed_sequence(self.configured_seed_list)
+        self.max_seed_slots = max(1, int(self.max_seed_slots))
+
+    def _selectable_seed_names(self, state: Dict[str, Any]) -> List[str]:
+        values: List[Any] = []
+        for key in (
+            "selectableSeedNames",
+            "confirmedSelectableSeedCardNames",
+            "visibleSeedCardNames",
+            "availableSeedNames",
+        ):
+            values.extend(_state_list(state, key))
+        for slot in _state_list(state, "seedSlots"):
+            if not isinstance(slot, dict):
+                continue
+            if any(
+                bool(slot.get(key))
+                for key in (
+                    "availableSeedCard",
+                    "isAvailableSeedCard",
+                    "visibleSeedCard",
+                    "isVisibleSeedCard",
+                    "seedChoice",
+                    "isSeedChoice",
+                    "selectableSeedCard",
+                    "isSelectableSeedCard",
+                )
+            ):
+                values.append(
+                    slot.get("plantTypeName")
+                    or slot.get("displayName")
+                    or slot.get("seedName")
+                    or slot.get("plantType")
+                )
+        supported = {canonical_seed_name(entry.get("canonical_name")) for entry in registry_entries()}
+        return [
+            name
+            for name in _ordered_unique_seed_names(values)
+            if name in supported
+        ]
+
+    def _capacity(self, state: Dict[str, Any], current: List[str]) -> int:
+        candidates: List[int] = []
+        for key in (
+            "seedBankCapacity",
+            "seedSlotCapacity",
+            "seedSlotCount",
+            "seedCardSlotCount",
+            "seedSelectionSlotCount",
+            "selectableSeedCapacity",
+            "currentSeedBankCapacity",
+            "activeSeedSlotCapacity",
+        ):
+            try:
+                value = int(state.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                candidates.append(value)
+        # Without direct capacity evidence, preserve the current count.  The
+        # selectable-card list can authorize a rotation but not a bank resize.
+        fallback = len(current) or len(self.configured_seed_list) or 1
+        return min(self.max_seed_slots, max(1, max(candidates, default=fallback)))
+
+    def __call__(self, state: Dict[str, Any], current_seed_list: List[str]) -> Tuple[List[str], str]:
+        current = _canonical_seed_sequence(current_seed_list or self.configured_seed_list)
+        selectable = self._selectable_seed_names(state)
+        capacity = self._capacity(state, current)
+        if not selectable:
+            self.context.update(
+                {
+                    "evaluation_seed_selection_mode": "runtime_rotation",
+                    "evaluation_seed_selection_evidence": "none_preserved_current_loadout",
+                    "selectable_seeds": [],
+                    "selected_seeds": list(current[:capacity]),
+                    "selected_loadout": list(current[:capacity]),
+                }
+            )
+            return list(current[:capacity]), ""
+
+        selectable_set = set(selectable)
+        selected: List[str] = []
+        for seed in EVALUATION_LOADOUT_PRIORITY:
+            if seed in selectable_set and seed not in selected and len(selected) < capacity:
+                selected.append(seed)
+        for seed in current:
+            if (
+                seed in selectable_set
+                and selected.count(seed) < current.count(seed)
+                and len(selected) < capacity
+            ):
+                selected.append(seed)
+        remaining = [seed for seed in selectable if seed not in selected]
+        if remaining and len(selected) < capacity:
+            offset = self.rotation_cursor % len(remaining)
+            rotated = remaining[offset:] + remaining[:offset]
+            selected.extend(rotated[: max(0, capacity - len(selected))])
+            self.rotation_cursor += 1
+        if not selected:
+            return [], "evaluation_seed_selection_no_supported_runtime_cards"
+
+        self.context.update(
+            {
+                "evaluation_seed_selection_mode": "runtime_rotation",
+                "evaluation_seed_selection_evidence": "interactive_cardui",
+                "evaluation_seed_selection_capacity": int(capacity),
+                "evaluation_seed_selection_rotation_cursor": int(self.rotation_cursor),
+                "selectable_seeds": list(selectable),
+                "selected_seeds": list(selected),
+                "selected_loadout": list(selected),
+                "selected_loadout_count": len(selected),
+                "active_seed_slot_count": len(selected),
+                "inactive_seed_slot_count": max(0, self.max_seed_slots - len(selected)),
+                "inactive_model_slots": max(0, self.max_seed_slots - len(selected)),
+                "loadout_reason": "evaluation_runtime_cardui_rotation",
+            }
+        )
+        return selected, ""
 
 
 def _state_list(state: Dict[str, Any], key: str) -> List[Any]:
@@ -590,6 +745,42 @@ def _combine_unlock_snapshots(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     return combined
 
 
+def _post_win_level_handoff_status(
+    state: Dict[str, Any],
+    completed_level: int,
+) -> Tuple[str, Dict[str, Any]]:
+    """Classify a gameplay frame at the sequential Adventure handoff.
+
+    A terminal detector can finish before the old board disappears.  During
+    that narrow window the bridge truthfully reports gameplayReady for the
+    completed level.  That is transition evidence, not proof that the next
+    Adventure level is ready and not an identity contradiction by itself.
+    """
+
+    current_level = max(1, int(completed_level))
+    expected_level = current_level + 1
+    diagnostics = adventure_level_identity_diagnostics(state, expected_level)
+    if diagnostics.get("level_identity_reliable"):
+        return "confirmed", diagnostics
+
+    observed_levels = [
+        _positive_int_or_none(diagnostics.get("bridge_detected_level")),
+        _positive_int_or_none(diagnostics.get("profile_adventure_level")),
+    ]
+    unexpected_levels = sorted(
+        {
+            value
+            for value in observed_levels
+            if value is not None and value not in {current_level, expected_level}
+        }
+    )
+    if diagnostics.get("challenge_mode_context") or unexpected_levels:
+        diagnostics = dict(diagnostics)
+        diagnostics["unexpected_levels"] = unexpected_levels
+        return "blocked", diagnostics
+    return "transitional", diagnostics
+
+
 def collect_post_win_unlocks(
     env: PvZMaskedPPOEnv,
     writer: LiveStatusWriter,
@@ -623,6 +814,11 @@ def collect_post_win_unlocks(
     blocked_reason = ""
     available_after: List[str] = []
     seed_names = list(context.get("selected_seeds", []) or env.config.seed_list)
+    expected_next_level = max(1, int(level)) + 1
+    last_level_identity: Dict[str, Any] = {}
+    transition["expected_next_adventure_level"] = expected_next_level
+    transition["level_handoff_status"] = "waiting"
+    transition["level_identity"] = {}
 
     while time.monotonic() < deadline:
         state = env.base.adventure_screen_state()
@@ -646,11 +842,33 @@ def collect_post_win_unlocks(
         click: Optional[Dict[str, Any]] = None
 
         if state.get("isGameplayReady") or state.get("gameplayReady"):
-            context["state"] = "POST_WIN_GAMEPLAY_READY"
-            transition["post_win_transition_completed"] = True
+            handoff_status, level_identity = _post_win_level_handoff_status(state, level)
+            last_level_identity = dict(level_identity)
+            transition["level_handoff_status"] = handoff_status
+            transition["level_identity"] = dict(level_identity)
+            context["post_win_level_identity"] = dict(level_identity)
+            if handoff_status == "confirmed":
+                context["state"] = "POST_WIN_GAMEPLAY_READY"
+                transition["post_win_transition_completed"] = True
+                context.update(transition)
+                _record_post_win_iteration(writer, env, context, state, started=started)
+                break
+            if handoff_status == "blocked":
+                blocked_reason = (
+                    "post_win_level_identity_unreliable:"
+                    f"expected={expected_next_level}:"
+                    f"reason={level_identity.get('level_identity_reason', 'unreliable')}:"
+                    f"mismatches={','.join(str(value) for value in level_identity.get('level_identity_mismatches', []))}"
+                ).rstrip(":")
+                context["state"] = "POST_WIN_LEVEL_HANDOFF_BLOCKED"
+                context.update(transition)
+                _record_post_win_iteration(writer, env, context, state, started=started)
+                break
+            context["state"] = "POST_WIN_WAIT_LEVEL_HANDOFF"
             context.update(transition)
             _record_post_win_iteration(writer, env, context, state, started=started)
-            break
+            time.sleep(max(POST_WIN_RECOVERY_POLL_SECONDS, env.config.poll_seconds))
+            continue
 
         if state.get("isSeedSelectionScreen") or state.get("seedSelectionActive"):
             context["state"] = "POST_WIN_SEED_SELECTION"
@@ -671,11 +889,32 @@ def collect_post_win_unlocks(
                     fail_on_terminal=False,
                 )
                 if observation.get("gameplayReady"):
-                    transition["post_win_transition_completed"] = True
+                    handoff_status, level_identity = _post_win_level_handoff_status(
+                        observation,
+                        level,
+                    )
+                    last_level_identity = dict(level_identity)
+                    transition["level_handoff_status"] = handoff_status
+                    transition["level_identity"] = dict(level_identity)
+                    context["post_win_level_identity"] = dict(level_identity)
+                    if handoff_status == "confirmed":
+                        transition["post_win_transition_completed"] = True
+                        context.update(transition)
+                        state = env.base.adventure_screen_state()
+                        _record_post_win_iteration(writer, env, context, state, started=started)
+                        break
+                    if handoff_status == "blocked":
+                        blocked_reason = (
+                            "post_win_level_identity_unreliable:"
+                            f"expected={expected_next_level}:"
+                            f"reason={level_identity.get('level_identity_reason', 'unreliable')}:"
+                            f"mismatches={','.join(str(value) for value in level_identity.get('level_identity_mismatches', []))}"
+                        ).rstrip(":")
+                        break
+                    context["state"] = "POST_WIN_WAIT_LEVEL_HANDOFF"
                     context.update(transition)
-                    state = env.base.adventure_screen_state()
-                    _record_post_win_iteration(writer, env, context, state, started=started)
-                    break
+                    time.sleep(max(POST_WIN_RECOVERY_POLL_SECONDS, env.config.poll_seconds))
+                    continue
             except Exception as exc:
                 context["last_error"] = str(exc)
                 blocked_reason = "post_win_bridge_state_inconsistent"
@@ -736,7 +975,15 @@ def collect_post_win_unlocks(
         time.sleep(max(POST_WIN_RECOVERY_POLL_SECONDS, env.config.poll_seconds))
 
     if not transition["post_win_transition_completed"] and not blocked_reason:
-        blocked_reason = _post_win_timeout_reason(state, transition)
+        if last_level_identity:
+            blocked_reason = (
+                "post_win_level_handoff_timeout:"
+                f"expected={expected_next_level}:"
+                f"reason={last_level_identity.get('level_identity_reason', 'unreliable')}:"
+                f"mismatches={','.join(str(value) for value in last_level_identity.get('level_identity_mismatches', []))}"
+            ).rstrip(":")
+        else:
+            blocked_reason = _post_win_timeout_reason(state, transition)
 
     fallback_added = update_unlocked_from_state(
         unlocked,
@@ -1043,6 +1290,37 @@ def _commit_seed_selection_transaction(
     if not callable(hook):
         return True
     return bool(hook(selection, list(seed_list)))
+
+
+def _interactive_seed_selection_after_transition(
+    selection: Dict[str, Any],
+    state: Dict[str, Any],
+) -> bool:
+    """Return true only for a proven safe post-transition chooser retry."""
+
+    transition_status = str(selection.get("transitionStatus") or "")
+    if bool(selection.get("startInvoked")):
+        # Once Let's Rock owns the transition, only the bounded multi-frame
+        # stability check inside ``auto_select_seeds`` may authorize another
+        # chooser transaction.  A raw/stale seed flag is insufficient.
+        return transition_status == "seed_selection_still_interactive"
+    if transition_status == "seed_selection_still_interactive":
+        return True
+    if not isinstance(state, dict):
+        return False
+    seed_visible = bool(
+        state.get("isSeedSelectionScreen")
+        or state.get("seedSelectionActive")
+        or state.get("screenState") == "seed_selection"
+    )
+    if not seed_visible or bool(state.get("isGameplayReady") or state.get("gameplayReady")):
+        return False
+    strict_fields_present = "seedSelectionPanelActive" in state or "startButtonActive" in state
+    if strict_fields_present:
+        return bool(state.get("seedSelectionPanelActive") and state.get("startButtonActive"))
+    # Compatibility for an older bridge response before a start click.  This
+    # path can never authorize a retry after start invocation.
+    return True
 
 
 def replay_current_level_after_validation_win(
@@ -1540,6 +1818,8 @@ def prepare_adventure_gameplay(
     deadline = time.monotonic() + max(1.0, timeout)
     last_state: Dict[str, Any] = {}
     active_seed_list = [str(seed).strip() for seed in seed_list if str(seed).strip()]
+    seed_selection_attempts = 0
+    adventure_click_attempts = 0
 
     def level_identity_block(state: Dict[str, Any]) -> str:
         if expected_level is None:
@@ -1563,6 +1843,17 @@ def prepare_adventure_gameplay(
             time.sleep(max(0.25, env.config.poll_seconds))
             continue
 
+        # A terminal board can remain structurally present for a few frames.
+        # Loss/restart evidence must outrank that stale gameplay-ready signal.
+        if _is_loss_restart_state(state):
+            context["state"] = "LOSS_RECOVERY_CLICK_RESTART"
+            click = env.base.click_try_again_once()
+            context["last_ui_action"] = click
+            if not click.get("ok", False):
+                return None, {"reset": {"ok": False, "methodUsed": "click_try_again_once"}}, "game_over_unhandled"
+            time.sleep(max(0.5, env.config.poll_seconds))
+            continue
+
         if state.get("isGameplayReady"):
             identity_block = level_identity_block(state)
             if identity_block:
@@ -1577,8 +1868,20 @@ def prepare_adventure_gameplay(
             return observation, {"reset": {"ok": True, "methodUsed": "adventure_existing_gameplay"}}, ""
 
         if state.get("isAdventureButtonVisible"):
+            adventure_click_attempts += 1
+            context["adventure_click_attempts"] = adventure_click_attempts
             click = env.base.press_adventure_once()
             context["last_ui_action"] = click
+            if not click.get("ok", False) and adventure_click_attempts >= 3:
+                return None, {"reset": {"ok": False, "methodUsed": "press_adventure_once"}}, (
+                    "adventure_navigation_click_failed: "
+                    + str(click.get("message") or "Adventure button click failed")
+                )
+            if click.get("ok", False) and adventure_click_attempts >= 6:
+                return None, {"reset": {"ok": False, "methodUsed": "press_adventure_once"}}, (
+                    "adventure_navigation_no_transition: "
+                    + str(click.get("methodUsed") or "Adventure click reported success")
+                )
             time.sleep(max(0.5, env.config.poll_seconds))
             continue
 
@@ -1586,6 +1889,9 @@ def prepare_adventure_gameplay(
             identity_block = level_identity_block(state)
             if identity_block:
                 return None, {"reset": {"ok": False, "methodUsed": "level_identity"}}, identity_block
+            seed_selection_attempts += 1
+            context["seed_selection_attempts"] = seed_selection_attempts
+            context["state"] = "SEED_SELECTION"
             if seed_selection_callback is not None:
                 try:
                     callback_seed_list, callback_blocked_reason = seed_selection_callback(state, list(active_seed_list))
@@ -1606,6 +1912,15 @@ def prepare_adventure_gameplay(
                 )
             context["last_seed_selection"] = selection
             context["last_reset_reason"] = "auto_select_seeds"
+            transition_status = str(selection.get("transitionStatus") or "")
+            context["seed_selection_transition_status"] = transition_status
+            context["seed_selection_start_invoked"] = bool(selection.get("startInvoked"))
+            if selection.get("startInvoked"):
+                context["state"] = (
+                    "GAMEPLAY_READY"
+                    if transition_status == "gameplay_confirmed"
+                    else "WAITING_FOR_GAMEPLAY"
+                )
             if selection.get("ok", False):
                 try:
                     committed = _commit_seed_selection_transaction(env, selection, active_seed_list)
@@ -1621,15 +1936,50 @@ def prepare_adventure_gameplay(
                     )
             if not selection.get("ok", False):
                 _rollback_seed_selection_transaction(env)
+                selection_state = (
+                    selection.get("after")
+                    or selection.get("afterStart")
+                    or selection.get("afterSelectionBeforeStart")
+                    or state
+                )
+                still_on_seed_screen = isinstance(selection_state, dict) and bool(
+                    selection_state.get("isSeedSelectionScreen")
+                    or selection_state.get("seedSelectionActive")
+                    or selection_state.get("screenState") == "seed_selection"
+                )
+                gameplay_ready = isinstance(selection_state, dict) and bool(
+                    selection_state.get("isGameplayReady") or selection_state.get("gameplayReady")
+                )
+                safe_retry = _interactive_seed_selection_after_transition(selection, selection_state)
+                if seed_selection_attempts < 3 and still_on_seed_screen and not gameplay_ready and safe_retry:
+                    retry_reason = str(selection.get("message", "unknown"))
+                    context["seed_selection_retry_reason"] = retry_reason
+                    print(
+                        "[adventure] seed selection retry "
+                        f"attempt={seed_selection_attempts} "
+                        f"transition_status={transition_status or 'pre_start_failure'} "
+                        f"reason={retry_reason}"
+                    )
+                    time.sleep(max(0.1, env.config.poll_seconds))
+                    continue
                 return None, {"reset": {"ok": False, "methodUsed": "auto_select_seeds"}}, (
                     "seed_selection_failed: " + str(selection.get("message", "unknown"))
                 )
-            observation = env.base.wait_for_gameplay_ready(
-                timeout=max(1.0, min(timeout, deadline - time.monotonic() + 1.0)),
-                poll_seconds=env.config.poll_seconds,
-                quiet=True,
-                fail_on_terminal=False,
-            )
+            final_observation = selection.get("finalObservation")
+            if isinstance(final_observation, dict) and bool(
+                final_observation.get("gameplayReady")
+                and not final_observation.get("seedSelectionActive")
+            ):
+                observation = final_observation
+            else:
+                context["state"] = "WAITING_FOR_GAMEPLAY"
+                observation = env.base.wait_for_gameplay_ready(
+                    timeout=max(1.0, min(timeout, deadline - time.monotonic() + 1.0)),
+                    poll_seconds=env.config.poll_seconds,
+                    quiet=True,
+                    fail_on_terminal=False,
+                )
+            context["state"] = "GAMEPLAY_READY"
             context["last_reset_reason"] = "auto_select_seeds"
             return (
                 observation,
@@ -1649,14 +1999,6 @@ def prepare_adventure_gameplay(
             context["last_ui_action"] = click
             if not click.get("ok", False):
                 return None, {"reset": {"ok": False, "methodUsed": "click_reward_continue_once"}}, "reward_screen_unhandled"
-            time.sleep(max(0.5, env.config.poll_seconds))
-            continue
-
-        if _is_loss_restart_state(state):
-            click = env.base.click_try_again_once()
-            context["last_ui_action"] = click
-            if not click.get("ok", False):
-                return None, {"reset": {"ok": False, "methodUsed": "click_try_again_once"}}, "game_over_unhandled"
             time.sleep(max(0.5, env.config.poll_seconds))
             continue
 
@@ -1956,6 +2298,7 @@ def run_policy_attempt(
     soft_max_steps: int,
     hard_max_steps: int,
     final_wave_extension: bool,
+    seed_selection_callback: Optional[Callable[[Dict[str, Any], List[str]], Tuple[List[str], str]]] = None,
 ) -> AdventureAttemptLog:
     log = AdventureAttemptLog(attempt=attempt_index, selected_seeds=list(selected_seeds))
     apply_level_metadata(log, tracker_level, progression_index)
@@ -1982,6 +2325,7 @@ def run_policy_attempt(
         context,
         selected_seeds,
         timeout=env.config.gameplay_ready_timeout,
+        seed_selection_callback=seed_selection_callback,
         expected_level=tracker_level,
     )
     if observation is None:
@@ -1990,6 +2334,8 @@ def run_policy_attempt(
         log.blocked_reason = blocked_reason
         update_timeout_context(context, log)
         return log
+
+    log.selected_seeds = list(context.get("selected_seeds", selected_seeds) or selected_seeds)
 
     obs, _ = env.start_episode_from_observation(observation, reset_info)
     context["current_attempt"] = attempt_index
@@ -2162,6 +2508,12 @@ def build_live_status(
         + list(adventure_state.get("visibleSeedCardNames", []) or [])
     )
     reward_totals = getattr(env, "_episode_reward_totals", {})
+    reward_diagnostics = (
+        dict(last_info.get("reward_diagnostics", {}))
+        if isinstance(last_info, dict)
+        and isinstance(last_info.get("reward_diagnostics"), dict)
+        else {}
+    )
     lane_diagnostics = last_info.get("lane_diagnostics", {}) if isinstance(last_info, dict) else {}
     fusion_diagnostics = dict(
         last_info.get("fusion_diagnostics", {})
@@ -2171,6 +2523,11 @@ def build_live_status(
     mask_diagnostics = last_info.get("mask_diagnostics", {}) if isinstance(last_info, dict) else {}
     if not isinstance(mask_diagnostics, dict):
         mask_diagnostics = {}
+    if not mask_diagnostics and observation:
+        try:
+            mask_diagnostics = dict(env.base.mask_diagnostics(observation))
+        except Exception:
+            mask_diagnostics = {}
     for key, value in mask_diagnostics.items():
         if str(key).startswith("fusion_"):
             fusion_diagnostics[str(key)] = value
@@ -2316,9 +2673,10 @@ def build_live_status(
     level_identity = context.get("level_identity", startup_validation.get("level_identity", {}))
     if not isinstance(level_identity, dict):
         level_identity = {}
-    return {
+    payload = {
         "mode": run_mode,
         "run_mode": run_mode,
+        "reward_policy_version": REWARD_POLICY_VERSION,
         "status": context.get("status", "running"),
         "updated_at": time.time(),
         "stop_reason": context.get("stop_reason", ""),
@@ -2456,6 +2814,14 @@ def build_live_status(
             getattr(env.config, "tactical_masks", False)
             or getattr(env.config, "cherrybomb_tactical_mask", False)
         ),
+        "total_legal_action_count": int(
+            mask_diagnostics.get("total_legal_action_count", legal_action_count) or 0
+        ),
+        "wait_legal": bool(mask_diagnostics.get("wait_legal", legal_action_count > 0)),
+        "active_seed_slot_mask_diagnostics": list(
+            mask_diagnostics.get("active_seed_slots", []) or []
+        ),
+        "mask_diagnostics": dict(mask_diagnostics),
         "seed_list": selected_loadout,
         "model_path": context.get("current_model_path", ""),
         "active_run": context.get("active_run", ""),
@@ -2672,13 +3038,43 @@ def build_live_status(
         ),
         "rows": build_rows_payload(observation, lane_diagnostics),
         "reward": {
+            "reward_policy_version": REWARD_POLICY_VERSION,
             "episode_reward": float(getattr(env, "_episode_reward", 0.0) or 0.0),
+            "terminal_reward_total": float(reward_totals.get("win_loss_reward_total", 0.0) or 0.0),
+            "threat_reward_total": float(reward_totals.get("threat_delta_reward_total", 0.0) or 0.0),
+            "mower_penalty_total": float(reward_totals.get("mower_loss_penalty_total", 0.0) or 0.0),
+            "illegal_action_penalty_total": float(reward_totals.get("illegal_penalty_total", 0.0) or 0.0),
+            "reward_component_total": sum(
+                float(reward_totals.get(field, 0.0) or 0.0)
+                for field in REWARD_EPISODE_TOTAL_FIELDS
+            ),
+            "reward_unattributed_adjustment_total": float(
+                getattr(env, "_episode_reward_unattributed_adjustment_total", 0.0) or 0.0
+            ),
+            **reward_diagnostics,
             **{field: float(reward_totals.get(field, 0.0) or 0.0) for field in REWARD_EPISODE_TOTAL_FIELDS},
         },
         "eval": summary,
         **fusion_fields,
         **coach_fields,
     }
+    reward_payload = payload["reward"]
+    reward_payload["reward_components_match"] = abs(
+        float(reward_payload.get("episode_reward", 0.0) or 0.0)
+        - (
+            float(reward_payload.get("reward_component_total", 0.0) or 0.0)
+            + float(reward_payload.get("reward_unattributed_adjustment_total", 0.0) or 0.0)
+        )
+    ) <= 1e-6
+    # Streamer V1 status is additive and only present when the source-neutral
+    # controller is attached.  Generalist/evaluation status remains on the
+    # existing schema when no Twitch controller is active.
+    if getattr(env, "streamer_v1_controller", None) is not None:
+        try:
+            payload.update(env._streamer_v1_live_status())
+        except Exception:
+            payload.setdefault("streamer_controller_error", "status_unavailable")
+    return payload
 
 
 def aggregate_level_metrics(level: AdventureLevelLog) -> None:
@@ -2788,7 +3184,9 @@ def run_adventure_eval(
     )
     episodes_completed = 0
     episode_limit_reached = False
+    level_identity_initial: Dict[str, Any] = {}
     level_identity_start: Dict[str, Any] = {}
+    level_identity_start_navigation_deferred = False
     level_identity_end: Dict[str, Any] = {}
     def resolve_stop_reason(reason: str) -> str:
         return adventure_stop_reason(reason)
@@ -2837,11 +3235,21 @@ def run_adventure_eval(
         "eval_summary": {},
         "model_compatibility": config.get("model_compatibility", {}),
         "run_mode": ADVENTURE_GENERALIST_EVAL_RUN_MODE,
-        "current_stage": "adventure_generalist_14slot_identity_v1",
+        "current_stage": "adventure_generalist_14slot_identity_full_v2",
         "current_model_family": str(config.get("model_family", "")),
         "current_model_path": str(model_path),
         "metadata_path": str(config.get("metadata_path", "")),
     }
+    runtime_loadout_selector: Optional[RuntimeEvaluationLoadoutSelector] = None
+    if bool(config.get("evaluation_runtime_seed_rotation", True)):
+        runtime_loadout_selector = RuntimeEvaluationLoadoutSelector(
+            configured_seed_list=list(config.get("seed_list", [])),
+            max_seed_slots=int(getattr(env.config, "max_seed_slots", 14) or 14),
+            context=context,
+        )
+        context["evaluation_seed_selection_mode"] = "runtime_rotation"
+    else:
+        context["evaluation_seed_selection_mode"] = "configured_static"
     print(
         "[adventure] timeout "
         f"soft_max_steps={soft_max_steps} "
@@ -2861,14 +3269,67 @@ def run_adventure_eval(
             initial_state,
             int(adventure_start_level),
         )
+        level_identity_initial = dict(level_identity_start)
+        context["level_identity_initial"] = dict(level_identity_initial)
         context["level_identity_start"] = dict(level_identity_start)
         if strict_level_identity and not level_identity_start.get("level_identity_reliable"):
-            raise RuntimeError(
-                "blocked_reason=streamer_evaluation_start_level_unreliable: "
-                f"expected={adventure_start_level} "
-                f"reason={level_identity_start.get('level_identity_reason', '')} "
-                f"mismatches={level_identity_start.get('level_identity_mismatches', [])}"
+            start_reason = str(level_identity_start.get("level_identity_reason") or "")
+            start_mismatches = list(level_identity_start.get("level_identity_mismatches", []) or [])
+            can_navigate_to_identity = bool(
+                start_reason == "navigation_or_unstable_screen"
+                and not start_mismatches
+                and not level_identity_start.get("challenge_mode_context")
             )
+            if not can_navigate_to_identity:
+                raise RuntimeError(
+                    "blocked_reason=streamer_evaluation_start_level_unreliable: "
+                    f"expected={adventure_start_level} "
+                    f"reason={start_reason} "
+                    f"mismatches={start_mismatches}"
+                )
+
+            level_identity_start_navigation_deferred = True
+            context["level_identity_start_navigation_deferred"] = True
+            context["state"] = "STARTUP_NAVIGATION_FOR_LEVEL_IDENTITY"
+            prepared_observation, prepared_reset, prepared_reason = prepare_adventure_gameplay(
+                env,
+                writer,
+                context,
+                list(config.get("seed_list", [])),
+                timeout=env.config.gameplay_ready_timeout,
+                seed_selection_callback=runtime_loadout_selector,
+                expected_level=int(adventure_start_level),
+            )
+            context["last_ui_action"] = prepared_reset.get("reset", prepared_reset)
+            if prepared_observation is None:
+                raise RuntimeError(
+                    "blocked_reason=streamer_evaluation_start_navigation_failed: "
+                    f"expected={adventure_start_level} reason={prepared_reason}"
+                )
+
+            prepared_state = env.base.adventure_screen_state()
+            prepared_candidates = [prepared_observation, prepared_state]
+            prepared_diagnostics = [
+                adventure_level_identity_diagnostics(candidate, int(adventure_start_level))
+                for candidate in prepared_candidates
+                if isinstance(candidate, dict)
+            ]
+            level_identity_start = next(
+                (
+                    diagnostics
+                    for diagnostics in prepared_diagnostics
+                    if diagnostics.get("level_identity_reliable")
+                ),
+                prepared_diagnostics[-1] if prepared_diagnostics else {},
+            )
+            context["level_identity_start"] = dict(level_identity_start)
+            if not level_identity_start.get("level_identity_reliable"):
+                raise RuntimeError(
+                    "blocked_reason=streamer_evaluation_start_level_unreliable_after_navigation: "
+                    f"expected={adventure_start_level} "
+                    f"reason={level_identity_start.get('level_identity_reason', '')} "
+                    f"mismatches={level_identity_start.get('level_identity_mismatches', [])}"
+                )
         for level_offset in range(max(0, max_adventure_levels)):
             tracker_level = int(adventure_start_level) + level_offset
             progression_index = level_offset + 1
@@ -2913,10 +3374,7 @@ def run_adventure_eval(
                 state = env.base.adventure_screen_state()
                 update_unlocked_from_state(unlocked, state, source="level_start", level=tracker_level)
                 available = _ordered_unique_seed_names(list(state.get("availableSeedNames", []) or []))
-                # The PPO decoder is slot-semantic, so Adventure must not reorder or replace
-                # seeds at runtime. Newly unlocked plants remain progression evidence; the
-                # protected Generalist identity layout controls which slots the policy uses.
-                selected_seeds = list(config.get("seed_list", []))
+                selected_seeds = list(context.get("selected_seeds", []) or config.get("seed_list", []))
                 level.selected_seeds = selected_seeds
                 level.available_seed_names = available
                 level.unknown_visible_seed_names = list(state.get("unknownVisibleSeedNames", []) or [])
@@ -2938,7 +3396,10 @@ def run_adventure_eval(
                     soft_max_steps=soft_max_steps,
                     hard_max_steps=hard_max_steps,
                     final_wave_extension=final_wave_extension,
+                    seed_selection_callback=runtime_loadout_selector,
                 )
+                selected_seeds = list(attempt.selected_seeds)
+                level.selected_seeds = selected_seeds
                 episode_counted = attempt.result in {"win", "loss", "timeout"}
                 if episode_counted:
                     episodes_completed += 1
@@ -3101,6 +3562,7 @@ def run_adventure_eval(
                             env,
                             writer,
                             context,
+                            seed_selection_callback=runtime_loadout_selector,
                             expected_level=tracker_level,
                         )
                         if not replay_ok:
@@ -3116,6 +3578,7 @@ def run_adventure_eval(
                         env,
                         writer,
                         context,
+                        seed_selection_callback=runtime_loadout_selector,
                         expected_level=tracker_level,
                     )
                     if not replay_ok:
@@ -3137,25 +3600,35 @@ def run_adventure_eval(
                     context["total_losses"] = int(context.get("total_losses", 0) or 0) + 1
                     update_attempt_progress(attempt, level, context, advance_on_wins)
                     writer.write(build_live_status(env, context))
-                    if attempt_index >= max_attempts_per_level:
-                        level.attempt_logs.append(asdict(attempt))
-                        break
+                    loss_boundary_reached = bool(
+                        episode_limit_reached or attempt_index >= max_attempts_per_level
+                    )
                     if episode_limit_reached:
                         stop_reason = "evaluation_episode_limit_reached"
-                        level.attempt_logs.append(asdict(attempt))
-                        break
-                    try_again = env.base.click_try_again_once()
-                    context["last_ui_action"] = try_again
-                    if not try_again.get("ok", False):
-                        last_blocked_reason = "loss_retry_failed"
+                    context["state"] = "LOSS_RECOVERY"
+                    recovery_observation, recovery_reset, recovery_reason = prepare_adventure_gameplay(
+                        env,
+                        writer,
+                        context,
+                        selected_seeds,
+                        timeout=env.config.gameplay_ready_timeout,
+                        seed_selection_callback=runtime_loadout_selector,
+                        expected_level=tracker_level if strict_level_identity else None,
+                    )
+                    context["last_ui_action"] = recovery_reset.get("reset", recovery_reset)
+                    if recovery_observation is None:
+                        last_blocked_reason = recovery_reason or "loss_retry_failed"
                         attempt.blocked_reason = last_blocked_reason
                         context["blocked_reason"] = last_blocked_reason
                         update_attempt_progress(attempt, level, context, advance_on_wins)
                         writer.write(build_live_status(env, context))
                         level.attempt_logs.append(asdict(attempt))
                         break
-                    time.sleep(max(0.5, env.config.poll_seconds))
+                    context["state"] = "GAMEPLAY_READY_AFTER_LOSS"
+                    context["last_reset_reason"] = "loss_recovery"
                     level.attempt_logs.append(asdict(attempt))
+                    if loss_boundary_reached:
+                        break
                     continue
 
                 if attempt.result == "timeout":
@@ -3276,8 +3749,9 @@ def run_adventure_eval(
                 env,
                 writer,
                 context,
-                list(config.get("seed_list", [])),
+                list(context.get("selected_seeds", []) or config.get("seed_list", [])),
                 timeout=env.config.gameplay_ready_timeout,
+                seed_selection_callback=runtime_loadout_selector,
                 expected_level=next_adventure_level,
             )
             if handoff_observation is None:
@@ -3331,7 +3805,11 @@ def run_adventure_eval(
             if levels
             else adventure_start_level
         ),
+        "level_identity_initial": level_identity_initial,
         "level_identity_start": level_identity_start,
+        "level_identity_start_navigation_deferred": bool(
+            level_identity_start_navigation_deferred
+        ),
         "level_identity_end": level_identity_end,
         "adventure_start_level_label": adventure_level_metadata(adventure_start_level, 1)["adventure_level_label"],
         "soft_max_steps": int(soft_max_steps),

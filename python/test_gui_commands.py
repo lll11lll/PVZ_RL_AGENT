@@ -28,6 +28,9 @@ def _dashboard() -> PvZDashboard:
     dashboard.repo_root = PROJECT_ROOT
     dashboard.live_status_path = Path("runs/live_status.json")
     values = {
+        "generalist_config_path_var": "configs/ppo_adventure_generalist_full_v2.json",
+        "eval_config_path_var": "configs/ppo_adventure_generalist_full_v2.json",
+        "live_status_path_var": "runs/live_status.json",
         "train_lab_mode_var": "Normal",
         "eval_lab_mode_var": "Normal",
         "human_coach_enabled_var": False,
@@ -54,6 +57,8 @@ def _dashboard() -> PvZDashboard:
         "fusion_bridge_enabled_var": False,
         "generalist_total_timesteps_var": "4444",
         "generalist_checkpoint_freq_var": "555",
+        "generalist_n_steps_var": "512",
+        "generalist_batch_size_var": "64",
         "generalist_initial_loadout_var": "SunFlower,SunFlower,Peashooter,Peashooter",
         "generalist_max_seed_slots_var": "14",
         "generalist_start_level_var": "1",
@@ -85,6 +90,23 @@ def _dashboard() -> PvZDashboard:
         "generalist_resume_model_path_var": "",
         "generalist_run_dir_var": "runs/generalist_snapshot",
         "generalist_eval_model_path_var": "runs/generalist/model.zip",
+        "eval_initial_loadout_var": "SunFlower,SunFlower,Peashooter,Peashooter",
+        "eval_max_seed_slots_var": "14",
+        "eval_start_level_var": "3",
+        "eval_max_levels_var": "9",
+        "eval_max_attempts_var": "7",
+        "eval_game_speed_var": "3.5",
+        "eval_step_seconds_var": "0.08",
+        "eval_board_timeout_var": "77",
+        "eval_soft_max_steps_var": "2100",
+        "eval_hard_max_steps_var": "3600",
+        "eval_final_wave_extension_var": False,
+        "eval_quick_wait_var": False,
+        "eval_wait_gameplay_ready_var": True,
+        "eval_tactical_masks_var": True,
+        "eval_wallnut_mask_var": False,
+        "eval_cherrybomb_mask_var": True,
+        "eval_run_dir_var": "runs/generalist_eval_snapshot",
     }
     for name, value in values.items():
         setattr(dashboard, name, Var(value))
@@ -137,10 +159,10 @@ def _commands() -> dict[str, Callable[[], list[str]]]:
 
 
 EXPECTED_COMMAND_HASHES = {
-    "generalist_fresh": "e78855ee8babcee83b869f4e86b9997924a5460b0ed8ecc74e64108a15448651",
-    "generalist_resume": "20ad5007105a721401acff4db55d7989aec2247bbc90db1412ecaf9db9ecf2de",
-    "generalist_eval": "3b026cb774ee1d297994e82ad73b7dd901d322d3f579851e3c066447c7e6afb4",
-    "coach_stream_fusion": "bf8496e1408cfdfc68c162b2a108814ab6020f99f8046d8164be45f2d7039d7f",
+    "generalist_fresh": "0e7ea5f580238319c55598ec45840ae3281b877c54493e959867e8d1f5cddfc8",
+    "generalist_resume": "5302f2536322eba701fe6bda427f03ad53e7b15ae065172f0bbab2323157d8fe",
+    "generalist_eval": "c89c30dfd194d8c1e4c75b83d9e0a01f3c8cadf7c88fea2b6337480efb6233b1",
+    "coach_stream_fusion": "4ac57a4020acc99cb63a766506212241d913ec42f43d79fd42e09973d1c89de4",
 }
 
 
@@ -168,46 +190,32 @@ def test_gui_command_surface_is_generalist_only() -> None:
         assert "--action-space-mode" not in argv
         assert not any(flag in argv for flag in ("--train", "--eval", "--adventure-eval", "--level3-train", "--level3-eval"))
 
+    coach_command = _commands()["coach_stream_fusion"]()
+    assert "--coach-fusion-success-reward" not in coach_command
+    assert "--coach-tactical-usefulness-reward" not in coach_command
 
-def test_model_discovery_rejects_non_generalist_metadata(tmp_path: Path) -> None:
+
+def test_evaluation_command_uses_independent_eval_form_state() -> None:
     dashboard = _dashboard()
-    dashboard.repo_root = tmp_path
+    command = dashboard._build_adventure_generalist_eval_command()
 
-    fixed_dir = tmp_path / "runs" / "obsolete_fixed" / "checkpoints"
-    fixed_dir.mkdir(parents=True)
-    (fixed_dir / "ppo_pvz_999_steps.zip").write_bytes(b"fixed")
-    (fixed_dir.parent / "model_metadata.json").write_text(
-        json.dumps(
-            {
-                "metadata_version": 1,
-                "model_family": "ppo_fixed_specialist",
-                "action_count": 201,
-                "action_space_mode": "fixed",
-                "action_decoder_version": "fixed_slot_4x50_plus_wait_v1",
-                "observation_version": "fixed_slot_v1",
-                "max_seed_slots": 4,
-            }
-        ),
-        encoding="utf-8",
-    )
+    def value(flag: str) -> str:
+        return command[command.index(flag) + 1]
 
-    generalist_dir = tmp_path / "runs" / "generalist" / "checkpoints"
-    generalist_dir.mkdir(parents=True)
-    expected = generalist_dir / "ppo_pvz_370000_steps.zip"
-    expected.write_bytes(b"generalist")
-    (generalist_dir.parent / "model_metadata.json").write_text(
-        json.dumps(
-            {
-                "metadata_version": 1,
-                "model_family": "ppo_adventure_generalist_14slot_identity_v1",
-                "action_count": 701,
-                "action_space_mode": "adventure_14slot_identity",
-                "action_decoder_version": "seedslot14x50_plus_wait_v1",
-                "observation_version": "adventure_14slot_identity_v1",
-                "max_seed_slots": 14,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert dashboard._find_newest_usable_model_zip() == expected
+    assert value("--run-dir") == "runs/generalist_eval_snapshot"
+    assert value("--adventure-start-level") == "3"
+    assert value("--max-adventure-levels") == "9"
+    assert value("--max-attempts-per-level") == "7"
+    assert value("--game-speed") == "3.5"
+    assert value("--step-seconds") == "0.08"
+    assert value("--board-timeout") == "77"
+    assert value("--adventure-soft-max-steps") == "2100"
+    assert value("--adventure-hard-max-steps") == "3600"
+    assert "--no-adventure-final-wave-extension" in command
+    assert "--wallnut-tactical-mask" not in command
+    assert "--no-wallnut-tactical-mask" in command
+    assert "--cherrybomb-tactical-mask" in command
+    assert "--human-coach-enabled" not in command
+    assert "--no-human-coach" in command
+    assert "--stream-coach-enabled" not in command
+    assert "--no-stream-coach" in command

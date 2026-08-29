@@ -31,9 +31,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from pvzrl_action_space import (
     ADVENTURE_IDENTITY_ACTION_COUNT,
     ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    CELLS_PER_SLOT,
     adventure_identity_action_to_slot_cell,
+    build_action_space_spec,
 )
 from pvzrl_actions import ACTION_KIND_PLACEMENT, ActionDecision, ActionIntent
+from pvzrl_observation_layout import build_observation_layout
 from pvzrl_stream_actions import ViewerActionResolution, resolve_viewer_action
 from pvzrl_stream_commands import (
     BoundedViewerCommandQueue,
@@ -47,7 +50,7 @@ from pvzrl_streamer_source import DeterministicStreamCommandSource
 from test_refactor_support import dense_observation, make_wrapper
 
 
-OBSERVATION_SIZE = 4_297
+OBSERVATION_SIZE = build_observation_layout(build_action_space_spec()).total_features
 VIEWER_HASH = "a" * 64
 BENCHMARK_ROW = 1
 BENCHMARK_COLUMN = 3
@@ -285,7 +288,7 @@ def _paired_measurement(
 
 
 def _policy_action(slot: int, row: int, column: int) -> int:
-    return 1 + int(slot) * 50 + int(row) * 10 + int(column)
+    return 1 + int(slot) * CELLS_PER_SLOT + int(row) * 10 + int(column)
 
 
 def _action_fixture() -> tuple[ViewerCommand, np.ndarray, Mapping[int, ActionDecision]]:

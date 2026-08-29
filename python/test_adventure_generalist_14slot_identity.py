@@ -16,12 +16,19 @@ import pvzrl_adventure_generalist as generalist_module
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    ADVENTURE_IDENTITY_OBSERVATION_VERSION,
+    CELLS_PER_SLOT,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
     adventure_identity_action_to_slot_cell,
     build_action_space_spec,
     structural_adventure_identity_mask,
 )
 from pvzrl_adventure_generalist import (
     ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+    ADVENTURE_GENERALIST_MODEL_FAMILY,
     AdventureGeneralistTrainingEnv,
     AdventureSeedCurriculum,
     BLOCKED_INITIAL_LOADOUT_UNAVAILABLE,
@@ -41,6 +48,9 @@ from pvzrl_seed_inventory import (
     adventure_identity_features,
 )
 from train_ppo import build_config, validate_adventure_generalist_model_compatibility
+
+
+FIVE_LANE_LIVE_ROWS = DEFAULT_ROWS - 1
 
 
 class Var:
@@ -82,8 +92,10 @@ def observation(seed_slots: List[Dict[str, Any]]) -> Dict[str, Any]:
         "plantCount": 0,
         "zombieCount": 0,
         "gameplayReady": True,
-        "rowCount": 5,
-        "columnCount": 10,
+        # A classic five-lane observation still uses the permanent padded
+        # six-row action decoder; the sixth action row is masked at runtime.
+        "rowCount": FIVE_LANE_LIVE_ROWS,
+        "columnCount": DEFAULT_COLS,
         "seedSlots": seed_slots,
         "legalActions": [0, 1],
         "unlockedSeedNames": ["SunFlower", "Peashooter", "WallNut", "CherryBomb"],
@@ -96,8 +108,11 @@ def fake_dashboard() -> PvZDashboard:
     dashboard.project_root = Path.cwd()
     dashboard.repo_root = Path.cwd()
     dashboard.active_run_path = ""
+    dashboard.live_status_path_var = Var(str(dashboard.live_status_path))
     dashboard.generalist_total_timesteps_var = Var("1234")
     dashboard.generalist_checkpoint_freq_var = Var("250")
+    dashboard.generalist_n_steps_var = Var("512")
+    dashboard.generalist_batch_size_var = Var("64")
     dashboard.generalist_initial_loadout_var = Var(GUI_INITIAL_LOADOUT)
     dashboard.generalist_max_seed_slots_var = Var("14")
     dashboard.generalist_start_level_var = Var("1")
@@ -114,9 +129,26 @@ def fake_dashboard() -> PvZDashboard:
     dashboard.generalist_frontier_win_streak_required_var = Var("1")
     dashboard.generalist_unlock_delay_var = Var("0")
     dashboard.generalist_new_plant_prob_var = Var("0.15")
-    dashboard.generalist_run_dir_var = Var("")
+    dashboard.generalist_run_dir_var = Var("runs/test_gui_train")
     dashboard.generalist_resume_model_path_var = Var("")
     dashboard.generalist_eval_model_path_var = Var("")
+    dashboard.eval_initial_loadout_var = Var(GUI_INITIAL_LOADOUT)
+    dashboard.eval_max_seed_slots_var = Var(str(ADVENTURE_IDENTITY_MAX_SEED_SLOTS))
+    dashboard.eval_run_dir_var = Var("runs/test_gui_eval")
+    dashboard.eval_start_level_var = Var("1")
+    dashboard.eval_max_levels_var = Var("3")
+    dashboard.eval_max_attempts_var = Var("2")
+    dashboard.eval_game_speed_var = Var("4.0")
+    dashboard.eval_step_seconds_var = Var("0.05")
+    dashboard.eval_board_timeout_var = Var("60")
+    dashboard.eval_soft_max_steps_var = Var("2000")
+    dashboard.eval_hard_max_steps_var = Var("3500")
+    dashboard.eval_final_wave_extension_var = Var(True)
+    dashboard.eval_quick_wait_var = Var(True)
+    dashboard.eval_wait_gameplay_ready_var = Var(True)
+    dashboard.eval_tactical_masks_var = Var(True)
+    dashboard.eval_wallnut_mask_var = Var(True)
+    dashboard.eval_cherrybomb_mask_var = Var(True)
     dashboard.generalist_unlock_curriculum_var = Var(True)
     dashboard.generalist_replay_cleared_var = Var(True)
     dashboard.generalist_final_wave_extension_var = Var(True)
@@ -244,9 +276,9 @@ def fake_generalist_env(tmp_dir: Path) -> AdventureGeneralistTrainingEnv:
     env._last_observation = {}
     env._episode_reward_totals = {}
     env._episode_reward = 0.0
-    env.action_count = 701
-    env.rows = 5
-    env.cols = 10
+    env.action_count = ADVENTURE_IDENTITY_ACTION_COUNT
+    env.rows = DEFAULT_ROWS
+    env.cols = DEFAULT_COLS
     env.action_spec = build_action_space_spec(
         mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
         plant_types=[1, 1, 0, 0],
@@ -357,7 +389,7 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
                 model_path,
                 resume_config,
                 "test compatible resume metadata",
-                model_action_count=701,
+                model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             )
             ok = summary.get("compatible") is True
         except SystemExit as exc:
@@ -383,13 +415,13 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
             results,
             "Adventure Generalist resume rejects wrong action count with incompatible_resume_model",
             "blocked_reason=incompatible_resume_model" in error_text
-            and "expected_action_count=701" in error_text
+            and f"expected_action_count={ADVENTURE_IDENTITY_ACTION_COUNT}" in error_text
             and "actual_action_count=201" in error_text,
             error_text,
         )
 
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        metadata["action_count"] = 701
+        metadata["action_count"] = ADVENTURE_IDENTITY_ACTION_COUNT
         metadata["model_family"] = "ppo_sunflower_peashooter"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         try:
@@ -397,7 +429,7 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
                 model_path,
                 resume_config,
                 "test wrong model family",
-                model_action_count=701,
+                model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             )
             error_text = ""
         except SystemExit as exc:
@@ -406,13 +438,13 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
             results,
             "Adventure Generalist resume rejects wrong model family",
             "blocked_reason=incompatible_resume_model" in error_text
-            and "expected_model_family=ppo_adventure_generalist_14slot_identity_v1" in error_text
+            and f"expected_model_family={ADVENTURE_GENERALIST_MODEL_FAMILY}" in error_text
             and "actual_model_family=ppo_sunflower_peashooter" in error_text,
             error_text,
         )
 
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        metadata["model_family"] = "ppo_adventure_generalist_14slot_identity_v1"
+        metadata["model_family"] = ADVENTURE_GENERALIST_MODEL_FAMILY
         metadata["observation_version"] = "fixed_slot_v1"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         try:
@@ -420,7 +452,7 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
                 model_path,
                 resume_config,
                 "test wrong observation schema",
-                model_action_count=701,
+                model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             )
             error_text = ""
         except SystemExit as exc:
@@ -429,13 +461,13 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
             results,
             "Adventure Generalist resume rejects wrong observation schema",
             "blocked_reason=incompatible_resume_model" in error_text
-            and "expected_observation_schema=adventure_14slot_identity_v1" in error_text
+            and f"expected_observation_schema={ADVENTURE_IDENTITY_OBSERVATION_VERSION}" in error_text
             and "actual_observation_schema=fixed_slot_v1" in error_text,
             error_text,
         )
 
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        metadata["observation_version"] = "adventure_14slot_identity_v1"
+        metadata["observation_version"] = ADVENTURE_IDENTITY_OBSERVATION_VERSION
         metadata["seed_list"] = ["SunFlower", "Peashooter", "SunFlower", "Peashooter"]
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         try:
@@ -443,7 +475,7 @@ def assert_resume_metadata_compatibility_checks(results: List[Dict[str, Any]]) -
                 model_path,
                 resume_config,
                 "test changed seed slot order",
-                model_action_count=701,
+                model_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             )
             error_text = ""
         except SystemExit as exc:
@@ -1171,21 +1203,31 @@ def main() -> int:
     assert_same_level_replay_retries_transient_seed_selection_failure(results)
 
     spec = build_action_space_spec(mode=ACTION_SPACE_ADVENTURE_14_IDENTITY, plant_types=[1, 1, 0, 0])
-    assert_case(results, "action count is exactly 701", spec.action_count == ADVENTURE_IDENTITY_ACTION_COUNT)
+    assert_case(
+        results,
+        f"action count is exactly {ADVENTURE_IDENTITY_ACTION_COUNT}",
+        spec.action_count == ADVENTURE_IDENTITY_ACTION_COUNT,
+    )
     assert_case(results, "wait action decodes to wait", adventure_identity_action_to_slot_cell(0)["kind"] == 0)
-    decoded = adventure_identity_action_to_slot_cell(1 + 13 * 50 + 49)
+    decoded = adventure_identity_action_to_slot_cell(ADVENTURE_IDENTITY_ACTION_COUNT - 1)
     assert_case(
         results,
         "placement action decodes slot/row/col",
-        decoded == {"kind": 1, "slot_index": 13, "row": 4, "column": 9},
+        decoded
+        == {
+            "kind": 1,
+            "slot_index": ADVENTURE_IDENTITY_MAX_SEED_SLOTS - 1,
+            "row": DEFAULT_ROWS - 1,
+            "column": DEFAULT_COLS - 1,
+        },
         decoded,
     )
 
     mask = structural_adventure_identity_mask(4)
     assert_case(results, "wait remains valid", mask[0] is True)
-    assert_case(results, "slot 3 placement valid", mask[1 + 3 * 50] is True)
-    assert_case(results, "inactive slot 4 placement masked", mask[1 + 4 * 50] is False)
-    assert_case(results, "last inactive slot masked", mask[700] is False)
+    assert_case(results, "slot 3 placement valid", mask[1 + 3 * CELLS_PER_SLOT] is True)
+    assert_case(results, "inactive slot 4 placement masked", mask[1 + 4 * CELLS_PER_SLOT] is False)
+    assert_case(results, "last inactive slot masked", mask[ADVENTURE_IDENTITY_ACTION_COUNT - 1] is False)
 
     four_slots = [
         slot(1, "SunFlower", 0),
@@ -1529,12 +1571,12 @@ def main() -> int:
         )
     assert_case(
         results,
-        "runtime infers six-slot loadout when bridge capacity is stuck at four",
-        selected_inferred_runtime == ["SunFlower", "Peashooter", "WallNut", "CherryBomb", "SunFlower", "SunFlower"]
+        "runtime rotates live priority cards within the bridge-reported four-slot capacity",
+        selected_inferred_runtime == ["SunFlower", "Peashooter", "WallNut", "CherryBomb"]
         and blocked_inferred_runtime == ""
         and inferred_runtime_env.context.get("observed_seed_bank_capacity") == 4
-        and inferred_runtime_env.context.get("effective_seed_capacity") == 6
-        and inferred_runtime_env.context.get("max_effective_seed_capacity_seen") == 6,
+        and inferred_runtime_env.context.get("effective_seed_capacity") == 4
+        and inferred_runtime_env.context.get("max_effective_seed_capacity_seen") == 4,
         {
             "selected": selected_inferred_runtime,
             "blocked": blocked_inferred_runtime,
@@ -1565,13 +1607,14 @@ def main() -> int:
         )
     assert_case(
         results,
-        "runtime selects CherryBomb from confirmed unlock event when bridge stays at four visible slots",
-        selected_cherry_runtime == ["SunFlower", "Peashooter", "CherryBomb", "SunFlower", "SunFlower"]
+        "runtime does not select an unlock absent from the current four-slot CardUI",
+        selected_cherry_runtime == ADVENTURE_GENERALIST_INITIAL_LOADOUT
         and blocked_cherry_runtime == ""
-        and cherry_runtime_env.context.get("effective_seed_capacity") == 5
+        and cherry_runtime_env.context.get("effective_seed_capacity") == 4
         and cherry_runtime_env.context.get("selected_loadout") == ADVENTURE_GENERALIST_INITIAL_LOADOUT
         and cherry_runtime_env.context.get("proposed_selected_loadout") == selected_cherry_runtime
-        and cherry_runtime_env.context.get("proposed_rejected_priority_seeds", []) == [],
+        and cherry_runtime_env.context.get("proposed_rejected_priority_seeds", [])
+        == [{"seed": "CherryBomb", "reason": "name_not_in_selectable"}],
         {
             "selected": selected_cherry_runtime,
             "blocked": blocked_cherry_runtime,
@@ -1708,10 +1751,10 @@ def main() -> int:
     )
     assert_case(
         results,
-        "capacity inference expands to five when CherryBomb alone is selectable",
+        "selectable CherryBomb authorizes rotation but not a fifth slot",
         cherry_alone_capacity.observed_capacity == 4
         and cherry_alone_capacity.inferred_capacity_from_unlocks >= 5
-        and cherry_alone_capacity.effective_seed_capacity == 5
+        and cherry_alone_capacity.effective_seed_capacity == 4
         and cherry_alone_capacity.available_priority_seeds == ["CherryBomb"],
         cherry_alone_capacity.__dict__,
     )
@@ -1732,9 +1775,9 @@ def main() -> int:
     )
     assert_case(
         results,
-        "capacity inference uses confirmed CherryBomb unlock event even when visible list is starter only",
+        "confirmed CherryBomb unlock does not expand a four-slot chooser",
         cherry_medium_capacity.inferred_capacity_from_unlocks == 5
-        and cherry_medium_capacity.effective_seed_capacity == 5
+        and cherry_medium_capacity.effective_seed_capacity == 4
         and cherry_medium_capacity.inferred_capacity_source == "unlock_event_priority_seed",
         cherry_medium_capacity.__dict__,
     )
@@ -1754,10 +1797,10 @@ def main() -> int:
     )
     assert_case(
         results,
-        "capacity inference expands to six when WallNut and CherryBomb are selectable",
+        "selectable WallNut and CherryBomb do not expand a four-slot chooser",
         wallnut_cherry_capacity.observed_capacity == 4
         and wallnut_cherry_capacity.inferred_capacity_from_unlocks >= 6
-        and wallnut_cherry_capacity.effective_seed_capacity == 6
+        and wallnut_cherry_capacity.effective_seed_capacity == 4
         and wallnut_cherry_capacity.inferred_capacity_source == "selectable_priority_seeds",
         wallnut_cherry_capacity.__dict__,
     )
@@ -1907,10 +1950,10 @@ def main() -> int:
     )
     assert_case(
         results,
-        "capacity inference session maximum prevents drop back to four",
+        "live four-slot capacity overrides prior inference-only estimates",
         monotonic_later_capacity.inferred_capacity_from_unlocks == 4
-        and monotonic_later_capacity.effective_seed_capacity == 6
-        and monotonic_later_capacity.max_effective_seed_capacity_seen == 6,
+        and monotonic_later_capacity.effective_seed_capacity == 4
+        and monotonic_later_capacity.max_effective_seed_capacity_seen == 4,
         monotonic_later_capacity.__dict__,
     )
 
@@ -1962,9 +2005,9 @@ def main() -> int:
         )
 
     wallnut_obs = observation([slot(1, "SunFlower", 0), *[slot(0, "Peashooter", i) for i in range(1, 5)], slot(3, "WallNut", 5)])
-    decoded_wallnut = decode_action(1 + 5 * 50, wallnut_obs, [1, 0, 0, 0])
+    decoded_wallnut = decode_action(1 + 5 * CELLS_PER_SLOT, wallnut_obs, [1, 0, 0, 0])
     cherry_obs = observation([slot(1, "SunFlower", 0), *[slot(0, "Peashooter", i) for i in range(1, 7)], slot(2, "CherryBomb", 7)])
-    decoded_cherry = decode_action(1 + 7 * 50, cherry_obs, [1, 0, 0, 0])
+    decoded_cherry = decode_action(1 + 7 * CELLS_PER_SLOT, cherry_obs, [1, 0, 0, 0])
     assert_case(results, "WallNut tactical identity follows slot content", decoded_wallnut.get("plant_type") == 3, decoded_wallnut)
     assert_case(results, "CherryBomb tactical identity follows slot content", decoded_cherry.get("plant_type") == 2, decoded_cherry)
 
@@ -2464,8 +2507,9 @@ def main() -> int:
     coach_eval_command = dash_with_coach._build_adventure_generalist_eval_command()
     assert_case(
         results,
-        "Adventure Generalist eval launch includes coach flags when enabled",
-        "--human-coach-enabled" in coach_eval_command and "--stream-coach-enabled" in coach_eval_command,
+        "Adventure Generalist evaluation stays autonomous when local coach controls are enabled",
+        "--human-coach-enabled" not in coach_eval_command
+        and "--stream-coach-enabled" not in coach_eval_command,
         coach_eval_command,
     )
 
@@ -2571,8 +2615,8 @@ def main() -> int:
         live_path = Path(temp_dir) / "live_status.json"
         payload = {
             "mode": "adventure_generalist_14slot_train",
-            "action_count": 701,
-            "action_decoder_version": "seedslot14x50_plus_wait_v1",
+            "action_count": ADVENTURE_IDENTITY_ACTION_COUNT,
+            "action_decoder_version": ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
             "current_level": 2,
             "wave": 3,
             "sun": 450,
@@ -2617,7 +2661,7 @@ def main() -> int:
     assert_case(
         results,
         "GUI eval launch requires model path",
-        any("requires model_path" in line for line in log_lines),
+        any("model_path is required" in line for line in log_lines),
         log_lines,
     )
 
@@ -2631,7 +2675,7 @@ def main() -> int:
     assert_case(
         results,
         "GUI train validation blocks invalid initial loadout",
-        any("requires initial loadout" in line for line in loadout_logs) and not loadout_launches,
+        any("Initial loadout must preserve" in line for line in loadout_logs) and not loadout_launches,
         {"logs": loadout_logs, "launches": loadout_launches},
     )
 
@@ -2645,7 +2689,7 @@ def main() -> int:
     assert_case(
         results,
         "GUI train validation blocks invalid max seed slots",
-        any("requires max seed slots = 14" in line for line in slot_logs) and not slot_launches,
+        any("requires exactly 14 identity slots" in line for line in slot_logs) and not slot_launches,
         {"logs": slot_logs, "launches": slot_launches},
     )
 
@@ -2672,7 +2716,7 @@ def main() -> int:
     assert_case(
         results,
         "GUI train resume path must exist",
-        any("resume model does not exist" in line for line in missing_resume_logs) and not missing_resume_launches,
+        any("Model file not found" in line for line in missing_resume_logs) and not missing_resume_launches,
         {"logs": missing_resume_logs, "launches": missing_resume_launches},
     )
 

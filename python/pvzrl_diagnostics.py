@@ -25,6 +25,8 @@ class EnvironmentSafetyResult:
 
     diagnostics: Dict[str, Any]
     next_lost_mower_rows: FrozenSet[int]
+    next_missing_mower_rows: FrozenSet[int]
+    mower_baseline_ready: bool
 
 
 def _coerce(value: Any, default: Any) -> Any:
@@ -124,6 +126,8 @@ def compose_environment_safety_diagnostics(
     fallback_plant_types: Sequence[int] = (),
     fallback_row_count: int = 5,
     lost_mower_rows: AbstractSet[int] = frozenset(),
+    missing_mower_rows: AbstractSet[int] = frozenset(),
+    mower_baseline_ready: bool = False,
     live_board_progress: bool,
     post_win_signal_present: bool,
     cleanup_signal_active: bool,
@@ -133,7 +137,7 @@ def compose_environment_safety_diagnostics(
     previous_facts: Optional[StepFacts] = None,
     current_facts: Optional[StepFacts] = None,
 ) -> EnvironmentSafetyResult:
-    """Compose exact legacy diagnostics and the next lost-mower-row set."""
+    """Compose safety diagnostics and immutable per-attempt mower history."""
 
     fallback_types = tuple(int(value) for value in fallback_plant_types)
     current_snapshot = current_facts or build_step_facts(current, fallback_types)
@@ -141,6 +145,8 @@ def compose_environment_safety_diagnostics(
         build_step_facts(previous, fallback_types) if previous is not None else None
     )
     next_lost_rows = {int(row) for row in lost_mower_rows}
+    next_missing_rows = {int(row) for row in missing_mower_rows}
+    next_mower_baseline_ready = bool(mower_baseline_ready)
     events: list[Dict[str, Any]] = []
 
     if live_board_progress and post_win_signal_present:
@@ -165,39 +171,50 @@ def compose_environment_safety_diagnostics(
         and not current_snapshot.lifecycle.seed_selection_active
         and not current_snapshot.lifecycle.over
     )
+    respawn_rows: list[int] = []
     if previous and previous_snapshot is not None and active_runtime_context:
         previous_rows = previous_snapshot.mower.active_rows
         current_rows = current_snapshot.mower.active_rows
-        if previous_rows is not None and current_rows is not None:
+        if current_rows is not None:
             rows = max(_row_count(previous, fallback_row_count), _row_count(current, fallback_row_count))
-            next_lost_rows.update(
-                row for row in range(rows) if row in previous_rows and row not in current_rows
+            expected_rows = set(range(rows))
+            current_active_rows = {
+                int(row) for row in current_rows if 0 <= int(row) < rows
+            }
+            full_current_baseline = bool(
+                rows > 0
+                and expected_rows.issubset(current_active_rows)
+                and int(current_snapshot.mower.logical_count) >= rows
+                and int(current_snapshot.mower.visible_count) >= rows
             )
-            respawn_rows = sorted(
-                row
-                for row in current_rows
-                if 0 <= row < rows and (row not in previous_rows or row in next_lost_rows)
-            )
+
+            if not next_mower_baseline_ready:
+                # A structurally playable board can precede mower materialization.
+                # UNKNOWN -> PRESENT establishes the baseline; it is not a respawn.
+                if full_current_baseline:
+                    next_mower_baseline_ready = True
+                    next_missing_rows.clear()
+            else:
+                absent_rows = expected_rows - current_active_rows
+                confirmed_absent_rows = absent_rows.intersection(next_missing_rows)
+                next_lost_rows.update(confirmed_absent_rows)
+                # Two consecutive known observations are required before an
+                # absence is treated as consumed. A one-frame scan omission is
+                # forgotten as soon as the row is visible again.
+                next_missing_rows = absent_rows - next_lost_rows
+                respawn_rows = sorted(current_active_rows.intersection(next_lost_rows))
+
             if respawn_rows:
+                previous_active_rows = previous_rows or frozenset()
                 append_safety_event(
                     events,
                     "mower_respawn_detected",
                     current,
                     rows=respawn_rows,
-                    mowers_before=[row in previous_rows for row in range(rows)],
-                    mowers_after=[row in current_rows for row in range(rows)],
+                    mowers_before=[row in previous_active_rows for row in range(rows)],
+                    mowers_after=[row in current_active_rows for row in range(rows)],
                     last_action=requested_action,
                 )
-        elif current_snapshot.mower.count > previous_snapshot.mower.count:
-            append_safety_event(
-                events,
-                "mower_respawn_detected",
-                current,
-                rows=[],
-                mowerCountBefore=int(previous_snapshot.mower.count),
-                mowerCountAfter=int(current_snapshot.mower.count),
-                last_action=requested_action,
-            )
 
         previous_plant_count = _coerce(previous.get("plantCount"), 0)
         current_plant_count = _coerce(current.get("plantCount"), 0)
@@ -215,10 +232,7 @@ def compose_environment_safety_diagnostics(
             and current_visible_plants <= max(1, int(previous_visible_plants * 0.25))
         ) or (previous_wave > 0 and current_wave < previous_wave) or (
             previous_time > 5.0 and current_time + 1.0 < previous_time
-        ) or (
-            previous_mower_count < max(1, _row_count(previous, fallback_row_count))
-            and current_mower_count >= max(1, _row_count(current, fallback_row_count))
-        )
+        ) or bool(respawn_rows)
         if board_refreshed:
             append_safety_event(
                 events,
@@ -334,7 +348,12 @@ def compose_environment_safety_diagnostics(
         reset_reward_ui_cleanup_blocked_count=0,
         safety_events=events,
     )
-    return EnvironmentSafetyResult(diagnostics, frozenset(next_lost_rows))
+    return EnvironmentSafetyResult(
+        diagnostics,
+        frozenset(next_lost_rows),
+        frozenset(next_missing_rows),
+        bool(next_mower_baseline_ready),
+    )
 
 
 __all__ = [

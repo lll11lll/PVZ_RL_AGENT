@@ -46,6 +46,8 @@ from pvzrl_action_space import (
     ADVENTURE_IDENTITY_ACTION_DECODER_VERSION,
     ADVENTURE_IDENTITY_ACTION_COUNT,
     ADVENTURE_IDENTITY_OBSERVATION_VERSION,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
     action_count_for_config as action_space_count_for_config,
     build_action_space_spec,
     normalize_action_space_mode,
@@ -55,6 +57,7 @@ from pvzrl_rewards import (
     FUSION_REWARD_COMPONENT_NAMES,
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
+    REWARD_POLICY_VERSION,
     RewardConfig,
 )
 from pvzrl_fusion import FUSION_POLICY_NONE, fusion_live_fields, normalize_fusion_policy
@@ -80,7 +83,7 @@ from pvzrl_telemetry import LiveStatusWriter, live_status_significant_state
 from pvzrl_streamer import EVALUATE, STREAM_TRAIN, run_streamer_cycles
 
 
-DEFAULT_CONFIG_PATH = Path("configs/ppo_adventure_generalist_14slot_identity_v1.json")
+DEFAULT_CONFIG_PATH = Path("configs/ppo_adventure_generalist_full_v2.json")
 STREAMER_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 LANE_DIAGNOSTIC_DICT_FIELDS = [
     "plants_by_row",
@@ -232,6 +235,7 @@ FUSION_REWARD_FLOAT_FIELDS = [
     "fusion_last_usefulness_bonus",
 ]
 EPISODE_STRING_FIELDS = [
+    "reward_policy_version",
     "fusion_policy",
     "fusion_last_reward_reason",
     "fusion_last_source",
@@ -264,6 +268,20 @@ EPISODE_METRIC_FIELDS = [
     "bridge_errors",
     "illegal_actions",
     "avg_legal_actions",
+    "terminal_reward_total",
+    "threat_reward_total",
+    "mower_penalty_total",
+    "illegal_action_penalty_total",
+    "reward_component_total",
+    "reward_unattributed_adjustment_total",
+    "reward_components_match",
+    "threat_raw_before",
+    "threat_raw_after",
+    "threat_before",
+    "threat_after",
+    "threat_raw_delta",
+    "threat_normalized_delta",
+    "threat_clipped_delta",
 ] + EPISODE_STRING_FIELDS + LANE_DIAGNOSTIC_DICT_FIELDS + LANE_DIAGNOSTIC_FLOAT_DICT_FIELDS + LANE_DIAGNOSTIC_NUMERIC_FIELDS + [
     "wallnut_damage_absorbed_total",
     "cherrybomb_avg_kills_per_use",
@@ -339,13 +357,27 @@ class TeeStream:
 
     def write(self, data: str) -> int:
         for stream in self.streams:
-            stream.write(data)
-            stream.flush()
+            try:
+                if bool(getattr(stream, "closed", False)):
+                    continue
+                stream.write(data)
+                stream.flush()
+            except (OSError, ValueError):
+                # colorama/stdio atexit hooks may write this proxy after the
+                # rotating capture handle has already been closed.
+                continue
         return len(data)
 
     def flush(self) -> None:
         for stream in self.streams:
-            stream.flush()
+            try:
+                if bool(getattr(stream, "closed", False)):
+                    continue
+                stream.flush()
+            except (OSError, ValueError):
+                # colorama/stdio atexit hooks may flush this proxy after the
+                # rotating capture handle has already been closed.
+                continue
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.streams[0], name)
@@ -388,10 +420,17 @@ class RotatingTextStream:
 
     def flush(self) -> None:
         with self._lock:
-            self._handle.flush()
+            if bool(getattr(self._handle, "closed", False)):
+                return
+            try:
+                self._handle.flush()
+            except (OSError, ValueError):
+                return
 
     def close(self) -> None:
         with self._lock:
+            if bool(getattr(self._handle, "closed", False)):
+                return
             self._handle.close()
 
 
@@ -520,6 +559,9 @@ def env_metadata_for_config(config: Dict[str, Any], env: Optional[Any] = None) -
     else:
         metadata = env_metadata_from_config(config)
     metadata["model_family"] = str(config.get("model_family") or metadata.get("model_family") or "")
+    metadata["reward_policy_version"] = str(
+        config.get("reward_policy_version") or REWARD_POLICY_VERSION
+    )
     return metadata
 
 
@@ -546,6 +588,8 @@ def raise_if_incompatible(result: CompatibilityCheck) -> None:
 
 def print_compatibility_report(prefix: str, result: CompatibilityCheck) -> None:
     print(f"{prefix} model_compatibility=" + json.dumps(result.to_dict(), separators=(",", ":"), sort_keys=True))
+    for warning in result.warnings:
+        print(f"{prefix} compatibility_warning={warning}")
 
 
 def _metadata_bool(value: Any) -> bool:
@@ -732,7 +776,7 @@ def _build_config_mapping(
     resolver = ConfigResolver(args, raw_config)
     value = resolver.value
     enabled = resolver.enabled
-    quick_wait = enabled("quick_wait")
+    quick_wait = enabled("quick_wait", explicit_false=True)
     board_timeout = value(
         "board_timeout",
         180.0,
@@ -852,7 +896,7 @@ def _build_config_mapping(
         if requested_action_space_mode != ACTION_SPACE_ADVENTURE_14_IDENTITY:
             raise SystemExit(
                 "blocked_reason=invalid_adventure_generalist_action_space: "
-                "Adventure Generalist requires adventure_14slot_identity."
+                f"Adventure Generalist requires {ACTION_SPACE_ADVENTURE_14_IDENTITY}."
             )
 
     raw_adventure_soft = getattr(args, "adventure_soft_max_steps", None)
@@ -886,19 +930,22 @@ def _build_config_mapping(
     randomize_seed_order = enabled(
         "randomize_seed_order",
         json_aliases=("seed_order_randomization",),
+        explicit_false=True,
     )
     if adventure_generalist_requested and randomize_seed_order:
         seed_order_source = SEED_ORDER_SOURCE_RANDOMIZED
-    coach_allow_fusion_planning = enabled("coach_allow_fusion_planning")
-    fusion_bridge_enabled = enabled("fusion_bridge_enabled")
-    human_coach_enabled = enabled("human_coach_enabled")
-    streamer_v1_enabled = enabled("streamer_v1_enabled")
+    coach_allow_fusion_planning = enabled(
+        "coach_allow_fusion_planning", explicit_false=True
+    )
+    fusion_bridge_enabled = enabled("fusion_bridge_enabled", explicit_false=True)
+    human_coach_enabled = enabled("human_coach_enabled", explicit_false=True)
+    streamer_v1_enabled = enabled("streamer_v1_enabled", explicit_false=True)
     human_coach_command_mode = str(
         getattr(args, "human_coach_command_mode", None)
         or raw_config.get("human_coach_command_mode", "override")
         or "override"
     ).strip().lower()
-    stream_coach_enabled = enabled("stream_coach_enabled")
+    stream_coach_enabled = enabled("stream_coach_enabled", explicit_false=True)
     try:
         stream_coach_mode = str(
             resolver.aliased_value(
@@ -985,7 +1032,9 @@ def _build_config_mapping(
         "board_timeout": float(board_timeout),
         "gameplay_ready_timeout": float(gameplay_ready_timeout),
         "poll_seconds": float(poll_seconds),
-        "wait_gameplay_ready": enabled("wait_gameplay_ready", True),
+        "wait_gameplay_ready": enabled(
+            "wait_gameplay_ready", True, explicit_false=True
+        ),
         "skip_board_wait": enabled("skip_board_wait"),
         "quick_wait": quick_wait,
         "plant_types": plant_types,
@@ -1019,6 +1068,7 @@ def _build_config_mapping(
         "fusion_action_mask_enabled": enabled(
             "fusion_action_mask_enabled",
             mode_default=streamer_v1_enabled,
+            explicit_false=True,
         ),
         "enable_board_plant_identity": bool(
             value(
@@ -1037,9 +1087,13 @@ def _build_config_mapping(
         "later_plant_curriculum_prob": float(value("later_plant_curriculum_prob", 0.10)),
         "coach_fusion_prob": float(value("coach_fusion_prob", 0.10)),
         "run_mode": run_mode,
-        "tactical_masks": enabled("tactical_masks"),
-        "wallnut_tactical_mask": enabled("wallnut_tactical_mask"),
-        "cherrybomb_tactical_mask": enabled("cherrybomb_tactical_mask"),
+        "tactical_masks": enabled("tactical_masks", explicit_false=True),
+        "wallnut_tactical_mask": enabled(
+            "wallnut_tactical_mask", explicit_false=True
+        ),
+        "cherrybomb_tactical_mask": enabled(
+            "cherrybomb_tactical_mask", explicit_false=True
+        ),
         "checkpoint_warm_start": bool(requested_training_continuation),
         "warm_start_used": False,
         "checkpoint_warm_start_reason": (
@@ -1052,7 +1106,9 @@ def _build_config_mapping(
         "resume_source_model_family": "",
         "scratch_initialization": bool(adventure_generalist_train_requested and not requested_training_continuation),
         "active_seed_slots_at_start": len(initial_loadout),
-        "unlock_aware_seed_curriculum": enabled("unlock_aware_seed_curriculum", True),
+        "unlock_aware_seed_curriculum": enabled(
+            "unlock_aware_seed_curriculum", True, explicit_false=True
+        ),
         "seed_curriculum": str(value("seed_curriculum", "conservative")),
         "unlock_introduction_delay": int(value("unlock_introduction_delay", 0)),
         "new_plant_min_inclusion_prob": float(value("new_plant_min_inclusion_prob", 0.15)),
@@ -1066,7 +1122,9 @@ def _build_config_mapping(
             )
         ),
         "allow_weak_unlocked_capacity_fallback": enabled("allow_weak_unlocked_capacity_fallback"),
-        "adventure_replay_cleared_levels": enabled("adventure_replay_cleared_levels"),
+        "adventure_replay_cleared_levels": enabled(
+            "adventure_replay_cleared_levels", explicit_false=True
+        ),
         "adventure_frontier_sample_prob": float(value("adventure_frontier_sample_prob", 0.60)),
         "adventure_recent_cleared_sample_prob": float(value("adventure_recent_cleared_sample_prob", 0.30)),
         "adventure_maintenance_sample_prob": float(value("adventure_maintenance_sample_prob", 0.10)),
@@ -1076,13 +1134,13 @@ def _build_config_mapping(
         ),
         "adventure_generalist_strict_startup_validation": bool(adventure_generalist_strict_startup_validation),
         "adventure_start_level": int(value("adventure_start_level", 1)),
-        "max_adventure_levels": int(value("max_adventure_levels", 5)),
+        "max_adventure_levels": int(value("max_adventure_levels", 50)),
         "max_attempts_per_level": int(value("max_attempts_per_level", 10)),
         "advance_on_wins": int(value("advance_on_wins", 1)),
         "human_coach_enabled": bool(human_coach_enabled),
         "human_coach_command_path": str(human_coach_command_path),
         "human_coach_log_path": str(value("human_coach_log_path", "runs/human_coach.jsonl") or ""),
-        "human_coach_reward": enabled("human_coach_reward"),
+        "human_coach_reward": enabled("human_coach_reward", explicit_false=True),
         "human_coach_fusion_enabled": bool(human_coach_fusion_enabled),
         "human_coach_platform": str(raw_config.get("human_coach_platform", "mock") or "mock"),
         "human_coach_command_mode": human_coach_command_mode,
@@ -1105,7 +1163,7 @@ def _build_config_mapping(
         "stream_coach_mock_script": str(value("stream_coach_mock_script", "") or ""),
         "stream_coach_dry_run": bool(stream_coach_dry_run),
         "stream_coach_apply_enabled": bool(stream_coach_apply_enabled),
-        "stream_coach_reward": enabled("stream_coach_reward"),
+        "stream_coach_reward": enabled("stream_coach_reward", explicit_false=True),
         "stream_coach_log_path": str(value("stream_coach_log_path", "runs/stream_coach.jsonl") or ""),
         "stream_coach_fusion_enabled": bool(stream_coach_fusion_enabled),
         "coach_allow_fusion_planning": bool(coach_allow_fusion_planning),
@@ -1152,6 +1210,7 @@ def _build_config_mapping(
         ).strip(),
         "streamer_mock_script": str(value("streamer_mock_script", "") or "").strip(),
         "reward": build_reward_config(args, raw_config),
+        "reward_policy_version": REWARD_POLICY_VERSION,
         "model_path": requested_model_path,
         "run_dir": run_dir,
         "checkpoint_freq": int(value("checkpoint_freq", 5000)),
@@ -1352,8 +1411,8 @@ def make_env_config(config: Dict[str, Any]) -> PvZSB3Config:
         max_seed_slots=int(config.get("max_seed_slots", len(config["plant_types"]))),
         observation_version=str(config.get("observation_version", "")),
         action_decoder_version=str(config.get("action_decoder_version", "")),
-        row_count=5,
-        column_count=10,
+        row_count=DEFAULT_ROWS,
+        column_count=DEFAULT_COLS,
         game_speed=config["game_speed"],
         game_speed_mode=config.get("game_speed_mode", "game_speed"),
         seed=config["seed"],
@@ -1424,7 +1483,7 @@ def make_monitored_env(config: Dict[str, Any], monitor_path: Path, live_status_p
             run_dir=Path(config["run_dir"]),
             live_status_path=live_status_path,
             initial_loadout=parse_initial_loadout(config.get("initial_loadout", ADVENTURE_GENERALIST_INITIAL_LOADOUT)),
-            max_adventure_levels=int(config.get("max_adventure_levels", 5) or 5),
+            max_adventure_levels=int(config.get("max_adventure_levels", 50) or 50),
             max_attempts_per_level=int(config.get("max_attempts_per_level", 10) or 10),
             adventure_start_level=int(config.get("adventure_start_level", 1) or 1),
             unlock_aware_seed_curriculum=bool(config.get("unlock_aware_seed_curriculum", True)),
@@ -1634,8 +1693,8 @@ def make_streamer_v1_controller(config: Dict[str, Any]) -> Any:
 
 
 def write_action_map(config: Dict[str, Any], path: Path) -> None:
-    rows = 5
-    cols = 10
+    rows = DEFAULT_ROWS
+    cols = DEFAULT_COLS
     plant_types = list(config["plant_types"])
     seed_list = list(config.get("seed_list", []))
     spec = build_action_space_spec(
@@ -1789,11 +1848,25 @@ def clean_episode_row(summary: Dict[str, Any], fallback_episode: int) -> Dict[st
         "avg_row_danger",
         *PROGRESS_CSV_ACTION_DURATION_FIELDS,
         *FUSION_REWARD_FLOAT_FIELDS,
+        "terminal_reward_total",
+        "threat_reward_total",
+        "mower_penalty_total",
+        "illegal_action_penalty_total",
+        "reward_component_total",
+        "reward_unattributed_adjustment_total",
+        "threat_raw_before",
+        "threat_raw_after",
+        "threat_before",
+        "threat_after",
+        "threat_raw_delta",
+        "threat_normalized_delta",
+        "threat_clipped_delta",
         *REWARD_EPISODE_TOTAL_FIELDS,
     ):
         row[field] = float(row.get(field) or 0.0)
     row["tactical_mask_enabled"] = bool(row.get("tactical_mask_enabled"))
     row["fusion_reward_capped"] = bool(row.get("fusion_reward_capped"))
+    row["reward_components_match"] = bool(row.get("reward_components_match"))
     return row
 
 
@@ -2463,6 +2536,113 @@ def coach_live_status_fields_from_summary(config: Dict[str, Any], summary: Optio
     return fields
 
 
+_STREAMER_EVALUATION_METRIC_FIELDS = (
+    "episodes_completed",
+    "win_rate",
+    "avg_reward",
+    "avg_wave",
+    "avg_kills",
+    "avg_plants",
+    "avg_mowers_lost",
+    "illegal_actions",
+    "model_steps",
+)
+_STREAMER_EVALUATION_CONTEXT_FIELDS = (
+    "adventure_start_level",
+    "next_adventure_level",
+    "streamer_cycle",
+)
+_STREAMER_COMPARISON_FIELDS = (
+    "comparison_to_baseline",
+    "comparison_to_previous_current",
+    "comparison_to_best_before_promotion",
+    "comparison_protocol_compatible",
+    "best_promoted",
+    "train_start_adventure_level",
+    "evaluation_start_adventure_level",
+    "next_adventure_level",
+)
+_STREAMER_REJECTED_COUNTER_FIELDS = (
+    "permanently_rejected",
+    "phase_rejected",
+    "capacity_rejected",
+    "duplicate",
+)
+
+
+def compact_streamer_evaluation(value: Any) -> Dict[str, Any]:
+    """Keep only privacy-safe evaluation metrics and Adventure-level context."""
+
+    payload = value if isinstance(value, dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+    compact = {
+        key: summary[key]
+        for key in _STREAMER_EVALUATION_METRIC_FIELDS
+        if key in summary
+    }
+    for key in _STREAMER_EVALUATION_CONTEXT_FIELDS:
+        if key in payload:
+            compact[key] = payload[key]
+        elif key in summary:
+            compact[key] = summary[key]
+    return compact
+
+
+def compact_streamer_comparison(value: Any) -> Dict[str, Any]:
+    """Keep the bounded comparison result emitted by the Streamer orchestrator."""
+
+    payload = value if isinstance(value, dict) else {}
+    return {
+        key: payload[key]
+        for key in _STREAMER_COMPARISON_FIELDS
+        if key in payload
+    }
+
+
+def _streamer_status_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def streamer_viewer_counter_fields(value: Any) -> Dict[str, int]:
+    """Normalize safe queue counters without exposing messages or viewer identity."""
+
+    payload = value if isinstance(value, dict) else {}
+    queue = payload.get("streamer_command_queue")
+    queue_fields = queue if isinstance(queue, dict) else {}
+    counters = queue_fields.get("counters")
+    counter_fields = counters if isinstance(counters, dict) else {}
+
+    accepted = _streamer_status_count(
+        counter_fields.get(
+            "accepted",
+            payload.get("viewer_commands_accepted_count", 0),
+        )
+    )
+    invalid = _streamer_status_count(
+        counter_fields.get(
+            "permanently_rejected",
+            payload.get("viewer_commands_invalid_count", 0),
+        )
+    )
+    if counter_fields:
+        rejected = sum(
+            _streamer_status_count(counter_fields.get(key, 0))
+            for key in _STREAMER_REJECTED_COUNTER_FIELDS
+        )
+    else:
+        rejected = _streamer_status_count(
+            payload.get("viewer_commands_rejected_count", invalid)
+        )
+    return {
+        "viewer_commands_accepted_count": accepted,
+        "viewer_commands_rejected_count": rejected,
+        "viewer_commands_invalid_count": invalid,
+    }
+
+
 def streamer_live_status_fields(
     config: Dict[str, Any],
     summary: Optional[Dict[str, Any]] = None,
@@ -2502,11 +2682,15 @@ def streamer_live_status_fields(
         "streamer_mode": phase,
         "streamer_cycle": int(config.get("streamer_cycle", 0) or 0),
         "streamer_platform": str(config.get("streamer_platform", "twitch") or "twitch"),
+        "streamer_experiment_dir": str(
+            config.get("streamer_experiment_dir") or config.get("run_dir", "")
+        ),
         "current_model_ppo_steps": current_steps,
         "baseline_model_ppo_steps": baseline_steps,
         "cycle_policy_steps_completed": cycle_completed,
         "next_evaluation_countdown": max(0, target - cycle_completed),
         "evaluation_chat_control": False,
+        "ppo_updates_enabled": bool(phase == STREAM_TRAIN),
         "bc_updates_enabled": bool(
             phase == STREAM_TRAIN and config.get("streamer_bc_enabled", True)
         ),
@@ -2517,16 +2701,46 @@ def streamer_live_status_fields(
             )
             or 0
         ),
+        "bc_demo_rejected_count": int(
+            values.get(
+                "bc_demo_rejected_count",
+                runtime_fields.get("bc_demo_rejected_count", 0),
+            )
+            or 0
+        ),
         "bc_loss": float(values.get("bc_loss", runtime_fields.get("bc_loss", 0.0)) or 0.0),
         "bc_update_count": int(
             values.get("bc_update_count", runtime_fields.get("bc_update_count", 0)) or 0
         ),
-        "baseline_evaluation": config.get("streamer_baseline_evaluation", {}),
-        "current_evaluation": config.get("streamer_current_evaluation", {}),
-        "best_evaluation": config.get("streamer_best_evaluation", {}),
+        "baseline_evaluation": compact_streamer_evaluation(
+            config.get("streamer_baseline_evaluation", {})
+        ),
+        "current_evaluation": compact_streamer_evaluation(
+            config.get("streamer_current_evaluation", {})
+        ),
+        "best_evaluation": compact_streamer_evaluation(
+            config.get("streamer_best_evaluation", {})
+        ),
+        "evaluation_comparison": compact_streamer_comparison(
+            values.get(
+                "evaluation_comparison",
+                config.get("streamer_evaluation_comparison", values.get("last_cycle", {})),
+            )
+        ),
         "best_model_steps": int(config.get("streamer_best_model_steps", 0) or 0),
     }
     fields.update(runtime_fields)
+    # Phase ownership must not be overridden by a stale runtime snapshot.
+    fields["streamer_mode"] = phase
+    fields["evaluation_chat_control"] = False
+    fields["ppo_updates_enabled"] = bool(phase == STREAM_TRAIN)
+    fields["bc_updates_enabled"] = bool(
+        phase == STREAM_TRAIN and config.get("streamer_bc_enabled", True)
+    )
+    fields["bc_demo_rejected_count"] = _streamer_status_count(
+        fields.get("bc_demo_rejected_count", 0)
+    )
+    fields.update(streamer_viewer_counter_fields(fields))
     return fields
 
 
@@ -2835,13 +3049,13 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
             demonstration_buffer = DemonstrationBuffer.load(
                 demonstration_path,
                 capacity=demonstration_capacity,
-                expected_observation_shape=(4297,),
+                expected_observation_shape=tuple(config["observation_shape"]),
                 expected_action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
             )
         else:
             demonstration_buffer = DemonstrationBuffer(
                 demonstration_capacity,
-                observation_shape=(4297,),
+                observation_shape=tuple(config["observation_shape"]),
                 action_count=ADVENTURE_IDENTITY_ACTION_COUNT,
                 persist_path=demonstration_path,
             )
@@ -3013,7 +3227,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
     print(
         "Resolved PPO action space: "
         f"mode={config['action_space_mode']} seed_slots={len(config['plant_types'])}, "
-        f"max_seed_slots={config['max_seed_slots']} rows=5, cols=10, "
+        f"max_seed_slots={config['max_seed_slots']} rows={DEFAULT_ROWS}, cols={DEFAULT_COLS}, "
         f"action_count={config['action_count']} decoder={config['action_decoder_version']}"
     )
     print(
@@ -3095,13 +3309,21 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
                     bc_demonstration_count=(
                         len(demonstration_buffer) if demonstration_buffer is not None else 0
                     ),
+                    bc_demo_rejected_count=int(
+                        getattr(self.model, "bc_demo_rejected_count", 0) or 0
+                    ),
                     bc_loss=float(getattr(self.model, "last_bc_loss", 0.0) or 0.0),
                     bc_update_count=int(getattr(self.model, "bc_update_count", 0) or 0),
                     total_environment_actions=int(
                         getattr(self.model, "total_environment_actions", 0) or 0
                     ),
                     viewer_intervention_count=int(
-                        getattr(self.model, "viewer_interventions", 0) or 0
+                        getattr(
+                            self.model,
+                            "verified_viewer_interventions",
+                            getattr(self.model, "viewer_interventions", 0),
+                        )
+                        or 0
                     ),
                 )
             return True
@@ -3175,7 +3397,14 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
 
     starting_model_steps = int(getattr(model, "num_timesteps", 0) or 0)
     starting_environment_actions = int(getattr(model, "total_environment_actions", 0) or 0)
-    starting_viewer_interventions = int(getattr(model, "viewer_interventions", 0) or 0)
+    starting_viewer_interventions = int(
+        getattr(
+            model,
+            "verified_viewer_interventions",
+            getattr(model, "viewer_interventions", 0),
+        )
+        or 0
+    )
     starting_policy_transitions = int(getattr(model, "policy_transitions_collected", 0) or 0)
     starting_bc_updates = int(getattr(model, "bc_update_count", 0) or 0)
     starting_demonstrations_added = int(
@@ -3241,7 +3470,14 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
                         ),
                         "viewer_interventions": accumulated(
                             "viewer_interventions",
-                            int(getattr(checkpoint_model, "viewer_interventions", 0) or 0)
+                            int(
+                                getattr(
+                                    checkpoint_model,
+                                    "verified_viewer_interventions",
+                                    getattr(checkpoint_model, "viewer_interventions", 0),
+                                )
+                                or 0
+                            )
                             - starting_viewer_interventions,
                         ),
                         "policy_transitions_collected": accumulated(
@@ -3350,6 +3586,9 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
                     "bc_demonstration_count": (
                         len(demonstration_buffer) if demonstration_buffer is not None else 0
                     ),
+                    "bc_demo_rejected_count": int(
+                        getattr(model, "bc_demo_rejected_count", 0) or 0
+                    ),
                     "bc_loss": float(getattr(model, "last_bc_loss", 0.0) or 0.0),
                     "bc_update_count": int(getattr(model, "bc_update_count", 0) or 0),
                 },
@@ -3407,7 +3646,14 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
     summary["model_path"] = str(model_path)
     if streamer_v1_enabled:
         lifetime_environment_actions = int(getattr(model, "total_environment_actions", 0) or 0)
-        lifetime_viewer_interventions = int(getattr(model, "viewer_interventions", 0) or 0)
+        lifetime_viewer_interventions = int(
+            getattr(
+                model,
+                "verified_viewer_interventions",
+                getattr(model, "viewer_interventions", 0),
+            )
+            or 0
+        )
         lifetime_policy_transitions = int(getattr(model, "policy_transitions_collected", 0) or 0)
         lifetime_bc_updates = int(getattr(model, "bc_update_count", 0) or 0)
         lifetime_demonstrations_added = int(
@@ -3425,6 +3671,9 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
                     0, lifetime_policy_transitions - starting_policy_transitions
                 ),
                 "bc_demonstration_count": int(len(demonstration_buffer)) if demonstration_buffer is not None else 0,
+                "bc_demo_rejected_count": int(
+                    getattr(model, "bc_demo_rejected_count", 0) or 0
+                ),
                 "bc_demonstrations_added": max(
                     0, lifetime_demonstrations_added - starting_demonstrations_added
                 ),
@@ -3445,6 +3694,7 @@ def train(config: Dict[str, Any], live_status_path: Optional[Path] = None) -> Di
                 "streamer_lifetime_counters": {
                     "total_environment_actions": lifetime_environment_actions,
                     "viewer_interventions": lifetime_viewer_interventions,
+                    "viewer_step_attempts": int(getattr(model, "viewer_interventions", 0) or 0),
                     "policy_transitions_collected": lifetime_policy_transitions,
                     "bc_demonstrations_added": lifetime_demonstrations_added,
                     "bc_update_count": lifetime_bc_updates,
@@ -3545,6 +3795,31 @@ def adventure_evaluate(config: Dict[str, Any], model_path: Path, args: argparse.
     return payload
 
 
+def _streamer_cycle_prior_metrics(
+    *,
+    start_model: Path,
+    experiment_current_model: Path,
+    cycle: int,
+    source_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return recovery metrics only for this experiment's CURRENT checkpoint.
+
+    A new Streamer experiment commonly starts from an external Generalist
+    checkpoint.  That checkpoint may itself live beside a historical
+    ``streamer_checkpoint.json``.  Its counters belong to the old experiment
+    and must not become progress for the new cycle.
+    """
+
+    if start_model.resolve() != experiment_current_model.resolve():
+        return {}
+    if str(source_record.get("role") or "") != "CURRENT":
+        return {}
+    if int(source_record.get("training_cycle", 0) or 0) != int(cycle):
+        return {}
+    metrics = source_record.get("training_metrics")
+    return dict(metrics) if isinstance(metrics, dict) else {}
+
+
 def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     """Run Streamer V1 as an overlay on the maintained train/eval entrypoints."""
 
@@ -3574,23 +3849,7 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
     status_writer = LiveStatusWriter(resolved_live_status_path(args.live_status_path))
 
     def compact_evaluation(value: Any) -> Dict[str, Any]:
-        payload = value if isinstance(value, dict) else {}
-        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
-        return {
-            key: summary[key]
-            for key in (
-                "episodes_completed",
-                "win_rate",
-                "avg_reward",
-                "avg_wave",
-                "avg_kills",
-                "avg_plants",
-                "avg_mowers_lost",
-                "illegal_actions",
-                "model_steps",
-            )
-            if key in summary
-        }
+        return compact_streamer_evaluation(value)
 
     def read_object(path: Path) -> Dict[str, Any]:
         try:
@@ -3599,7 +3858,8 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    experiment_dir = Path(str(config["run_dir"]))
+    experiment_dir = Path(str(config["run_dir"])).resolve(strict=False)
+    config["streamer_experiment_dir"] = str(experiment_dir)
 
     def experiment_status_context() -> Dict[str, Any]:
         baseline_eval = read_object(
@@ -3609,12 +3869,14 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
         best = read_object(
             experiment_dir / "checkpoints" / "best" / "streamer_checkpoint.json"
         )
+        last_cycle = state.get("last_cycle") if isinstance(state.get("last_cycle"), dict) else {}
         return {
             "streamer_baseline_evaluation": compact_evaluation(baseline_eval),
             "streamer_current_evaluation": compact_evaluation(
                 state.get("current_evaluation", {})
             ),
             "streamer_best_evaluation": compact_evaluation(best.get("evaluation", {})),
+            "streamer_evaluation_comparison": compact_streamer_comparison(last_cycle),
             "streamer_best_model_steps": int(best.get("model_steps", 0) or 0),
             "streamer_next_adventure_level": int(
                 state.get("next_adventure_level", baseline_eval.get("next_adventure_level", 0))
@@ -3627,6 +3889,18 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
         last_cycle = state.get("last_cycle") if isinstance(state.get("last_cycle"), dict) else {}
         training = last_cycle.get("training") if isinstance(last_cycle.get("training"), dict) else {}
         runtime = training.get("streamer_runtime") if isinstance(training.get("streamer_runtime"), dict) else {}
+        # The runtime snapshot is the canonical source for viewer execution
+        # truth.  ``training.viewer_interventions`` is a trajectory-attempt
+        # diagnostic (it includes rejected viewer-owned steps), and can also
+        # be stale when this cycle publisher runs after the environment has
+        # already written a newer runtime snapshot.  Surface only verified
+        # bridge/board executions as the public intervention count.
+        verified_viewer_interventions = runtime.get("viewer_intervention_count")
+        if verified_viewer_interventions is None:
+            verified_viewer_interventions = training.get(
+                "verified_viewer_interventions",
+                training.get("viewer_interventions", 0),
+            )
         live_payload = {
             "streamer_v1_enabled": True,
             "mode": str(state.get("mode") or state.get("streamer_phase") or STREAM_TRAIN),
@@ -3638,6 +3912,7 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
             "health": "LIVE" if state.get("status") == "running" else "DEAD",
             "updated_at": time.time(),
             "active_run": str(config.get("run_dir", "")),
+            "streamer_experiment_dir": str(experiment_dir),
             "streamer_platform": str(config.get("streamer_platform", "twitch") or "twitch"),
             "streamer_cycle": int(
                 state.get("current_cycle", state.get("completed_cycle", 0)) or 0
@@ -3660,20 +3935,28 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
             "last_viewer_action": runtime.get("last_viewer_action", {}),
             "last_action_source": runtime.get("last_action_source", "MODEL"),
             "viewer_intervention_count": int(
-                training.get("viewer_interventions", runtime.get("viewer_intervention_count", 0))
+                verified_viewer_interventions
                 or 0
             ),
+            "viewer_step_attempts": int(
+                training.get("viewer_step_attempts", training.get("viewer_interventions", 0))
+                or 0
+            ),
+            **streamer_viewer_counter_fields(runtime),
             "evaluation_chat_control": False,
             "bc_updates_enabled": bool(state.get("bc_updates_enabled", False)),
             "ppo_updates_enabled": bool(
                 state.get("ppo_updates_enabled", state.get("mode") == STREAM_TRAIN)
             ),
             "bc_demonstration_count": int(training.get("bc_demonstration_count", 0) or 0),
+            "bc_demo_rejected_count": int(training.get("bc_demo_rejected_count", 0) or 0),
             "bc_loss": float(training.get("bc_loss", 0.0) or 0.0),
             "bc_update_count": int(training.get("bc_update_count", 0) or 0),
             "baseline_evaluation": compact_evaluation(state.get("baseline_evaluation", {})),
             "current_evaluation": compact_evaluation(state.get("current_evaluation", {})),
             "best_evaluation": compact_evaluation(state.get("best_evaluation", {})),
+            "evaluation_comparison": compact_streamer_comparison(last_cycle),
+            "evaluation_role": str(state.get("evaluation_role") or ""),
             "best_model_steps": int(state.get("best_model_steps", 0) or 0),
             "current_checkpoint": str(state.get("current_checkpoint") or ""),
             "best_checkpoint": str(state.get("best_checkpoint") or ""),
@@ -3699,13 +3982,20 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
         adventure_start_level: int,
     ) -> Dict[str, Any]:
         cycle_config = deepcopy(config)
-        source_record = read_object(start_model.parent / "streamer_checkpoint.json")
-        source_cycle = int(source_record.get("training_cycle", 0) or 0)
-        prior_training = (
-            source_record.get("training_metrics", {})
-            if source_cycle == int(cycle)
-            and isinstance(source_record.get("training_metrics"), dict)
+        experiment_current_model = experiment_dir / "checkpoints" / "current" / "model.zip"
+        source_is_experiment_current = (
+            start_model.resolve() == experiment_current_model.resolve()
+        )
+        source_record = (
+            read_object(start_model.parent / "streamer_checkpoint.json")
+            if source_is_experiment_current
             else {}
+        )
+        prior_training = _streamer_cycle_prior_metrics(
+            start_model=start_model,
+            experiment_current_model=experiment_current_model,
+            cycle=cycle,
+            source_record=source_record,
         )
         source_model_steps = int(source_record.get("model_steps", 0) or 0)
         cycle_start_model_steps = int(
@@ -3726,7 +4016,7 @@ def run_streamer_v1(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
                 "streamer_curriculum_state_path": str(
                     Path(str(config["run_dir"])) / "curriculum_state.json"
                 ),
-                "streamer_preserve_bc_rng_state": bool(source_record),
+                "streamer_preserve_bc_rng_state": source_is_experiment_current,
                 "streamer_cycle_policy_steps_completed_before": int(
                     prior_training.get("ppo_policy_timesteps", 0) or 0
                 ),
@@ -3930,9 +4220,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--board-timeout", type=float)
     parser.add_argument("--gameplay-ready-timeout", type=float)
     parser.add_argument("--poll-seconds", type=float)
-    parser.add_argument("--wait-gameplay-ready", action="store_true")
+    parser.add_argument(
+        "--wait-gameplay-ready",
+        dest="wait_gameplay_ready",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-wait-gameplay-ready",
+        dest="wait_gameplay_ready",
+        action="store_false",
+    )
     parser.add_argument("--skip-board-wait", action="store_true")
-    parser.add_argument("--quick-wait", action="store_true")
+    parser.add_argument("--quick-wait", dest="quick_wait", action="store_true", default=None)
+    parser.add_argument("--no-quick-wait", dest="quick_wait", action="store_false")
     parser.add_argument("--seed-list", default=None)
     parser.add_argument("--initial-loadout", default=None)
     parser.add_argument("--max-seed-slots", type=int, default=None)
@@ -3959,9 +4260,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="adventure_generalist_strict_startup_validation",
         action="store_false",
     )
-    parser.add_argument("--unlock-aware-seed-curriculum", action="store_true")
+    parser.add_argument(
+        "--unlock-aware-seed-curriculum",
+        dest="unlock_aware_seed_curriculum",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-unlock-aware-seed-curriculum",
+        dest="unlock_aware_seed_curriculum",
+        action="store_false",
+    )
     parser.add_argument("--seed-curriculum", choices=("conservative", "varied"), default=None)
-    parser.add_argument("--randomize-seed-order", action="store_true")
+    parser.add_argument(
+        "--randomize-seed-order",
+        dest="randomize_seed_order",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-randomize-seed-order",
+        dest="randomize_seed_order",
+        action="store_false",
+    )
     parser.add_argument("--unlock-introduction-delay", type=int, default=None)
     parser.add_argument("--new-plant-min-inclusion-prob", type=float, default=None)
     parser.add_argument("--core-seed-names", default=None)
@@ -3969,7 +4290,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_true", default=None)
     parser.add_argument("--no-infer-capacity-from-unlocks", dest="infer_capacity_from_unlocks", action="store_false")
     parser.add_argument("--allow-weak-unlocked-capacity-fallback", action="store_true")
-    parser.add_argument("--adventure-replay-cleared-levels", action="store_true")
+    parser.add_argument(
+        "--adventure-replay-cleared-levels",
+        dest="adventure_replay_cleared_levels",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-adventure-replay-cleared-levels",
+        dest="adventure_replay_cleared_levels",
+        action="store_false",
+    )
     parser.add_argument("--adventure-frontier-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-recent-cleared-sample-prob", type=float, default=None)
     parser.add_argument("--adventure-maintenance-sample-prob", type=float, default=None)
@@ -3979,7 +4310,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--streamer-v1",
         dest="streamer_v1_enabled",
         action="store_true",
+        default=None,
         help="Run the FIFO Twitch/mock intervention, PPO+BC, and autonomous evaluation cycle overlay.",
+    )
+    parser.add_argument(
+        "--no-streamer-v1",
+        dest="streamer_v1_enabled",
+        action="store_false",
+        help="Explicitly disable the Streamer V1 overlay selected by JSON configuration.",
     )
     parser.add_argument("--streamer-platform", choices=("twitch", "mock"), default=None)
     parser.add_argument("--streamer-baseline-checkpoint", type=Path, default=None)
@@ -4005,7 +4343,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--streamer-twitch-user-id-env", default=None)
     parser.add_argument("--streamer-viewer-hash-secret-env", default=None)
     parser.add_argument("--streamer-mock-script", type=Path, default=None)
-    parser.add_argument("--human-coach-enabled", action="store_true", help="Enable local/mock human coach action overrides.")
+    parser.add_argument(
+        "--human-coach-enabled",
+        dest="human_coach_enabled",
+        action="store_true",
+        default=None,
+        help="Enable local/mock human coach action overrides.",
+    )
+    parser.add_argument(
+        "--no-human-coach",
+        dest="human_coach_enabled",
+        action="store_false",
+        help="Explicitly disable human coach overrides selected by JSON configuration.",
+    )
     parser.add_argument(
         "--human-coach-command-mode",
         choices=("override", "assist", "coach_only", "viewer_suggestion"),
@@ -4020,9 +4370,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--human-coach-command-path", type=Path, default=None, help="Plain text or JSONL file of local coach commands.")
     parser.add_argument("--human-coach-log-path", type=Path, default=None, help="JSONL log path for human coach decisions.")
-    parser.add_argument("--human-coach-reward", action="store_true", help="Apply small optional coach reward shaping.")
+    parser.add_argument(
+        "--human-coach-reward",
+        dest="human_coach_reward",
+        action="store_true",
+        default=None,
+        help="Apply small optional coach reward shaping.",
+    )
+    parser.add_argument(
+        "--no-human-coach-reward",
+        dest="human_coach_reward",
+        action="store_false",
+    )
     parser.add_argument("--human-coach-fusion-enabled", action="store_true", help="Enable bridge-probed !fuse coach overrides.")
-    parser.add_argument("--stream-coach-enabled", action="store_true", help="Enable mock/local stream crowd coach overrides.")
+    parser.add_argument(
+        "--stream-coach-enabled",
+        dest="stream_coach_enabled",
+        action="store_true",
+        default=None,
+        help="Enable mock/local stream crowd coach overrides.",
+    )
+    parser.add_argument(
+        "--no-stream-coach",
+        dest="stream_coach_enabled",
+        action="store_false",
+        help="Explicitly disable local crowd-coach overrides selected by JSON configuration.",
+    )
     parser.add_argument(
         "--stream-coach-mode",
         choices=("twitch", "youtube", "mock"),
@@ -4042,16 +4415,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-coach-mock-script", type=Path, default=None, help="Deterministic mock stream chat JSONL script.")
     parser.add_argument("--stream-coach-dry-run", action="store_true", help="Parse/validate stream commands without applying them.")
     parser.add_argument("--stream-coach-apply", action="store_true", help="Allow validated safe stream commands to affect the active coach path.")
-    parser.add_argument("--stream-coach-reward", action="store_true", help="Apply optional stream crowd-coach reward shaping.")
+    parser.add_argument(
+        "--stream-coach-reward",
+        dest="stream_coach_reward",
+        action="store_true",
+        default=None,
+        help="Apply optional stream crowd-coach reward shaping.",
+    )
+    parser.add_argument(
+        "--no-stream-coach-reward",
+        dest="stream_coach_reward",
+        action="store_false",
+    )
     parser.add_argument("--stream-coach-log-path", type=Path, default=None, help="JSONL log path for stream crowd-coach events.")
-    parser.add_argument("--coach-allow-fusion-planning", action="store_true", help="Allow coach !fuse planning via fusion probe when available.")
-    parser.add_argument("--fusion-bridge-enabled", action="store_true", help="Enable fusion bridge probe routing for coach commands.")
+    parser.add_argument(
+        "--coach-allow-fusion-planning",
+        dest="coach_allow_fusion_planning",
+        action="store_true",
+        default=None,
+        help="Allow coach !fuse planning via fusion probe when available.",
+    )
+    parser.add_argument(
+        "--no-coach-allow-fusion-planning",
+        dest="coach_allow_fusion_planning",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--fusion-bridge-enabled",
+        dest="fusion_bridge_enabled",
+        action="store_true",
+        default=None,
+        help="Enable fusion bridge probe routing for coach commands.",
+    )
+    parser.add_argument(
+        "--no-fusion-bridge",
+        dest="fusion_bridge_enabled",
+        action="store_false",
+    )
     parser.add_argument("--fusion-policy", choices=("none", "observe", "scripted", "assist"), default=None)
     parser.add_argument(
         "--fusion-action-mask-enabled",
+        dest="fusion_action_mask_enabled",
         action="store_true",
+        default=None,
         help="Expose occupied compatible tiles as legal fuse actions in the model action mask "
         "(and route those placements to the fusion bridge). Off by default.",
+    )
+    parser.add_argument(
+        "--no-fusion-action-mask",
+        dest="fusion_action_mask_enabled",
+        action="store_false",
     )
     parser.add_argument("--enable-board-plant-identity", dest="enable_board_plant_identity", action="store_true", default=None)
     parser.add_argument("--no-board-plant-identity", dest="enable_board_plant_identity", action="store_false")
@@ -4070,9 +4483,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fusion-curriculum-prob", type=float)
     parser.add_argument("--later-plant-curriculum-prob", type=float)
     parser.add_argument("--coach-fusion-prob", type=float)
-    parser.add_argument("--tactical-masks", action="store_true")
-    parser.add_argument("--wallnut-tactical-mask", action="store_true")
-    parser.add_argument("--cherrybomb-tactical-mask", action="store_true")
+    parser.add_argument(
+        "--tactical-masks", dest="tactical_masks", action="store_true", default=None
+    )
+    parser.add_argument("--no-tactical-masks", dest="tactical_masks", action="store_false")
+    parser.add_argument(
+        "--wallnut-tactical-mask",
+        dest="wallnut_tactical_mask",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-wallnut-tactical-mask",
+        dest="wallnut_tactical_mask",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--cherrybomb-tactical-mask",
+        dest="cherrybomb_tactical_mask",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-cherrybomb-tactical-mask",
+        dest="cherrybomb_tactical_mask",
+        action="store_false",
+    )
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--deterministic", dest="deterministic", action="store_true", default=True)
     parser.add_argument("--stochastic", dest="deterministic", action="store_false")
@@ -4085,7 +4521,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sample interval in steps for debug sun economy logging.",
     )
+    parser.add_argument("--kill-reward", type=float, default=None)
+    parser.add_argument("--wave-reward", type=float, default=None)
+    parser.add_argument("--win-reward", type=float, default=None)
+    parser.add_argument("--loss-penalty", type=float, default=None)
+    parser.add_argument("--illegal-action-penalty", type=float, default=None)
     parser.add_argument("--mower-loss-penalty", type=float, default=None)
+    parser.add_argument("--threat-delta-coef", type=float, default=None)
+    parser.add_argument("--threat-delta-clip", type=float, default=None)
     parser.add_argument("--danger-delta-scale", type=float, default=None)
     parser.add_argument("--lane-response-reward", type=float, default=None)
     parser.add_argument("--undefended-close-threat-penalty", type=float, default=None)

@@ -8,7 +8,8 @@ tuple of those same decisions, so diagnostics and execution safeguards do not
 need independent legality implementations.
 
 Adventure Generalist has one permanent action identity: action ``0`` waits and
-actions ``1..700`` are fourteen seed-slot-major 5x10 placement/fusion blocks.
+actions ``1..840`` are fourteen seed-slot-major padded 6x10 placement/fusion
+blocks.  Five-lane boards retain that identity and reject sixth-lane actions.
 ``policy_action`` and ``bridge_action`` therefore carry the same integer; no
 alternate decoder identity or wait-position adapter remains.
 """
@@ -24,6 +25,8 @@ from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
     ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
     ActionSpaceSpec,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
     build_action_space_spec,
     decode_policy_action,
 )
@@ -148,8 +151,8 @@ class ActionValidationConfig:
     action_space_mode: str = ACTION_SPACE_ADVENTURE_14_IDENTITY
     plant_types: Tuple[int, ...] = ()
     max_seed_slots: int = ADVENTURE_IDENTITY_MAX_SEED_SLOTS
-    rows: int = 5
-    cols: int = 10
+    rows: int = DEFAULT_ROWS
+    cols: int = DEFAULT_COLS
     fusion_action_mask_enabled: bool = False
     tactical_masks: bool = False
     wallnut_tactical_mask: bool = False
@@ -276,6 +279,10 @@ class ActionDecision:
     resolved_action_kind: str
     selected_plant_type: int = -1
     existing_plant_type: int = -1
+    # Canonical seed cost used by Streamer Mode's resource reservation.  This
+    # is metadata derived from the same seed-slot facts that validate the
+    # action; it does not introduce another legality implementation.
+    required_sun: int = 0
     bridge_authoritative: bool = True
     cache_reused: bool = False
 
@@ -489,7 +496,7 @@ def build_action_validation_context(
     slots = snapshot.seed_slots
     # Model-facing width is checkpoint semantics, never a mutable observation
     # hint.  Startup validation reports bridge/config mismatches separately;
-    # the mask and decision cache must always retain the protected 701 entries.
+    # the mask and decision cache always retain the padded 841 entries.
     action_count = config.spec.action_count
     occupancy = snapshot.occupancy
     config_fingerprint = config.fingerprint
@@ -530,8 +537,8 @@ def build_action_intent(
     observation: Optional[Mapping[str, Any]] = None,
     plant_types: Sequence[int] = (),
     max_seed_slots: Optional[int] = None,
-    rows: int = 5,
-    cols: int = 10,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
     bridge_command: Optional[Mapping[str, Any]] = None,
     source_metadata: Optional[Mapping[str, Any]] = None,
 ) -> ActionIntent:
@@ -609,8 +616,25 @@ def _decision(
     reason: str = "",
     resolved_action_kind: Optional[str] = None,
     selected_plant_type: int = -1,
-    existing_plant_type: int = -1,
+    existing_plant_type: Optional[int] = None,
 ) -> ActionDecision:
+    resolved_existing = existing_plant_type
+    if resolved_existing is None:
+        # Preserve the canonical occupancy fact even when an earlier
+        # readiness/resource gate (for example insufficient sun) rejected the
+        # action.  Streamer classification can then distinguish a temporary
+        # resource wait from a tile that is already permanently occupied.
+        if 0 <= int(intent.row) < int(context.rows) and 0 <= int(intent.column) < int(context.cols):
+            resolved_existing = int(context.occupancy_by_cell.get((int(intent.row), int(intent.column)), -1))
+        else:
+            resolved_existing = -1
+    required_sun = 0
+    try:
+        slot_index = int(intent.seed_slot)
+        if 0 <= slot_index < len(context.seed_slots):
+            required_sun = max(0, int(context.seed_slots[slot_index].seed_cost))
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        required_sun = 0
     return ActionDecision(
         intent=intent,
         legal=bool(legal),
@@ -619,7 +643,8 @@ def _decision(
         config_fingerprint=context.config_fingerprint,
         resolved_action_kind=resolved_action_kind or intent.action_kind,
         selected_plant_type=int(selected_plant_type),
-        existing_plant_type=int(existing_plant_type),
+        existing_plant_type=int(resolved_existing),
+        required_sun=int(required_sun),
     )
 
 
@@ -714,7 +739,15 @@ def validate_action_intent(
                 selected_plant_type=selected_type,
                 existing_plant_type=existing_type,
             )
-        if (existing_type, selected_type) not in context.config.fusion_compatible_pairs:
+        # Known Python recipes are a useful offline fallback, but the live
+        # bridge can authorize additional runtime formulas discovered from the
+        # active seed-card bank.  Occupied-cell action IDs are now included in
+        # the bridge legal-action list when that probe succeeds.
+        runtime_authorized = intent.bridge_action in context.bridge_legal_actions
+        if (
+            (existing_type, selected_type) not in context.config.fusion_compatible_pairs
+            and not runtime_authorized
+        ):
             return _decision(
                 intent,
                 context,

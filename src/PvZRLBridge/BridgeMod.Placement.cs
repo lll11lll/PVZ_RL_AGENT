@@ -223,6 +223,20 @@ public sealed partial class BridgeMod
                 .WithSeedSlot(seedSlotIndex, slot.CardInstanceId);
         }
 
+        if (!gateObservation.GameplayReady)
+        {
+            var reason = string.IsNullOrWhiteSpace(gateObservation.LegalActionReason)
+                ? "gameplay_not_ready"
+                : gateObservation.LegalActionReason;
+            return PlacementResult.Fail(
+                plantTypeId,
+                row,
+                column,
+                $"Gameplay is not ready; placement is blocked ({reason}).",
+                reason)
+                .WithSeedSlot(seedSlotIndex, slot.CardInstanceId);
+        }
+
         var plantType = (PlantType)plantTypeId;
         var costInfo = new PlantCostInfo
         {

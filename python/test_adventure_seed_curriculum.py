@@ -11,6 +11,7 @@ from pvzrl_adventure_generalist import (
     ADVENTURE_GENERALIST_INITIAL_LOADOUT,
     AdventureGeneralistTrainingEnv,
     AdventureSeedCurriculum,
+    resolve_adventure_generalist_seed_capacity,
 )
 from pvzrl_env import resolve_seed_list
 from train_ppo import build_arg_parser, build_config
@@ -55,6 +56,60 @@ def test_core_is_unique_after_unlock_but_initial_duplicate_slots_are_preserved()
         "core",
         "guaranteed_unlock",
     ]
+
+
+def test_committed_starter_only_episode_keeps_configured_duplicate_order() -> None:
+    curriculum = _curriculum(capacity=4)
+    first = curriculum.choose_loadout(
+        selectable_seeds=["SunFlower", "Peashooter"],
+        observed_capacity=4,
+        previous_loadout=ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+        validation_seeds=["SunFlower", "Peashooter"],
+    )
+    curriculum.commit_loadout(first, episode_index=1)
+
+    retry = curriculum.choose_loadout(
+        selectable_seeds=["SunFlower", "Peashooter"],
+        observed_capacity=4,
+        previous_loadout=ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+        validation_seeds=["SunFlower", "Peashooter"],
+    )
+
+    assert first.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+    assert retry.selected_loadout == ADVENTURE_GENERALIST_INITIAL_LOADOUT
+    assert retry.loadout_reason == "explicit_config"
+    assert retry.seed_order_preserved is True
+
+
+def test_selectable_unlock_rotates_within_live_four_slot_capacity() -> None:
+    capacity = resolve_adventure_generalist_seed_capacity(
+        {
+            "visibleSeedCardNames": ["SunFlower", "Peashooter", "CherryBomb"],
+            "availableSeedNames": ["SunFlower", "Peashooter", "CherryBomb"],
+            "selectedSeedNames": list(ADVENTURE_GENERALIST_INITIAL_LOADOUT),
+            "seedSlotCapacity": 4,
+        },
+        context={},
+        previous_observed_capacity=4,
+        previous_effective_capacity=4,
+        selected_loadout=list(ADVENTURE_GENERALIST_INITIAL_LOADOUT),
+        eligible_seeds=["SunFlower", "Peashooter", "CherryBomb"],
+        unlocked_seeds=["SunFlower", "Peashooter", "CherryBomb"],
+    )
+    curriculum = _curriculum(capacity=4)
+    curriculum.record_unlocked(["CherryBomb"], episode_index=1)
+    curriculum.episode_index = 2
+    decision = curriculum.choose_loadout(
+        selectable_seeds=["SunFlower", "Peashooter", "CherryBomb"],
+        observed_capacity=capacity.effective_seed_capacity,
+        previous_loadout=ADVENTURE_GENERALIST_INITIAL_LOADOUT,
+        validation_seeds=["SunFlower", "Peashooter", "CherryBomb"],
+    )
+
+    assert capacity.observed_capacity == 4
+    assert capacity.inferred_capacity_from_unlocks == 5
+    assert capacity.effective_seed_capacity == 4
+    assert decision.selected_loadout == ["SunFlower", "Peashooter", "CherryBomb", "SunFlower"]
 
 
 def test_guaranteed_rotation_keeps_duplicate_filler_next_to_its_identity() -> None:

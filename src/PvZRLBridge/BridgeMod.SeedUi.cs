@@ -261,7 +261,14 @@ public sealed partial class BridgeMod
                 return false;
             }
 
-            return board.startMove && _config.PlantTypes.All(plantType => GetCardCooldown(plantType).Found);
+            // The configured plant list is only the startup compatibility
+            // projection. The caller separately requires a non-empty runtime
+            // CardUI bank, which is authoritative after curriculum rotation.
+            return BridgeObservationHelpers.IsRawBoardGameplayReady(
+                boardFound: true,
+                createPlantFound: true,
+                boardStartMove: board.startMove,
+                done: false);
         }
         catch
         {
@@ -1153,6 +1160,7 @@ public sealed partial class BridgeMod
         if (startClicked)
         {
             _letsRockClickCount++;
+            ArmBoardSingletonCheck("lets_rock");
         }
 
         var after = BuildSeedProbe();
@@ -1169,6 +1177,7 @@ public sealed partial class BridgeMod
             {
                 methodUsed = "TryStartSelectedLevel";
                 _letsRockClickCount++;
+                ArmBoardSingletonCheck("lets_rock_fallback");
                 after = BuildSeedProbe();
             }
         }
@@ -2240,6 +2249,11 @@ public sealed partial class BridgeMod
     private bool TryPressExactStartButtonOnce(GameObject gameObject, List<string> actions, out string methodUsed)
     {
         methodUsed = "";
+        if (TryInvokeTypedStartGameButton(gameObject, actions, out methodUsed))
+        {
+            return true;
+        }
+
         foreach (var component in gameObject.GetComponents<Component>())
         {
             if (component == null)
@@ -2286,6 +2300,67 @@ public sealed partial class BridgeMod
         }
 
         return TrySendStartMessageRequireReceiver(gameObject, actions, out methodUsed);
+    }
+
+    private bool TryInvokeTypedStartGameButton(
+        GameObject startObject,
+        List<string> actions,
+        out string methodUsed)
+    {
+        methodUsed = "";
+        try
+        {
+            var startPath = BuildHierarchyPath(startObject.transform);
+            var candidates = Object.FindObjectsOfType<StartGameBtn>()
+                .Where(button =>
+                    button != null &&
+                    button.gameObject != null &&
+                    button.gameObject.activeInHierarchy &&
+                    (button.gameObject.GetInstanceID() == startObject.GetInstanceID() ||
+                     string.Equals(
+                         BuildHierarchyPath(button.transform),
+                         startPath,
+                         StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            foreach (var button in candidates)
+            {
+                var targetPath = BuildHierarchyPath(button.transform);
+                var downInvoked = TryInvokeNoArg(button, "OnMouseDown", out var downError);
+                if (downInvoked)
+                {
+                    actions.Add($"StartGameBtn.OnMouseDown({targetPath})");
+                }
+
+                if (TryInvokeNoArg(button, "OnMouseUpAsButton", out var upError))
+                {
+                    methodUsed = "StartGameBtn.OnMouseUpAsButton";
+                    actions.Add($"{methodUsed}({targetPath})");
+                    return true;
+                }
+                if (TryInvokeNoArg(button, "OnMouseUp", out upError))
+                {
+                    methodUsed = "StartGameBtn.OnMouseUp";
+                    actions.Add($"{methodUsed}({targetPath})");
+                    return true;
+                }
+                if (downInvoked)
+                {
+                    methodUsed = "StartGameBtn.OnMouseDown";
+                    return true;
+                }
+
+                actions.Add(
+                    $"StartGameBtn candidate unavailable: {targetPath} " +
+                    $"down={downError} up={upError}");
+            }
+            actions.Add($"StartGameBtn candidates={candidates.Count} path={startPath}");
+        }
+        catch (Exception ex)
+        {
+            actions.Add("FindObjectsOfType<StartGameBtn>() failed: " + ex.Message);
+        }
+        return false;
     }
 
     private bool TrySendStartMessageRequireReceiver(GameObject gameObject, List<string> actions, out string methodUsed)
@@ -2800,6 +2875,10 @@ public sealed partial class BridgeMod
         if (TryPressLetsRockButton(actions, out var buttonMethod))
         {
             actions.Add($"LetRock pressed via {buttonMethod}");
+            // auto_select_seeds(start_level=true) uses this shared helper
+            // directly, so arm the transition gate here as well as in the
+            // explicit press_lets_rock_once command wrapper.
+            ArmBoardSingletonCheck("auto_select_seeds_start");
             return true;
         }
 

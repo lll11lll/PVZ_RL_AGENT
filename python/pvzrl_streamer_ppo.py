@@ -33,6 +33,7 @@ from pvzrl_demonstrations import (
     DemonstrationBuffer,
     DemonstrationValidationError,
 )
+from pvzrl_streamer_logging import observation_vector_digest
 
 
 STREAMER_TRANSITION_INFO_KEY = "streamer_transition"
@@ -89,6 +90,20 @@ class BehaviorTransition:
     demo_eligible: bool
     execution_status: str = ""
     demonstration: dict[str, Any] = field(default_factory=dict)
+    # This is the canonical viewer-execution mask captured from the exact
+    # pre-intervention frame.  It is intentionally separate from the policy
+    # mask passed to MaskablePPO.
+    demonstration_action_mask: Optional[tuple[bool, ...]] = None
+    demonstration_observation_revision: str = ""
+    demonstration_observation_digest: str = ""
+    viewer_observation_revision: str = ""
+    policy_observation_revision: str = ""
+    policy_mask_allowed: Optional[bool] = None
+    demonstration_mask_allowed: Optional[bool] = None
+    viewer_action_id: Optional[int] = None
+    canonical_legality_result: str = ""
+    canonical_legality_reason: str = ""
+    bridge_success: Optional[bool] = None
     schema_version: int = STREAMER_TRANSITION_SCHEMA_VERSION
 
     @classmethod
@@ -170,6 +185,15 @@ class BehaviorTransition:
         demonstration = payload.get("demonstration") or {}
         if not isinstance(demonstration, Mapping):
             raise OffPolicyContaminationError("demonstration metadata must be an object")
+        raw_demonstration_mask = payload.get("demonstration_action_mask")
+        demonstration_mask: Optional[tuple[bool, ...]] = None
+        if raw_demonstration_mask is not None:
+            try:
+                demonstration_mask = tuple(bool(value) for value in raw_demonstration_mask)
+            except TypeError as exc:
+                raise OffPolicyContaminationError(
+                    "demonstration_action_mask must be a one-dimensional sequence"
+                ) from exc
         return cls(
             behavior_source=source,
             viewer_controlled=viewer_controlled,
@@ -179,6 +203,51 @@ class BehaviorTransition:
             demo_eligible=demo_eligible,
             execution_status=str(payload.get("execution_status") or ""),
             demonstration=dict(demonstration),
+            demonstration_action_mask=demonstration_mask,
+            demonstration_observation_revision=str(
+                payload.get("demonstration_observation_revision") or ""
+            ),
+            demonstration_observation_digest=str(
+                payload.get("demonstration_observation_digest") or ""
+            ),
+            viewer_observation_revision=str(
+                payload.get("viewer_observation_revision")
+                or payload.get("demonstration_observation_revision")
+                or ""
+            ),
+            policy_observation_revision=str(
+                payload.get("policy_observation_revision") or ""
+            ),
+            policy_mask_allowed=(
+                bool(payload["policy_mask_allowed"])
+                if payload.get("policy_mask_allowed") is not None
+                else None
+            ),
+            demonstration_mask_allowed=(
+                bool(payload["demonstration_mask_allowed"])
+                if payload.get("demonstration_mask_allowed") is not None
+                else None
+            ),
+            viewer_action_id=(
+                int(payload["viewer_action_id"])
+                if payload.get("viewer_action_id") is not None
+                else None
+            ),
+            canonical_legality_result=str(
+                payload.get("canonical_legality_result")
+                or demonstration.get("canonical_legality_result")
+                or ""
+            ),
+            canonical_legality_reason=str(
+                payload.get("canonical_legality_reason")
+                or demonstration.get("canonical_legality_reason")
+                or ""
+            ),
+            bridge_success=(
+                bool(payload["bridge_success"])
+                if payload.get("bridge_success") is not None
+                else None
+            ),
             schema_version=schema_version,
         )
 
@@ -193,6 +262,25 @@ class BehaviorTransition:
             "demo_eligible": bool(self.demo_eligible),
             "execution_status": str(self.execution_status),
             "demonstration": dict(self.demonstration),
+            "demonstration_action_mask": (
+                list(self.demonstration_action_mask)
+                if self.demonstration_action_mask is not None
+                else None
+            ),
+            "demonstration_observation_revision": str(
+                self.demonstration_observation_revision
+            ),
+            "demonstration_observation_digest": str(
+                self.demonstration_observation_digest
+            ),
+            "viewer_observation_revision": str(self.viewer_observation_revision),
+            "policy_observation_revision": str(self.policy_observation_revision),
+            "policy_mask_allowed": self.policy_mask_allowed,
+            "demonstration_mask_allowed": self.demonstration_mask_allowed,
+            "viewer_action_id": self.viewer_action_id,
+            "canonical_legality_result": str(self.canonical_legality_result),
+            "canonical_legality_reason": str(self.canonical_legality_reason),
+            "bridge_success": self.bridge_success,
         }
 
 
@@ -306,6 +394,7 @@ class StreamerMaskablePPO(MaskablePPO):
         bc_update_frequency: int = 1,
         bc_min_demonstrations: int = 32,
         bc_seed: Optional[int] = None,
+        fail_fast_demo_validation: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -340,11 +429,19 @@ class StreamerMaskablePPO(MaskablePPO):
         effective_seed = int(bc_seed) if bc_seed is not None else int(getattr(self, "seed", 0) or 0) + 947
         self.bc_seed = effective_seed
         self._bc_rng = np.random.default_rng(effective_seed)
+        self.fail_fast_demo_validation = bool(fail_fast_demo_validation)
 
         self.total_environment_actions = 0
+        # ``viewer_interventions`` remains the trajectory-owned viewer-step
+        # count used by existing rollout diagnostics.  The verified counter is
+        # the user-facing intervention count and is incremented only after the
+        # canonical bridge/observation proof succeeds.
         self.viewer_interventions = 0
+        self.verified_viewer_interventions = 0
         self.policy_transitions_collected = 0
         self.demonstrations_recorded = int(len(self.demonstration_buffer))
+        self.bc_demo_rejected_count = 0
+        self.last_bc_demo_reject_reason = ""
         self.bc_update_count = 0
         self._streamer_train_calls = 0
         self.last_bc_loss = 0.0
@@ -406,6 +503,16 @@ class StreamerMaskablePPO(MaskablePPO):
         if kwargs.get("bc_seed") is not None:
             model.bc_seed = int(kwargs["bc_seed"])
             model._bc_rng = np.random.default_rng(model.bc_seed)
+        if not hasattr(model, "verified_viewer_interventions"):
+            model.verified_viewer_interventions = int(
+                getattr(model, "viewer_interventions", 0) or 0
+            )
+        if not hasattr(model, "bc_demo_rejected_count"):
+            model.bc_demo_rejected_count = 0
+        if not hasattr(model, "last_bc_demo_reject_reason"):
+            model.last_bc_demo_reject_reason = ""
+        if not hasattr(model, "fail_fast_demo_validation"):
+            model.fail_fast_demo_validation = False
         return model
 
     def set_transition_classifier(
@@ -486,42 +593,185 @@ class StreamerMaskablePPO(MaskablePPO):
     def _record_demonstration(
         self,
         pre_step_observation: Any,
-        action_masks: Optional[np.ndarray],
         transition: BehaviorTransition,
     ) -> bool:
+        self.last_bc_demo_reject_reason = ""
         if not transition.demo_eligible:
             return False
-        if action_masks is None:
-            if not isinstance(self.action_space, spaces.Discrete):
-                raise DemonstrationValidationError(
-                    "cannot synthesize a demonstration mask for a non-Discrete action space"
-                )
-            mask = np.ones(int(self.action_space.n), dtype=bool)
-        else:
-            masks = np.asarray(action_masks, dtype=bool)
-            if masks.ndim != 2 or masks.shape[0] != 1:
-                raise DemonstrationValidationError(
-                    f"expected one batched action mask, got shape={masks.shape}"
-                )
-            mask = masks[0].copy()
+        if str(transition.execution_status or "") != "executed_verified":
+            self.last_bc_demo_reject_reason = "viewer_execution_not_verified"
+            raise DemonstrationValidationError(
+                "eligible viewer transition must have execution_status=executed_verified"
+            )
+        if str(transition.canonical_legality_result or "").strip().upper() != "LEGAL":
+            self.last_bc_demo_reject_reason = "canonical_viewer_legality_missing_or_invalid"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing canonical LEGAL execution proof"
+            )
+        if transition.bridge_success is not True:
+            self.last_bc_demo_reject_reason = "bridge_success_proof_missing"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing bridge_success=true"
+            )
+        if transition.demonstration_action_mask is None:
+            self.last_bc_demo_reject_reason = "missing_demonstration_action_mask"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing demonstration_action_mask"
+            )
+        demonstration_revision = str(
+            transition.viewer_observation_revision
+            or transition.demonstration_observation_revision
+            or ""
+        )
+        if (
+            transition.viewer_observation_revision
+            and transition.demonstration_observation_revision
+            and transition.viewer_observation_revision
+            != transition.demonstration_observation_revision
+        ):
+            self.last_bc_demo_reject_reason = "viewer_demonstration_revision_mismatch"
+            raise DemonstrationValidationError(
+                "viewer and demonstration observation revisions disagree: "
+                f"viewer={transition.viewer_observation_revision} "
+                f"demo={transition.demonstration_observation_revision}"
+            )
+        if not demonstration_revision:
+            self.last_bc_demo_reject_reason = "missing_demonstration_observation_revision"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing demonstration observation revision"
+            )
+        if (
+            demonstration_revision != transition.policy_observation_revision
+        ):
+            self.last_bc_demo_reject_reason = "viewer_policy_observation_revision_mismatch"
+            raise DemonstrationValidationError(
+                "viewer demonstration observation revision mismatch: "
+                f"demo={demonstration_revision} "
+                f"policy={transition.policy_observation_revision}"
+            )
+
+        observation = self._single_observation(pre_step_observation)
+        if not transition.demonstration_observation_digest:
+            self.last_bc_demo_reject_reason = "missing_demonstration_observation_digest"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing demonstration observation digest"
+            )
+        actual_digest = observation_vector_digest(observation)
+        if actual_digest != transition.demonstration_observation_digest:
+            self.last_bc_demo_reject_reason = "demonstration_observation_digest_mismatch"
+            raise DemonstrationValidationError(
+                "viewer demonstration observation digest mismatch: "
+                f"expected={transition.demonstration_observation_digest} actual={actual_digest}"
+            )
+
+        mask = np.asarray(transition.demonstration_action_mask, dtype=bool)
+        if mask.ndim != 1:
+            self.last_bc_demo_reject_reason = "demonstration_action_mask_not_1d"
+            raise DemonstrationValidationError(
+                f"expected one-dimensional demonstration action mask, got shape={mask.shape}"
+            )
+        action_id = int(transition.executed_action)
+        if transition.viewer_action_id is None or int(transition.viewer_action_id) != action_id:
+            self.last_bc_demo_reject_reason = "viewer_action_id_mismatch"
+            raise DemonstrationValidationError(
+                "viewer action id does not match executed_action"
+            )
+        demonstration_mask_allowed = bool(
+            0 <= action_id < int(mask.shape[0]) and mask[action_id]
+        )
+        if transition.demonstration_mask_allowed is False and demonstration_mask_allowed:
+            self.last_bc_demo_reject_reason = "demonstration_mask_provenance_mismatch"
+            raise DemonstrationValidationError(
+                "demonstration mask provenance disagrees with its action bit"
+            )
+        if transition.demonstration_mask_allowed is None and demonstration_mask_allowed:
+            self.last_bc_demo_reject_reason = "demonstration_mask_provenance_missing"
+            raise DemonstrationValidationError(
+                "eligible viewer transition is missing demonstration_mask_allowed=true"
+            )
+        policy_mask_allowed = transition.policy_mask_allowed
         payload = transition.to_mapping()
         demonstration = dict(payload.get("demonstration") or {})
         demonstration.setdefault("policy_timestep", int(self.num_timesteps))
         demonstration.setdefault("environment_action", int(self.total_environment_actions))
+        demonstration.setdefault("viewer_action_id", action_id)
+        demonstration.setdefault("policy_mask_allowed", policy_mask_allowed)
+        demonstration.setdefault("demonstration_mask_allowed", demonstration_mask_allowed)
+        demonstration.setdefault("viewer_observation_revision", demonstration_revision)
+        demonstration.setdefault(
+            "demonstration_observation_revision",
+            demonstration_revision,
+        )
         payload["demonstration"] = demonstration
+        payload["viewer_action_id"] = action_id
+        payload["policy_mask_allowed"] = policy_mask_allowed
+        payload["demonstration_mask_allowed"] = demonstration_mask_allowed
+        payload["viewer_observation_revision"] = demonstration_revision
+        payload["demonstration_observation_revision"] = demonstration_revision
+        if not demonstration_mask_allowed:
+            # Let DemonstrationBuffer raise its authoritative validation error;
+            # this marker only gives the production collector a safe rejection
+            # reason after it catches that unchanged exception.
+            self.last_bc_demo_reject_reason = "demonstration_mask_disallowed"
         record = self.demonstration_buffer.add_if_eligible(
-            self._single_observation(pre_step_observation),
+            observation,
             mask,
             payload,
         )
         if record is None:
+            self.last_bc_demo_reject_reason = "demonstration_buffer_rejected_transition"
             return False
+        self.last_bc_demo_reject_reason = ""
         self.demonstrations_recorded = len(self.demonstration_buffer)
         if "episode_id" in record.metadata:
             self._active_demo_episode_id = record.metadata["episode_id"]
             self._active_demo_training_cycle = record.metadata.get("training_cycle")
         self._persist_demonstrations_if_due()
         return True
+
+    def _record_bc_demo_rejection(
+        self,
+        reason: str,
+        *,
+        transition: BehaviorTransition,
+    ) -> str:
+        normalized_reason = str(reason or "bc_demo_rejected")
+        self.bc_demo_rejected_count += 1
+        self.last_bc_demo_reject_reason = normalized_reason
+        print(
+            "[streamer][bc] demonstration rejected "
+            f"action={int(transition.executed_action)} "
+            f"status={str(transition.execution_status or '')!r} "
+            f"reason={normalized_reason!r}"
+        )
+        return normalized_reason
+
+    @staticmethod
+    def _annotate_bc_demo_result(
+        info: Mapping[str, Any],
+        *,
+        recorded: bool,
+        reject_reason: str = "",
+    ) -> None:
+        """Expose the post-collector BC result without weakening validation."""
+
+        if not isinstance(info, dict):
+            return
+        payload = info.get(STREAMER_TRANSITION_INFO_KEY)
+        if not isinstance(payload, dict):
+            return
+        demonstration = payload.get("demonstration")
+        if not isinstance(demonstration, dict):
+            demonstration = {}
+            payload["demonstration"] = demonstration
+        demonstration["bc_demo_recorded"] = bool(recorded)
+        demonstration["bc_demo_reject_reason"] = str(reject_reason or "")
+        payload["bc_demo_recorded"] = bool(recorded)
+        payload["bc_demo_reject_reason"] = str(reject_reason or "")
+        diagnostics = info.get("streamer_viewer_diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics["bc_demo_recorded"] = bool(recorded)
+            diagnostics["bc_demo_reject_reason"] = str(reject_reason or "")
 
     def _persist_demonstrations_if_due(self) -> None:
         if self.demonstration_buffer.persist_path is None:
@@ -641,7 +891,13 @@ class StreamerMaskablePPO(MaskablePPO):
             self.total_environment_actions += 1
 
             if transition.viewer_controlled:
+                # Every viewer-owned step remains a PPO trajectory boundary,
+                # but the intervention metric counts only a verified canonical
+                # execution.  A bridge rejection/no-op is not a successful
+                # viewer intervention and must not become a BC example.
                 self.viewer_interventions += 1
+                if transition.execution_succeeded:
+                    self.verified_viewer_interventions += 1
                 self.last_rollout_viewer_transitions += 1
                 if policy_tail_reaches_current_observation:
                     if rollout_buffer.pos <= 0:
@@ -663,11 +919,65 @@ class StreamerMaskablePPO(MaskablePPO):
                         )
                     )
                 policy_tail_reaches_current_observation = False
-                self._record_demonstration(
-                    pre_step_observation,
-                    action_masks,
-                    transition,
+                reject_reason = ""
+                demonstration_recorded = False
+                if transition.demo_eligible:
+                    if transition.execution_status != "executed_verified":
+                        reject_reason = self._record_bc_demo_rejection(
+                            "viewer_execution_not_verified",
+                            transition=transition,
+                        )
+                    else:
+                        try:
+                            demonstration_recorded = self._record_demonstration(
+                                pre_step_observation,
+                                transition,
+                            )
+                        except DemonstrationValidationError as exc:
+                            reject_reason = self._record_bc_demo_rejection(
+                                self.last_bc_demo_reject_reason or str(exc),
+                                transition=transition,
+                            )
+                            if self.fail_fast_demo_validation:
+                                self._annotate_bc_demo_result(
+                                    info,
+                                    recorded=False,
+                                    reject_reason=reject_reason,
+                                )
+                                raise
+                if not demonstration_recorded and not reject_reason:
+                    reject_reason = str(
+                        transition.demonstration.get("bc_demo_reject_reason")
+                        or self.last_bc_demo_reject_reason
+                        or ("transition_not_demo_eligible" if not transition.demo_eligible else "demonstration_buffer_rejected_transition")
+                    )
+                    if transition.demo_eligible:
+                        reject_reason = self._record_bc_demo_rejection(
+                            reject_reason,
+                            transition=transition,
+                        )
+                self._annotate_bc_demo_result(
+                    info,
+                    recorded=demonstration_recorded,
+                    reject_reason=reject_reason,
                 )
+                try:
+                    env.env_method(
+                        "record_streamer_bc_result",
+                        action_id=int(transition.executed_action),
+                        observation_revision=str(
+                            transition.viewer_observation_revision
+                            or transition.demonstration_observation_revision
+                            or ""
+                        ),
+                        recorded=bool(demonstration_recorded),
+                        reject_reason=reject_reason,
+                    )
+                except (AttributeError, TypeError, RuntimeError):
+                    # Bridge-free fixtures and older wrappers do not expose
+                    # the optional live-event annotation hook.  The transition
+                    # info still carries the complete BC result.
+                    pass
                 self._last_obs = new_obs
                 # A viewer transition is a trajectory boundary even when the
                 # underlying game episode continues.
@@ -896,6 +1206,10 @@ class StreamerMaskablePPO(MaskablePPO):
         self.logger.record("train/bc_loss", self.last_bc_loss)
         self.logger.record("train/bc_coefficient", float(self.bc_coefficient))
         self.logger.record("train/bc_demonstration_count", len(self.demonstration_buffer))
+        self.logger.record(
+            "train/bc_demo_rejected_count",
+            int(self.bc_demo_rejected_count),
+        )
         self.logger.record("train/bc_update_count", int(self.bc_update_count))
         self.logger.record(
             "train/bc_policy_agreement",
@@ -912,6 +1226,10 @@ class StreamerMaskablePPO(MaskablePPO):
         self.logger.record(
             "streamer/viewer_interventions",
             int(self.viewer_interventions),
+        )
+        self.logger.record(
+            "streamer/verified_viewer_interventions",
+            int(getattr(self, "verified_viewer_interventions", 0) or 0),
         )
         if self._streamer_checkpoint_hook is not None:
             self._streamer_checkpoint_hook(self)

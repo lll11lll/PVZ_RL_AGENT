@@ -217,9 +217,9 @@ def _recipe(
 
 
 # The one authoritative result-producing recipe registry.  These IDs match the
-# live hybrid game's PlantType enum and observed fusion results.  Numeric seed
-# ID 7 remains the base-game Repeater seed and is never conflated with the
-# recursive fusion chain.
+# live hybrid game's PlantType enum and observed fusion results.  Base seed IDs
+# are resolved from the runtime registry; fusion results stay in their own
+# namespace and are never conflated with a seed-card identity.
 FUSION_RECIPES: Tuple[FusionRecipe, ...] = (
     _recipe(
         PEASHOOTER_ID,
@@ -304,13 +304,14 @@ BUCKETHEAD_TYPES = {4, 13}
 # Plant identity ids match configs/plant_registry.json.
 
 # Fusion-result names are a separate namespace layered over base seed names.
-# Result aliases intentionally win for ambiguous text such as ``Repeater``;
-# numeric base seed ID 7 still resolves through the canonical plant registry.
+# Result aliases intentionally win for ambiguous coach text such as
+# ``Repeater``; numeric base seed IDs still resolve through the canonical plant
+# registry.
 FUSION_RESULT_NAME_TO_ID: Mapping[str, int] = MappingProxyType({
     "doubleshooer": 1030,
     "doubleshooter": 1030,
     # Compatibility alias retained for older coach/config text. The live
-    # PlantType 1030 canonical name is DoubleShooer; seed ID 7 is Repeater.
+    # PlantType 1030 canonical name is DoubleShooer.
     "repeater": 1030,
     "splitpea": 1090,
     "threepeater": 1090,
@@ -530,14 +531,31 @@ def fusion_intent_from_candidate(
     if recipe is not None:
         predicted_type = int(recipe.result_plant_type)
         predicted_name = str(recipe.result_plant_name)
-    elif compatibility_kind != "none":
-        # Symmetric/reverse and runtime-only compatibility may be executable at
-        # the bridge, but Python has no authoritative directional result.
-        predicted_type = -1
-        predicted_name = ""
     else:
-        predicted_type = _safe_int(candidate.get("predicted_result_type"), default=-1)
-        predicted_name = str(candidate.get("predicted_result_name") or "")
+        predicted_result_source = str(
+            candidate.get("predicted_result_resolution_source")
+            or candidate.get("predictedResultResolutionSource")
+            or ""
+        ).strip().lower()
+        runtime_prediction_authorized = bool(
+            candidate.get("mix_lookup_found")
+            or candidate.get("mixLookupFound")
+            or predicted_result_source in {
+                "runtime_cache",
+                "post_fusion_observation",
+                "checkmix_object.resultplanttype",
+            }
+        )
+        if runtime_prediction_authorized:
+            predicted_type = _safe_int(candidate.get("predicted_result_type"), default=-1)
+            predicted_name = str(candidate.get("predicted_result_name") or "")
+        else:
+            # Runtime-only and newly discovered pairs may be executable at the
+            # bridge, but Python must not trust an unproven caller-supplied
+            # result ID.  The bridge post-observation/cache is the only source
+            # that upgrades this field from unknown.
+            predicted_type = -1
+            predicted_name = ""
     candidate_metadata = _deep_thaw(candidate)
     if not isinstance(candidate_metadata, dict):
         candidate_metadata = {}
@@ -874,6 +892,13 @@ def validate_fusion_intent(
         # Preserve tile scoping and duplicate-slot identity.  A tile/slot that
         # changed between parsing and execution is stale even if the newly
         # observed pair happens to be compatible.
+        runtime_compatibility_override = (
+            rejection == FUSION_ILLEGAL_INCOMPATIBLE
+            and bool(intent.metadata.get("fusion_runtime_authorized"))
+        )
+        if runtime_compatibility_override:
+            rejection = FUSION_ILLEGAL_NONE
+
         fundamental_rejections = {
             FUSION_ILLEGAL_DISABLED,
             FUSION_ILLEGAL_BRIDGE_UNAVAILABLE,
@@ -882,7 +907,7 @@ def validate_fusion_intent(
             FUSION_ILLEGAL_INVALID_SEED_SLOT,
             FUSION_ILLEGAL_EMPTY_TILE,
         }
-        if rejection not in fundamental_rejections:
+        if runtime_compatibility_override or rejection not in fundamental_rejections:
             actual_source = plant_type_at_cell(
                 observation,
                 intent.source_row,
@@ -1094,6 +1119,14 @@ def scan_fusion_candidates(
             rule = FUSION_RULES.get((source_type, ingredient_type))
             blocked_reason = "" if rule else "incomplete_fusion_mapping"
             fusion_legal = bool(rule)
+            predicted_result_type = _safe_int(
+                (rule or {}).get("predicted_result_type"),
+                default=-1,
+            )
+            predicted_result_name = str((rule or {}).get("predicted_result_name") or "unknown")
+            predicted_result_resolution_source = ""
+            mix_lookup_found = False
+            mix_lookup_key = ""
             probe = _match_probe_candidate(
                 probe_candidates,
                 source.instance_id,
@@ -1115,15 +1148,46 @@ def scan_fusion_candidates(
                     or probe.get("blockedReason")
                     or ""
                 )
-                fusion_legal = bool(rule) and probe_legal
+                # A live probe is the authority for runtime-discovered
+                # formulas.  It may authorize a pair with no Python recipe.
+                fusion_legal = probe_legal
                 if probe_reason:
                     blocked_reason = probe_reason
                 elif not probe_legal:
                     blocked_reason = "bridge_rejected"
-                elif not rule:
-                    blocked_reason = "incomplete_fusion_mapping"
                 else:
                     blocked_reason = ""
+                probe_result_type = _safe_int(
+                    probe.get("predictedResultType"),
+                    probe.get("predicted_result_type"),
+                    probe.get("resultPlantType"),
+                    default=-1,
+                )
+                probe_result_name = str(
+                    probe.get("predictedResultName")
+                    or probe.get("predicted_result_name")
+                    or probe.get("resultPlantName")
+                    or ""
+                )
+                if probe_result_type >= 0:
+                    predicted_result_type = probe_result_type
+                if probe_result_name:
+                    predicted_result_name = probe_result_name
+                predicted_result_resolution_source = str(
+                    probe.get("predictedResultResolutionSource")
+                    or probe.get("predicted_result_resolution_source")
+                    or ""
+                )
+                mix_lookup_found = bool(
+                    probe.get("mixLookupFound")
+                    if "mixLookupFound" in probe
+                    else probe.get("mix_lookup_found")
+                )
+                mix_lookup_key = str(
+                    probe.get("mixLookupKey")
+                    or probe.get("mix_lookup_key")
+                    or ""
+                )
             elif not slot.legacy_ready:
                 fusion_legal = False
                 blocked_reason = "target_not_available"
@@ -1134,12 +1198,7 @@ def scan_fusion_candidates(
             lane = _lane_context(observation, source_row, source_col, facts=snapshot)
             health_ratio = source.fusion_health_ratio
             strategic_score, reason = _strategic_score(source_type, ingredient_type, rule, lane, health_ratio)
-            if rule and not bool(rule.get("scripted_enabled")) and not blocked_reason:
-                fusion_legal = False
-                blocked_reason = "low_strategic_value"
-
-            candidates.append(
-                {
+            candidate_payload = {
                     "source_plant_name": source.type_name or plant_name(source_type),
                     "source_plant_type": source_type,
                     "source_instance_id": source.instance_id,
@@ -1149,8 +1208,8 @@ def scan_fusion_candidates(
                     "target_or_ingredient_type": ingredient_type,
                     "ingredient_seed_slot_index": slot_index,
                     "ingredient_card_instance_id": slot.card_instance_id,
-                    "predicted_result_name": str((rule or {}).get("predicted_result_name") or "unknown"),
-                    "predicted_result_type": _safe_int((rule or {}).get("predicted_result_type"), default=-1),
+                    "predicted_result_name": predicted_result_name,
+                    "predicted_result_type": predicted_result_type,
                     "fusion_legal": bool(fusion_legal and not blocked_reason),
                     "fusion_blocked_reason": blocked_reason,
                     "lane_danger_score": lane["lane_danger_score"],
@@ -1162,7 +1221,17 @@ def scan_fusion_candidates(
                     "strategic_score": strategic_score,
                     "reason": reason,
                 }
-            )
+            if probe is not None and fusion_legal and not blocked_reason:
+                candidate_payload["fusion_runtime_authorized"] = True
+            if probe is not None:
+                candidate_payload.update(
+                    {
+                        "predicted_result_resolution_source": predicted_result_resolution_source,
+                        "mix_lookup_found": mix_lookup_found,
+                        "mix_lookup_key": mix_lookup_key,
+                    }
+                )
+            candidates.append(candidate_payload)
 
     return sorted(candidates, key=lambda item: float(item.get("strategic_score") or 0.0), reverse=True)
 

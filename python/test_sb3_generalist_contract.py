@@ -27,14 +27,14 @@ def test_default_sb3_config_is_exact_generalist_contract() -> None:
     assert config.auto_select_seeds is True
     assert config.enable_board_plant_identity is True
     assert metadata["action_space_mode"] == ACTION_SPACE_ADVENTURE_14_IDENTITY
-    assert metadata["env_action_count"] == ADVENTURE_IDENTITY_ACTION_COUNT == 701
+    assert metadata["env_action_count"] == ADVENTURE_IDENTITY_ACTION_COUNT == 841
     assert metadata["max_seed_slots"] == 14
     assert metadata["dynamic_seed_slots"] is True
     assert metadata["identity_seed_slots"] is True
     assert metadata["observation_version"] == ADVENTURE_IDENTITY_OBSERVATION_VERSION
     assert metadata["action_decoder_version"] == ADVENTURE_IDENTITY_ACTION_DECODER_VERSION
     assert metadata["decoder_wait_action"] == 0
-    assert metadata["placement_action_range"] == [1, 700]
+    assert metadata["placement_action_range"] == [1, 840]
     assert not hasattr(config, "target_level")
     assert not hasattr(config, "adventure_eval_mode")
     assert not hasattr(config, "dynamic_seed_slots")
@@ -66,7 +66,7 @@ def test_obsolete_action_modes_are_rejected(obsolete_action_mode: str) -> None:
         ("max_seed_slots", 4, "exactly 14 seed slots"),
         ("observation_version", "fixed_slot_v1", "observation_version mismatch"),
         ("action_decoder_version", "max_seed_slots_14_v1", "action_decoder_version mismatch"),
-        ("column_count", 9, "requires a 5x10 board"),
+        ("column_count", 9, "5x10 or 6x10 live board"),
     ],
 )
 def test_non_generalist_contract_values_are_rejected(

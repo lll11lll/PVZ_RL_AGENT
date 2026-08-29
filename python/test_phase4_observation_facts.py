@@ -61,7 +61,7 @@ def test_fixture_builds_all_reusable_indexes_without_contract_changes() -> None:
     observation = _observation()
     facts = build_step_facts(observation, (1, 1, 0, 0))
 
-    assert (facts.rows, facts.columns, facts.action_count, facts.sun) == (5, 10, 701, 175)
+    assert (facts.rows, facts.columns, facts.action_count, facts.sun) == (5, 10, 841, 175)
     assert facts.identity.revision == "1234"
     assert len(facts.identity.content_digest) == 64
     assert facts.occupancy == ((0, 0, 1), (2, 3, 0), (4, 9, 1030))
@@ -216,7 +216,7 @@ def test_generalist_action_context_reuses_snapshot_and_matches_fact_views() -> N
     fallback = (1, 1, 0, 0)
     facts = build_step_facts(observation, fallback)
     config = ActionValidationConfig(
-        action_space_mode="adventure_14slot_identity",
+        action_space_mode="adventure_14slot_identity_full_v2",
         plant_types=fallback,
         max_seed_slots=14,
         rows=5,
@@ -229,7 +229,7 @@ def test_generalist_action_context_reuses_snapshot_and_matches_fact_views() -> N
         facts=facts,
     )
     assert context.facts is facts
-    assert context.action_count == 701
+    assert context.action_count == 841
     assert context.seed_slots is facts.seed_slots
     assert context.occupancy == _expected_occupancy(observation)
 
@@ -295,11 +295,11 @@ def test_tactical_mask_hashes_observation_once_at_owner_boundary(
         "frameCount": 11,
         "rowCount": 5,
         "columnCount": 10,
-        "actionCount": 701,
+        "actionCount": 841,
         "gameplayReady": True,
         "boardFound": True,
         "sun": 500,
-        "legalActions": list(range(701)),
+        "legalActions": list(range(841)),
         "seedSlots": [
             {
                 "slotIndex": index,
@@ -340,7 +340,7 @@ def test_tactical_mask_hashes_observation_once_at_owner_boundary(
     )
     try:
         mask = env.action_mask(observation)
-        assert len(mask) == 701
+        assert len(mask) == 841
         assert calls == 1
         monkeypatch.setattr(
             pvzrl_actions.ActionDecisionCache,
@@ -352,6 +352,60 @@ def test_tactical_mask_hashes_observation_once_at_owner_boundary(
         diagnostics = env.mask_diagnostics(observation, mask)
         assert diagnostics["python_legal_action_count"] == sum(mask)
         assert calls == 2
+    finally:
+        env.close()
+
+
+def test_viewer_execution_mask_excludes_policy_tactical_restrictions() -> None:
+    observation = {
+        "frameCount": 12,
+        "rowCount": 5,
+        "columnCount": 10,
+        "actionCount": 841,
+        "gameplayReady": True,
+        "boardFound": True,
+        "sun": 500,
+        "legalActions": list(range(841)),
+        "seedSlots": [
+            {
+                "slotIndex": index,
+                "plantType": plant_type,
+                "ready": True,
+                "usable": True,
+                "seedCost": cost,
+            }
+            for index, (plant_type, cost) in enumerate(
+                ((1, 50), (0, 100), (2, 150), (3, 50))
+            )
+        ],
+        "plants": [{"row": 2, "column": 1, "type": 0}],
+        "zombies": [{"row": 2, "x": 5.0, "alive": True}],
+        "lanes": [{"row": 2, "zombieCount": 1, "danger": 0.8}],
+        "mowerCount": 5,
+    }
+    env = PvZGymEnv(
+        PvZEnvConfig(
+            plant_types=[1, 0, 2, 3],
+            tactical_masks=True,
+            fusion_action_mask_enabled=False,
+        )
+    )
+    try:
+        wallnut_action = 1 + 3 * 50 + 0 * 10 + 5
+        policy_mask = env.action_mask(observation)
+        viewer_mask = env.action_mask(
+            observation,
+            include_tactical_masks=False,
+        )
+        assert bool(policy_mask[wallnut_action]) is False
+        assert bool(viewer_mask[wallnut_action]) is True
+        assert not env.action_decision(wallnut_action, observation).legal
+        assert env.action_decision(
+            wallnut_action,
+            observation,
+            source="twitch",
+            include_tactical_masks=False,
+        ).legal
     finally:
         env.close()
 

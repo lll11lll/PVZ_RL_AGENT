@@ -15,6 +15,7 @@ from pvzrl_gui_status import (
     NormalizedStatusIndex,
     diagnostics_render_key,
 )
+from pvzrl_gui_stream_events import resolve_streamer_experiment_directory
 
 
 POLL_MS = 1000
@@ -111,6 +112,73 @@ class GuiStatusViewMixin:
             self._set_live_status(info)
             self._set_diagnostics_status(info, using_last_good=using_last_good)
             self._render_diagnostics_payload(display_payload, str(info["health"]), using_last_good)
+            event_refresh = getattr(self, "refresh_streamer_event_history", None)
+            if callable(event_refresh):
+                event_payload = display_payload if isinstance(display_payload, dict) else {}
+                configured_streamer_run = getattr(self, "streamer_run_dir_var", None)
+                configured_streamer_run = (
+                    configured_streamer_run.get()
+                    if configured_streamer_run is not None
+                    else ""
+                )
+                process_running = self._active_process_is_running()
+                streamer_enabled = bool(
+                    self._first_value(
+                        event_payload,
+                        ["streamer_v1_enabled"],
+                        default=False,
+                    )
+                )
+                status_active_run = self._first_value(
+                    event_payload,
+                    ["active_run", "run_dir"],
+                    default="",
+                )
+                event_health = str(info.get("health") or "")
+                status_is_current = bool(
+                    event_health == "LIVE" or event_health.startswith("BLOCKED_")
+                )
+                experiment_run = resolve_streamer_experiment_directory(
+                    explicit_experiment=self._first_value(
+                        event_payload,
+                        ["streamer_experiment_dir", "streamer.experiment_dir"],
+                        default="",
+                    ),
+                    active_run=status_active_run if streamer_enabled else "",
+                    configured_run=configured_streamer_run,
+                    launched_run=(
+                        getattr(self, "active_run_path", "")
+                        if process_running and streamer_enabled
+                        else ""
+                    ),
+                    prefer_configured=bool(
+                        configured_streamer_run
+                        and not process_running
+                        and (
+                            using_last_good
+                            or not status_is_current
+                            or not streamer_enabled
+                        )
+                    ),
+                )
+                event_refresh(experiment_run)
+            started_at = getattr(self, "active_process_started_at", None)
+            uptime_var = getattr(self, "stream_uptime_var", None)
+            duration_text = getattr(self, "_duration_text", None)
+            if started_at is not None and uptime_var is not None and callable(duration_text):
+                self._set_live_variable(
+                    uptime_var,
+                    duration_text(max(0.0, time.monotonic() - started_at)),
+                )
+            if (
+                self._active_process_is_running()
+                and (
+                    str(info["health"]) == "LIVE"
+                    or str(info["health"]).startswith("BLOCKED_")
+                )
+                and getattr(self, "process_lifecycle_state", "") == "STARTING"
+            ):
+                self._set_process_state("RUNNING", self.active_process_name or "backend")
             self._log_live_health_change(info)
             self._maybe_warn_live_writer(info)
         except Exception as exc:
@@ -263,6 +331,9 @@ class GuiStatusViewMixin:
         self._set_adventure_status(self._adventure_status_content({}, health=health, using_last_good=False))
         self._set_generalist_status(self._generalist_status_content({}, health=health, using_last_good=False))
         self._set_coach_live_fields({})
+        application_renderer = getattr(self, "_render_application_status", None)
+        if callable(application_renderer):
+            application_renderer({}, health=health, using_last_good=False)
         for title in list(self.panels):
             if title == "Rows":
                 self._set_panel(title, "No row diagnostics in live_status.json")
@@ -307,6 +378,9 @@ class GuiStatusViewMixin:
         self._set_adventure_status(self._adventure_status_content(payload, health=health, using_last_good=using_last_good))
         self._set_generalist_status(self._generalist_status_content(payload, health=health, using_last_good=using_last_good))
         self._set_coach_live_fields(payload)
+        application_renderer = getattr(self, "_render_application_status", None)
+        if callable(application_renderer):
+            application_renderer(payload, health=health, using_last_good=using_last_good)
 
         self._set_panel(
             "Adventure",
@@ -394,6 +468,7 @@ class GuiStatusViewMixin:
                     ("cherry_masked", self._first_value(payload, ["summary.cherrybomb_actions_masked", "eval.cherrybomb_actions_masked"])),
                     ("decoder", self._first_value(payload, ["agent.action_decoder_version", "action_decoder_version", "compatibility.action_decoder_version"])),
                     ("obs", self._first_value(payload, ["agent.observation_version", "observation_version", "compatibility.observation_version"])),
+                    ("reward_policy", self._first_value(payload, ["reward.reward_policy_version", "reward_policy_version"])),
                 ]
             ),
         )
@@ -402,16 +477,21 @@ class GuiStatusViewMixin:
             "Reward Breakdown",
             lines_from_pairs(
                 [
+                    ("policy", self._first_value(payload, ["reward.reward_policy_version", "reward_policy_version"])),
                     ("episode", self._first_value(payload, ["reward.episode", "reward.episode_reward", "current_reward", "episode_reward", "reward_total"])),
                     ("kill", self._first_value(payload, ["reward.kill", "reward.kill_reward_total", "kill_reward_total"])),
                     ("wave", self._first_value(payload, ["reward.wave", "reward.wave_reward_total", "wave_reward_total"])),
-                    ("win_loss", self._first_value(payload, ["reward.win_loss", "reward.win_loss_reward_total", "win_loss_reward_total"])),
-                    ("plant_health", self._first_value(payload, ["reward.plant_health", "reward.plant_health_loss_penalty_total", "plant_health_loss_penalty_total"])),
-                    ("undef_threat", self._first_value(payload, ["reward.undef_threat", "reward.undefended_threat_penalty_total", "undefended_threat_penalty_total"])),
-                    ("first_def", self._first_value(payload, ["reward.first_def", "reward.first_defense_reward_total", "reward.first_defense_undefended_threatened_row_reward_total", "first_defense_reward_total", "first_def"])),
-                    ("sun_undef", self._first_value(payload, ["reward.sunflower_while_undefended_threat_penalty_total", "sunflower_while_undefended_threat_penalty_total"])),
-                    ("elsewhere", self._first_value(payload, ["reward.plant_elsewhere_while_undefended_threat_penalty_total", "plant_elsewhere_while_undefended_threat_penalty_total"])),
-                    ("reduced", self._first_value(payload, ["reward.reduce_undefended_threat_reward_total", "reduce_undefended_threat_reward_total"])),
+                    ("terminal", self._first_value(payload, ["reward.terminal_reward_total", "reward.win_loss_reward_total", "win_loss_reward_total"])),
+                    ("threat", self._first_value(payload, ["reward.threat_reward_total", "reward.threat_delta_reward_total", "threat_delta_reward_total"])),
+                    ("mower", self._first_value(payload, ["reward.mower_penalty_total", "reward.mower_loss_penalty_total", "mower_loss_penalty_total"])),
+                    ("illegal", self._first_value(payload, ["reward.illegal_action_penalty_total", "reward.illegal_penalty_total", "illegal_penalty_total"])),
+                    ("fusion", self._first_value(payload, ["reward.fusion_reward_total", "fusion_reward_total"])),
+                    ("threat_before", self._first_value(payload, ["reward.threat_before", "threat_before"])),
+                    ("threat_after", self._first_value(payload, ["reward.threat_after", "threat_after"])),
+                    ("raw_delta", self._first_value(payload, ["reward.threat_raw_delta", "threat_raw_delta"])),
+                    ("clipped_delta", self._first_value(payload, ["reward.threat_clipped_delta", "threat_clipped_delta"])),
+                    ("components_match", self._first_value(payload, ["reward.reward_components_match", "reward_components_match"])),
+                    ("adjustments", self._first_value(payload, ["reward.reward_unattributed_adjustment_total", "reward_unattributed_adjustment_total"])),
                 ]
             ),
         )
@@ -468,6 +548,10 @@ class GuiStatusViewMixin:
                     ("env_actions", compatibility.get("env_action_count", compatibility.get("action_count"))),
                     ("decoder", compatibility.get("action_decoder_version")),
                     ("observation", compatibility.get("observation_version")),
+                    ("model_reward", compatibility.get("model_reward_policy_version")),
+                    ("env_reward", compatibility.get("env_reward_policy_version")),
+                    ("reward_mismatch", compatibility.get("reward_policy_version_mismatch")),
+                    ("warnings", compatibility.get("warnings")),
                     ("metadata", compatibility.get("metadata_path")),
                     ("compatible", compatibility.get("compatible")),
                     ("blocked", compatibility.get("blocked_reason")),
@@ -544,11 +628,16 @@ class GuiStatusViewMixin:
             lines_from_pairs(
                 [
                     ("local", self.assisted_command_queue.counts()),
-                    ("pending_stream", self._first_value(payload, ["pending_stream_commands", "stream_coach.pending_count"])),
-                    ("messages_seen", self._first_value(payload, ["mock_stream_messages_seen", "stream_coach_messages_seen"])),
-                    ("accepted", self._first_value(payload, ["mock_stream_commands_accepted", "stream_coach_commands_accepted"])),
-                    ("rejected", self._first_value(payload, ["mock_stream_commands_rejected", "stream_coach_commands_rejected"])),
-                    ("top", self._first_value(payload, ["stream_coach_top_commands"])),
+                    ("streamer_v1", self._first_value(payload, ["streamer_v1_enabled"])),
+                    ("queue_depth", self._first_value(payload, ["viewer_command_queue_depth", "streamer_command_queue.depth", "pending_stream_commands", "stream_coach.pending_count"])),
+                    ("accepted", self._first_value(payload, ["viewer_commands_accepted_count", "streamer_command_queue.counters.enqueued", "mock_stream_commands_accepted", "stream_coach_commands_accepted"])),
+                    ("rejected", self._first_value(payload, ["viewer_commands_rejected_count", "mock_stream_commands_rejected", "stream_coach_commands_rejected"])),
+                    ("invalid", self._first_value(payload, ["viewer_commands_invalid_count", "streamer_command_queue.counters.permanently_rejected"])),
+                    ("expired", self._first_value(payload, ["streamer_expired_count", "streamer_command_queue.counters.expired"])),
+                    ("verified", self._first_value(payload, ["viewer_intervention_count"])),
+                    ("last_source", self._first_value(payload, ["last_action_source"])),
+                    ("last_action", self._first_value(payload, ["last_viewer_action"])),
+                    ("legacy_top", self._first_value(payload, ["stream_coach_top_commands"])),
                 ]
             ),
         )

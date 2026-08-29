@@ -441,7 +441,11 @@ public sealed partial class BridgeMod
         return null;
     }
 
-    private FusionCandidateDto ProbeFusionCandidate(ObservationDto obs, PlantDto source, SeedSlotDto slot)
+    private FusionCandidateDto ProbeFusionCandidate(
+        ObservationDto obs,
+        PlantDto source,
+        SeedSlotDto slot,
+        CreatePlant? knownCreatePlant = null)
     {
         var mixLookupKey = BuildMixLookupKey(source.Type, slot.PlantType);
         var candidate = new FusionCandidateDto
@@ -473,7 +477,7 @@ public sealed partial class BridgeMod
             candidate.FusionBlockedReason = "target_not_available";
             return candidate;
         }
-        var createPlant = FindCreatePlant();
+        var createPlant = knownCreatePlant ?? FindCreatePlant();
         if (createPlant == null)
         {
             candidate.FusionBlockedReason = "fusion_not_available";

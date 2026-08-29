@@ -954,39 +954,68 @@ def _run_streamer_cycles_impl(
                     )
             else:
                 if evaluation_marker is not None:
-                    raise RuntimeError("blocked_reason=streamer_cycle_evaluation_interrupted")
+                    raise RuntimeError(
+                        "blocked_reason=streamer_cycle_evaluation_interrupted: "
+                        f"marker={evaluation_marker_path} "
+                        f"status={evaluation_marker.get('status', '')!r} "
+                        f"started_at={evaluation_marker.get('started_at', '')!r} "
+                        f"error_type={evaluation_marker.get('error_type', '')!r} "
+                        f"error={evaluation_marker.get('error', '')!r}; "
+                        f"missing_result={evaluation_path}"
+                    )
+                evaluation_started_at = utc_now_iso()
                 atomic_write_json(
                     evaluation_marker_path,
                     {
                         **marker_identity,
                         "status": "in_progress",
-                        "started_at": utc_now_iso(),
+                        "started_at": evaluation_started_at,
                     },
                 )
-                evaluation = dict(
-                    evaluate_checkpoint(
-                        manager.current_model_path,
-                        cycle_dir / "evaluation",
-                        episodes,
-                        evaluation_start_level,
+                try:
+                    evaluation = dict(
+                        evaluate_checkpoint(
+                            manager.current_model_path,
+                            cycle_dir / "evaluation",
+                            episodes,
+                            evaluation_start_level,
+                        )
                     )
-                )
-                evaluation.setdefault("adventure_start_level", evaluation_start_level)
-                if int(evaluation.get("adventure_start_level", 0) or 0) != evaluation_start_level:
-                    raise RuntimeError("blocked_reason=streamer_cycle_evaluation_level_mismatch")
-                _required_positive_level(evaluation, "next_adventure_level")
-                evaluation["streamer_cycle"] = cycle
-                evaluation["current_sha256"] = current_sha256
-                evaluation["evaluation_protocol"] = evaluation_protocol
-                atomic_write_json(evaluation_path, evaluation)
-                atomic_write_json(
-                    evaluation_marker_path,
-                    {
-                        **marker_identity,
-                        "status": "complete",
-                        "completed_at": utc_now_iso(),
-                    },
-                )
+                    evaluation.setdefault("adventure_start_level", evaluation_start_level)
+                    if int(evaluation.get("adventure_start_level", 0) or 0) != evaluation_start_level:
+                        raise RuntimeError("blocked_reason=streamer_cycle_evaluation_level_mismatch")
+                    _required_positive_level(evaluation, "next_adventure_level")
+                    evaluation["streamer_cycle"] = cycle
+                    evaluation["current_sha256"] = current_sha256
+                    evaluation["evaluation_protocol"] = evaluation_protocol
+                    atomic_write_json(evaluation_path, evaluation)
+                    atomic_write_json(
+                        evaluation_marker_path,
+                        {
+                            **marker_identity,
+                            "status": "complete",
+                            "completed_at": utc_now_iso(),
+                        },
+                    )
+                except BaseException as exc:
+                    # Keep the transaction fence in place, but preserve the
+                    # first failure so the next invocation can identify why
+                    # the result file was never committed.
+                    try:
+                        atomic_write_json(
+                            evaluation_marker_path,
+                            {
+                                **marker_identity,
+                                "status": "in_progress",
+                                "started_at": evaluation_started_at,
+                                "interrupted_at": utc_now_iso(),
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:1000],
+                            },
+                        )
+                    except Exception:
+                        pass
+                    raise
             next_adventure_level = _required_positive_level(
                 evaluation,
                 "next_adventure_level",

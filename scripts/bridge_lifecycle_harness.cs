@@ -34,7 +34,13 @@ internal static class BridgeLifecycleHarness
             OccupancyIndexMatchesLegacyScans();
             LaneSummariesMatchLegacyProjection();
             SeedCompatibilityCollectionsMatchLegacyProjection();
+            RawGameplayReadinessIsStructural();
+            DuplicateBoardGateRequiresSingleton();
+            GameplaySpeedTargetsMatchNativeSemantics();
             ActiveGameplaySeedBankReadinessUsesRuntimeBank();
+            AdventureScreenClassificationPrioritizesLoss();
+            MainMenuAlmanacIsNotUnlockContext();
+            SeedSelectionAlmanacIsNotUnlockContext();
             Console.WriteLine($"Bridge lifecycle harness passed: {_checks} checks.");
             return 0;
         }
@@ -471,11 +477,151 @@ internal static class BridgeLifecycleHarness
             "a bank count without runtime card identities must not satisfy gameplay readiness");
     }
 
+    private static void RawGameplayReadinessIsStructural()
+    {
+        Check(
+            BridgeObservationHelpers.IsRawBoardGameplayReady(
+                boardFound: true,
+                createPlantFound: true,
+                boardStartMove: true,
+                done: false),
+            "a running board must satisfy structural gameplay readiness");
+        Check(
+            !BridgeObservationHelpers.IsRawBoardGameplayReady(
+                boardFound: true,
+                createPlantFound: true,
+                boardStartMove: false,
+                done: false),
+            "a board that has not started must not satisfy gameplay readiness");
+        Check(
+            !BridgeObservationHelpers.IsRawBoardGameplayReady(
+                boardFound: true,
+                createPlantFound: true,
+                boardStartMove: true,
+                done: true),
+            "a terminal board must not satisfy gameplay readiness");
+    }
+
+    private static void DuplicateBoardGateRequiresSingleton()
+    {
+        Check(!BridgeObservationHelpers.HasDuplicateActiveBoards(0), "missing board must not be classified as a duplicate");
+        Check(!BridgeObservationHelpers.HasDuplicateActiveBoards(1), "one active board must pass the singleton gate");
+        Check(BridgeObservationHelpers.HasDuplicateActiveBoards(2), "two active boards must block gameplay");
+        Check(BridgeObservationHelpers.HasDuplicateActiveBoards(99), "any board count above one must block gameplay");
+    }
+
+    private static void GameplaySpeedTargetsMatchNativeSemantics()
+    {
+        var transition = BridgeObservationHelpers.ResolveGameSpeedTargets(
+            mode: "game_speed",
+            requestedGameSpeed: 4f,
+            originalGameSpeed: 1f,
+            originalTimeScale: 1f,
+            originalFixedDeltaTime: 0.02f,
+            currentTimeScale: 1f,
+            gameplayReady: false);
+        Check(transition.GameSpeed == 1f, "transitions must retain native game speed");
+        Check(transition.TimeScale == 1f, "transitions must retain native time scale");
+        Check(transition.FixedDeltaTime == 0.02f, "transitions must retain native fixed delta");
+
+        var gameplay = BridgeObservationHelpers.ResolveGameSpeedTargets(
+            mode: "game_speed",
+            requestedGameSpeed: 4f,
+            originalGameSpeed: 1f,
+            originalTimeScale: 1f,
+            originalFixedDeltaTime: 0.02f,
+            currentTimeScale: 1f,
+            gameplayReady: true);
+        Check(gameplay.GameSpeed == 4f, "ready gameplay must store the configured multiplier");
+        Check(gameplay.TimeScale == 4f, "ready gameplay must apply the multiplier to simulation time");
+        Check(gameplay.FixedDeltaTime == 0.02f, "native game-speed mode must preserve fixed delta");
+
+        var drifted = BridgeObservationHelpers.ResolveGameSpeedTargets(
+            mode: "game_speed",
+            requestedGameSpeed: 4f,
+            originalGameSpeed: 1f,
+            originalTimeScale: 1f,
+            originalFixedDeltaTime: 0.02f,
+            currentTimeScale: 1f,
+            gameplayReady: true);
+        Check(drifted.TimeScale == 4f, "gameplay drift to 1x must target 4x again");
+
+        var paused = BridgeObservationHelpers.ResolveGameSpeedTargets(
+            mode: "game_speed",
+            requestedGameSpeed: 4f,
+            originalGameSpeed: 1f,
+            originalTimeScale: 1f,
+            originalFixedDeltaTime: 0.02f,
+            currentTimeScale: 0f,
+            gameplayReady: true);
+        Check(paused.GameSpeed == 4f, "pause must retain the configured multiplier");
+        Check(paused.TimeScale == 0f, "speed enforcement must not unpause the game");
+    }
+
     private static void ProtectedActionCountRemainsStable()
     {
         Check(
-            BridgeMod.MaintainedActionCount == 701,
-            "the bridge must retain the protected 701-action surface");
+            BridgeMod.MaintainedActionCount == 841,
+            "the bridge must retain the full-Adventure 841-action surface");
+    }
+
+    private static void AdventureScreenClassificationPrioritizesLoss()
+    {
+        string Classify(
+            bool lossDetected,
+            bool gameplayReady,
+            bool rewardActive = false,
+            bool seedSelectionActive = false) =>
+            BridgeObservationHelpers.ClassifyAdventureScreenState(
+                boardFound: true,
+                startupPopupVisible: false,
+                lossDetected,
+                seedSelectionActive,
+                gameplayReady,
+                rewardActive,
+                adventureVisible: false,
+                mainMenuVisible: false);
+
+        Check(
+            Classify(lossDetected: true, gameplayReady: true) == "game_over",
+            "loss/restart evidence must outrank stale gameplay readiness");
+        Check(
+            Classify(lossDetected: true, gameplayReady: true, rewardActive: true) == "game_over",
+            "loss/restart evidence must outrank stale reward evidence");
+        Check(
+            Classify(lossDetected: false, gameplayReady: true) == "gameplay",
+            "ordinary ready boards must remain gameplay");
+        Check(
+            Classify(
+                lossDetected: false,
+                gameplayReady: false,
+                rewardActive: true,
+                seedSelectionActive: true) == "seed_selection",
+            "confirmed seed selection must outrank stale reward hints");
+    }
+
+    private static void MainMenuAlmanacIsNotUnlockContext()
+    {
+        Check(
+            BridgeObservationHelpers.IsMainMenuControlPath(
+                "MainMenuCanvas/MainMenu(Clone)/Grave/Btn/Almanac"),
+            "the main-menu Almanac control must be recognized as navigation UI");
+        Check(
+            !BridgeObservationHelpers.IsMainMenuControlPath(
+                "CanvasUp/Award/NewPlant/SeedPacket"),
+            "post-win reward UI must not be classified as a main-menu control");
+    }
+
+    private static void SeedSelectionAlmanacIsNotUnlockContext()
+    {
+        Check(
+            BridgeObservationHelpers.IsSeedSelectionControlPath(
+                "CanvasUp/InGameUI(Clone)/Bottom/SeedLibrary/LookAlmanac/text"),
+            "the seed chooser Almanac control must be recognized as selection UI");
+        Check(
+            !BridgeObservationHelpers.IsSeedSelectionControlPath(
+                "CanvasUp/Award/NewPlant/SeedPacket"),
+            "post-win seed-packet UI must not be classified as a seed chooser control");
     }
 
     private static PendingRequest NewRequest(long requestId, int timeoutMilliseconds = 1000) =>

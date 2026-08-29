@@ -34,7 +34,15 @@ from pvzrl_gui_commands import (
     STREAM_COACH_PLATFORMS,
     GuiCommandMixin,
 )
+from pvzrl_gui_artifacts import ArtifactIndex, ModelArtifact, scan_run_artifacts
 from pvzrl_gui_coach import CoachCommandSink, CoachQueueCommand
+from pvzrl_gui_config import (
+    FULL_ADVENTURE_CONTRACT,
+    ValidationIssue,
+    validate_evaluation_form,
+    validate_streamer_v1_form,
+    validate_train_form,
+)
 from pvzrl_gui_process import (
     LOG_BACKLOG_POLL_MS,
     LOG_DRAIN_BUDGET_SECONDS,
@@ -43,8 +51,11 @@ from pvzrl_gui_process import (
     LOG_QUEUE_MAX_ITEMS,
     STOP_GRACE_SECONDS,
     STOP_KILL_WAIT_SECONDS,
+    PROCESS_OFFLINE,
     ProcessLogMixin,
 )
+from pvzrl_gui_shell import GuiApplicationShellMixin
+from pvzrl_gui_stream_events import StreamerEventReader
 from pvzrl_gui_status import (
     LIVE_MAX_AGE_SECONDS,
     STALE_MAX_AGE_SECONDS,
@@ -56,6 +67,11 @@ from pvzrl_gui_view import (
     GuiStatusViewMixin,
 )
 from pvzrl_registry import get_plant_registry
+from pvzrl_action_space import (
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    adventure_identity_action_to_slot_cell,
+)
+from pvzrl_rewards import REWARD_POLICY_VERSION, reward_policy_v2_core_config
 
 
 LOG_HISTORY_MAX_LINES = 5000
@@ -65,7 +81,6 @@ CLOSE_POLL_MS = 50
 PROCESS_THREAD_JOIN_SECONDS = 0.2
 CLOSE_LOG_DRAIN_SECONDS = 0.3
 ROLLING_WIN_WINDOW = 20
-MODEL_ZIP_NAMES = {"model.zip", "final_model.zip"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LIVE_STATUS_PATH = Path("runs") / "live_status.json"
 DEFAULT_COACH_COMMAND_QUEUE_PATH = Path("runs") / "coach_commands.jsonl"
@@ -75,8 +90,8 @@ _PLANT_REGISTRY = get_plant_registry()
 _GENERALIST_INITIAL_LOADOUT = _PLANT_REGISTRY.require_gui_preset("adventure_generalist_initial_loadout")
 STRUCTURED_COACH_COMMANDS = tuple(command.value for command in AssistedCommandType)
 ASSISTED_EXECUTION_MODES = tuple(mode.value for mode in AssistedExecutionMode)
-LAB_MODES = ("Normal", "Assisted", "Fusion", "Curriculum")
-ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
+LAB_MODES = ("Normal", "Assisted", "Fusion")
+ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_full_v2"
 ADVENTURE_GENERALIST_INITIAL_LOADOUT = _GENERALIST_INITIAL_LOADOUT.seed_csv
 
 
@@ -107,17 +122,49 @@ class _Tooltip:
             self.popup = None
 
 
-class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
+class PvZDashboard(GuiApplicationShellMixin, GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
     def __init__(self, root: tk.Tk, live_status_path: Path):
         self.root = root
         self.project_root = PROJECT_ROOT
         self.repo_root = self.project_root
         self.live_status_path = self._resolve_path(live_status_path)
         self.root.title("PvZRL Dashboard")
-        self.root.geometry("1180x780")
-        self.root.minsize(980, 650)
+        self.root.geometry("1380x900")
+        self.root.minsize(1120, 720)
 
-        default_generalist_model = self._find_newest_usable_model_zip()
+        # Checkpoints are never silently selected. Runs & Models owns explicit
+        # user selection, while refresh buttons remain explicit conveniences.
+        default_generalist_model: Optional[Path] = None
+        launch_stamp = time.strftime("%Y%m%d_%H%M%S")
+        # Application shell and canonical path state.
+        self.current_page_var = tk.StringVar(value="Dashboard")
+        self.settings_config_target_var = tk.StringVar(value="Training")
+        self.process_lifecycle_var = tk.StringVar(value=PROCESS_OFFLINE)
+        self.header_health_var = tk.StringVar(value="MISSING")
+        self.generalist_config_path_var = tk.StringVar(
+            value=str(Path("configs") / "ppo_adventure_generalist_full_v2.json")
+        )
+        self.eval_config_path_var = tk.StringVar(
+            value=str(Path("configs") / "ppo_adventure_generalist_full_v2.json")
+        )
+        self.streamer_config_path_var = tk.StringVar(
+            value=str(Path("configs") / "streamer_full_v2.example.json")
+        )
+        self.runs_root_var = tk.StringVar(value="runs")
+        self.live_status_path_var = tk.StringVar(value=str(live_status_path))
+
+        # Dashboard projection. Canonical runtime status remains authoritative.
+        self.dashboard_state_var = tk.StringVar(value="offline")
+        self.dashboard_mode_var = tk.StringVar(value="-")
+        self.dashboard_level_var = tk.StringVar(value="-")
+        self.dashboard_timesteps_var = tk.StringVar(value="-")
+        self.dashboard_model_var = tk.StringVar(value="-")
+        self.dashboard_run_var = tk.StringVar(value="-")
+        self.dashboard_bridge_var = tk.StringVar(value="unknown")
+        self.dashboard_twitch_var = tk.StringVar(value="offline")
+        self.dashboard_health_var = tk.StringVar(value="MISSING · offline")
+        self.dashboard_warning_var = tk.StringVar(value="No current warning or blocked reason.")
+
         self.max_steps_var = tk.StringVar(value="1000")
         self.step_seconds_var = tk.StringVar(value="0.05")
         self.game_speed_var = tk.StringVar(value="4.0")
@@ -134,10 +181,12 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.fast_only_var = tk.BooleanVar(value=False)
         self.generalist_total_timesteps_var = tk.StringVar(value="250000")
         self.generalist_checkpoint_freq_var = tk.StringVar(value="5000")
+        self.generalist_n_steps_var = tk.StringVar(value="512")
+        self.generalist_batch_size_var = tk.StringVar(value="64")
         self.generalist_initial_loadout_var = tk.StringVar(value=ADVENTURE_GENERALIST_INITIAL_LOADOUT)
         self.generalist_max_seed_slots_var = tk.StringVar(value="14")
         self.generalist_start_level_var = tk.StringVar(value="1")
-        self.generalist_max_levels_var = tk.StringVar(value="10")
+        self.generalist_max_levels_var = tk.StringVar(value="50")
         self.generalist_max_attempts_var = tk.StringVar(value="10")
         self.generalist_game_speed_var = tk.StringVar(value="4.0")
         self.generalist_step_seconds_var = tk.StringVar(value="0.05")
@@ -150,7 +199,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.generalist_frontier_win_streak_required_var = tk.StringVar(value="1")
         self.generalist_unlock_delay_var = tk.StringVar(value="0")
         self.generalist_new_plant_prob_var = tk.StringVar(value="0.15")
-        self.generalist_run_dir_var = tk.StringVar(value="")
+        self.generalist_run_dir_var = tk.StringVar(
+            value=str(Path("runs") / "gui" / f"train_{launch_stamp}")
+        )
         self.generalist_resume_model_path_var = tk.StringVar(value="")
         self.generalist_eval_model_path_var = tk.StringVar(value=str(default_generalist_model) if default_generalist_model else "")
         self.generalist_unlock_curriculum_var = tk.BooleanVar(value=True)
@@ -168,13 +219,133 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.generalist_fusion_action_mask_eval_var = tk.BooleanVar(value=False)
         self.generalist_curriculum_var = tk.StringVar(value="conservative")
         self.generalist_randomize_seed_order_var = tk.BooleanVar(value=False)
+
+        # Evaluation has independent form state; editing evaluation must not
+        # mutate a prepared training launch.
+        self.eval_run_dir_var = tk.StringVar(
+            value=str(Path("runs") / "gui" / f"eval_{launch_stamp}")
+        )
+        self.eval_initial_loadout_var = tk.StringVar(value=ADVENTURE_GENERALIST_INITIAL_LOADOUT)
+        self.eval_max_seed_slots_var = tk.StringVar(value="14")
+        self.eval_start_level_var = tk.StringVar(value="1")
+        self.eval_max_levels_var = tk.StringVar(value="50")
+        self.eval_max_attempts_var = tk.StringVar(value="10")
+        self.eval_game_speed_var = tk.StringVar(value="4.0")
+        self.eval_step_seconds_var = tk.StringVar(value="0.05")
+        self.eval_board_timeout_var = tk.StringVar(value="60")
+        self.eval_soft_max_steps_var = tk.StringVar(value="2000")
+        self.eval_hard_max_steps_var = tk.StringVar(value="3500")
+        self.eval_wait_gameplay_ready_var = tk.BooleanVar(value=True)
+        self.eval_quick_wait_var = tk.BooleanVar(value=True)
+        self.eval_tactical_masks_var = tk.BooleanVar(value=True)
+        self.eval_wallnut_mask_var = tk.BooleanVar(value=True)
+        self.eval_cherrybomb_mask_var = tk.BooleanVar(value=True)
+        self.eval_final_wave_extension_var = tk.BooleanVar(value=True)
+
+        # Streamer V1 form state. This is intentionally separate from the
+        # legacy/local stream-coach controls below.
+        self.streamer_platform_var = tk.StringVar(value="twitch")
+        self.streamer_baseline_checkpoint_var = tk.StringVar(
+            value=str(default_generalist_model) if default_generalist_model else ""
+        )
+        self.streamer_run_dir_var = tk.StringVar(value=str(Path("runs") / "streamer_full_v2" / "live"))
+        self.streamer_start_level_var = tk.StringVar(value="1")
+        self.streamer_max_levels_var = tk.StringVar(value="50")
+        self.streamer_max_attempts_var = tk.StringVar(value="10")
+        self.streamer_quick_wait_var = tk.BooleanVar(value=True)
+        self.streamer_wait_gameplay_ready_var = tk.BooleanVar(value=True)
+        self.streamer_mock_script_var = tk.StringVar(value="")
+        self.streamer_n_steps_var = tk.StringVar(value="500")
+        self.streamer_batch_size_var = tk.StringVar(value="50")
+        self.streamer_interval_var = tk.StringVar(value="2.0")
+        self.streamer_ttl_var = tk.StringVar(value="10.0")
+        self.streamer_queue_capacity_var = tk.StringVar(value="256")
+        self.streamer_message_max_var = tk.StringVar(value="256")
+        self.streamer_policy_steps_var = tk.StringVar(value="25000")
+        self.streamer_checkpoint_steps_var = tk.StringVar(value="5000")
+        self.streamer_eval_episodes_var = tk.StringVar(value="50")
+        self.streamer_max_cycles_var = tk.StringVar(value="0")
+        self.streamer_endurance_hours_var = tk.StringVar(value="0.0")
+        self.streamer_bc_enabled_var = tk.BooleanVar(value=True)
+        self.streamer_bc_coefficient_var = tk.StringVar(value="0.01")
+        self.streamer_demo_capacity_var = tk.StringVar(value="4096")
+        self.streamer_demo_persist_var = tk.StringVar(value="512")
+        self.streamer_bc_batch_var = tk.StringVar(value="32")
+        self.streamer_bc_frequency_var = tk.StringVar(value="1")
+        self.streamer_bc_min_var = tk.StringVar(value="8")
+        self.streamer_client_id_env_var = tk.StringVar(value="PVZRL_TWITCH_CLIENT_ID")
+        self.streamer_access_token_env_var = tk.StringVar(value="PVZRL_TWITCH_USER_ACCESS_TOKEN")
+        self.streamer_broadcaster_id_env_var = tk.StringVar(value="PVZRL_TWITCH_BROADCASTER_USER_ID")
+        self.streamer_user_id_env_var = tk.StringVar(value="PVZRL_TWITCH_EVENTSUB_USER_ID")
+        self.streamer_hash_secret_env_var = tk.StringVar(value="PVZRL_TWITCH_VIEWER_HASH_SECRET")
+        self.streamer_client_id_ready_var = tk.StringVar(value="UNKNOWN")
+        self.streamer_access_token_ready_var = tk.StringVar(value="UNKNOWN")
+        self.streamer_broadcaster_id_ready_var = tk.StringVar(value="UNKNOWN")
+        self.streamer_user_id_ready_var = tk.StringVar(value="UNKNOWN")
+        self.streamer_hash_secret_ready_var = tk.StringVar(value="UNKNOWN")
+        self.streamer_credentials_summary_var = tk.StringVar(value="Credential readiness not checked.")
+        self.stream_validation_var = tk.StringVar(value="Validate the form before launch.")
+        self.stream_lifecycle_var = tk.StringVar(value="OFFLINE")
+        self.stream_health_var = tk.StringVar(value="MISSING")
+        self.stream_phase_var = tk.StringVar(value="OFFLINE")
+        self.stream_cycle_var = tk.StringVar(value="0")
+        self.stream_uptime_var = tk.StringVar(value="-")
+        self.stream_active_run_var = tk.StringVar(value="-")
+        self.stream_next_level_var = tk.StringVar(value="-")
+        self.stream_model_steps_var = tk.StringVar(value="0")
+        self.stream_baseline_steps_var = tk.StringVar(value="0")
+        self.stream_eval_countdown_var = tk.StringVar(value="0")
+        self.stream_connection_var = tk.StringVar(value="offline")
+        self.stream_queue_depth_var = tk.StringVar(value="0")
+        self.stream_accepted_var = tk.StringVar(value="0")
+        self.stream_rejected_var = tk.StringVar(value="0")
+        self.stream_expired_var = tk.StringVar(value="0")
+        self.stream_interventions_var = tk.StringVar(value="0")
+        self.stream_attempts_var = tk.StringVar(value="0")
+        self.stream_total_commands_var = tk.StringVar(value="0")
+        self.stream_invalid_var = tk.StringVar(value="0")
+        self.stream_latest_command_var = tk.StringVar(value="-")
+        self.stream_viewers_var = tk.StringVar(value="0")
+        self.stream_pending_reason_var = tk.StringVar(value="-")
+        self.stream_action_source_var = tk.StringVar(value="MODEL")
+        self.stream_last_result_var = tk.StringVar(value="-")
+        self.stream_ppo_enabled_var = tk.StringVar(value="DISABLED")
+        self.stream_bc_updates_var = tk.StringVar(value="DISABLED")
+        self.stream_eval_chat_control_var = tk.StringVar(value="DISABLED")
+        self.stream_policy_timesteps_var = tk.StringVar(value="0")
+        self.stream_environment_actions_var = tk.StringVar(value="0")
+        self.stream_demo_count_var = tk.StringVar(value="0")
+        self.stream_demo_rejected_var = tk.StringVar(value="0")
+        self.stream_bc_update_count_var = tk.StringVar(value="0")
+        self.stream_bc_loss_var = tk.StringVar(value="0")
+        self.stream_baseline_checkpoint_status_var = tk.StringVar(value="-")
+        self.stream_current_checkpoint_var = tk.StringVar(value="-")
+        self.stream_best_checkpoint_var = tk.StringVar(value="-")
+        self.stream_baseline_eval_var = tk.StringVar(value="-")
+        self.stream_current_eval_var = tk.StringVar(value="-")
+        self.stream_best_eval_var = tk.StringVar(value="-")
+        self.stream_evaluation_comparison_var = tk.StringVar(value="-")
+        self.stream_game_level_var = tk.StringVar(value="-")
+        self.stream_wave_var = tk.StringVar(value="-")
+        self.stream_sun_var = tk.StringVar(value="-")
+        self.stream_plants_var = tk.StringVar(value="-")
+        self.stream_zombies_var = tk.StringVar(value="-")
+        self.stream_board_geometry_var = tk.StringVar(value="6×10 policy")
+        self.stream_seed_bank_var = tk.StringVar(value="-")
+        self.stream_unlocked_var = tk.StringVar(value="-")
+        self.artifact_index_status_var = tk.StringVar(value="Not indexed")
+        self.artifact_details_var = tk.StringVar(value="Select a model or checkpoint explicitly.")
+        self.action_inspector_id_var = tk.StringVar(value="0")
+        self.action_inspector_result_var = tk.StringVar(
+            value="Action 0: WAIT (Full-Adventure 6×10 policy)"
+        )
         self.human_coach_enabled_var = tk.BooleanVar(value=False)
         self.human_coach_reward_var = tk.BooleanVar(value=False)
         self.human_coach_bonus_var = tk.StringVar(value="")
         self.human_coach_match_bonus_var = tk.StringVar(value="")
         self.human_coach_override_penalty_var = tk.StringVar(value="")
-        # Reward sent to the model when a coach command succeeds. Blank = use the
-        # train_ppo defaults (--coach-fusion-success-reward / -tactical-usefulness).
+        # Retained only for loading older GUI state. Reward Policy V2 does not
+        # expose fusion/tactical coach shaping controls.
         self.human_coach_fusion_reward_var = tk.StringVar(value="")
         self.human_coach_tactical_reward_var = tk.StringVar(value="")
         self.human_coach_log_path_var = tk.StringVar(value=str(DEFAULT_HUMAN_COACH_LOG_PATH))
@@ -275,6 +446,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         }
 
         self.panels: Dict[str, tk.Text] = {}
+        self.page_frames: Dict[str, ttk.Frame] = {}
+        self.navigation_buttons: Dict[str, ttk.Button] = {}
+        self.current_page = "Dashboard"
         self.diagnostic_panel_frames: Dict[str, ttk.LabelFrame] = {}
         self.last_panel_content: Dict[str, str] = {}
         self.last_adventure_status_content = ""
@@ -284,6 +458,16 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.log_text: Optional[scrolledtext.ScrolledText] = None
         self.train_preview: Optional[scrolledtext.ScrolledText] = None
         self.eval_preview: Optional[scrolledtext.ScrolledText] = None
+        self.streamer_preview: Optional[scrolledtext.ScrolledText] = None
+        self.stream_event_tree: Optional[ttk.Treeview] = None
+        self.artifact_tree: Optional[ttk.Treeview] = None
+        self._artifact_records: Dict[str, Any] = {}
+        self._artifact_scan_generation = 0
+        self._artifact_scan_thread: Optional[threading.Thread] = None
+        self._artifact_result_queue: queue.Queue[Any] = queue.Queue(maxsize=2)
+        self._artifact_after_id: Optional[str] = None
+        self._streamer_event_reader: Any = None
+        self._streamer_event_path: Optional[Path] = None
         self.adventure_status_text: Optional[tk.Text] = None
         self.generalist_status_text: Optional[tk.Text] = None
         self.train_advanced_frame: Optional[ttk.LabelFrame] = None
@@ -308,6 +492,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self.active_process: Optional[subprocess.Popen[str]] = None
         self.active_process_name = ""
         self.active_process_started_at: Optional[float] = None
+        self.active_process_started_wall_time: Optional[float] = None
+        self.process_lifecycle_state = PROCESS_OFFLINE
+        self.process_lifecycle_detail = ""
         self._reader_thread: Optional[threading.Thread] = None
         self._stopper_thread: Optional[threading.Thread] = None
         self._stopping_process: Optional[subprocess.Popen[str]] = None
@@ -369,95 +556,12 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         except (OSError, ValueError):
             return text
 
-    def _find_newest_usable_model_zip(self) -> Optional[Path]:
-        runs_dir = self.repo_root / "runs"
-        if not runs_dir.exists():
-            return None
-        zips: List[Path] = []
-        for path in runs_dir.rglob("*.zip"):
-            try:
-                if not path.is_file() or path.stat().st_size <= 0 or not self._has_generalist_model_metadata(path):
-                    continue
-            except OSError:
-                continue
-            zips.append(path)
-        preferred = [
-            path
-            for path in zips
-            if path.name.lower() in MODEL_ZIP_NAMES or path.parent.name.lower() == "checkpoints"
-        ]
-        candidates = preferred or zips
-        if not candidates:
-            return None
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    def _has_generalist_model_metadata(self, model_path: Path) -> bool:
-        directories = [model_path.parent]
-        if model_path.parent.name.lower() == "checkpoints":
-            directories.append(model_path.parent.parent)
-        for directory in directories:
-            metadata_path = directory / "model_metadata.json"
-            if not metadata_path.exists():
-                continue
-            try:
-                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (
-                isinstance(payload, dict)
-                and payload.get("metadata_version") is not None
-                and payload.get("model_family") == ADVENTURE_GENERALIST_MODEL_FAMILY
-                and payload.get("action_count") == 701
-                and payload.get("action_space_mode") == "adventure_14slot_identity"
-                and payload.get("action_decoder_version") == "seedslot14x50_plus_wait_v1"
-                and payload.get("observation_version") == "adventure_14slot_identity_v1"
-                and payload.get("max_seed_slots") == 14
-            ):
-                return True
-        return False
-
     def _build(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=4)
-        self.root.rowconfigure(2, weight=1)
-
-        notebook = ttk.Notebook(self.root)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
-
-        train_tab = ttk.Frame(notebook)
-        eval_tab = ttk.Frame(notebook)
-        coach_tab = ttk.Frame(notebook)
-        diagnostics_tab = ttk.Frame(notebook)
-        runs_tab = ttk.Frame(notebook)
-        notebook.add(train_tab, text="Train")
-        notebook.add(eval_tab, text="Eval")
-        notebook.add(coach_tab, text="Coach")
-        notebook.add(diagnostics_tab, text="Diagnostics")
-        notebook.add(runs_tab, text="Runs/Models")
-
-        self._build_train_tab(train_tab)
-        self._build_eval_tab(eval_tab)
-        self._build_coach_tab(coach_tab)
-        self._build_diagnostics_tab(diagnostics_tab)
-        self._build_runs_models_tab(runs_tab)
-        self._build_status_bar()
-        self._build_log_panel()
-
-    def _build_runs_models_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        notebook = ttk.Notebook(parent)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        runs = ttk.Frame(notebook)
-        fusion = ttk.Frame(notebook)
-        notebook.add(runs, text="Runs and Models")
-        notebook.add(fusion, text="Fusion Planner")
-        self._build_runs_tab(runs)
-        self._build_fusion_tab(fusion)
+        self._build_application_shell()
 
     def _build_status_bar(self) -> None:
         frame = ttk.Frame(self.root)
-        frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(2, weight=4)
         ttk.Label(frame, text="Process:").grid(row=0, column=0, sticky="w")
@@ -467,7 +571,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
 
     def _build_log_panel(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Subprocess logs")
-        frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 8))
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
         toolbar = ttk.Frame(frame)
@@ -507,23 +611,21 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         status = ttk.LabelFrame(content, text="Adventure Generalist Training")
         status.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
         status.columnconfigure(1, weight=1)
-        ttk.Label(status, text="Mode", style="Heading.TLabel").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(status, text="Mode", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w", padx=6, pady=3)
         ttk.Label(
             status,
-            text=f"{ADVENTURE_GENERALIST_MODEL_FAMILY} · 14-slot identity-aware policy",
+            text=(
+                f"{ADVENTURE_GENERALIST_MODEL_FAMILY} · 14 identity slots · "
+                f"6×10 policy board · {ADVENTURE_IDENTITY_ACTION_COUNT} actions"
+            ),
         ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
         ttk.Label(status, text="Process").grid(row=0, column=2, sticky="e", padx=(6, 2), pady=3)
         ttk.Label(status, textvariable=self.process_status_var).grid(row=0, column=3, sticky="w", padx=(2, 6), pady=3)
-        ttk.Label(status, text="Lab mode").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Combobox(
-            status, textvariable=self.train_lab_mode_var, values=LAB_MODES, state="readonly", width=13
-        ).grid(row=1, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(status, text="Streamer mode", variable=self.stream_coach_enabled_var).grid(
-            row=1, column=2, sticky="e", padx=6, pady=3
-        )
-        ttk.Label(status, textvariable=self.assisted_execution_mode_var).grid(
-            row=1, column=3, sticky="w", padx=6, pady=3
-        )
+        ttk.Label(status, text="Runtime ownership").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(
+            status,
+            text="train_ppo.py → Adventure Generalist → MaskablePPO → localhost bridge",
+        ).grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=3)
         ttk.Label(status, textvariable=self.command_enablement_var).grid(
             row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 3)
         )
@@ -545,8 +647,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             tooltip="First Adventure level eligible for the curriculum frontier.",
         )
         self._add_labeled_entry(
-            core, 1, 2, "Max levels", self.generalist_max_levels_var,
-            tooltip="Highest Adventure level included in this training run.",
+            core, 1, 2, "Levels to attempt", self.generalist_max_levels_var,
+            tooltip="Number of Adventure levels to attempt, beginning at Start level.",
         )
         self._add_labeled_entry(
             core, 2, 0, "Max attempts", self.generalist_max_attempts_var,
@@ -562,7 +664,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         run.columnconfigure(1, weight=1)
         self._add_labeled_entry(
             run, 0, 0, "Run directory", self.generalist_run_dir_var, width=68,
-            tooltip="Optional output directory. Blank lets train_ppo.py create the run folder.",
+            tooltip="Required output directory for this run. Resume never overwrites its source checkpoint.",
         )
         ttk.Button(run, text="Browse", command=self.browse_run_folder).grid(row=0, column=2, padx=(0, 6), pady=2)
         self._add_labeled_entry(
@@ -570,7 +672,11 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             tooltip="Existing compatible 14-slot model. Leave blank for a fresh initialization.",
         )
         ttk.Button(run, text="Browse", command=self.browse_generalist_resume_model).grid(row=1, column=2, padx=(0, 4), pady=2)
-        ttk.Button(run, text="Refresh", command=self.refresh_generalist_resume_model).grid(row=1, column=3, padx=(0, 6), pady=2)
+        ttk.Button(
+            run,
+            text="Choose in Runs & Models",
+            command=self.refresh_generalist_resume_model,
+        ).grid(row=1, column=3, padx=(0, 6), pady=2)
 
         actions = ttk.Frame(content)
         actions.grid(row=3, column=0, sticky="ew", padx=8, pady=3)
@@ -627,6 +733,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         )
         self._add_labeled_entry(advanced, 4, 0, "New plant min probability", self.generalist_new_plant_prob_var)
         self._add_labeled_entry(advanced, 4, 2, "Promotion win streak", self.generalist_frontier_win_streak_required_var)
+        self._add_labeled_entry(advanced, 5, 0, "PPO rollout steps", self.generalist_n_steps_var)
+        self._add_labeled_entry(advanced, 5, 2, "PPO batch size", self.generalist_batch_size_var)
         option_specs = (
             ("Unlock-aware curriculum", self.generalist_unlock_curriculum_var),
             ("Replay cleared levels", self.generalist_replay_cleared_var),
@@ -641,7 +749,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         )
         for index, (label, variable) in enumerate(option_specs):
             ttk.Checkbutton(advanced, text=label, variable=variable).grid(
-                row=5 + index // 3, column=index % 3, sticky="w", padx=6, pady=2
+                row=6 + index // 3, column=index % 3, sticky="w", padx=6, pady=2
             )
         advanced.grid_remove()
 
@@ -664,15 +772,13 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         ).grid(row=0, column=0, sticky="w", padx=6, pady=3)
         ttk.Label(
             header,
-            text=f"Requires family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count=701, max_seed_slots=14",
+            text=f"Requires family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count={ADVENTURE_IDENTITY_ACTION_COUNT}, max_seed_slots=14",
         ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Label(header, text="Lab mode").grid(row=1, column=0, sticky="w", padx=6, pady=3)
-        ttk.Combobox(
-            header, textvariable=self.eval_lab_mode_var, values=LAB_MODES, state="readonly", width=13
-        ).grid(row=1, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(header, text="Streamer mode", variable=self.stream_coach_enabled_var).grid(
-            row=1, column=2, sticky="w", padx=6, pady=3
-        )
+        ttk.Label(header, text="Runtime ownership").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(
+            header,
+            text="Autonomous evaluation; no Twitch control, PPO update, or BC update",
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=3)
         ttk.Label(header, textvariable=self.command_enablement_var).grid(
             row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 3)
         )
@@ -687,14 +793,14 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         ttk.Button(model, text="Browse model", command=self.browse_generalist_eval_model).grid(
             row=0, column=2, padx=(0, 4), pady=2
         )
-        ttk.Button(model, text="Refresh", command=self.refresh_generalist_eval_model).grid(
+        ttk.Button(model, text="Choose in Runs & Models", command=self.refresh_generalist_eval_model).grid(
             row=0, column=3, padx=(0, 6), pady=2
         )
         self._add_labeled_entry(
-            model, 1, 0, "Run directory", self.generalist_run_dir_var, width=68,
-            tooltip="Optional output directory for evaluation metrics and live status.",
+            model, 1, 0, "Run directory", self.eval_run_dir_var, width=68,
+            tooltip="Required output directory for evaluation metrics and live status; keep it separate from the source checkpoint.",
         )
-        ttk.Button(model, text="Browse run", command=self.browse_run_folder).grid(
+        ttk.Button(model, text="Browse run", command=self.browse_eval_run_folder).grid(
             row=1, column=2, padx=(0, 6), pady=2
         )
 
@@ -702,21 +808,34 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         settings.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
         for column in (1, 3):
             settings.columnconfigure(column, weight=1)
-        self._add_labeled_entry(settings, 0, 0, "Initial loadout", self.generalist_initial_loadout_var, width=42)
-        self._add_labeled_entry(settings, 0, 2, "Start level", self.generalist_start_level_var)
-        self._add_labeled_entry(settings, 1, 0, "Max levels", self.generalist_max_levels_var)
-        self._add_labeled_entry(settings, 1, 2, "Max attempts", self.generalist_max_attempts_var)
-        self._add_labeled_entry(settings, 2, 0, "Game speed", self.generalist_game_speed_var)
-        self._add_labeled_entry(settings, 2, 2, "Step seconds", self.generalist_step_seconds_var)
-        self._add_labeled_entry(settings, 3, 0, "Board timeout", self.generalist_board_timeout_var)
-        ttk.Checkbutton(settings, text="Wait for gameplay", variable=self.generalist_wait_gameplay_ready_var).grid(
+        self._add_labeled_entry(settings, 0, 0, "Initial loadout", self.eval_initial_loadout_var, width=42)
+        self._add_labeled_entry(settings, 0, 2, "Start level", self.eval_start_level_var)
+        self._add_labeled_entry(settings, 1, 0, "Levels to attempt", self.eval_max_levels_var)
+        self._add_labeled_entry(settings, 1, 2, "Max attempts", self.eval_max_attempts_var)
+        self._add_labeled_entry(settings, 2, 0, "Game speed", self.eval_game_speed_var)
+        self._add_labeled_entry(settings, 2, 2, "Step seconds", self.eval_step_seconds_var)
+        self._add_labeled_entry(settings, 3, 0, "Board timeout", self.eval_board_timeout_var)
+        self._add_labeled_entry(settings, 3, 2, "Soft / hard steps", self.eval_soft_max_steps_var)
+        ttk.Entry(settings, textvariable=self.eval_hard_max_steps_var, width=12).grid(
+            row=3, column=4, sticky="w", padx=6, pady=2
+        )
+        ttk.Checkbutton(settings, text="Wait for gameplay", variable=self.eval_wait_gameplay_ready_var).grid(
             row=4, column=0, sticky="w", padx=6, pady=3
         )
-        ttk.Checkbutton(settings, text="Quick wait", variable=self.generalist_quick_wait_var).grid(
+        ttk.Checkbutton(settings, text="Quick wait", variable=self.eval_quick_wait_var).grid(
             row=4, column=1, sticky="w", padx=6, pady=3
         )
-        ttk.Checkbutton(settings, text="Tactical masks", variable=self.generalist_tactical_masks_var).grid(
+        ttk.Checkbutton(settings, text="Tactical masks", variable=self.eval_tactical_masks_var).grid(
             row=4, column=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="WallNut mask", variable=self.eval_wallnut_mask_var).grid(
+            row=4, column=3, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="CherryBomb mask", variable=self.eval_cherrybomb_mask_var).grid(
+            row=5, column=2, sticky="w", padx=6, pady=3
+        )
+        ttk.Checkbutton(settings, text="Final-wave extension", variable=self.eval_final_wave_extension_var).grid(
+            row=5, column=3, sticky="w", padx=6, pady=3
         )
         ttk.Checkbutton(settings, text="Fusion mask (model self-fuse)", variable=self.generalist_fusion_action_mask_eval_var).grid(
             row=5, column=0, columnspan=2, sticky="w", padx=6, pady=3
@@ -733,9 +852,9 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         utilities.grid(row=4, column=0, sticky="ew", padx=8, pady=3)
         utility_specs = (
             ("Browse model", self.browse_generalist_eval_model),
-            ("Browse run folder", self.browse_run_folder),
+            ("Browse run folder", self.browse_eval_run_folder),
             ("Open run folder", self.open_run_folder),
-            ("Refresh models", self.refresh_generalist_models),
+            ("Open Runs & Models", self.refresh_generalist_models),
             ("Analyze selected run", self.analyze_selected_run),
             ("Show charts", self.show_charts),
         )
@@ -968,10 +1087,10 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             text="Raw input keeps the existing parser syntax and queue behavior.",
         ).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
 
-        streamer = ttk.LabelFrame(content, text="Streamer Coach")
+        streamer = ttk.LabelFrame(content, text="Local Crowd Coach (legacy tool; not Streamer V1)")
         streamer.grid(row=2, column=1, sticky="nsew", padx=(4, 8), pady=3)
         streamer.columnconfigure(1, weight=1)
-        ttk.Checkbutton(streamer, text="Enable stream coach", variable=self.stream_coach_enabled_var).grid(
+        ttk.Checkbutton(streamer, text="Enable local crowd coach", variable=self.stream_coach_enabled_var).grid(
             row=0, column=0, sticky="w", padx=6, pady=3
         )
         ttk.Checkbutton(streamer, text="Dry run", variable=self.stream_coach_dry_run_var).grid(
@@ -1003,10 +1122,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._add_labeled_entry(rewards, 1, 0, "Legal execution reward", self.human_coach_bonus_var)
         self._add_labeled_entry(rewards, 2, 0, "Match reward", self.human_coach_match_bonus_var)
         self._add_labeled_entry(rewards, 3, 0, "Override penalty", self.human_coach_override_penalty_var)
-        self._add_labeled_entry(rewards, 4, 0, "Fusion success reward", self.human_coach_fusion_reward_var)
-        self._add_labeled_entry(rewards, 5, 0, "Tactical usefulness reward", self.human_coach_tactical_reward_var)
-        self._add_labeled_value(rewards, 6, "Human reward total", self.human_coach_reward_total_var, width=32)
-        self._add_labeled_value(rewards, 7, "Stream reward total", self.stream_coach_reward_total_var, width=32)
+        self._add_labeled_value(rewards, 4, "Human reward total", self.human_coach_reward_total_var, width=32)
+        self._add_labeled_value(rewards, 5, "Stream reward total", self.stream_coach_reward_total_var, width=32)
 
         fusion = ttk.LabelFrame(content, text="Fusion Bridge Controls")
         fusion.grid(row=3, column=1, sticky="nsew", padx=(4, 8), pady=3)
@@ -1048,7 +1165,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         ):
             self._add_labeled_value(human_live, row, label, variable, width=28)
 
-        stream_live = ttk.LabelFrame(live, text="Streamer")
+        stream_live = ttk.LabelFrame(live, text="Local crowd coach")
         stream_live.grid(row=0, column=1, sticky="nsew", padx=2, pady=4)
         stream_live.columnconfigure(1, weight=1)
         for row, (label, variable) in enumerate(
@@ -1378,26 +1495,6 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._add_labeled_value(diagnostics, 5, "Failures", self.fusion_failure_count_var, width=28)
         self._add_labeled_value(diagnostics, 6, "Rejected", self.fusion_rejected_count_var, width=28)
 
-    def _build_runs_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        paths = ttk.LabelFrame(parent, text="Runs and Models")
-        paths.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 3))
-        paths.columnconfigure(1, weight=1)
-        self._add_labeled_entry(paths, 0, 0, "Generalist model .zip", self.generalist_eval_model_path_var, width=56)
-        self._add_labeled_entry(paths, 1, 0, "Generalist run dir", self.generalist_run_dir_var, width=56)
-
-        actions = ttk.Frame(parent)
-        actions.grid(row=1, column=0, sticky="ew", padx=8, pady=3)
-        ttk.Button(actions, text="Browse model.zip", command=self.browse_generalist_eval_model).grid(row=0, column=0, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Browse run folder", command=self.browse_run_folder).grid(row=0, column=1, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Open run folder", command=self.open_run_folder).grid(row=0, column=2, sticky="w", padx=(0, 5))
-        ttk.Button(actions, text="Refresh Models", command=self.refresh_generalist_models).grid(row=0, column=3, sticky="w")
-
-        charts = ttk.LabelFrame(parent, text="Analyze / Charts")
-        charts.grid(row=2, column=0, sticky="ew", padx=8, pady=3)
-        ttk.Button(charts, text="Analyze Selected Run", command=self.analyze_selected_run).grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Button(charts, text="Show Charts", command=self.show_charts).grid(row=0, column=1, sticky="w", padx=6, pady=6)
-
     def _toggle_train_advanced(self) -> None:
         frame = self.train_advanced_frame
         if frame is None:
@@ -1606,6 +1703,11 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.fast_only_var,
             self.generalist_total_timesteps_var,
             self.generalist_checkpoint_freq_var,
+            self.generalist_n_steps_var,
+            self.generalist_batch_size_var,
+            self.generalist_config_path_var,
+            self.eval_config_path_var,
+            self.live_status_path_var,
             self.generalist_initial_loadout_var,
             self.generalist_max_seed_slots_var,
             self.generalist_start_level_var,
@@ -1636,6 +1738,56 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.generalist_fusion_action_mask_train_var,
             self.generalist_fusion_action_mask_eval_var,
             self.generalist_curriculum_var,
+            self.eval_run_dir_var,
+            self.eval_initial_loadout_var,
+            self.eval_max_seed_slots_var,
+            self.eval_start_level_var,
+            self.eval_max_levels_var,
+            self.eval_max_attempts_var,
+            self.eval_game_speed_var,
+            self.eval_step_seconds_var,
+            self.eval_board_timeout_var,
+            self.eval_soft_max_steps_var,
+            self.eval_hard_max_steps_var,
+            self.eval_wait_gameplay_ready_var,
+            self.eval_quick_wait_var,
+            self.eval_tactical_masks_var,
+            self.eval_wallnut_mask_var,
+            self.eval_cherrybomb_mask_var,
+            self.eval_final_wave_extension_var,
+            self.streamer_config_path_var,
+            self.streamer_platform_var,
+            self.streamer_baseline_checkpoint_var,
+            self.streamer_run_dir_var,
+            self.streamer_start_level_var,
+            self.streamer_max_levels_var,
+            self.streamer_max_attempts_var,
+            self.streamer_quick_wait_var,
+            self.streamer_wait_gameplay_ready_var,
+            self.streamer_mock_script_var,
+            self.streamer_n_steps_var,
+            self.streamer_batch_size_var,
+            self.streamer_interval_var,
+            self.streamer_ttl_var,
+            self.streamer_queue_capacity_var,
+            self.streamer_message_max_var,
+            self.streamer_policy_steps_var,
+            self.streamer_checkpoint_steps_var,
+            self.streamer_eval_episodes_var,
+            self.streamer_max_cycles_var,
+            self.streamer_endurance_hours_var,
+            self.streamer_bc_enabled_var,
+            self.streamer_bc_coefficient_var,
+            self.streamer_demo_capacity_var,
+            self.streamer_demo_persist_var,
+            self.streamer_bc_batch_var,
+            self.streamer_bc_frequency_var,
+            self.streamer_bc_min_var,
+            self.streamer_client_id_env_var,
+            self.streamer_access_token_env_var,
+            self.streamer_broadcaster_id_env_var,
+            self.streamer_user_id_env_var,
+            self.streamer_hash_secret_env_var,
             self.human_coach_enabled_var,
             self.human_coach_reward_var,
             self.human_coach_bonus_var,
@@ -1680,7 +1832,7 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         viewer_enabled = bool(self.stream_coach_enabled_var.get())
         self.command_enablement_var.set(
             f"Coach commands {'enabled' if coach_enabled else 'off'} | "
-            f"Viewer commands {'enabled' if viewer_enabled else 'off'} | "
+            f"Local crowd coach {'enabled' if viewer_enabled else 'off'} | "
             f"mode={self.assisted_execution_mode_var.get()}"
         )
 
@@ -1710,10 +1862,34 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             lines.extend(
                 [
                     "",
-                    f"Compatibility: family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count=701, max_seed_slots=14",
+                    f"Compatibility: family={ADVENTURE_GENERALIST_MODEL_FAMILY}, action_count={ADVENTURE_IDENTITY_ACTION_COUNT}, max_seed_slots=14",
                 ]
             )
             self._set_text_widget(self.eval_preview, "\n".join(lines))
+        if self.streamer_preview is not None:
+            validation = validate_streamer_v1_form(
+                self._streamer_form_mapping(),
+                base_dir=self.project_root,
+                validate_mock_script=False,
+            )
+            lines = [
+                "Adventure Generalist + Streamer V1:",
+                (
+                    self._command_text(self._build_streamer_v1_command(validation.value))
+                    if validation.ok and validation.value is not None
+                    else "Configuration is not launchable yet."
+                ),
+                "",
+                "Lifecycle: BASELINE eval → STREAM_TRAIN → CURRENT → autonomous EVALUATE → BEST comparison",
+                "Evaluation chat control: disabled",
+            ]
+            if validation.issues:
+                lines.append("Validation:")
+                lines.extend(
+                    f"- {issue.severity.upper()} [{issue.field}] {issue.message}"
+                    for issue in validation.issues
+                )
+            self._set_text_widget(self.streamer_preview, "\n".join(lines))
 
     def _set_text_widget(self, widget: tk.Text, content: str) -> None:
         widget.configure(state="normal")
@@ -1786,46 +1962,147 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             return
         self.start_adventure_generalist_train()
 
+    def _train_form_mapping(self) -> Dict[str, Any]:
+        config_var = getattr(self, "generalist_config_path_var", None)
+        return {
+            "config_path": config_var.get() if config_var is not None else "",
+            "initial_loadout": self.generalist_initial_loadout_var.get(),
+            "max_seed_slots": self.generalist_max_seed_slots_var.get(),
+            "run_dir": self.generalist_run_dir_var.get(),
+            "live_status_path": self.live_status_path_var.get(),
+            "resume_model_path": self.generalist_resume_model_path_var.get(),
+            "total_timesteps": self.generalist_total_timesteps_var.get(),
+            "checkpoint_freq": self.generalist_checkpoint_freq_var.get(),
+            "n_steps": self.generalist_n_steps_var.get(),
+            "batch_size": self.generalist_batch_size_var.get(),
+            "adventure_start_level": self.generalist_start_level_var.get(),
+            "max_adventure_levels": self.generalist_max_levels_var.get(),
+            "max_attempts_per_level": self.generalist_max_attempts_var.get(),
+            "adventure_soft_max_steps": self.generalist_soft_max_steps_var.get(),
+            "adventure_hard_max_steps": self.generalist_hard_max_steps_var.get(),
+            "game_speed": self.generalist_game_speed_var.get(),
+            "step_seconds": self.generalist_step_seconds_var.get(),
+            "board_timeout": self.generalist_board_timeout_var.get(),
+        }
+
+    def _evaluation_form_mapping(self) -> Dict[str, Any]:
+        config_var = getattr(self, "eval_config_path_var", None)
+        return {
+            "config_path": config_var.get() if config_var is not None else "",
+            "initial_loadout": self.eval_initial_loadout_var.get(),
+            "max_seed_slots": self.eval_max_seed_slots_var.get(),
+            "model_path": self.generalist_eval_model_path_var.get(),
+            "run_dir": self.eval_run_dir_var.get(),
+            "live_status_path": self.live_status_path_var.get(),
+            "adventure_start_level": self.eval_start_level_var.get(),
+            "max_adventure_levels": self.eval_max_levels_var.get(),
+            "max_attempts_per_level": self.eval_max_attempts_var.get(),
+            "adventure_soft_max_steps": self.eval_soft_max_steps_var.get(),
+            "adventure_hard_max_steps": self.eval_hard_max_steps_var.get(),
+            "game_speed": self.eval_game_speed_var.get(),
+            "step_seconds": self.eval_step_seconds_var.get(),
+            "board_timeout": self.eval_board_timeout_var.get(),
+        }
+
+    def _streamer_form_mapping(self) -> Dict[str, Any]:
+        config_var = getattr(self, "streamer_config_path_var", None)
+        return {
+            "config_path": config_var.get() if config_var is not None else "",
+            "streamer_platform": self.streamer_platform_var.get(),
+            "streamer_baseline_checkpoint": self.streamer_baseline_checkpoint_var.get(),
+            "run_dir": self.streamer_run_dir_var.get(),
+            "live_status_path": self.live_status_path_var.get(),
+            "adventure_start_level": self.streamer_start_level_var.get(),
+            "max_adventure_levels": self.streamer_max_levels_var.get(),
+            "max_attempts_per_level": self.streamer_max_attempts_var.get(),
+            "n_steps": self.streamer_n_steps_var.get(),
+            "batch_size": self.streamer_batch_size_var.get(),
+            "streamer_intervention_interval_seconds": self.streamer_interval_var.get(),
+            "streamer_command_ttl_seconds": self.streamer_ttl_var.get(),
+            "streamer_command_queue_capacity": self.streamer_queue_capacity_var.get(),
+            "streamer_message_max_chars": self.streamer_message_max_var.get(),
+            "streamer_policy_steps_per_cycle": self.streamer_policy_steps_var.get(),
+            "streamer_checkpoint_policy_steps": self.streamer_checkpoint_steps_var.get(),
+            "streamer_evaluation_episodes": self.streamer_eval_episodes_var.get(),
+            "streamer_max_cycles": self.streamer_max_cycles_var.get(),
+            "streamer_endurance_hours": self.streamer_endurance_hours_var.get(),
+            "streamer_bc_enabled": self.streamer_bc_enabled_var.get(),
+            "streamer_bc_coefficient": self.streamer_bc_coefficient_var.get(),
+            "streamer_demonstration_capacity": self.streamer_demo_capacity_var.get(),
+            "streamer_demonstration_persist_every": self.streamer_demo_persist_var.get(),
+            "streamer_bc_batch_size": self.streamer_bc_batch_var.get(),
+            "streamer_bc_update_frequency": self.streamer_bc_frequency_var.get(),
+            "streamer_bc_min_demonstrations": self.streamer_bc_min_var.get(),
+            "streamer_twitch_client_id_env": self.streamer_client_id_env_var.get(),
+            "streamer_twitch_access_token_env": self.streamer_access_token_env_var.get(),
+            "streamer_twitch_broadcaster_id_env": self.streamer_broadcaster_id_env_var.get(),
+            "streamer_twitch_user_id_env": self.streamer_user_id_env_var.get(),
+            "streamer_viewer_hash_secret_env": self.streamer_hash_secret_env_var.get(),
+            "streamer_mock_script": self.streamer_mock_script_var.get(),
+        }
+
+    def _report_form_issues(
+        self,
+        title: str,
+        issues: Tuple[ValidationIssue, ...],
+    ) -> bool:
+        errors = [issue for issue in issues if issue.severity == "error"]
+        for issue in issues:
+            prefix = "ERROR" if issue.severity == "error" else "Warning"
+            self._append_log(f"{prefix}: {title} [{issue.field}] {issue.message}\n")
+        return not errors
+
     def start_adventure_generalist_train(self) -> None:
-        if self.generalist_initial_loadout_var.get().strip() != ADVENTURE_GENERALIST_INITIAL_LOADOUT:
-            self._append_log(
-                "ERROR: Adventure Generalist training requires initial loadout "
-                f"{ADVENTURE_GENERALIST_INITIAL_LOADOUT}.\n"
-            )
+        validation = validate_train_form(
+            self._train_form_mapping(), base_dir=self.project_root
+        )
+        if not self._report_form_issues("training form", validation.issues) or not validation.ok:
             return
-        if self.generalist_max_seed_slots_var.get().strip() != "14":
-            self._append_log("ERROR: Adventure Generalist training requires max seed slots = 14.\n")
-            return
-        raw_resume_path = self.generalist_resume_model_path_var.get().strip()
-        if raw_resume_path:
-            resume_path = self._resolve_text_path(raw_resume_path)
-            if not resume_path.exists():
-                self._append_log(f"ERROR: Adventure Generalist resume model does not exist: {resume_path}\n")
-                return
-            self._append_log(f"Launching Adventure Generalist training (resume): {resume_path}\n")
+        assert validation.value is not None
+        if validation.value.resume_model_path is None:
+            self._append_log("Launching Adventure Generalist training (fresh Full-Adventure model).\n")
         else:
-            self._append_log("Launching Adventure Generalist training (fresh model initialization)...\n")
+            self._append_log(
+                "Launching Adventure Generalist training from compatible resume source: "
+                f"{validation.value.resume_model_path}\n"
+            )
         self.launch_process("Start Adventure Generalist Train", self._build_adventure_generalist_command())
 
     def start_adventure_generalist_eval(self) -> None:
-        if self.generalist_initial_loadout_var.get().strip() != ADVENTURE_GENERALIST_INITIAL_LOADOUT:
-            self._append_log(
-                "ERROR: Adventure Generalist v1 eval requires initial loadout "
-                f"{ADVENTURE_GENERALIST_INITIAL_LOADOUT}.\n"
+        validation = validate_evaluation_form(
+            self._evaluation_form_mapping(), base_dir=self.project_root
+        )
+        if not self._report_form_issues("evaluation form", validation.issues) or not validation.ok:
+            return
+        assert validation.value is not None
+        self._append_log(
+            "Launching autonomous Full-Adventure evaluation with compatible model: "
+            f"{validation.value.model_path}\n"
+        )
+        self.launch_process("Start Adventure Generalist Eval", self._build_adventure_generalist_eval_command())
+
+    def start_streamer_v1(self) -> None:
+        validation = validate_streamer_v1_form(
+            self._streamer_form_mapping(),
+            base_dir=self.project_root,
+        )
+        if not self._report_form_issues("Streamer V1 form", validation.issues) or not validation.ok:
+            self.stream_validation_var.set(
+                validation.errors[0].message if validation.errors else "Streamer validation failed."
             )
             return
-        if self.generalist_max_seed_slots_var.get().strip() != "14":
-            self._append_log("ERROR: Adventure Generalist v1 eval requires max seed slots = 14.\n")
-            return
-        raw_model_path = self.generalist_eval_model_path_var.get().strip()
-        if not raw_model_path:
-            self._append_log("ERROR: Adventure Generalist eval requires model_path.\n")
-            return
-        model_path = self._resolve_text_path(raw_model_path)
-        if not model_path.exists():
-            self._append_log(f"ERROR: Adventure Generalist eval model does not exist: {model_path}\n")
-            return
-        self.launch_process("Start Adventure Generalist Eval", self._build_adventure_generalist_eval_command())
+        assert validation.value is not None
+        self.stream_validation_var.set(
+            "Validated Full-Adventure Streamer V1 configuration; launching backend."
+        )
+        self._append_log(
+            f"Launching Streamer V1 ({validation.value.platform}) with BASELINE "
+            f"{validation.value.baseline_checkpoint}.\n"
+        )
+        self.launch_process(
+            "Start Streamer V1",
+            self._build_streamer_v1_command(validation.value),
+        )
 
     def auto_reset_test(self) -> None:
         command = self._script_command("pvzrl_env.py", "--terminal-auto-reset-test")
@@ -1908,36 +2185,572 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self.generalist_run_dir_var.set(dirname)
             self._append_log(f"Selected run directory: {dirname}\n")
 
-    def refresh_generalist_models(self) -> None:
-        model = self._find_newest_usable_model_zip()
-        if model is None:
-            self._append_log("Refresh Models: no metadata-backed Adventure Generalist model found.\n")
-            return
-        self.generalist_eval_model_path_var.set(str(model))
-        self.generalist_resume_model_path_var.set(str(model))
-        self._append_log(f"Refresh Models: selected Adventure Generalist model: {model}\n")
+    def browse_eval_run_folder(self) -> None:
+        initial_dir = self.repo_root / "runs"
+        dirname = filedialog.askdirectory(
+            title="Select evaluation output folder",
+            initialdir=str(initial_dir if initial_dir.exists() else self.repo_root),
+        )
+        if dirname:
+            self.eval_run_dir_var.set(dirname)
+            self._append_log(f"Selected evaluation run directory: {dirname}\n")
 
-    def refresh_generalist_eval_model(self) -> None:
-        model = self._find_newest_usable_model_zip()
-        if model is None:
-            self._append_log("Refresh Adventure Generalist eval model: no metadata-backed .zip models found under runs.\n")
-            return
-        self.generalist_eval_model_path_var.set(str(model))
-        self._append_log(f"Refresh Adventure Generalist eval model: selected newest metadata-backed model path: {model}\n")
+    def browse_streamer_baseline(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Select compatible Full-Adventure BASELINE model.zip",
+            initialdir=str(self.repo_root / "runs"),
+            filetypes=[("Zip models", "*.zip"), ("All files", "*.*")],
+        )
+        if filename:
+            self.streamer_baseline_checkpoint_var.set(filename)
 
-    def refresh_generalist_resume_model(self) -> None:
-        model = self._find_newest_usable_model_zip()
-        if model is None:
-            self._append_log("Refresh Adventure Generalist resume model: no metadata-backed .zip models found under runs.\n")
-            return
-        self.generalist_resume_model_path_var.set(str(model))
-        self._append_log(f"Refresh Adventure Generalist resume model: selected newest metadata-backed model path: {model}\n")
+    def browse_streamer_run_folder(self) -> None:
+        dirname = filedialog.askdirectory(
+            title="Select Streamer V1 experiment directory",
+            initialdir=str(self.repo_root / "runs"),
+        )
+        if dirname:
+            self.streamer_run_dir_var.set(dirname)
 
-    def open_run_folder(self) -> None:
-        path = self._selected_run_dir()
-        if path is None:
-            path = self.repo_root / "runs"
-        if not path.exists():
+    def browse_streamer_mock_script(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Select privacy-safe Streamer mock JSONL",
+            initialdir=str(self.repo_root),
+            filetypes=[("JSON Lines", "*.jsonl"), ("All files", "*.*")],
+        )
+        if filename:
+            self.streamer_mock_script_var.set(filename)
+
+    def _read_gui_config(self, raw_path: str) -> Optional[Dict[str, Any]]:
+        try:
+            path = self._resolve_text_path(raw_path)
+            if not path.is_file():
+                raise ValueError(f"configuration file not found: {path}")
+            if path.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("configuration file exceeds 2 MiB")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("configuration root must be a JSON object")
+            return payload
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            self._append_log(f"ERROR: Could not load GUI configuration: {exc}\n")
+            return None
+
+    @staticmethod
+    def _config_text(value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            return ",".join(str(item) for item in value)
+        return str(value)
+
+    def _apply_config_to_forms(self, payload: Dict[str, Any], *, target: str) -> None:
+        """Apply a JSON payload to exactly one launch form.
+
+        The live-status path is an explicitly shared application setting. All
+        other editable launch values remain owned by the selected form so that
+        loading an evaluation or Streamer configuration cannot rewrite a
+        prepared training launch.
+        """
+
+        if target not in {"training", "evaluation", "streamer"}:
+            raise ValueError(f"unsupported GUI configuration target: {target}")
+
+        def assign(variable: Any, *keys: str) -> None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    variable.set(self._config_text(payload[key]))
+                    return
+
+        def assign_bool(variable: Any, key: str) -> None:
+            if key in payload:
+                variable.set(bool(payload[key]))
+
+        assign(self.live_status_path_var, "live_status_path")
+
+        if target == "training":
+            specs = (
+                (self.generalist_initial_loadout_var, ("initial_loadout", "seed_list")),
+                (self.generalist_max_seed_slots_var, ("max_seed_slots",)),
+                (self.generalist_start_level_var, ("adventure_start_level",)),
+                (self.generalist_max_levels_var, ("max_adventure_levels",)),
+                (self.generalist_max_attempts_var, ("max_attempts_per_level",)),
+                (self.generalist_game_speed_var, ("game_speed",)),
+                (self.generalist_step_seconds_var, ("step_seconds",)),
+                (self.generalist_board_timeout_var, ("board_timeout",)),
+                (self.generalist_soft_max_steps_var, ("adventure_soft_max_steps",)),
+                (self.generalist_hard_max_steps_var, ("adventure_hard_max_steps",)),
+                (self.generalist_n_steps_var, ("n_steps",)),
+                (self.generalist_batch_size_var, ("batch_size",)),
+                (self.generalist_total_timesteps_var, ("total_timesteps",)),
+                (self.generalist_checkpoint_freq_var, ("checkpoint_freq",)),
+                (self.generalist_run_dir_var, ("run_dir",)),
+                (self.generalist_resume_model_path_var, ("resume_model_path",)),
+                (self.generalist_curriculum_var, ("seed_curriculum",)),
+                (self.generalist_unlock_delay_var, ("unlock_introduction_delay",)),
+                (self.generalist_new_plant_prob_var, ("new_plant_min_inclusion_prob",)),
+                (self.generalist_frontier_prob_var, ("adventure_frontier_sample_prob",)),
+                (self.generalist_recent_prob_var, ("adventure_recent_cleared_sample_prob",)),
+                (self.generalist_maintenance_prob_var, ("adventure_maintenance_sample_prob",)),
+                (
+                    self.generalist_frontier_win_streak_required_var,
+                    ("adventure_frontier_win_streak_required",),
+                ),
+            )
+            for variable, keys in specs:
+                assign(variable, *keys)
+            for variable, key in (
+                (self.generalist_final_wave_extension_var, "adventure_final_wave_extension"),
+                (self.generalist_unlock_curriculum_var, "unlock_aware_seed_curriculum"),
+                (self.generalist_randomize_seed_order_var, "randomize_seed_order"),
+                (self.generalist_replay_cleared_var, "adventure_replay_cleared_levels"),
+                (self.generalist_tactical_masks_var, "tactical_masks"),
+                (self.generalist_wallnut_mask_var, "wallnut_tactical_mask"),
+                (self.generalist_cherrybomb_mask_var, "cherrybomb_tactical_mask"),
+                (self.generalist_fusion_action_mask_train_var, "fusion_action_mask_enabled"),
+                (self.generalist_quick_wait_var, "quick_wait"),
+                (self.generalist_wait_gameplay_ready_var, "wait_gameplay_ready"),
+            ):
+                assign_bool(variable, key)
+            return
+
+        if target == "evaluation":
+            specs = (
+                (self.eval_initial_loadout_var, ("initial_loadout", "seed_list")),
+                (self.eval_max_seed_slots_var, ("max_seed_slots",)),
+                (self.eval_start_level_var, ("adventure_start_level",)),
+                (self.eval_max_levels_var, ("max_adventure_levels",)),
+                (self.eval_max_attempts_var, ("max_attempts_per_level",)),
+                (self.eval_game_speed_var, ("game_speed",)),
+                (self.eval_step_seconds_var, ("step_seconds",)),
+                (self.eval_board_timeout_var, ("board_timeout",)),
+                (self.eval_soft_max_steps_var, ("adventure_soft_max_steps",)),
+                (self.eval_hard_max_steps_var, ("adventure_hard_max_steps",)),
+                (self.eval_run_dir_var, ("run_dir",)),
+                (self.generalist_eval_model_path_var, ("model_path",)),
+            )
+            for variable, keys in specs:
+                assign(variable, *keys)
+            for variable, key in (
+                (self.eval_final_wave_extension_var, "adventure_final_wave_extension"),
+                (self.eval_tactical_masks_var, "tactical_masks"),
+                (self.eval_wallnut_mask_var, "wallnut_tactical_mask"),
+                (self.eval_cherrybomb_mask_var, "cherrybomb_tactical_mask"),
+                (self.generalist_fusion_action_mask_eval_var, "fusion_action_mask_enabled"),
+                (self.eval_quick_wait_var, "quick_wait"),
+                (self.eval_wait_gameplay_ready_var, "wait_gameplay_ready"),
+            ):
+                assign_bool(variable, key)
+            return
+
+        streamer_specs = (
+            (self.streamer_platform_var, "streamer_platform"),
+            (self.streamer_baseline_checkpoint_var, "streamer_baseline_checkpoint"),
+            (self.streamer_run_dir_var, "run_dir"),
+            (self.streamer_start_level_var, "adventure_start_level"),
+            (self.streamer_max_levels_var, "max_adventure_levels"),
+            (self.streamer_max_attempts_var, "max_attempts_per_level"),
+            (self.streamer_n_steps_var, "n_steps"),
+            (self.streamer_batch_size_var, "batch_size"),
+            (self.streamer_interval_var, "streamer_intervention_interval_seconds"),
+            (self.streamer_ttl_var, "streamer_command_ttl_seconds"),
+            (self.streamer_queue_capacity_var, "streamer_command_queue_capacity"),
+            (self.streamer_message_max_var, "streamer_message_max_chars"),
+            (self.streamer_policy_steps_var, "streamer_policy_steps_per_cycle"),
+            (self.streamer_checkpoint_steps_var, "streamer_checkpoint_policy_steps"),
+            (self.streamer_eval_episodes_var, "streamer_evaluation_episodes"),
+            (self.streamer_max_cycles_var, "streamer_max_cycles"),
+            (self.streamer_endurance_hours_var, "streamer_endurance_hours"),
+            (self.streamer_bc_coefficient_var, "streamer_bc_coefficient"),
+            (self.streamer_demo_capacity_var, "streamer_demonstration_capacity"),
+            (self.streamer_demo_persist_var, "streamer_demonstration_persist_every"),
+            (self.streamer_bc_batch_var, "streamer_bc_batch_size"),
+            (self.streamer_bc_frequency_var, "streamer_bc_update_frequency"),
+            (self.streamer_bc_min_var, "streamer_bc_min_demonstrations"),
+            (self.streamer_client_id_env_var, "streamer_twitch_client_id_env"),
+            (self.streamer_access_token_env_var, "streamer_twitch_access_token_env"),
+            (self.streamer_broadcaster_id_env_var, "streamer_twitch_broadcaster_id_env"),
+            (self.streamer_user_id_env_var, "streamer_twitch_user_id_env"),
+            (self.streamer_hash_secret_env_var, "streamer_viewer_hash_secret_env"),
+            (self.streamer_mock_script_var, "streamer_mock_script"),
+        )
+        for variable, key in streamer_specs:
+            assign(variable, key)
+        assign_bool(self.streamer_bc_enabled_var, "streamer_bc_enabled")
+        assign_bool(self.streamer_quick_wait_var, "quick_wait")
+        assign_bool(self.streamer_wait_gameplay_ready_var, "wait_gameplay_ready")
+        self.refresh_streamer_credentials()
+
+    def load_streamer_config(self) -> None:
+        raw_path = self.streamer_config_path_var.get().strip()
+        if not raw_path:
+            raw_path = filedialog.askopenfilename(
+                title="Select Streamer V1 JSON configuration",
+                initialdir=str(self.repo_root / "configs"),
+                filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            )
+            if not raw_path:
+                return
+            self.streamer_config_path_var.set(raw_path)
+        payload = self._read_gui_config(raw_path)
+        if payload is None:
+            return
+        self._apply_config_to_forms(payload, target="streamer")
+        self._append_log(f"Loaded Streamer V1 configuration: {self._resolve_text_path(raw_path)}\n")
+
+    def load_active_form_config(self) -> None:
+        target = self._configuration_target()
+        filename = filedialog.askopenfilename(
+            title="Load GUI form configuration",
+            initialdir=str(self.repo_root / "configs"),
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+        payload = self._read_gui_config(filename)
+        if payload is None:
+            return
+        if target == "streamer":
+            self.streamer_config_path_var.set(filename)
+        elif target == "evaluation":
+            self.eval_config_path_var.set(filename)
+        else:
+            self.generalist_config_path_var.set(filename)
+        self._apply_config_to_forms(payload, target=target)
+        self._append_log(f"Loaded configuration into {target.title()} form: {filename}\n")
+
+    def _configuration_target(self) -> str:
+        """Return the workflow form selected for Settings load/save/reset."""
+
+        if self.current_page == "Streamer":
+            return "streamer"
+        if self.current_page == "Evaluation":
+            return "evaluation"
+        if self.current_page == "Training":
+            return "training"
+        selected = self.settings_config_target_var.get().strip().lower()
+        return selected if selected in {"training", "evaluation", "streamer"} else "training"
+
+    def _serializable_active_form(self) -> Dict[str, Any]:
+        contract = FULL_ADVENTURE_CONTRACT
+        target = self._configuration_target()
+
+        def loadout(value: str) -> List[str]:
+            return [item.strip() for item in value.split(",") if item.strip()]
+
+        base: Dict[str, Any] = {
+            "model_family": contract.model_family,
+            "reward_policy_version": REWARD_POLICY_VERSION,
+            "reward": reward_policy_v2_core_config(),
+            "action_space_mode": contract.action_space_mode,
+            "row_count": contract.rows,
+            "column_count": contract.cols,
+            "max_seed_slots": contract.max_seed_slots,
+            "seed_list": list(contract.initial_loadout),
+            "initial_loadout": list(contract.initial_loadout),
+        }
+        if target == "streamer":
+            base.update(self._streamer_form_mapping())
+            base["quick_wait"] = bool(self.streamer_quick_wait_var.get())
+            base["wait_gameplay_ready"] = bool(self.streamer_wait_gameplay_ready_var.get())
+            base["run_mode"] = "adventure_generalist_14slot_train"
+            base["streamer_v1_enabled"] = True
+        elif target == "evaluation":
+            base.update(self._evaluation_form_mapping())
+            selected_loadout = loadout(self.eval_initial_loadout_var.get())
+            base["initial_loadout"] = selected_loadout
+            base["seed_list"] = selected_loadout
+            base.update(
+                {
+                    "board_timeout": self.eval_board_timeout_var.get(),
+                    "adventure_final_wave_extension": bool(
+                        self.eval_final_wave_extension_var.get()
+                    ),
+                    "quick_wait": bool(self.eval_quick_wait_var.get()),
+                    "wait_gameplay_ready": bool(self.eval_wait_gameplay_ready_var.get()),
+                    "tactical_masks": bool(self.eval_tactical_masks_var.get()),
+                    "wallnut_tactical_mask": bool(self.eval_wallnut_mask_var.get()),
+                    "cherrybomb_tactical_mask": bool(self.eval_cherrybomb_mask_var.get()),
+                    "fusion_action_mask_enabled": bool(
+                        self.generalist_fusion_action_mask_eval_var.get()
+                    ),
+                }
+            )
+            base["run_mode"] = "adventure_generalist_14slot_eval"
+        else:
+            base.update(self._train_form_mapping())
+            selected_loadout = loadout(self.generalist_initial_loadout_var.get())
+            base["initial_loadout"] = selected_loadout
+            base["seed_list"] = selected_loadout
+            base.update(
+                {
+                    "board_timeout": self.generalist_board_timeout_var.get(),
+                    "adventure_final_wave_extension": bool(
+                        self.generalist_final_wave_extension_var.get()
+                    ),
+                    "quick_wait": bool(self.generalist_quick_wait_var.get()),
+                    "wait_gameplay_ready": bool(
+                        self.generalist_wait_gameplay_ready_var.get()
+                    ),
+                    "unlock_aware_seed_curriculum": bool(
+                        self.generalist_unlock_curriculum_var.get()
+                    ),
+                    "seed_curriculum": self.generalist_curriculum_var.get(),
+                    "randomize_seed_order": bool(
+                        self.generalist_randomize_seed_order_var.get()
+                    ),
+                    "unlock_introduction_delay": self.generalist_unlock_delay_var.get(),
+                    "new_plant_min_inclusion_prob": self.generalist_new_plant_prob_var.get(),
+                    "adventure_replay_cleared_levels": bool(
+                        self.generalist_replay_cleared_var.get()
+                    ),
+                    "adventure_frontier_sample_prob": self.generalist_frontier_prob_var.get(),
+                    "adventure_recent_cleared_sample_prob": self.generalist_recent_prob_var.get(),
+                    "adventure_maintenance_sample_prob": self.generalist_maintenance_prob_var.get(),
+                    "adventure_frontier_win_streak_required": (
+                        self.generalist_frontier_win_streak_required_var.get()
+                    ),
+                    "tactical_masks": bool(self.generalist_tactical_masks_var.get()),
+                    "wallnut_tactical_mask": bool(
+                        self.generalist_wallnut_mask_var.get()
+                    ),
+                    "cherrybomb_tactical_mask": bool(
+                        self.generalist_cherrybomb_mask_var.get()
+                    ),
+                    "fusion_action_mask_enabled": bool(
+                        self.generalist_fusion_action_mask_train_var.get()
+                    ),
+                }
+            )
+            base["run_mode"] = "adventure_generalist_14slot_train"
+        # ``config_path`` is GUI launch provenance, not a backend config key.
+        # Never persist a self-reference into the JSON being saved.
+        base.pop("config_path", None)
+        return base
+
+    def save_active_form_config(self) -> None:
+        target = self._configuration_target()
+        filename = filedialog.asksaveasfilename(
+            title=f"Save {target.title()} form configuration",
+            initialdir=str(self.repo_root / "configs"),
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        temp_path = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(
+                json.dumps(self._serializable_active_form(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+            if target == "streamer":
+                self.streamer_config_path_var.set(str(path))
+            elif target == "evaluation":
+                self.eval_config_path_var.set(str(path))
+            else:
+                self.generalist_config_path_var.set(str(path))
+            self._append_log(f"Saved {target.title()} form configuration: {path}\n")
+        except OSError as exc:
+            self._append_log(f"ERROR: Could not save GUI configuration: {exc}\n")
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def reset_gui_defaults(self) -> None:
+        target = self._configuration_target()
+        if target == "streamer":
+            self.streamer_config_path_var.set(str(Path("configs") / "streamer_full_v2.example.json"))
+            self.load_streamer_config()
+            return
+        payload = self._read_gui_config(str(Path("configs") / "ppo_adventure_generalist_full_v2.json"))
+        if payload is not None:
+            canonical_path = str(Path("configs") / "ppo_adventure_generalist_full_v2.json")
+            if target == "evaluation":
+                self.eval_config_path_var.set(canonical_path)
+            else:
+                self.generalist_config_path_var.set(canonical_path)
+            self._apply_config_to_forms(payload, target=target)
+            self._append_log(f"Reset {target.title()} form to canonical Full-Adventure defaults.\n")
+
+    def apply_live_status_path(self) -> None:
+        raw_path = self.live_status_path_var.get().strip()
+        if not raw_path:
+            self._append_log("ERROR: Live-status path cannot be blank.\n")
+            return
+        self.live_status_path = self._resolve_text_path(raw_path)
+        self._live_status_reader.set_path(self.live_status_path)
+        self.last_good_status = None
+        self.last_good_read_time = None
+        self.last_live_parse_error = ""
+        self._diagnostics_render_key = None
+        self._append_log(f"Applied live-status path: {self.live_status_path}\n")
+
+    def refresh_artifact_index(self) -> None:
+        if self._closing or self._destroyed:
+            return
+        self._artifact_scan_generation += 1
+        generation = self._artifact_scan_generation
+        root = self._resolve_text_path(self.runs_root_var.get().strip() or "runs")
+        self.artifact_index_status_var.set(f"Scanning {root}…")
+
+        def worker() -> None:
+            try:
+                result: Any = scan_run_artifacts(root)
+            except Exception as exc:  # UI worker boundary; surfaced below.
+                result = exc
+            try:
+                self._artifact_result_queue.put_nowait((generation, result))
+            except queue.Full:
+                try:
+                    self._artifact_result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._artifact_result_queue.put_nowait((generation, result))
+                except queue.Full:
+                    pass
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"PvZRL artifact scan {generation}",
+            daemon=True,
+        )
+        self._artifact_scan_thread = thread
+        thread.start()
+        self._schedule_after("_artifact_after_id", 50, self._poll_artifact_index)
+
+    def _poll_artifact_index(self) -> None:
+        self._artifact_after_id = None
+        newest: Optional[Tuple[int, Any]] = None
+        while True:
+            try:
+                item = self._artifact_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if newest is None or item[0] >= newest[0]:
+                newest = item
+        if newest is not None and newest[0] == self._artifact_scan_generation:
+            result = newest[1]
+            if isinstance(result, Exception):
+                self.artifact_index_status_var.set(f"Scan failed: {result}")
+                self._append_log(f"ERROR: Runs & Models scan failed: {result}\n")
+            else:
+                self._render_artifact_index(result)
+            return
+        thread = self._artifact_scan_thread
+        if thread is not None and thread.is_alive() and not self._closing:
+            self._schedule_after("_artifact_after_id", 50, self._poll_artifact_index)
+
+    def _render_artifact_index(self, index: ArtifactIndex) -> None:
+        tree = self.artifact_tree
+        if tree is None:
+            return
+        for item in tree.get_children(""):
+            tree.delete(item)
+        self._artifact_records.clear()
+        for position, artifact in enumerate(index.models):
+            item_id = f"model-{position}"
+            compatibility = "YES" if artifact.compatibility.compatible else "NO"
+            tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    artifact.role,
+                    compatibility,
+                    artifact.timesteps if artifact.timesteps is not None else "-",
+                    artifact.adventure_level if artifact.adventure_level is not None else "-",
+                    artifact.modified_at,
+                    artifact.relative_path,
+                ),
+            )
+            self._artifact_records[item_id] = artifact
+        suffix = " · truncated" if index.truncated else ""
+        issues = len(index.issues) + int(index.dropped_issue_count)
+        self.artifact_index_status_var.set(
+            f"{len(index.models)} models · {len(index.runs)} runs · {issues} issues{suffix}"
+        )
+        self.artifact_details_var.set(
+            "Select a model explicitly. Refreshing never changes evaluation, resume, or BASELINE paths."
+        )
+
+    def _selected_artifact(self, *, compatible: bool) -> Optional[ModelArtifact]:
+        tree = self.artifact_tree
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            self._append_log("ERROR: Select a model in Runs & Models first.\n")
+            return None
+        artifact = self._artifact_records.get(selection[0])
+        if not isinstance(artifact, ModelArtifact):
+            return None
+        if compatible and not artifact.compatibility.compatible:
+            reason = artifact.compatibility.blocked_reason or "metadata incompatible"
+            self._append_log(
+                f"ERROR: Refusing incompatible checkpoint {artifact.path}: {reason}\n"
+            )
+            return None
+        return artifact
+
+    def show_selected_artifact_details(self) -> None:
+        artifact = self._selected_artifact(compatible=False)
+        if artifact is None:
+            return
+        compatibility = artifact.compatibility
+        eval_text = "-"
+        if artifact.evaluations:
+            evaluation = artifact.evaluations[0]
+            eval_text = (
+                f"{evaluation.scope}: win_rate={evaluation.win_rate}, "
+                f"avg_reward={evaluation.avg_reward}, levels="
+                f"{evaluation.adventure_start_level}→{evaluation.next_adventure_level}"
+            )
+        self.artifact_details_var.set(
+            "\n".join(
+                (
+                    f"Path: {artifact.path}",
+                    f"Role(s): {', '.join(artifact.roles)}",
+                    f"Compatible Full-Adventure v2: {compatibility.compatible}",
+                    f"Compatibility reason: {compatibility.blocked_reason or '-'}",
+                    f"Timesteps: {artifact.timesteps} ({artifact.timesteps_source or 'unknown source'})",
+                    f"Adventure level: {artifact.adventure_level} ({artifact.adventure_level_source or 'unknown source'})",
+                    f"Evaluation: {eval_text}",
+                    "Compatibility is metadata-only; the backend still performs MaskablePPO.load.",
+                )
+            )
+        )
+
+    def use_selected_artifact_for_evaluation(self) -> None:
+        artifact = self._selected_artifact(compatible=True)
+        if artifact is not None:
+            self.generalist_eval_model_path_var.set(artifact.path)
+            self._show_page("Evaluation")
+
+    def use_selected_artifact_for_resume(self) -> None:
+        artifact = self._selected_artifact(compatible=True)
+        if artifact is not None:
+            self.generalist_resume_model_path_var.set(artifact.path)
+            self._show_page("Training")
+
+    def use_selected_artifact_for_streamer(self) -> None:
+        artifact = self._selected_artifact(compatible=True)
+        if artifact is not None:
+            self.streamer_baseline_checkpoint_var.set(artifact.path)
+            self._show_page("Streamer")
+
+    def open_selected_artifact_folder(self) -> None:
+        artifact = self._selected_artifact(compatible=False)
+        if artifact is None:
+            return
+        path = Path(artifact.run_dir) if artifact.run_dir else Path(artifact.path).parent
+        self._open_folder_path(path)
+
+    def _open_folder_path(self, path: Path) -> None:
+        if not path.is_dir():
             self._append_log(f"ERROR: Folder does not exist: {path}\n")
             return
         try:
@@ -1951,8 +2764,126 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         except OSError as exc:
             self._append_log(f"ERROR: Failed to open folder {path}: {exc}\n")
 
+    def refresh_streamer_event_history(self, active_run: Any) -> None:
+        tree = self.stream_event_tree
+        if tree is None:
+            return
+
+        def clear_display(*, drop_reader: bool) -> None:
+            if drop_reader:
+                self._streamer_event_reader = None
+                self._streamer_event_path = None
+            for item in tree.get_children(""):
+                tree.delete(item)
+            self.stream_latest_command_var.set("-")
+            self.stream_last_result_var.set("-")
+
+        raw_run = str(active_run or "").strip()
+        if not raw_run or raw_run in {"-", "n/a", "unknown"}:
+            clear_display(drop_reader=True)
+            return
+        try:
+            run_path = self._resolve_text_path(raw_run)
+        except (OSError, ValueError):
+            clear_display(drop_reader=True)
+            return
+        if self._streamer_event_path != run_path:
+            clear_display(drop_reader=True)
+            self._streamer_event_reader = StreamerEventReader.for_run(run_path, max_rows=100)
+            self._streamer_event_path = run_path
+        rows, diagnostics = self._streamer_event_reader.poll()
+        for item in tree.get_children(""):
+            tree.delete(item)
+        for position, row in enumerate(rows):
+            command = row.get("command") if isinstance(row.get("command"), dict) else {}
+            target = ""
+            if command.get("row") is not None and command.get("column") is not None:
+                target = f"R{command['row']} C{command['column']}"
+                if command.get("slot") is not None:
+                    target += f" · slot {command['slot']}"
+            legal = row.get("legal")
+            legal_text = "YES" if legal is True else "NO" if legal is False else row.get("legality", "?")
+            executed = row.get("executed")
+            executed_text = "YES" if executed is True else "NO" if executed is False else "?"
+            label = str(row.get("command_label") or "")
+            command_text = label.split(" at ", 1)[0] if label else str(row.get("event_type") or "")
+            tree.insert(
+                "",
+                "end",
+                iid=f"event-{position}",
+                values=(
+                    row.get("time", ""),
+                    row.get("viewer", ""),
+                    command_text,
+                    target,
+                    legal_text,
+                    executed_text,
+                    row.get("result", ""),
+                ),
+            )
+        if rows:
+            latest = rows[-1]
+            self.stream_latest_command_var.set(latest.get("command_label") or "-")
+            self.stream_last_result_var.set(
+                latest.get("result") or latest.get("execution_status") or "-"
+            )
+        else:
+            self.stream_latest_command_var.set("-")
+            self.stream_last_result_var.set("-")
+        if diagnostics.get("last_error"):
+            self.stream_validation_var.set(
+                "Streamer event history warning: " + str(diagnostics["last_error"])
+            )
+
+    def inspect_action_id(self) -> None:
+        try:
+            action_id = int(self.action_inspector_id_var.get().strip())
+        except ValueError:
+            self.action_inspector_result_var.set("Action ID must be a whole number from 0 through 840.")
+            return
+        decoded = adventure_identity_action_to_slot_cell(action_id)
+        kind = int(decoded.get("kind", -1))
+        if kind == 0:
+            result = "Action 0: WAIT (Full-Adventure 6×10 policy)"
+        elif kind == 1:
+            result = (
+                f"Action {action_id}: slot {int(decoded['slot_index']) + 1} · "
+                f"viewer R{int(decoded['row']) + 1} C{int(decoded['column']) + 1} · "
+                f"canonical row={decoded['row']} col={decoded['column']}"
+            )
+        else:
+            result = "Out of range: Full-Adventure action IDs are 0 through 840."
+        self.action_inspector_result_var.set(result)
+
+    def refresh_generalist_models(self) -> None:
+        self._show_page("Runs & Models")
+        self._append_log(
+            "Runs & Models opened. Refresh never changes evaluation, resume, or BASELINE paths; "
+            "select an artifact and choose its explicit destination.\n"
+        )
+
+    def refresh_generalist_eval_model(self) -> None:
+        self.refresh_generalist_models()
+
+    def refresh_generalist_resume_model(self) -> None:
+        self.refresh_generalist_models()
+
+    def open_run_folder(self) -> None:
+        path = self._selected_run_dir()
+        if path is None:
+            path = self.repo_root / "runs"
+        if not path.exists():
+            self._append_log(f"ERROR: Folder does not exist: {path}\n")
+            return
+        self._open_folder_path(path)
+
     def _selected_run_dir(self) -> Optional[Path]:
-        run_dir = self.generalist_run_dir_var.get().strip()
+        if self.current_page == "Streamer":
+            run_dir = self.streamer_run_dir_var.get().strip()
+        elif self.current_page == "Evaluation":
+            run_dir = self.eval_run_dir_var.get().strip()
+        else:
+            run_dir = self.generalist_run_dir_var.get().strip()
         model_path = (
             self.generalist_eval_model_path_var.get().strip()
             or self.generalist_resume_model_path_var.get().strip()
@@ -2374,7 +3305,11 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
             self._schedule_after("_close_after_id", CLOSE_POLL_MS, self._poll_close_cleanup)
             return
 
-        for thread in (self._stopper_thread, self._reader_thread):
+        for thread in (
+            self._stopper_thread,
+            self._reader_thread,
+            getattr(self, "_artifact_scan_thread", None),
+        ):
             if thread is not None and thread is not threading.current_thread() and thread.is_alive():
                 thread.join(timeout=PROCESS_THREAD_JOIN_SECONDS)
         self._drain_remaining_logs_for_close()
@@ -2395,6 +3330,8 @@ class PvZDashboard(GuiCommandMixin, ProcessLogMixin, GuiStatusViewMixin):
         self._stopping_process = None
         self._reader_thread = None
         self._stopper_thread = None
+        if hasattr(self, "_artifact_scan_thread"):
+            self._artifact_scan_thread = None
         try:
             self.root.destroy()
         except tk.TclError:

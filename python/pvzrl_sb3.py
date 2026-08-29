@@ -22,6 +22,8 @@ from gymnasium import spaces
 from pvzrl_actions import build_action_intent
 from pvzrl_action_space import (
     ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
     build_action_space_spec,
     decode_policy_action,
     normalize_action_space_mode,
@@ -53,10 +55,16 @@ from pvzrl_human_coach import (
     human_coach_live_status_from_hook,
 )
 from pvzrl_observation_layout import build_observation_layout
-from pvzrl_observation_facts import ObservationIdentity, StepFacts, observation_identity
+from pvzrl_observation_facts import (
+    ObservationIdentity,
+    StepFacts,
+    build_step_facts,
+    observation_identity,
+)
 from pvzrl_rewards import (
     REWARD_COMPONENT_FIELDS,
     REWARD_EPISODE_TOTAL_FIELDS,
+    REWARD_POLICY_VERSION,
     RewardConfig,
     merge_reward_components,
 )
@@ -64,7 +72,10 @@ from pvzrl_runtime_state import EpisodeRuntimeState, WatchdogRuntimeState
 from pvzrl_seed_inventory import adventure_identity_features
 from pvzrl_stream_coach import StreamCoachController
 from pvzrl_assisted_coach import InterventionJSONLLogger
-from pvzrl_streamer_logging import BufferedStreamerEventLogger
+from pvzrl_streamer_logging import (
+    BufferedStreamerEventLogger,
+    observation_vector_digest,
+)
 
 
 @dataclass
@@ -83,8 +94,8 @@ class PvZSB3Config:
     max_seed_slots: Optional[int] = None
     observation_version: str = ""
     action_decoder_version: str = ""
-    row_count: int = 5
-    column_count: int = 10
+    row_count: int = DEFAULT_ROWS
+    column_count: int = DEFAULT_COLS
     game_speed: float = 4.0
     game_speed_mode: str = "game_speed"
     seed: int = 12345
@@ -228,6 +239,120 @@ def _stream_raw_text(command: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def apply_streamer_sun_reservation_mask(
+    mask: np.ndarray,
+    observation: Dict[str, Any],
+    *,
+    reserved_sun: int,
+    action_decision: Any,
+    wait_action: int = 0,
+) -> np.ndarray:
+    """Mask policy actions that would spend a pending viewer reservation.
+
+    The callback is the existing canonical ``action_decision`` path.  This
+    helper only applies the resource-priority predicate; it never substitutes
+    a different action after PPO selects one.
+    """
+
+    output = np.asarray(mask, dtype=bool).copy()
+    reservation = max(0, int(reserved_sun))
+    if reservation <= 0:
+        if 0 <= int(wait_action) < output.size:
+            output[int(wait_action)] = True
+        return output
+    try:
+        current_sun = int(observation.get("sun", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        current_sun = 0
+    for action_id in range(output.size):
+        if action_id == int(wait_action) or not bool(output[action_id]):
+            continue
+        try:
+            decision = action_decision(int(action_id))
+            required_sun = max(0, int(getattr(decision, "required_sun", 0) or 0))
+        except Exception:
+            # A canonical decision that cannot be inspected is not a safe
+            # resource-spending candidate while a reservation is active.
+            output[action_id] = False
+            continue
+        if required_sun > 0 and current_sun - required_sun < reservation:
+            output[action_id] = False
+    if 0 <= int(wait_action) < output.size:
+        output[int(wait_action)] = True
+    return output
+
+
+def _viewer_tile_snapshot(
+    observation: Dict[str, Any],
+    row: int,
+    column: int,
+) -> Dict[str, Any]:
+    """Read one tile through the canonical observation facts.
+
+    Streamer execution diagnostics must not invent a second board parser.  The
+    same ``StepFacts`` used by the action validator is therefore used to prove
+    whether the requested tile changed after the bridge call.  ``known`` is
+    false when the observation did not expose board plant collections, in
+    which case the bridge result remains the available execution authority.
+    """
+
+    raw_plants = observation.get("plants")
+    raw_visible = observation.get("visiblePlants")
+    known = isinstance(raw_plants, list) or isinstance(raw_visible, list)
+    snapshot: Dict[str, Any] = {
+        "known": bool(known),
+        "occupied": False,
+        "count": 0,
+        "signature": (),
+        "resulting_plant": None,
+        "resulting_plant_type": -1,
+    }
+    if not known:
+        return snapshot
+    try:
+        facts = build_step_facts(observation)
+        candidates = [
+            plant
+            for plant in (*facts.plants, *facts.visible_plants)
+            if int(plant.row) == int(row) and int(plant.column) == int(column)
+        ]
+        unique: Dict[tuple[int, int, int, int], Any] = {}
+        for plant in candidates:
+            key = (
+                int(getattr(plant, "instance_id", 0) or 0),
+                int(getattr(plant, "plant_type", -1)),
+                int(getattr(plant, "row", -1)),
+                int(getattr(plant, "column", -1)),
+            )
+            unique.setdefault(key, plant)
+        plants = tuple(unique.values())
+        snapshot["occupied"] = bool(plants)
+        snapshot["count"] = len(plants)
+        snapshot["signature"] = tuple(
+            sorted(
+                (
+                    int(getattr(plant, "plant_type", -1)),
+                    int(getattr(plant, "instance_id", 0) or 0),
+                )
+                for plant in plants
+            )
+        )
+        primary = facts.occupant_by_cell.get((int(row), int(column)))
+        if primary is None and plants:
+            primary = plants[-1]
+        if primary is not None:
+            plant_type = int(getattr(primary, "plant_type", -1))
+            snapshot["resulting_plant_type"] = plant_type
+            snapshot["resulting_plant"] = str(
+                getattr(primary, "type_name", "") or plant_type_name(plant_type)
+            )
+    except Exception:
+        # A malformed diagnostic payload must not make a successful bridge
+        # action look verified.  Keep the board state explicitly unknown.
+        snapshot["known"] = False
+    return snapshot
+
+
 class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
     """Adventure Generalist Gymnasium wrapper around the live PvZ bridge."""
 
@@ -326,6 +451,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._streamer_v1_last_action: Optional[Dict[str, Any]] = None
         self._streamer_v1_last_action_source = "MODEL"
         self._streamer_v1_intervention_count = 0
+        self._streamer_v1_policy_action_mask: Optional[np.ndarray] = None
+        self._streamer_v1_policy_observation_revision = ""
         self._streamer_v1_training_status: Dict[str, Any] = {}
         self._streamer_v1_distinct_viewers: set[str] = set()
         self._streamer_v1_distinct_viewer_capacity = 100_000
@@ -428,6 +555,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "cycle_policy_steps_completed",
             "next_evaluation_countdown",
             "bc_demonstration_count",
+            "bc_demo_rejected_count",
             "bc_loss",
             "bc_update_count",
             "total_environment_actions",
@@ -438,7 +566,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 self._streamer_v1_training_status[key] = value
 
     def _streamer_v1_live_status(self) -> Dict[str, Any]:
-        controller = self.streamer_v1_controller
+        controller = getattr(self, "streamer_v1_controller", None)
         if controller is None:
             return {"streamer_v1_enabled": False}
         try:
@@ -480,6 +608,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         viewer_selected: Optional[Any],
         viewer_resolution: Optional[Any],
         viewer_source_metadata: Dict[str, Any],
+        viewer_execution_mask: Optional[np.ndarray],
+        viewer_execution_observation_revision: str,
+        reserved_sun: int,
         proposed_action: int,
         executed_action: int,
         pre_observation: Dict[str, Any],
@@ -537,30 +668,207 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         decision = getattr(viewer_resolution, "decision", None)
         action_kind = str(getattr(decision, "resolved_action_kind", "") or "")
         expected_action = int(getattr(viewer_resolution, "action_id", executed_action))
-        bridge_executed = self._safe_int_value(result.get("executedAction"), default=-1)
+        bridge_executed = self._safe_int_value(
+            result.get("executedAction"),
+            default=int(executed_action),
+        )
         action_matched = bridge_executed == expected_action
-        accepted_effect = (
-            bool(result.get("fusionSucceeded"))
-            if action_kind == "fusion"
-            else bool(result.get("plantPlaced") or placement.get("success"))
+        pre_observation_identity = observation_identity(pre_observation).token
+        policy_observation_revision = str(
+            getattr(self, "_streamer_v1_policy_observation_revision", "") or ""
         )
-        execution_succeeded = bool(
-            action_matched
-            and accepted_effect
-            and not result.get("illegalAction")
-            and not result.get("bridgeTimeout")
-            and not info.get("bridge_error")
+        policy_revision_match = bool(
+            policy_observation_revision
+            and policy_observation_revision == pre_observation_identity
         )
-        execution_status = (
-            "executed"
-            if execution_succeeded
-            else str(
-                result.get("illegalReason")
-                or result.get("fusionNoEffectReason")
-                or info.get("terminal_reason")
-                or "execution_not_proven"
+        policy_mask = getattr(self, "_streamer_v1_policy_action_mask", None)
+        policy_mask_allowed = bool(
+            policy_revision_match
+            and isinstance(policy_mask, np.ndarray)
+            and 0 <= expected_action < int(policy_mask.shape[0])
+            and bool(policy_mask[expected_action])
+        )
+        viewer_mask_allowed = bool(
+            isinstance(viewer_execution_mask, np.ndarray)
+            and 0 <= expected_action < int(viewer_execution_mask.shape[0])
+            and bool(viewer_execution_mask[expected_action])
+        )
+        canonical_legality_result = (
+            "LEGAL" if bool(getattr(viewer_resolution, "legal", False)) else
+            str(getattr(viewer_resolution, "classification", "STALE") or "STALE").upper()
+        )
+        canonical_legality_reason = str(
+            getattr(viewer_resolution, "reason", "") or ""
+        )
+        actual_action_decision = result.get("actionDecision")
+        if not isinstance(actual_action_decision, dict):
+            structured_result = result.get("structuredActionResult")
+            actual_action_decision = (
+                structured_result.get("decision")
+                if isinstance(structured_result, dict)
+                else None
             )
+        actual_frame_identity = (
+            str(actual_action_decision.get("frame_identity") or "")
+            if isinstance(actual_action_decision, dict)
+            else ""
         )
+        canonical_frame_identity = str(
+            getattr(viewer_resolution, "frame_identity", "") or ""
+        )
+        execution_revision_match = bool(
+            viewer_execution_observation_revision
+            and viewer_execution_observation_revision == pre_observation_identity
+            and canonical_frame_identity
+            and actual_frame_identity
+            and canonical_frame_identity == actual_frame_identity
+        )
+
+        # The bridge response is the first execution gate.  A placement result
+        # is accepted only when the canonical bridge reports both placement and
+        # payment; fusion uses its dedicated success flag.  Calling env.step()
+        # alone is not evidence that the viewer action reached the game.
+        bridge_timeout = bool(result.get("bridgeTimeout"))
+        bridge_error = str(info.get("bridge_error") or result.get("bridgeError") or "")
+        explicit_rejection = bool(result.get("illegalAction"))
+        if placement and placement.get("success") is False:
+            explicit_rejection = True
+        if action_kind == "fusion":
+            accepted_effect = bool(
+                result.get("fusionSucceeded")
+                or placement.get("success")
+            )
+        else:
+            accepted_effect = bool(
+                placement.get("success")
+                or (
+                    result.get("plantPlaced")
+                    and result.get("costPaid")
+                )
+            )
+        bridge_success = bool(
+            bool(result)
+            and not bridge_timeout
+            and not bridge_error
+            and not explicit_rejection
+            and accepted_effect
+        )
+
+        intent = getattr(viewer_resolution, "intent", None)
+        requested_slot = self._safe_int_value(
+            getattr(intent, "seed_slot", -1),
+            default=-1,
+        )
+        requested_row = self._safe_int_value(
+            getattr(intent, "row", -1),
+            default=-1,
+        )
+        requested_col = self._safe_int_value(
+            getattr(intent, "column", -1),
+            default=-1,
+        )
+        pre_tile = _viewer_tile_snapshot(pre_observation, requested_row, requested_col)
+        post_tile = _viewer_tile_snapshot(post_observation, requested_row, requested_col)
+        mutation_verification_available = bool(pre_tile["known"] and post_tile["known"])
+        expected_plant_type = self._safe_int_value(
+            getattr(decision, "selected_plant_type", -1),
+            default=-1,
+        )
+        if action_kind == "fusion":
+            tile_mutated = pre_tile["signature"] != post_tile["signature"]
+        else:
+            tile_mutated = bool(
+                not pre_tile["occupied"]
+                and post_tile["occupied"]
+                and pre_tile["signature"] != post_tile["signature"]
+            )
+            if expected_plant_type >= 0 and post_tile["resulting_plant_type"] >= 0:
+                tile_mutated = bool(
+                    tile_mutated
+                    and post_tile["resulting_plant_type"] == expected_plant_type
+                )
+        mutation_verified = bool(
+            not mutation_verification_available or tile_mutated
+        )
+
+        if bridge_timeout or bridge_error or not result:
+            bridge_reason = "bridge_timeout" if bridge_timeout else bridge_error or "bridge_result_missing"
+            execution_status = "bridge_failed"
+        elif explicit_rejection or not accepted_effect:
+            bridge_reason = str(
+                result.get("illegalReason")
+                or placement.get("illegalReason")
+                or result.get("fusionNoEffectReason")
+                or "bridge_rejected"
+            )
+            execution_status = "bridge_rejected"
+        elif not action_matched:
+            bridge_reason = "executed_action_mismatch"
+            execution_status = "bridge_failed"
+        elif not mutation_verified:
+            bridge_reason = "post_observation_no_mutation"
+            execution_status = "dispatched"
+        else:
+            bridge_reason = (
+                "success"
+                if mutation_verification_available
+                else "bridge_success_unverified_board"
+            )
+            execution_status = "executed_verified"
+        canonical_execution_succeeded = bool(
+            bridge_success
+            and action_matched
+            and mutation_verified
+        )
+        if not execution_revision_match:
+            canonical_legality_result = "STALE"
+            canonical_legality_reason = "observation_revision_mismatch"
+        elif not viewer_mask_allowed:
+            canonical_legality_result = "STALE"
+            canonical_legality_reason = "viewer_execution_mask_disallowed"
+        viewer_diagnostics = {
+            "action_id": expected_action,
+            "viewer_action_id": expected_action,
+            "observation_revision": pre_observation_identity,
+            "viewer_observation_revision": pre_observation_identity,
+            "demonstration_observation_revision": pre_observation_identity,
+            "policy_mask_allowed": policy_mask_allowed,
+            "viewer_execution_mask_allowed": viewer_mask_allowed,
+            "demonstration_mask_allowed": viewer_mask_allowed,
+            "canonical_legality_result": canonical_legality_result,
+            "canonical_legality_reason": canonical_legality_reason,
+            "reserved_sun": max(0, int(reserved_sun)),
+            "bridge_success": bool(bridge_success),
+            "execution_status": execution_status,
+            "execution_result": {
+                "status": execution_status,
+                "bridge_success": bool(bridge_success),
+                "executed_action": int(bridge_executed),
+            },
+            "bc_demo_recorded": False,
+            "bc_demo_reject_reason": "",
+        }
+        demo_reject_reason = ""
+        if not canonical_execution_succeeded:
+            demo_reject_reason = canonical_legality_reason or bridge_reason
+        elif not execution_revision_match:
+            demo_reject_reason = "observation_revision_mismatch"
+        elif not viewer_mask_allowed:
+            demo_reject_reason = "viewer_execution_mask_disallowed"
+        elif not policy_revision_match:
+            demo_reject_reason = "observation_revision_mismatch"
+        execution_succeeded = canonical_execution_succeeded
+        demo_eligible = bool(canonical_execution_succeeded and not demo_reject_reason)
+        viewer_diagnostics["bc_demo_reject_reason"] = demo_reject_reason
+        controller = getattr(self, "streamer_v1_controller", None)
+        if controller is not None and hasattr(controller, "record_viewer_execution"):
+            try:
+                controller.record_viewer_execution(
+                    str(viewer_source_metadata.get("command_id") or ""),
+                    succeeded=execution_succeeded,
+                )
+            except Exception:
+                pass
         structured_command = viewer_source_metadata.get("viewer_command")
         demonstration = {
             "observation_version": str(self.config.observation_version),
@@ -583,6 +891,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "executed_at_unix": time.time(),
             "reward": float(reward),
             "result": execution_status,
+            "bridge_success": bool(bridge_success),
+            "bridge_reason": bridge_reason,
+            "pre_sun": self._safe_int_value(pre_observation.get("sun"), default=0),
+            "post_sun": self._safe_int_value(post_observation.get("sun"), default=0),
+            "pre_tile_occupancy": bool(pre_tile["occupied"]),
+            "post_tile_occupancy": bool(post_tile["occupied"]),
+            "resulting_plant": post_tile["resulting_plant"],
+            "mutation_verification_available": mutation_verification_available,
+            "mutation_verified": mutation_verified,
+            **viewer_diagnostics,
         }
         transition = {
             "schema_version": 1,
@@ -592,23 +910,63 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "requested_action": expected_action,
             "executed_action": bridge_executed,
             "execution_succeeded": execution_succeeded,
-            "demo_eligible": execution_succeeded,
+            "demo_eligible": demo_eligible,
             "execution_status": execution_status,
+            "bridge_success": bool(bridge_success),
+            "bridge_reason": bridge_reason,
+            "viewer_action_id": expected_action,
+            "policy_mask_allowed": policy_mask_allowed,
+            "demonstration_mask_allowed": viewer_mask_allowed,
+            "canonical_legality_result": canonical_legality_result,
+            "canonical_legality_reason": canonical_legality_reason,
+            "viewer_observation_revision": pre_observation_identity,
+            "demonstration_observation_revision": pre_observation_identity,
+            "demonstration_action_mask": (
+                viewer_execution_mask.tolist()
+                if isinstance(viewer_execution_mask, np.ndarray)
+                else None
+            ),
+            "demonstration_observation_digest": observation_vector_digest(
+                self._encode_observation(
+                    pre_observation,
+                    facts=build_step_facts(pre_observation, self.config.plant_types),
+                )
+            ),
+            "policy_observation_revision": policy_observation_revision,
             "demonstration": demonstration,
         }
         info["streamer_transition"] = transition
+        info["streamer_viewer_diagnostics"] = dict(viewer_diagnostics)
         info["action_source"] = "TWITCH"
         info["viewer_action"] = expected_action
         info["model_action"] = int(proposed_action)
         self._streamer_v1_last_action_source = "TWITCH"
-        self._streamer_v1_intervention_count += 1
+        if execution_succeeded:
+            self._streamer_v1_intervention_count += 1
         self._streamer_v1_last_action = {
             "action_id": expected_action,
+            "viewer_action_id": expected_action,
+            "decoded_action_id": expected_action,
             "command_id": str(viewer_source_metadata.get("command_id") or ""),
             "event_id": str(viewer_source_metadata.get("event_id") or ""),
             "command_type": str(viewer_source_metadata.get("command_kind") or ""),
+            "requested_slot": requested_slot,
+            "requested_row": requested_row,
+            "requested_col": requested_col,
+            "bridge_success": bool(bridge_success),
+            "bridge_reason": bridge_reason,
+            "pre_sun": self._safe_int_value(pre_observation.get("sun"), default=0),
+            "post_sun": self._safe_int_value(post_observation.get("sun"), default=0),
+            "pre_tile_occupancy": bool(pre_tile["occupied"]),
+            "post_tile_occupancy": bool(post_tile["occupied"]),
+            "resulting_plant": post_tile["resulting_plant"],
+            "selected": True,
+            "dispatched": True,
+            "selection_status": "selected",
+            "dispatch_status": "dispatched",
             "execution_status": execution_status,
             "observation_revision": demonstration["observation_revision"],
+            **viewer_diagnostics,
         }
         if logger is not None:
             logger.append(
@@ -622,15 +980,62 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                     "parsed_fields": demonstration["structured_command"],
                     "model_action": int(proposed_action),
                     "viewer_action": expected_action,
+                    "viewer_action_id": expected_action,
                     "executed_action": bridge_executed,
                     "canonical_action_id": expected_action,
                     "action_source": "TWITCH",
                     "legal": bool(getattr(viewer_resolution, "legal", False)),
                     "execution_status": execution_status,
+                    "bridge_success": bool(bridge_success),
+                    "bridge_reason": bridge_reason,
+                    "policy_mask_allowed": policy_mask_allowed,
+                    "demonstration_mask_allowed": viewer_mask_allowed,
+                    "viewer_observation_revision": pre_observation_identity,
+                    "demonstration_observation_revision": pre_observation_identity,
+                    "pre_sun": self._safe_int_value(pre_observation.get("sun"), default=0),
+                    "post_sun": self._safe_int_value(post_observation.get("sun"), default=0),
+                    "pre_tile_occupancy": bool(pre_tile["occupied"]),
+                    "post_tile_occupancy": bool(post_tile["occupied"]),
+                    "resulting_plant": post_tile["resulting_plant"],
                     "reward": float(reward),
                     "reward_components": dict(info.get("reward_breakdown") or {}),
                 },
                 force=bool(terminated or truncated),
+            )
+
+    def record_streamer_bc_result(
+        self,
+        *,
+        action_id: int,
+        observation_revision: str,
+        recorded: bool,
+        reject_reason: str = "",
+    ) -> None:
+        """Attach the collector's BC outcome to the verified viewer event."""
+
+        current = dict(getattr(self, "_streamer_v1_last_action", {}) or {})
+        expected_revision = str(current.get("viewer_observation_revision") or "")
+        if (
+            int(current.get("viewer_action_id", current.get("action_id", -1)) or -1)
+            == int(action_id)
+            and expected_revision == str(observation_revision or "")
+        ):
+            current["bc_demo_recorded"] = bool(recorded)
+            current["bc_demo_reject_reason"] = str(reject_reason or "")
+            self._streamer_v1_last_action = current
+        logger = getattr(self, "streamer_v1_event_logger", None)
+        if logger is not None:
+            logger.append(
+                {
+                    "event": "bc_demo_result",
+                    "action_id": int(action_id),
+                    "viewer_action_id": int(action_id),
+                    "observation_revision": str(observation_revision or ""),
+                    "viewer_observation_revision": str(observation_revision or ""),
+                    "bc_demo_recorded": bool(recorded),
+                    "bc_demo_reject_reason": str(reject_reason or ""),
+                },
+                force=True,
             )
 
     def _episode_runtime_state(self) -> EpisodeRuntimeState:
@@ -837,6 +1242,16 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 )
             except Exception:
                 stale_detected = True
+        streamer_controller = getattr(self, "streamer_v1_controller", None)
+        if streamer_controller is not None and hasattr(streamer_controller, "clear_pending_state"):
+            try:
+                streamer_controller.clear_pending_state(
+                    clear_queue=True,
+                    clear_source=True,
+                    reason=reason,
+                )
+            except Exception:
+                stale_detected = True
         if hasattr(self.base, "clear_coach_runtime_state"):
             self.base.clear_coach_runtime_state(
                 queue_cleared=True,
@@ -925,6 +1340,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         reset_info = reset_info or {"reset": {"ok": True, "methodUsed": "adventure_existing_board"}}
         reset_payload = reset_info.get("reset", {}) if isinstance(reset_info, dict) else {}
         method_used = str(reset_payload.get("methodUsed") or "adventure_existing_board")
+        observation = self.base.ensure_gameplay_speed(observation)
         self.base.begin_new_attempt(observation, reason=f"adventure:{method_used}")
         stale_detected = self._clear_coach_command_state_on_reset(reason=f"adventure_{method_used}_start")
         reset_payload["coach_command_queue_cleared_on_reset"] = True
@@ -963,26 +1379,55 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         viewer_selected: Optional[Any] = None
         viewer_resolution: Optional[Any] = None
         viewer_source_metadata: Dict[str, Any] = {}
+        viewer_execution_mask: Optional[np.ndarray] = None
+        viewer_execution_observation_revision = ""
+        viewer_reserved_sun = 0
         streamer_environment_step = int(self.episode_state.global_step_count)
+        pre_action_observation = (
+            self._last_observation
+            if isinstance(self._last_observation, dict)
+            else {}
+        )
 
         if self.streamer_v1_controller is not None:
             from pvzrl_stream_actions import resolve_viewer_action
-            from pvzrl_stream_commands import safe_action_source_metadata
+            from pvzrl_stream_commands import (
+                ViewerCommandOutcome,
+                safe_action_source_metadata,
+            )
 
-            current_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
-            current_mask: Optional[np.ndarray] = None
+            try:
+                reservation = dict(self.streamer_v1_controller.pending_reservation())
+                viewer_reserved_sun = max(
+                    0,
+                    int(reservation.get("reserved_sun", 0) or 0),
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                viewer_reserved_sun = 0
 
             def resolve_current_viewer_command(command: Any) -> Any:
-                nonlocal current_mask
-                if current_mask is None:
-                    current_mask = self.action_masks()
+                nonlocal viewer_execution_mask, viewer_execution_observation_revision
+                current_observation = (
+                    self._last_observation
+                    if isinstance(self._last_observation, dict)
+                    else {}
+                )
+                # Recompute both the canonical mask and the action decision on
+                # every resolver call.  The controller can retain a temporary
+                # FIFO head across PPO steps, so a cached policy mask is not a
+                # valid execution proof when the command becomes legal.
+                (
+                    viewer_execution_mask,
+                    viewer_execution_observation_revision,
+                ) = self._viewer_execution_snapshot(current_observation)
                 return resolve_viewer_action(
                     command,
-                    action_mask=current_mask,
+                    action_mask=viewer_execution_mask,
                     action_decision=lambda action_id: self.base.action_decision(
                         int(action_id),
                         current_observation,
                         source="twitch",
+                        include_tactical_masks=False,
                     ),
                     source=self.streamer_v1_platform or "twitch",
                 )
@@ -1003,6 +1448,95 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                     )
                     viewer_selected = None
                     viewer_resolution = None
+            if viewer_selected is not None and viewer_resolution is not None:
+                # ``tick`` selected from a current resolution, but selection
+                # and the bridge dispatch are separate operations.  Recheck
+                # canonical legality immediately before dispatch and require
+                # the same action/frame identity.  A stale command is logged
+                # and falls back to this PPO step; it is never dispatched as a
+                # viewer action and never becomes a BC example.
+                fresh_observation = (
+                    self._last_observation
+                    if isinstance(self._last_observation, dict)
+                    else {}
+                )
+                (
+                    fresh_viewer_mask,
+                    fresh_viewer_revision,
+                ) = self._viewer_execution_snapshot(fresh_observation)
+                fresh_resolution = resolve_viewer_action(
+                    viewer_selected.command,
+                    action_mask=fresh_viewer_mask,
+                    action_decision=lambda action_id: self.base.action_decision(
+                        int(action_id),
+                        fresh_observation,
+                        source="twitch",
+                        include_tactical_masks=False,
+                    ),
+                    source=self.streamer_v1_platform or "twitch",
+                )
+                selected_action = int(getattr(viewer_resolution, "action_id", -1))
+                fresh_action = int(getattr(fresh_resolution, "action_id", -1))
+                same_frame = bool(
+                    str(getattr(viewer_resolution, "frame_identity", "") or "")
+                    and str(getattr(viewer_resolution, "frame_identity", "") or "")
+                    == str(getattr(fresh_resolution, "frame_identity", "") or "")
+                    and fresh_viewer_revision == observation_identity(
+                        fresh_observation
+                    ).token
+                )
+                if not bool(getattr(fresh_resolution, "legal", False)) or (
+                    fresh_action != selected_action
+                ) or not same_frame:
+                    reason = str(
+                        getattr(fresh_resolution, "reason", "")
+                        or "viewer_execution_revision_mismatch"
+                    )
+                    if not bool(getattr(fresh_resolution, "legal", False)):
+                        reason = reason or "viewer_action_not_canonically_legal"
+                    elif fresh_action != selected_action:
+                        reason = "viewer_action_resolution_changed"
+                    elif not same_frame:
+                        reason = "viewer_execution_revision_mismatch"
+                    viewer_tick = replace(
+                        viewer_tick,
+                        outcomes=(
+                            *viewer_tick.outcomes,
+                            ViewerCommandOutcome(
+                                status="stale",
+                                reason=reason,
+                                command_id=str(getattr(viewer_selected, "command_id", "") or ""),
+                                event_id=str(getattr(viewer_selected, "event_id", "") or ""),
+                                viewer_hash=str(getattr(viewer_selected, "viewer_hash", "") or ""),
+                                command=getattr(viewer_selected, "command", None),
+                                action_id=selected_action if selected_action >= 0 else None,
+                                frame_identity=str(
+                                    getattr(fresh_resolution, "frame_identity", "") or ""
+                                ),
+                                phase_generation=int(
+                                    getattr(viewer_selected, "phase_generation", 0) or 0
+                                ),
+                                legality=str(
+                                    getattr(fresh_resolution, "classification", "STALE")
+                                    or "STALE"
+                                ).upper(),
+                                required_sun=max(
+                                    0,
+                                    int(getattr(fresh_resolution, "required_sun", 0) or 0),
+                                ),
+                            ),
+                        ),
+                        selected=None,
+                        resolution=None,
+                    )
+                    viewer_selected = None
+                    viewer_resolution = None
+                    viewer_execution_mask = fresh_viewer_mask
+                    viewer_execution_observation_revision = fresh_viewer_revision
+                else:
+                    viewer_resolution = fresh_resolution
+                    viewer_execution_mask = fresh_viewer_mask
+                    viewer_execution_observation_revision = fresh_viewer_revision
             if viewer_selected is not None and viewer_resolution is not None:
                 resolved_action = getattr(viewer_resolution, "action_id", None)
                 if resolved_action is not None:
@@ -1126,7 +1660,6 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         bridge_action = policy_action
         action_started_at = time.time()
         action_started_perf = time.perf_counter()
-        pre_action_observation = self._last_observation if isinstance(self._last_observation, dict) else {}
         action_source = "model"
         raw_action_source = "model"
         source_platform = ""
@@ -1185,11 +1718,21 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         )
         action_exception = ""
         try:
+            base_step_kwargs: Dict[str, Any] = {
+                "coach_bridge_command": selected_bridge_command,
+                "coach_context": coach_context if coach_context else None,
+                "action_intent": structured_intent,
+            }
+            if viewer_selected is not None:
+                base_step_kwargs.update(
+                    {
+                        "action_source": action_source,
+                        "action_source_metadata": intent_source_metadata,
+                    }
+                )
             observation, reward, done, _, info = self.base.step(
                 bridge_action,
-                coach_bridge_command=selected_bridge_command,
-                coach_context=coach_context if coach_context else None,
-                action_intent=structured_intent,
+                **base_step_kwargs,
             )
         except BridgeTimeoutError as exc:
             action_exception = str(exc)
@@ -1468,8 +2011,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             self._episode_plants_in_threatened_row_count
             + self._episode_plants_in_unthreatened_row_count
         )
+        reward_component_total = sum(
+            float(self._episode_reward_totals.get(field_name, 0.0))
+            for field_name in REWARD_EPISODE_TOTAL_FIELDS
+        )
+        reward_accounted_total = (
+            reward_component_total + self._episode_reward_unattributed_adjustment_total
+        )
+        reward_diagnostics = dict(self._episode_last_reward_diagnostics)
         episode_summary = {
             "run_mode": self.config.run_mode,
+            "reward_policy_version": REWARD_POLICY_VERSION,
             "episode": self.episode_state.index,
             "result": done_reason,
             "reward_total": self.episode_state.reward_total,
@@ -1498,6 +2050,36 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             "illegal_actions": self.episode_state.illegal_actions,
             "avg_legal_actions": avg_legal_actions,
             "legal_action_count_mean": avg_legal_actions,
+            "terminal_reward_total": float(
+                self._episode_reward_totals.get("win_loss_reward_total", 0.0)
+            ),
+            "threat_reward_total": float(
+                self._episode_reward_totals.get("threat_delta_reward_total", 0.0)
+            ),
+            "mower_penalty_total": float(
+                self._episode_reward_totals.get("mower_loss_penalty_total", 0.0)
+            ),
+            "illegal_action_penalty_total": float(
+                self._episode_reward_totals.get("illegal_penalty_total", 0.0)
+            ),
+            "reward_component_total": reward_component_total,
+            "reward_unattributed_adjustment_total": (
+                self._episode_reward_unattributed_adjustment_total
+            ),
+            "reward_components_match": abs(
+                float(self.episode_state.reward_total) - reward_accounted_total
+            ) <= 1e-6,
+            "threat_raw_before": float(reward_diagnostics.get("threat_raw_before") or 0.0),
+            "threat_raw_after": float(reward_diagnostics.get("threat_raw_after") or 0.0),
+            "threat_before": float(reward_diagnostics.get("threat_before") or 0.0),
+            "threat_after": float(reward_diagnostics.get("threat_after") or 0.0),
+            "threat_raw_delta": float(reward_diagnostics.get("threat_raw_delta") or 0.0),
+            "threat_normalized_delta": float(
+                reward_diagnostics.get("threat_normalized_delta") or 0.0
+            ),
+            "threat_clipped_delta": float(
+                reward_diagnostics.get("threat_clipped_delta") or 0.0
+            ),
             "plants_by_row": self._row_dict(self._episode_final_plants_by_row),
             "peashooters_by_row": self._row_dict(self._episode_final_peashooters_by_row),
             "sunflowers_by_row": self._row_dict(self._episode_final_sunflowers_by_row),
@@ -1766,6 +2348,9 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 viewer_selected=viewer_selected,
                 viewer_resolution=viewer_resolution,
                 viewer_source_metadata=viewer_source_metadata,
+                viewer_execution_mask=viewer_execution_mask,
+                viewer_execution_observation_revision=viewer_execution_observation_revision,
+                reserved_sun=viewer_reserved_sun,
                 proposed_action=ppo_action,
                 executed_action=bridge_action,
                 pre_observation=pre_action_observation,
@@ -1793,10 +2378,27 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         return actions
 
     def _apply_stream_coach_reward(self, decision: Any, info: Dict[str, Any]) -> float:
+        action_result = info.get("action_result") if isinstance(info, dict) else {}
+        decoded = (
+            action_result.get("decoded")
+            if isinstance(action_result, dict)
+            and isinstance(action_result.get("decoded"), dict)
+            else {}
+        )
+        fusion_event = bool(
+            isinstance(action_result, dict)
+            and (
+                str(decoded.get("kind") or "") == "fusion"
+                or "fusionAttempted" in action_result
+                or "fusionSucceeded" in action_result
+                or bool(action_result.get("fusionCandidate"))
+            )
+        )
         if (
             not bool(self.config.stream_coach_reward)
             or not bool(getattr(decision, "selected", False))
             or bool(getattr(decision, "pending", False))
+            or fusion_event
         ):
             return 0.0
         components = {
@@ -1939,19 +2541,100 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         payload.update(self._streamer_v1_live_status())
         return payload
 
-    def action_masks(self) -> np.ndarray:
+    def _apply_streamer_v1_reservation(
+        self,
+        mask: np.ndarray,
+        observation: Dict[str, Any],
+    ) -> np.ndarray:
+        controller = getattr(self, "streamer_v1_controller", None)
+        if controller is None or not hasattr(controller, "pending_reservation"):
+            return mask
+        try:
+            reservation = dict(controller.pending_reservation())
+            reserved_sun = max(0, int(reservation.get("reserved_sun", 0) or 0))
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            return mask
+        if reserved_sun <= 0:
+            return mask
+        return apply_streamer_sun_reservation_mask(
+            mask,
+            observation,
+            reserved_sun=reserved_sun,
+            wait_action=int(getattr(self.action_spec, "wait_action", 0)),
+            action_decision=lambda action_id: self.base.action_decision(
+                int(action_id),
+                observation,
+                source="streamer_reservation",
+            ),
+        )
+
+    def _prepare_streamer_v1_pending(self, observation: Dict[str, Any]) -> None:
+        controller = getattr(self, "streamer_v1_controller", None)
+        if controller is None or not hasattr(controller, "prepare_pending"):
+            return
+        from pvzrl_stream_actions import resolve_viewer_action
+
+        raw_mask = self._viewer_execution_mask(observation)
+        controller.prepare_pending(
+            lambda command: resolve_viewer_action(
+                command,
+                action_mask=raw_mask,
+                action_decision=lambda action_id: self.base.action_decision(
+                    int(action_id),
+                    observation,
+                    source="twitch",
+                    include_tactical_masks=False,
+                ),
+                source=getattr(self, "streamer_v1_platform", "") or "twitch",
+            )
+        )
+
+    def _viewer_execution_mask(self, observation: Dict[str, Any]) -> np.ndarray:
+        """Return canonical physical legality for one exact observation frame."""
+
+        mask = np.zeros(self.action_count, dtype=bool)
+        raw_mask = self.base.action_mask(
+            observation,
+            include_tactical_masks=False,
+        )
+        copied = min(len(raw_mask), self.action_count)
+        if copied:
+            mask[:copied] = np.asarray(raw_mask[:copied], dtype=bool)
+        mask[self.action_spec.wait_action] = True
+        return mask
+
+    def _viewer_execution_snapshot(
+        self,
+        observation: Dict[str, Any],
+    ) -> tuple[np.ndarray, str]:
+        return self._viewer_execution_mask(observation), observation_identity(observation).token
+
+    def action_masks(
+        self,
+        *,
+        apply_streamer_reservation: bool = True,
+        prepare_streamer_pending: bool = True,
+    ) -> np.ndarray:
         self._assert_observation_synchronized(boundary="action_masks")
         started = time.perf_counter()
         observation = self._last_observation
         if not observation:
             observation = self.base.observe()
             self._adopt_observation(observation, source="action_masks_observe")
+        if prepare_streamer_pending:
+            self._prepare_streamer_v1_pending(observation)
         mask = np.zeros(self.action_count, dtype=bool)
         raw_mask = self.base.action_mask(observation)
         copied = min(len(raw_mask), self.action_count)
         if copied:
             mask[:copied] = np.asarray(raw_mask[:copied], dtype=bool)
         mask[self.action_spec.wait_action] = True
+        if apply_streamer_reservation:
+            mask = self._apply_streamer_v1_reservation(mask, observation)
+            self._streamer_v1_policy_action_mask = mask.copy()
+            self._streamer_v1_policy_observation_revision = observation_identity(
+                observation
+            ).token
         self._last_action_mask_ms = round((time.perf_counter() - started) * 1000.0, 3)
         return mask
 
@@ -2221,6 +2904,17 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         self._episode_reset_after_false_reward_signal_count = 0
         self._episode_timeout_reset_requested_count = 0
         self._episode_reward_totals: Dict[str, float] = {field: 0.0 for field in REWARD_EPISODE_TOTAL_FIELDS}
+        self._episode_reward_unattributed_adjustment_total = 0.0
+        self._episode_last_reward_diagnostics: Dict[str, Any] = {
+            "reward_policy_version": REWARD_POLICY_VERSION,
+            "threat_raw_before": 0.0,
+            "threat_raw_after": 0.0,
+            "threat_before": 0.0,
+            "threat_after": 0.0,
+            "threat_raw_delta": 0.0,
+            "threat_normalized_delta": 0.0,
+            "threat_clipped_delta": 0.0,
+        }
         self._episode_plant_action_counts: Counter[str] = Counter()
         self._episode_successful_placements_by_plant: Counter[str] = Counter()
         self._episode_invalid_actions_by_plant: Counter[str] = Counter()
@@ -2427,6 +3121,7 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
         breakdown = info.get("reward_breakdown") if isinstance(info, dict) else {}
         if not isinstance(breakdown, dict):
             return
+        component_sum = 0.0
         for component in REWARD_COMPONENT_FIELDS:
             field_name = f"{component}_total"
             try:
@@ -2434,6 +3129,15 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
             except (TypeError, ValueError):
                 continue
             self._episode_reward_totals[field_name] = self._episode_reward_totals.get(field_name, 0.0) + value
+            component_sum += value
+        try:
+            step_total = float(breakdown.get("reward_total") or 0.0)
+        except (TypeError, ValueError):
+            step_total = component_sum
+        self._episode_reward_unattributed_adjustment_total += step_total - component_sum
+        reward_diagnostics = info.get("reward_diagnostics")
+        if isinstance(reward_diagnostics, dict):
+            self._episode_last_reward_diagnostics.update(reward_diagnostics)
 
     def _record_environment_safety(self, info: Dict[str, Any]) -> None:
         if not isinstance(info, dict):
@@ -2869,6 +3573,8 @@ class PvZMaskedPPOEnv(gym.Env[np.ndarray, int]):
                 self._clip(legal_count / max(1, self.action_count)),
                 self._clip(float(observation.get("plantCount", 0)) / cells),
                 self._clip(float(observation.get("zombieCount", 0)) / 50.0),
+                self._clip(float(snapshot.rows) / max(1, self.rows)),
+                self._clip(float(snapshot.columns) / max(1, self.cols)),
             ]
         )
 

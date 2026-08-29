@@ -11,9 +11,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from pvzrl_action_space import DEFAULT_COLS, DEFAULT_ROWS
 
-LAWN_ROWS = 5
-LAWN_COLS = 9
+
+LAWN_ROWS = DEFAULT_ROWS
+LAWN_COLS = DEFAULT_COLS
 SEED_PACKET_SLOTS = 14
 
 

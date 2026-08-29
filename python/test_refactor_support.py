@@ -16,6 +16,7 @@ from typing import Any, Dict
 
 import numpy as np
 
+from pvzrl_action_space import ADVENTURE_IDENTITY_ACTION_COUNT, CELLS_PER_SLOT
 from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 
 
@@ -70,15 +71,15 @@ def dense_observation(*, slot_count: int) -> Dict[str, Any]:
         2: "CherryBomb",
         3: "WallNut",
         4: "PotatoMine",
-        5: "SnowPea",
-        6: "Chomper",
-        7: "Repeater",
-        8: "PuffShroom",
-        9: "SunShroom",
-        10: "FumeShroom",
-        11: "GraveBuster",
+        5: "Chomper",
+        6: "SmallPuff",
+        7: "FumeShroom",
+        8: "HypnoShroom",
+        9: "ScaredyShroom",
+        10: "IceShroom",
+        11: "DoomShroom",
     }
-    costs = {0: 100, 1: 50, 2: 150, 3: 50, 4: 25, 5: 175, 6: 150, 7: 200, 8: 0, 9: 25, 10: 75, 11: 75}
+    costs = {0: 100, 1: 50, 2: 150, 3: 50, 4: 25, 5: 150, 6: 0, 7: 75, 8: 75, 9: 25, 10: 75, 11: 125}
     observation["seedSlots"] = [
         {
             "slotIndex": index,
@@ -156,10 +157,10 @@ def dense_observation(*, slot_count: int) -> Dict[str, Any]:
     legal_actions = [0]
     empty_flats = [flat for flat in range(cells) if flat not in occupied_flats]
     for slot_index in range(slot_count):
-        legal_actions.extend(1 + slot_index * cells + flat for flat in empty_flats)
+        legal_actions.extend(1 + slot_index * CELLS_PER_SLOT + flat for flat in empty_flats)
     observation["legalActions"] = legal_actions
     observation["legalActionCount"] = len(legal_actions)
-    observation["actionCount"] = 1 + slot_count * cells
+    observation["actionCount"] = ADVENTURE_IDENTITY_ACTION_COUNT
     observation["sun"] = 500
     return observation
 

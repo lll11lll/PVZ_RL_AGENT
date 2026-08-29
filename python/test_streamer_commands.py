@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import threading
 from dataclasses import FrozenInstanceError, dataclass
@@ -16,7 +17,7 @@ from pvzrl_stream_commands import (
 )
 from pvzrl_streamer_source import StreamSourceMessage
 from pvzrl_streamer_logging import BufferedStreamerEventLogger
-from train_ppo import RotatingTextStream
+from train_ppo import RotatingTextStream, TeeStream
 
 
 VIEWER_A = "a" * 64
@@ -122,7 +123,7 @@ def test_strict_parser_accepts_only_v1_forms_and_converts_once(
         ("!plant pea 1", "wrong_argument_count"),
         ("!plant unknown 1 1", "unknown_plant"),
         ("!plant pea 0 1", "row_out_of_range"),
-        ("!plant pea 6 1", "row_out_of_range"),
+        ("!plant pea 7 1", "row_out_of_range"),
         ("!plant pea 1 0", "column_out_of_range"),
         ("!plant pea 1 11", "column_out_of_range"),
         ("!slot 0 1 1", "slot_out_of_range"),
@@ -515,3 +516,13 @@ def test_streamer_console_log_rotation_is_bounded(tmp_path) -> None:
     files = list(tmp_path.glob("streamer.log*"))
     assert 1 <= len(files) <= 3
     assert all(file.stat().st_size <= 1100 for file in files)
+
+
+def test_tee_stream_write_is_safe_after_rotating_handle_close(tmp_path) -> None:
+    path = tmp_path / "streamer.log"
+    stream = RotatingTextStream(path, max_bytes=1024, backup_count=2)
+    proxy = TeeStream(io.StringIO(), stream)
+    stream.close()
+
+    assert proxy.write("\u001b[0m") == len("\u001b[0m")
+    proxy.flush()

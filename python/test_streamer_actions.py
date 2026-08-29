@@ -8,6 +8,7 @@ import pytest
 
 from pvzrl_action_space import (
     ADVENTURE_IDENTITY_ACTION_COUNT,
+    CELLS_PER_SLOT,
     adventure_identity_action_to_slot_cell,
 )
 from pvzrl_actions import (
@@ -17,10 +18,13 @@ from pvzrl_actions import (
     ActionIntent,
 )
 from pvzrl_stream_actions import (
+    LEGAL,
+    PERMANENTLY_INVALID,
     RESOLUTION_CURRENTLY_ILLEGAL,
     RESOLUTION_RESOLVED,
     RESOLUTION_STALE,
     RESOLUTION_UNRESOLVABLE,
+    TEMPORARILY_BLOCKED,
     ViewerActionResolver,
     resolve_queued_viewer_action,
     resolve_viewer_action,
@@ -32,7 +36,7 @@ VIEWER_HASH = "c" * 64
 
 
 def policy_action(slot: int, row: int, column: int) -> int:
-    return 1 + int(slot) * 50 + int(row) * 10 + int(column)
+    return 1 + int(slot) * CELLS_PER_SLOT + int(row) * 10 + int(column)
 
 
 def decision_for(
@@ -142,6 +146,7 @@ def test_plant_name_uses_first_legal_duplicate_slot_in_action_id_order() -> None
     )
 
     assert resolved.legal
+    assert resolved.legality == LEGAL
     assert resolved.classification == RESOLUTION_RESOLVED
     assert resolved.action_id == first
     assert resolved.intent is not None and resolved.intent.source == "twitch"
@@ -183,7 +188,7 @@ def test_named_plant_absent_from_loadout_is_unresolvable() -> None:
     assert resolved.reason == "plant_not_in_current_loadout"
 
 
-def test_slot_command_resolves_exact_identity_and_never_implicitly_fuses() -> None:
+def test_slot_command_resolves_exact_identity_and_can_select_a_fusion_ingredient() -> None:
     command = parse_viewer_command("!slot 14 5 10")
     snapshot = DecisionSnapshot(row=4, column=9, slot_types={13: 2})
     exact = snapshot.set(13, legal=True)
@@ -199,9 +204,11 @@ def test_slot_command_resolves_exact_identity_and_never_implicitly_fuses() -> No
         resolved_kind=ACTION_KIND_FUSION,
     )
     fusion_instead = resolve_viewer_action(command, action_mask=snapshot.mask, action_decision=snapshot)
-    assert not fusion_instead.legal
-    assert fusion_instead.classification == RESOLUTION_CURRENTLY_ILLEGAL
-    assert fusion_instead.reason == "slot_command_requires_empty_tile"
+    assert fusion_instead.legal
+    assert fusion_instead.classification == RESOLUTION_RESOLVED
+    assert fusion_instead.action_id == exact
+    assert fusion_instead.decision is not None
+    assert fusion_instead.decision.resolved_action_kind == ACTION_KIND_FUSION
 
 
 def test_plant_command_never_turns_into_fusion() -> None:
@@ -279,6 +286,7 @@ def test_fusion_requires_a_currently_legal_canonical_fusion_action() -> None:
     assert not blocked.legal
     assert blocked.classification == RESOLUTION_CURRENTLY_ILLEGAL
     assert blocked.reason == "cooldown_not_ready"
+    assert blocked.legality == TEMPORARILY_BLOCKED
 
     empty_snapshot = DecisionSnapshot(row=0, column=0, slot_types={0: 0})
     tile = resolve_viewer_action(

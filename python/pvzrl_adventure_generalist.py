@@ -31,6 +31,7 @@ from pvzrl_adventure import (
 )
 from pvzrl_env import (
     active_gameplay_bank_state,
+    gameplay_slot_identity_verification,
     normalize_plant_name,
     parse_seed_list,
     plant_type_name,
@@ -51,7 +52,7 @@ from pvzrl_sb3 import PvZMaskedPPOEnv, PvZSB3Config
 from pvzrl_telemetry import live_status_significant_state
 
 
-ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_v1"
+ADVENTURE_GENERALIST_MODEL_FAMILY = "ppo_adventure_generalist_14slot_identity_full_v2"
 ADVENTURE_GENERALIST_RUN_MODE_TRAIN = "adventure_generalist_14slot_train"
 ADVENTURE_GENERALIST_RUN_MODE_EVAL = "adventure_generalist_14slot_eval"
 ADVENTURE_GENERALIST_INITIAL_LOADOUT = ["SunFlower", "SunFlower", "Peashooter", "Peashooter"]
@@ -639,18 +640,16 @@ class AdventureSeedCurriculum:
             for state in self.active_guarantees()
             if state.seed in selectable_set
         ]
-        has_progressed = bool(
-            self.last_committed_loadout
-            or any(
-                int(self.episodes_included.get(seed, 0)) > 0
-                for seed in self.unlock_episode
-                if seed not in initial_unique
-            )
-        )
+        # A completed starter-only episode must not itself authorize a slot
+        # rotation.  In particular, ``last_committed_loadout`` is expected
+        # after the first attempt and used to make the curriculum durable; it
+        # is not evidence that the configured duplicate deck may change.
+        # Without this guard, the component builder filled the remaining two
+        # slots from the start of ``initial_loadout`` and changed
+        # Sun,Sun,Pea,Pea into Sun,Pea,Sun,Sun on the next seed screen.
         preserve_initial = (
             not active_guarantees
             and not new_candidates
-            and not has_progressed
             and capacity >= len(self.initial_loadout)
         )
         guaranteed_selected: List[str] = []
@@ -1488,7 +1487,7 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             "status": "starting",
             "state": "STARTING",
             "active_run": str(self.run_dir),
-            "current_stage": "adventure_generalist_14slot_identity_v1",
+            "current_stage": "adventure_generalist_14slot_identity_full_v2",
             "current_model_family": ADVENTURE_GENERALIST_MODEL_FAMILY,
             "current_model_path": "",
             "configured_seed_list": list(self.configured_seed_list),
@@ -2716,6 +2715,34 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
             )
             return False
 
+        final_observation = selection.get("finalObservation")
+        slot_verification = selection.get("gameplaySlotVerification")
+        if isinstance(final_observation, dict) and final_observation:
+            if not isinstance(slot_verification, dict) or not slot_verification:
+                slot_verification = gameplay_slot_identity_verification(
+                    final_observation,
+                    expected_types,
+                )
+            try:
+                active_types = [
+                    int(value)
+                    for value in list(slot_verification.get("activeSeedTypes", []) or [])
+                ]
+            except (TypeError, ValueError, OverflowError):
+                active_types = []
+            if not bool(slot_verification.get("success")) or active_types != expected_types:
+                self.context["seed_selection_commit_blocked_reason"] = (
+                    "post_selection_slot_identity_mismatch:"
+                    + str(slot_verification.get("reason") or "unknown")
+                )
+                return False
+            self.context["post_selection_slot_identity_verification"] = dict(slot_verification)
+            # This single accepted observation already proves gameplayReady,
+            # seed-screen inactivity, and the exact ordered runtime slots.
+            # Do not sample a separate CardUI probe and allow stale chooser
+            # objects to veto the canonical gameplay frame.
+            return True
+
         base = getattr(self, "base", None)
         seed_probe = getattr(base, "seed_probe", None)
         if not callable(seed_probe):
@@ -2963,12 +2990,10 @@ class AdventureGeneralistTrainingEnv(PvZMaskedPPOEnv):
         # observation, not proof that every unlocked registry entry can be
         # clicked on this screen.  Keep the fallback for validating the
         # configured starter loadout, but never use it to expand the active
-        # loadout.  Capacity/unlock evidence may extend a populated screen
-        # whose current cards are visible; it must not turn an empty UI probe
-        # into a request for a card that the next strict selector cannot see.
+        # loadout. Only the cards exposed by this populated chooser can
+        # authorize a new slot identity; unlock/capacity signals remain
+        # diagnostics until CardUI exposes the matching card.
         current_seed_screen_candidates = list(selectable)
-        if selectable:
-            current_seed_screen_candidates.extend(capacity_inference.available_priority_seeds)
         selection_candidates = _filter_loadout_candidate_seeds(
             current_seed_screen_candidates,
             eligible_seeds=eligible_seeds,
@@ -3462,9 +3487,13 @@ def resolve_adventure_generalist_seed_capacity(
         allow_weak_unlocked_capacity_fallback=allow_weak_unlocked_capacity_fallback,
         max_seed_slots=maximum,
     )
-    raw_effective = _clamp_capacity(max(observed_capacity, inferred_capacity), maximum=maximum)
-    previous_effective = _clamp_capacity(previous_effective_capacity or raw_effective, maximum=maximum)
-    max_seen = _clamp_capacity(max(previous_effective, raw_effective), maximum=maximum)
+    # A visible/unlocked card proves it is a candidate for a rotation, not
+    # that the chooser has gained another selectable slot. Only live capacity
+    # evidence may grow the requested deck. This prevents a four-slot screen
+    # from receiving a five-card request immediately after an unlock.
+    del previous_effective_capacity
+    raw_effective = observed_capacity
+    max_seen = raw_effective
     return SeedCapacityInference(
         bridge_reported_capacity=bridge_reported_capacity,
         observed_capacity=observed_capacity,

@@ -13,6 +13,7 @@ from pvzrl_streamer import (
     compare_evaluations,
     run_streamer_cycles,
 )
+from train_ppo import _streamer_cycle_prior_metrics
 
 
 def _model(path: Path, body: bytes = b"model") -> Path:
@@ -23,6 +24,38 @@ def _model(path: Path, body: bytes = b"model") -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def test_external_baseline_record_cannot_become_new_cycle_recovery_progress(
+    tmp_path: Path,
+) -> None:
+    baseline = _model(tmp_path / "old-experiment" / "model.zip", b"baseline")
+    current = tmp_path / "new-experiment" / "checkpoints" / "current" / "model.zip"
+    historical_record = {
+        "role": "CURRENT",
+        "training_cycle": 1,
+        "model_steps": 505_000,
+        "training_metrics": {
+            "status": "trained_complete",
+            "ppo_policy_timesteps": 5_000,
+            "next_adventure_level": 2,
+        },
+    }
+
+    assert _streamer_cycle_prior_metrics(
+        start_model=baseline,
+        experiment_current_model=current,
+        cycle=1,
+        source_record=historical_record,
+    ) == {}
+
+    current.parent.mkdir(parents=True, exist_ok=True)
+    assert _streamer_cycle_prior_metrics(
+        start_model=current,
+        experiment_current_model=current,
+        cycle=1,
+        source_record=historical_record,
+    ) == historical_record["training_metrics"]
 
 
 def test_evaluation_comparison_uses_win_rate_then_reward_and_retains_ties() -> None:
@@ -370,6 +403,18 @@ def test_existing_cycle_evaluation_protocol_mismatch_fails_closed(tmp_path: Path
             evaluate_checkpoint=interrupted_evaluate,
         )
     assert evaluation_calls == 2
+    interrupted_marker = json.loads(
+        (
+            experiment
+            / "cycles"
+            / "cycle_000001"
+            / "evaluation"
+            / "evaluation_state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert interrupted_marker["status"] == "in_progress"
+    assert interrupted_marker["error_type"] == "RuntimeError"
+    assert interrupted_marker["error"] == "simulated_evaluation_crash"
 
     def must_not_evaluate(*_args: Any) -> Dict[str, Any]:
         raise AssertionError("interrupted evaluation must never be rerun implicitly")

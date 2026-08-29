@@ -38,7 +38,10 @@ def build_observation_layout(spec: ActionSpaceSpec) -> ObservationLayout:
     cols = int(spec.cols)
     card_slot_count = int(spec.max_seed_slots)
     return ObservationLayout(
-        global_features=12,
+        # Live board geometry distinguishes a padded five-lane board from an
+        # empty sixth lane on a six-lane Pool board.  It is model input, not a
+        # mutable action-space dimension.
+        global_features=14,
         card_slot_count=card_slot_count,
         card_features=5 * card_slot_count,
         cell_features=6 * rows * cols,

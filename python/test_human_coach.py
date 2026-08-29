@@ -7,7 +7,14 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from pvzrl_action_space import ACTION_SPACE_ADVENTURE_14_IDENTITY, ADVENTURE_IDENTITY_ACTION_COUNT
+from pvzrl_action_space import (
+    ACTION_SPACE_ADVENTURE_14_IDENTITY,
+    ADVENTURE_IDENTITY_ACTION_COUNT,
+    ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    CELLS_PER_SLOT,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
+)
 from pvzrl_human_coach import (
     COACH_REWARD_FUSION_SUCCESS_COMPONENT,
     COACH_REWARD_LEGAL_EXECUTION_COMPONENT,
@@ -23,6 +30,9 @@ from pvzrl_human_coach import (
 )
 
 
+FIVE_LANE_LIVE_ROWS = DEFAULT_ROWS - 1
+
+
 def seed_slot(index: int, plant_type: int, name: str) -> Dict[str, Any]:
     return {
         "slotIndex": index,
@@ -34,10 +44,18 @@ def seed_slot(index: int, plant_type: int, name: str) -> Dict[str, Any]:
     }
 
 
-def observation(legal_actions: List[int], include_fusion_board: bool = False, sun: int = 500) -> Dict[str, Any]:
+def observation(
+    legal_actions: List[int],
+    include_fusion_board: bool = False,
+    sun: int = 500,
+    *,
+    live_rows: int = FIVE_LANE_LIVE_ROWS,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
-        "rowCount": 5,
-        "columnCount": 10,
+        # Keep explicit five-lane coverage: model actions remain padded to six
+        # rows, while live legality masks the absent sixth lane.
+        "rowCount": int(live_rows),
+        "columnCount": DEFAULT_COLS,
         "gameplayReady": True,
         "boardFound": True,
         "canReadBoard": True,
@@ -94,9 +112,9 @@ def observation_duplicate_sunflower_fusion(legal_actions: List[int], sun: int = 
 
 class FakeActionSpec:
     mode = ACTION_SPACE_ADVENTURE_14_IDENTITY
-    max_seed_slots = 14
-    rows = 5
-    cols = 10
+    max_seed_slots = ADVENTURE_IDENTITY_MAX_SEED_SLOTS
+    rows = DEFAULT_ROWS
+    cols = DEFAULT_COLS
 
 
 class FakeConfig:
@@ -164,8 +182,8 @@ class FakeEnv:
             fusion_policy=fusion_policy,
             human_coach_fusion_enabled=human_coach_fusion_enabled,
         )
-        self.rows = 5
-        self.cols = 10
+        self.rows = int(obs.get("rowCount", DEFAULT_ROWS) or DEFAULT_ROWS)
+        self.cols = DEFAULT_COLS
         self.base = FakeBase(bridge_client)
         self._last_observation = obs
         self._action_mask = action_mask
@@ -606,39 +624,57 @@ def main() -> int:
     action, reason = command_to_policy_action(
         plant,
         action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
-        rows=5,
-        cols=10,
-        max_seed_slots=14,
+        rows=FIVE_LANE_LIVE_ROWS,
+        cols=DEFAULT_COLS,
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
         plant_types=[1, 0, 3, 2],
     )
-    assert_case(results, "convert plant to 701 action", action == 25 and reason == "", {"action": action, "reason": reason})
+    assert_case(
+        results,
+        "convert plant to Full-Adventure action",
+        action == 25 and reason == "",
+        {"action": action, "reason": reason},
+    )
     action_000, _ = command_to_policy_action(
         parse_coach_command("plant 0 0 0"),
         action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
-        rows=5,
-        cols=10,
-        max_seed_slots=14,
+        rows=FIVE_LANE_LIVE_ROWS,
+        cols=DEFAULT_COLS,
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
         plant_types=[1, 0, 3, 2],
     )
     action_100, _ = command_to_policy_action(
         parse_coach_command("plant 1 0 0"),
         action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
-        rows=5,
-        cols=10,
-        max_seed_slots=14,
+        rows=FIVE_LANE_LIVE_ROWS,
+        cols=DEFAULT_COLS,
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
         plant_types=[1, 0, 3, 2],
     )
-    action_1349, _ = command_to_policy_action(
-        parse_coach_command("plant 13 4 9"),
+    action_last, _ = command_to_policy_action(
+        parse_coach_command(
+            f"plant {ADVENTURE_IDENTITY_MAX_SEED_SLOTS - 1} "
+            f"{DEFAULT_ROWS - 1} {DEFAULT_COLS - 1}"
+        ),
         action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
-        rows=5,
-        cols=10,
-        max_seed_slots=14,
+        rows=FIVE_LANE_LIVE_ROWS,
+        cols=DEFAULT_COLS,
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
         plant_types=[1, 0, 3, 2],
     )
     assert_case(results, "plant 0 0 0 -> action 1", action_000 == 1, action_000)
-    assert_case(results, "plant 1 0 0 -> action 51", action_100 == 51, action_100)
-    assert_case(results, "plant 13 4 9 -> action 700", action_1349 == 700, action_1349)
+    assert_case(
+        results,
+        f"plant 1 0 0 -> action {1 + CELLS_PER_SLOT}",
+        action_100 == 1 + CELLS_PER_SLOT,
+        action_100,
+    )
+    assert_case(
+        results,
+        f"last slot/cell -> action {ADVENTURE_IDENTITY_ACTION_COUNT - 1}",
+        action_last == ADVENTURE_IDENTITY_ACTION_COUNT - 1,
+        action_last,
+    )
 
     obs = observation([0, 25])
     validation = validate_coach_command(
@@ -680,8 +716,9 @@ def main() -> int:
         not out_of_bounds.legal and out_of_bounds.rejected_reason == "seed_index_out_of_bounds",
         out_of_bounds.to_dict(),
     )
-    out_of_bounds_row = validate_coach_command(
-        parse_coach_command("plant 0 5 4"),
+    padded_sixth_lane_action = 1 + (DEFAULT_ROWS - 1) * DEFAULT_COLS + 4
+    masked_sixth_lane = validate_coach_command(
+        parse_coach_command(f"plant 0 {DEFAULT_ROWS - 1} 4"),
         action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
         observation=obs,
         action_mask=mask_with(0, 25),
@@ -690,9 +727,29 @@ def main() -> int:
     )
     assert_case(
         results,
-        "reject row outside bounds",
-        not out_of_bounds_row.legal and out_of_bounds_row.rejected_reason == "row_out_of_bounds",
-        out_of_bounds_row.to_dict(),
+        "five-lane board masks the padded sixth-lane action",
+        not masked_sixth_lane.legal
+        and masked_sixth_lane.policy_action == padded_sixth_lane_action
+        and masked_sixth_lane.rejected_reason == "illegal_action",
+        masked_sixth_lane.to_dict(),
+    )
+    legal_sixth_lane = validate_coach_command(
+        parse_coach_command(f"plant 0 {DEFAULT_ROWS - 1} 4"),
+        action_space_mode=ACTION_SPACE_ADVENTURE_14_IDENTITY,
+        observation=observation(
+            [0, padded_sixth_lane_action],
+            live_rows=DEFAULT_ROWS,
+        ),
+        action_mask=mask_with(0, padded_sixth_lane_action),
+        plant_types=[1, 0, 3, 2],
+        max_seed_slots=ADVENTURE_IDENTITY_MAX_SEED_SLOTS,
+    )
+    assert_case(
+        results,
+        "six-lane board accepts the same sixth-lane action",
+        legal_sixth_lane.legal
+        and legal_sixth_lane.policy_action == padded_sixth_lane_action,
+        legal_sixth_lane.to_dict(),
     )
     out_of_bounds_col = validate_coach_command(
         parse_coach_command("plant 0 4 10"),
@@ -1176,24 +1233,24 @@ def main() -> int:
     )
     assert_case(
         results,
-        "coach reward components include match/execution/fusion/tactical deltas",
+        "coach fusion receives no duplicate or tactical shaping",
         bool(
-            float(fusion_breakdown.get(COACH_REWARD_MATCH_COMPONENT, 0.0)) > 0.0
-            and float(fusion_breakdown.get(COACH_REWARD_LEGAL_EXECUTION_COMPONENT, 0.0)) > 0.0
-            and float(fusion_breakdown.get(COACH_REWARD_FUSION_SUCCESS_COMPONENT, 0.0)) > 0.0
-            and float(fusion_breakdown.get(COACH_REWARD_TACTICAL_USEFULNESS_COMPONENT, 0.0)) > 0.0
-            and float(fusion_reward) > 1.0
+            float(fusion_breakdown.get(COACH_REWARD_MATCH_COMPONENT, 0.0)) == 0.0
+            and float(fusion_breakdown.get(COACH_REWARD_LEGAL_EXECUTION_COMPONENT, 0.0)) == 0.0
+            and float(fusion_breakdown.get(COACH_REWARD_FUSION_SUCCESS_COMPONENT, 0.0)) == 0.0
+            and float(fusion_breakdown.get(COACH_REWARD_TACTICAL_USEFULNESS_COMPONENT, 0.0)) == 0.0
+            and float(fusion_reward) == 1.0
         ),
         {"reward": fusion_reward, "reward_breakdown": fusion_breakdown},
     )
     assert_case(
         results,
-        "fusion/tactical counters are tracked in live status",
+        "fusion/tactical diagnostics stay tracked without reward shaping",
         bool(
             int(fusion_status.get("human_coach_fusion_attempt_count", 0)) >= 1
             and int(fusion_status.get("human_coach_fusion_success_count", 0)) >= 1
             and int(fusion_status.get("human_coach_tactical_useful_count", 0)) >= 1
-            and float(fusion_status.get("human_coach_fusion_success_reward_total", 0.0)) > 0.0
+            and float(fusion_status.get("human_coach_fusion_success_reward_total", 0.0)) == 0.0
         ),
         fusion_status,
     )

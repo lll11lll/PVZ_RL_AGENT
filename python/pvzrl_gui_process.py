@@ -12,6 +12,8 @@ from typing import Any, List
 
 import tkinter as tk
 
+from pvzrl_gui_status import LiveStatusReader
+
 
 LOG_POLL_MS = 100
 LOG_BACKLOG_POLL_MS = 1
@@ -21,17 +23,30 @@ LOG_QUEUE_MAX_ITEMS = 10_000
 STOP_GRACE_SECONDS = 5.0
 STOP_KILL_WAIT_SECONDS = 2.0
 
+PROCESS_OFFLINE = "OFFLINE"
+PROCESS_STARTING = "STARTING"
+PROCESS_STOPPING = "STOPPING"
+PROCESS_ERROR = "ERROR"
+
 
 class ProcessLogMixin:
     def launch_process(self, name: str, command: List[str]) -> None:
         if self.active_process is not None:
             self._append_log(f"ERROR: Cannot launch {name}; {self.active_process_name} is still running.\n")
             return
+        live_status_arg = self._command_arg(command, "--live-status-path")
+        external_reason = self._external_backend_block_reason(command)
+        if external_reason:
+            self._append_log(
+                f"ERROR: Cannot launch {name}; another backend appears active ({external_reason}).\n"
+            )
+            self._set_process_state(PROCESS_ERROR, f"External backend: {external_reason}")
+            return
+        self._set_process_state(PROCESS_STARTING, name)
         self._append_log(f"\nStarting subprocess: {name}\n")
         model_path = self._command_arg(command, "--model-path")
         resume_model_path = self._command_arg(command, "--resume-model-path")
         run_dir = self._command_arg(command, "--run-dir")
-        live_status_arg = self._command_arg(command, "--live-status-path")
         if model_path:
             self._append_log(f"Selected model path: {model_path}\n")
         if resume_model_path:
@@ -41,6 +56,16 @@ class ProcessLogMixin:
                 resolved_live_status = self._resolve_text_path(live_status_arg)
             except (OSError, ValueError):
                 resolved_live_status = Path(live_status_arg)
+            self.live_status_path = resolved_live_status
+            live_path_var = getattr(self, "live_status_path_var", None)
+            if live_path_var is not None:
+                live_path_var.set(str(resolved_live_status))
+            reader = getattr(self, "_live_status_reader", None)
+            if reader is not None:
+                reader.set_path(resolved_live_status)
+            self.last_good_status = None
+            self.last_good_read_time = None
+            self.last_live_parse_error = ""
             self._append_log(f"[gui] live status path: {resolved_live_status}\n")
         if run_dir:
             self._append_log(f"Selected run directory: {run_dir}\n")
@@ -69,14 +94,17 @@ class ProcessLogMixin:
             )
         except OSError as exc:
             self._append_log(f"ERROR: Failed to launch {name}: {exc}\n")
-            self.process_status_var.set("Idle")
+            self._set_process_state(PROCESS_ERROR, f"Launch failed: {exc}")
             return
 
         self.active_process = process
         self.active_process_name = name
         self.active_process_started_at = time.monotonic()
+        self.active_process_started_wall_time = time.time()
         self.live_writer_warning_emitted = False
-        self.process_status_var.set(f"Running: {name}")
+        # A spawned process is not yet a ready backend. Canonical live status
+        # promotes STARTING to RUNNING/LIVE once the writer is observed.
+        self._set_process_state(PROCESS_STARTING, name)
         self._set_running(True)
         self._reader_thread = threading.Thread(
             target=self._read_process_output,
@@ -126,6 +154,7 @@ class ProcessLogMixin:
         if self._stopping_process is process:
             return
         self._stopping_process = process
+        self._set_process_state(PROCESS_STOPPING, name)
         for button in self.stop_buttons:
             button.configure(state="disabled")
         try:
@@ -214,6 +243,7 @@ class ProcessLogMixin:
         self._cancel_after("_poll_after_id")
         self._cancel_after("_log_after_id")
         self._cancel_after("_log_view_after_id")
+        self._cancel_after("_artifact_after_id")
         if include_close:
             self._cancel_after("_close_after_id")
 
@@ -253,14 +283,21 @@ class ProcessLogMixin:
     def _handle_process_exit(self, name: str, process: subprocess.Popen[str], exit_code: int) -> None:
         if self.active_process is not process and self._stopping_process is not process:
             return
+        was_stopping = self._stopping_process is process
         self._append_log(f"[{name}] exited with code {exit_code}\n")
         if self.active_process is process:
             self.active_process = None
             self.active_process_name = ""
             self.active_process_started_at = None
+            self.active_process_started_wall_time = None
             self._stopping_process = None
             self.live_writer_warning_emitted = False
-            self.process_status_var.set("Idle")
+            if was_stopping:
+                self._set_process_state(PROCESS_OFFLINE, f"{name} stopped")
+            elif exit_code == 0:
+                self._set_process_state(PROCESS_OFFLINE, f"{name} completed")
+            else:
+                self._set_process_state(PROCESS_ERROR, f"{name} exited {exit_code}")
             if not self._closing:
                 self._set_running(False)
         if self._reader_thread is not None and not self._reader_thread.is_alive():
@@ -274,3 +311,74 @@ class ProcessLogMixin:
             button.configure(state=state)
         for button in self.stop_buttons:
             button.configure(state="normal" if running else "disabled")
+
+    def _set_process_state(self, state: str, detail: str = "") -> None:
+        """Publish one explicit lifecycle state without making Tk a runtime authority."""
+
+        normalized = str(state or PROCESS_OFFLINE).strip().upper()
+        self.process_lifecycle_state = normalized
+        self.process_lifecycle_detail = str(detail or "")
+        label = normalized if not detail else f"{normalized}: {detail}"
+        variable = getattr(self, "process_status_var", None)
+        if variable is not None:
+            variable.set(label)
+        lifecycle_var = getattr(self, "process_lifecycle_var", None)
+        if lifecycle_var is not None:
+            lifecycle_var.set(normalized)
+
+    @staticmethod
+    def _backend_status_block_reason(payload: Any, health: str) -> str:
+        if not isinstance(payload, dict) or not (
+            health == "LIVE" or health.startswith("BLOCKED_")
+        ):
+            return ""
+        status = str(payload.get("status") or payload.get("state") or "").strip().lower()
+        run_mode = str(payload.get("run_mode") or payload.get("mode") or "").strip()
+        streamer = bool(payload.get("streamer_v1_enabled"))
+        if status not in {"running", "starting", "live", "active", "blocked", "waiting"}:
+            return ""
+        if not streamer and "adventure_generalist" not in run_mode and "STREAM_" not in run_mode.upper():
+            return ""
+        active_run = str(payload.get("active_run") or payload.get("run_dir") or "").strip()
+        return active_run or run_mode or "fresh live_status.json"
+
+    def _external_backend_block_reason(self, command: Any = None) -> str:
+        """Refuse a second run using a fresh read of the command's status target."""
+
+        if self.active_process is not None:
+            return self.active_process_name or "GUI child"
+        target_path: Any = None
+        if isinstance(command, list):
+            raw_target = self._command_arg(command, "--live-status-path")
+            if raw_target:
+                try:
+                    target_path = self._resolve_text_path(raw_target)
+                except (OSError, ValueError):
+                    target_path = Path(raw_target)
+        if target_path is None:
+            target_path = getattr(self, "live_status_path", None)
+
+        if target_path is not None:
+            try:
+                payload, info = LiveStatusReader(Path(target_path)).read()
+            except (OSError, ValueError):
+                payload, info = None, {}
+            reason = self._backend_status_block_reason(
+                payload, str(info.get("health") or "")
+            )
+            if reason:
+                return reason
+            current_path = getattr(self, "live_status_path", None)
+            if current_path is not None:
+                try:
+                    if Path(target_path).resolve(strict=False) == Path(current_path).resolve(
+                        strict=False
+                    ):
+                        return ""
+                except OSError:
+                    pass
+
+        return self._backend_status_block_reason(
+            getattr(self, "last_good_status", None),
+            str(getattr(self, "last_live_health", "")),
+        )
