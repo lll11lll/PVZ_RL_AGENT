@@ -8,17 +8,17 @@ Adventure Generalist is the sole maintained training and evaluation path. Legacy
 
 | Item | Value |
 | --- | --- |
-| Model family | `ppo_adventure_generalist_14slot_identity_v1` |
+| Model family | `ppo_adventure_generalist_14slot_identity_full_v2` |
 | Run modes | `adventure_generalist_14slot_train`, `adventure_generalist_14slot_eval` |
-| Action mode | `adventure_14slot_identity` |
-| Actions | 701: wait `0`, placement/fusion `1..700` |
-| Decoder | `seedslot14x50_plus_wait_v1` |
-| Observation | `adventure_14slot_identity_v1`, shape `(4297,)` |
-| Board/capacity | 5x10, 14 identity slots |
+| Action mode | `adventure_14slot_identity_full_v2` |
+| Actions | 841: wait `0`, placement/fusion `1..840` |
+| Decoder | `seedslot14x60_padded6x10_plus_wait_v2` |
+| Observation | `adventure_14slot_identity_full_v2`, shape `(4364,)` |
+| Board/capacity | fixed 6x10 model board, 14 identity slots; five-lane boards are padded |
 | Initial loadout | `SunFlower,SunFlower,Peashooter,Peashooter` |
-| Protected checkpoint | `runs/ppo_adventure_generalist_14slot_identity_v1_20260627_172727/checkpoints/ppo_pvz_370000_steps.zip` |
+| Full Adventure | levels 1 through 50; fresh v2 training is required |
 
-The action and observation spaces never resize with the current seed bank. Inactive slot blocks remain encoded and masked.
+The action and observation spaces never resize with the current seed bank or live board height. Inactive slot blocks and the padded sixth row on five-lane boards remain encoded and masked. The historic v1 701-action/4,297-observation checkpoint is intentionally incompatible with this v2 contract, so it cannot be resumed or evaluated here.
 
 ## Features
 
@@ -28,8 +28,8 @@ The action and observation spaces never resize with the current seed bank. Inact
 - one cached legality pipeline shared by policy, coaches, diagnostics, and execution
 - tile-scoped known and runtime-probed fusion with recursive identity/reward tracking
 - additive reward components, episode metrics, TensorBoard, live status, and watchdog bundles
-- Twitch EventSub Streamer Mode with strict FIFO commands, intervention-aware PPO, masked behavior cloning, autonomous evaluations, and protected baseline/current/best checkpoints
-- local human coach, mock crowd coach, assisted-coach interventions, and Tk dashboard
+- Twitch EventSub Streamer Mode V1 with strict FIFO commands, intervention-aware PPO, masked behavior cloning, autonomous evaluations, and protected BASELINE/CURRENT/BEST checkpoints
+- a Tk control center for Generalist train/resume/eval, first-class Streamer V1, runs/models, diagnostics, settings, and explicitly separate local coach tools
 - localhost-only Unity bridge with bounded request ownership/deadlines and reset/UI operations
 - bridge-free Python tests, deterministic C# lifecycle harness, and synthetic benchmarks
 
@@ -55,16 +55,15 @@ python -m compileall -q python
 python -m pytest -q
 ```
 
-Validate and actually load the protected checkpoint on CPU:
+Validate the v2 contract before starting a fresh run:
 
 ```powershell
 python .\python\train_ppo.py `
-  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
-  --metadata-dry-run `
-  --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip
+  --config configs\ppo_adventure_generalist_full_v2.json `
+  --metadata-dry-run
 ```
 
-Expected model contract: 701 actions, observation `(4297,)`, timestep 370000.
+Expected model contract: 841 actions and observation `(4364,)`. A CPU model-load check becomes available after the first v2 checkpoint is trained.
 
 ## Bridge build
 
@@ -83,7 +82,7 @@ Live commands are stateful. Select the intended profile and place the game at a 
 
 ```powershell
 python .\python\train_ppo.py `
-  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --config configs\ppo_adventure_generalist_full_v2.json `
   --adventure-generalist-train `
   --run-dir runs\manual_generalist\fresh `
   --quick-wait --wait-gameplay-ready
@@ -95,7 +94,7 @@ Resume loads a compatible Generalist model and must write to a different destina
 
 ```powershell
 python .\python\train_ppo.py `
-  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --config configs\ppo_adventure_generalist_full_v2.json `
   --adventure-generalist-train `
   --resume-model-path runs\manual_generalist\fresh\model.zip `
   --run-dir runs\manual_generalist\resume `
@@ -106,9 +105,9 @@ python .\python\train_ppo.py `
 
 ```powershell
 python .\python\train_ppo.py `
-  --config configs\ppo_adventure_generalist_14slot_identity_v1.json `
+  --config configs\ppo_adventure_generalist_full_v2.json `
   --adventure-generalist-eval `
-  --model-path runs\ppo_adventure_generalist_14slot_identity_v1_20260627_172727\checkpoints\ppo_pvz_370000_steps.zip `
+  --model-path runs\manual_generalist\fresh\model.zip `
   --run-dir runs\manual_generalist\eval `
   --quick-wait --wait-gameplay-ready
 ```
@@ -119,18 +118,18 @@ Evaluation performs masked inference and Adventure progression orchestration; it
 
 Streamer Mode layers Twitch-controlled interventions and behavior cloning onto the same Adventure Generalist trainer and evaluator. It uses Twitch EventSub WebSocket `channel.chat.message`, a bounded FIFO with one opportunity every two seconds, and the canonical action/mask/fusion path. Viewer transitions change the game and enter the bounded demonstration dataset, but never masquerade as policy actions in the PPO rollout.
 
-Copy/edit the safe environment-variable-name example and set the real Twitch values only in the process environment:
+After training a v2 baseline, copy/edit the full-Adventure environment-variable-name example and set the real Twitch values only in the process environment:
 
 ```powershell
 python .\python\train_ppo.py `
-  --config .\configs\streamer_v1.example.json `
+  --config .\configs\streamer_full_v2.example.json `
   --streamer-v1 `
   --run-dir .\runs\streamer_v1\live `
   --live-status-path .\runs\streamer_v1\live\live_status.json `
   --quick-wait --wait-gameplay-ready
 ```
 
-The default loop evaluates the untouched configured 500k baseline, trains for exactly 25,000 policy-generated steps with Twitch + BC, evaluates 50 autonomous episodes, compares against baseline/previous/BEST, then continues from CURRENT. Adventure levels are handed forward sequentially and validated against live profile/UI/bridge identity. OBS and all process/game startup remain manual.
+The default loop evaluates the newly trained configured v2 baseline, trains for exactly 25,000 policy-generated steps with Twitch + BC, evaluates 50 autonomous episodes, compares against baseline/previous/BEST, then continues from CURRENT. Adventure levels are handed forward sequentially and validated against live profile/UI/bridge identity. OBS and all process/game startup remain manual.
 
 Read [Streamer Mode V1](docs/STREAMER_MODE.md) for authentication, commands, privacy, PPO/GAE semantics, artifacts, recovery, known evaluation limitations, and six-hour endurance instructions.
 
@@ -140,7 +139,11 @@ Read [Streamer Mode V1](docs/STREAMER_MODE.md) for authentication, commands, pri
 python .\python\pvzrl_gui.py --live-status-path runs\live_status.json
 ```
 
-The Tk dashboard exposes Generalist fresh train, resume, evaluation, runs/models, coach, and diagnostics workflows. It launches child processes and reads status; it does not directly control Unity gameplay.
+The Tk control center has persistent pages for Dashboard, Training, Evaluation, Streamer, Runs & Models, Diagnostics, Local Coach, and Settings. Training, evaluation, and Streamer V1 forms validate before launch and show the exact backend command. Runs & Models indexes metadata and artifact provenance for an explicit operator selection; it never silently chooses a "latest" model. Streamer shows phase, queue/outcome counters, PPO/BC state, model roles, Adventure state, redacted Twitch health, and privacy-safe event history.
+
+The GUI is generalized around the fixed 6-row x 10-column, 14-slot Full-Adventure contract. It launches `train_ppo.py` child processes and reads canonical status/artifacts; it does not call the bridge directly or create another gameplay truth. Twitch fields store environment-variable names and readiness only. Credential values are never displayed or saved. The local assisted/crowd-coach page is a separate legacy-compatible local input surface, not Streamer V1.
+
+See [GUI control center](docs/GUI.md) for page ownership, launch workflows, compatibility checks, artifact provenance, lifecycle behavior, and status-source details.
 
 ## Architecture
 
@@ -174,13 +177,13 @@ flowchart LR
 | `python/pvzrl_twitch.py`, `python/pvzrl_streamer_source.py` | EventSub WebSocket and source-neutral command input |
 | `python/pvzrl_stream_commands.py`, `python/pvzrl_stream_actions.py` | Strict FIFO commands and canonical current-state action resolution |
 | `python/pvzrl_demonstrations.py`, `python/pvzrl_streamer_logging.py` | Bounded learning records and privacy-safe compact events |
-| `python/pvzrl_action_space.py`, `python/pvzrl_actions.py` | 701-action contract and legality cache |
-| `python/pvzrl_observation_*.py`, `python/pvzrl_seed_inventory.py` | 4,297-feature contract and facts |
+| `python/pvzrl_action_space.py`, `python/pvzrl_actions.py` | 841-action full-Adventure contract and legality cache |
+| `python/pvzrl_observation_*.py`, `python/pvzrl_seed_inventory.py` | 4,364-feature full-Adventure contract and facts |
 | `python/pvzrl_fusion.py`, `python/pvzrl_rewards.py` | Fusion and reward composition |
-| `python/pvzrl_gui*.py` | Tk dashboard, commands, process/status/coach support |
+| `python/pvzrl_gui*.py` | Tk control center, validated commands, bounded process/status/event handling, artifact indexing, and local coach support |
 | `src/PvZRLBridge/` | MelonLoader bridge and Unity operations |
-| `configs/ppo_adventure_generalist_14slot_identity_v1.json` | Canonical run configuration |
-| `configs/streamer_v1.example.json` | Safe Streamer V1 example with environment-variable names only |
+| `configs/ppo_adventure_generalist_full_v2.json` | Canonical full-Adventure run configuration |
+| `configs/streamer_full_v2.example.json` | Safe Full-Adventure Streamer example with environment-variable names only |
 | `scripts/` | Bridge generation/build/harness/benchmark scripts |
 | `docs/` | Architecture, configuration, operations, learning, and refactor evidence |
 
@@ -197,7 +200,9 @@ The Python benchmark and Streamer soak are synthetic. They do not measure Unity,
 ## Documentation
 
 - [Agent operating guide](AGENTS.md)
+- [GUI control center](docs/GUI.md)
 - [Configuration](docs/CONFIGURATION.md)
+- [Full-Adventure v2 migration and live evidence](docs/FULL_ADVENTURE_V2.md)
 - [Streamer Mode V1](docs/STREAMER_MODE.md)
 - [Removal inventory](docs/FIXED_MODE_REMOVAL_INVENTORY.md)
 - [Refactor plan](docs/REFACTOR_PLAN.md)
