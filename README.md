@@ -185,28 +185,8 @@ flowchart LR
 | `configs/ppo_adventure_generalist_full_v2.json` | Canonical full-Adventure run configuration |
 | `configs/streamer_full_v2.example.json` | Safe Full-Adventure Streamer example with environment-variable names only |
 | `scripts/` | Bridge generation/build/harness/benchmark scripts |
-| `docs/` | Architecture, configuration, operations, learning, and refactor evidence |
 
-## Benchmarks
-
-```powershell
-python .\python\benchmark_hotpaths.py --samples 50 --rounds 5 --json-out runs\benchmarks\manual_python.json
-.\scripts\benchmark_bridge_observation.ps1 -OutputPath runs\benchmarks\manual_bridge.json
-python .\python\pvzrl_streamer_soak.py --duration-hours 6 --report-path runs\streamer_soak\six_hour.json
-```
-
-The Python benchmark and Streamer soak are synthetic. They do not measure Unity, Twitch delivery, socket latency, live rollout SPS, or complete Tk rendering.
-
-## Documentation
-
-- [Agent operating guide](AGENTS.md)
-- [GUI control center](docs/GUI.md)
-- [Configuration](docs/CONFIGURATION.md)
-- [Full-Adventure v2 migration and live evidence](docs/FULL_ADVENTURE_V2.md)
-- [Streamer Mode V1](docs/STREAMER_MODE.md)
-- [Removal inventory](docs/FIXED_MODE_REMOVAL_INVENTORY.md)
-- [Refactor plan](docs/REFACTOR_PLAN.md)
-- [Refactor report](docs/REFACTOR_REPORT.md)
+ synthetic. They do not measure Unity, Twitch delivery, socket latency, live rollout SPS, or complete Tk rendering.
 
 ## Safety and evidence
 
