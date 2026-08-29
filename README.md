@@ -20,6 +20,18 @@ Adventure Generalist is the sole maintained training and evaluation path. Legacy
 
 The action and observation spaces never resize with the current seed bank or live board height. Inactive slot blocks and the padded sixth row on five-lane boards remain encoded and masked. The historic v1 701-action/4,297-observation checkpoint is intentionally incompatible with this v2 contract, so it cannot be resumed or evaluated here.
 
+## At a glance
+
+- 20,000+ lines across Python and C#
+- 841-action masked action space
+- 4,364-feature observation space
+- 500,000+ environment steps trained
+- 20+ hour sustained training sessions
+- PPO + behavior cloning
+- Twitch-driven demonstrations
+- Local C# Unity bridge
+
+  
 ## Features
 
 - Adventure Generalist fresh training, compatible resume, and evaluation
